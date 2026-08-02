@@ -1,0 +1,14 @@
+{
+  "source_filename": "Aranda Insurance.pdf",
+  "carrier_detected": "State Farm",
+  "claim_number": "4399W552P",
+  "insured_name": "ARANDA, GENARO",
+  "price_list": "TXDF28_APR26",
+  "minimum_line_items": 35,
+  "minimum_coverages": 2,
+  "minimum_sections": 8,
+  "must_include_descriptions": [
+    "R&R Gutter - aluminum - up to 5\"",
+    "Tear off, haul and dispose of comp. shingles - Laminated"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "source_filename": "Bagi Insurance Estimate.pdf",
+  "carrier_detected": "Allstate",
+  "claim_number": "0828254359",
+  "insured_name": "RAVIRAJ BAGI",
+  "price_list": "TXDF8X_02MAY26",
+  "minimum_line_items": 18,
+  "minimum_coverages": 1,
+  "minimum_sections": 5,
+  "must_include_descriptions": [
+    "Remove Laminated - comp. shingle rfg. - w/ felt",
+    "Roofing felt - 15 lb."
+  ]
+}

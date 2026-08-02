@@ -1,0 +1,143 @@
+# Canonical Xactimate group-name vocabulary, transcribed from the
+# reviewer-supplied group-name list (Phase 3.5 build spec). Used only
+# to SUGGEST a group name for an extracted section -- never to force a
+# rename. See docs/verified-catalog-builder.md "Group-name handling".
+#
+# `aliases` is a small, reviewer-extensible lookup of
+# lowercased-original-section-name -> canonical group name, grown over
+# time via "save as reusable group alias" in the review UI. It starts
+# with only the unambiguous example given in the build spec.
+groups:
+- Apartment
+- Apartment 1
+- Apartment 2
+- Apartment 3
+- Area
+- Atrium
+- Attic
+- Barn
+- Basement
+- Bathroom
+- Bathroom (1 1/2)
+- Bathroom (3/4)
+- Bathroom (full)
+- Bathroom (half)
+- Bedroom
+- Bedroom 1
+- Bedroom 2
+- Bedroom 3
+- Breakfast Area/Room
+- Breeze way
+- Building
+- Building 1
+- Building 2
+- Building 3
+- Cafeteria
+- Carport
+- Ceiling
+- Cellar
+- Cleaning
+- Closet
+- Computer Area/Room
+- Conference Room
+- Crawlspace
+- Debris Removal
+- Deck
+- Dining Room
+- Display Room
+- Doors
+- Electrical
+- Entry/Foyer
+- Exam Room
+- Exterior
+- Exterior/General
+- Family Room
+- Fencing
+- Finish Items
+- First Floor
+- Floor
+- Floor Coverings
+- Foyer/Entry
+- Framing
+- Front Elevation
+- Gable
+- Game Room
+- Garage
+- Gazebo
+- Great Room
+- Greenhouse
+- Guest Room
+- Hallway
+- Heat, Vent, & Cool
+- Hobby Area/Room
+- Interior
+- Kitchen
+- Laundry Room
+- Left Elevation
+- Library
+- Linen Closet
+- Living Room
+- Lobby
+- Location 1
+- Location 2
+- Location 3
+- Lot/Property
+- Masonry
+- Master Bath
+- Master Bedroom
+- Media Room
+- Meeting Room
+- Mill/Trim Work
+- Miscellaneous
+- Mud Room
+- Nook
+- Nursery
+- Office
+- Other
+- Painting
+- Pantry
+- Patio
+- Personal Property
+- Play Area/Room
+- Plumbing
+- Pool Area
+- Pool Enclosure
+- Porch
+- Rear Elevation
+- Recreation Room
+- Right Elevation
+- Roof
+- Roofing
+- Room
+- Sales Room
+- Sauna
+- Screened Lanai
+- Screened Porch
+- Second Floor
+- Shed
+- Shop
+- Show Room
+- Siding
+- Site Work
+- Slab/Foundation
+- Stairway
+- Storage Area/Room
+- Study
+- Sunroom
+- Temporary Repairs
+- Third Floor
+- Unit 1
+- Unit 2
+- Unit 3
+- Utility Room
+- Vanity Area/Room
+- Walk-in Closet
+- Wall
+- Wallpaper/Covering
+- Warehouse
+- Windows
+- Work Area/Room
+aliases:
+  dwelling roof: Roof
+  main dwelling roof: Roof
+  roof: Roof

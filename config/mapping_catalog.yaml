@@ -1,0 +1,370 @@
+# Starter Xactimate-candidate catalog. Honest and intentionally incomplete
+# -- see docs/mapping-engine.md "Xactimate data integrity".
+#
+# `xactimate.category` is populated ONLY where this repository has direct
+# verified evidence: the roofing ("RFG") entries are backed by literal
+# "Component RFG300 ..." / "Component RFG240 ..." text printed in several of
+# the fixture PDFs' own ITEL pricing notes (Aranda, Garrety, Bagi use
+# RFG300 for laminated shingles; Odom, Garcia, Wei Tang use RFG240 for
+# 3-tab). Every other trade has NO verified source in this repository for
+# its Xactimate category/selector, so `category` and `selector` are both
+# left null there, `requires_review: true`, and a note explains what must
+# be verified before automation. This is deliberate: it would be dishonest
+# to fabricate category letters from general industry familiarity alone
+# without a documented authoritative source (a licensed Xactimate price
+# list) in this repository -- see the build spec's "Xactimate data
+# integrity" requirement.
+
+- mapping_id: "rfg_laminated_shingle_remove"
+  canonical_terms: ["laminated composition shingles", "laminated comp. shingle"]
+  trade: "roofing"
+  component: "composition_shingles"
+  allowed_actions: ["remove"]
+  allowed_units: ["SQ"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: "remove"
+    description: "Tear off laminated composition shingle roofing"
+  confidence_base: 0.85
+  requires_review: true
+  notes:
+    - "Category 'RFG' verified from source-document ITEL pricing notes referencing component RFG300."
+    - "Exact selector must be verified against a licensed Xactimate price list."
+
+- mapping_id: "rfg_laminated_shingle_install"
+  canonical_terms: ["laminated composition shingles", "laminated comp. shingle"]
+  trade: "roofing"
+  component: "composition_shingles"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["SQ"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: "install"
+    description: "Laminated composition shingle roofing"
+  confidence_base: 0.90
+  requires_review: true
+  notes:
+    - "Category 'RFG' verified from source-document ITEL pricing notes referencing component RFG300."
+    - "Exact selector must be verified against a licensed Xactimate price list."
+
+- mapping_id: "rfg_3tab_shingle_install"
+  canonical_terms: ["3-tab composition shingles", "3 tab", "comp. shingle roofing"]
+  trade: "roofing"
+  component: "composition_shingles"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["SQ"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: "install"
+    description: "3-tab composition shingle roofing"
+  confidence_base: 0.88
+  requires_review: true
+  notes:
+    - "Category 'RFG' verified from source-document ITEL pricing notes referencing component RFG240."
+    - "Exact selector must be verified against a licensed Xactimate price list."
+
+- mapping_id: "rfg_roofing_felt"
+  canonical_terms: ["roofing felt"]
+  trade: "roofing"
+  component: "roofing_felt"
+  allowed_actions: ["install", "replace", "remove_and_replace", "remove"]
+  allowed_units: ["SQ"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: null
+    description: "Roofing felt underlayment"
+  confidence_base: 0.85
+  requires_review: true
+  notes:
+    - "Category 'RFG' inferred from trade grouping with the verified shingle entries above."
+    - "Selector not verified; requires a licensed Xactimate price list."
+
+- mapping_id: "rfg_ridge_cap"
+  canonical_terms: ["ridge cap"]
+  trade: "roofing"
+  component: "ridge_cap"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["LF"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: null
+    description: "Hip/ridge cap"
+  confidence_base: 0.85
+  requires_review: true
+  notes: ["Selector not verified; requires a licensed Xactimate price list."]
+
+- mapping_id: "rfg_starter_course"
+  canonical_terms: ["starter course"]
+  trade: "roofing"
+  component: "starter_course"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["LF"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: null
+    description: "Asphalt starter course"
+  confidence_base: 0.85
+  requires_review: true
+  notes: ["Selector not verified; requires a licensed Xactimate price list."]
+
+- mapping_id: "rfg_drip_edge"
+  canonical_terms: ["drip edge"]
+  trade: "roofing"
+  component: "drip_edge"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["LF"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: null
+    description: "Drip edge"
+  confidence_base: 0.85
+  requires_review: true
+  notes: ["Selector not verified; requires a licensed Xactimate price list."]
+
+- mapping_id: "rfg_valley_metal"
+  canonical_terms: ["valley metal"]
+  trade: "roofing"
+  component: "valley_metal"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["LF"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: null
+    description: "Valley metal"
+  confidence_base: 0.8
+  requires_review: true
+  notes: ["Selector not verified; requires a licensed Xactimate price list."]
+
+- mapping_id: "rfg_roof_vent"
+  canonical_terms: ["roof vent"]
+  trade: "roofing"
+  component: "roof_vent"
+  allowed_actions: ["install", "replace", "remove_and_replace", "detach_and_reset"]
+  allowed_units: ["EA"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: null
+    description: "Roof vent"
+  confidence_base: 0.8
+  requires_review: true
+  notes: ["Selector not verified; requires a licensed Xactimate price list."]
+
+- mapping_id: "rfg_pipe_flashing"
+  canonical_terms: ["pipe flashing"]
+  trade: "roofing"
+  component: "pipe_flashing"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["EA"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: null
+    description: "Pipe jack flashing"
+  confidence_base: 0.8
+  requires_review: true
+  notes: ["Selector not verified; requires a licensed Xactimate price list."]
+
+- mapping_id: "rfg_chimney_flashing"
+  canonical_terms: ["chimney flashing", "counterflashing"]
+  trade: "roofing"
+  component: "chimney_flashing"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["LF", "EA"]
+  xactimate:
+    category: "RFG"
+    selector: null
+    activity: null
+    description: "Chimney/sidewall flashing"
+  confidence_base: 0.75
+  requires_review: true
+  notes: ["Selector not verified; requires a licensed Xactimate price list."]
+
+- mapping_id: "gut_gutter"
+  canonical_terms: ["gutter"]
+  trade: "gutters"
+  component: "gutter"
+  allowed_actions: ["install", "replace", "remove_and_replace", "detach_and_reset"]
+  allowed_units: ["LF"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Aluminum gutter"
+  confidence_base: 0.7
+  requires_review: true
+  notes:
+    - "No verified Xactimate category is available in this repository for gutters; do not assume 'GUT' without a licensed price list."
+
+- mapping_id: "gut_downspout"
+  canonical_terms: ["downspout"]
+  trade: "gutters"
+  component: "downspout"
+  allowed_actions: ["install", "replace", "remove_and_replace", "detach_and_reset"]
+  allowed_units: ["LF"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Aluminum downspout"
+  confidence_base: 0.7
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for downspouts."]
+
+- mapping_id: "wdw_window_screen"
+  canonical_terms: ["window screen"]
+  trade: "windows"
+  component: "window_screen"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["EA", "SF"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Window screen"
+  confidence_base: 0.65
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for window screens."]
+
+- mapping_id: "dor_garage_door"
+  canonical_terms: ["garage door", "overhead door"]
+  trade: "doors"
+  component: "garage_door"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["EA"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Overhead garage door and hardware"
+  confidence_base: 0.65
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for garage doors."]
+
+- mapping_id: "cln_pressure_wash"
+  canonical_terms: ["pressure wash", "pressure/chemical spray"]
+  trade: "cleaning"
+  component: "exterior_surface"
+  allowed_actions: ["pressure_wash", "clean"]
+  allowed_units: ["SF"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Pressure/chemical wash"
+  confidence_base: 0.6
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for pressure washing."]
+
+- mapping_id: "fce_fence_stain"
+  canonical_terms: ["fence", "wood fence"]
+  trade: "fencing"
+  component: "fence"
+  allowed_actions: ["stain", "seal", "install", "replace", "remove_and_replace"]
+  allowed_units: ["SF", "LF", "EA"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Wood fence"
+  confidence_base: 0.6
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for fencing."]
+
+- mapping_id: "dmo_debris_haul"
+  canonical_terms: ["debris"]
+  trade: "debris_removal"
+  component: "debris"
+  allowed_actions: ["haul", "dispose"]
+  allowed_units: ["EA", "LS"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Debris haul/disposal"
+  confidence_base: 0.6
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for debris hauling."]
+
+- mapping_id: "dry_drywall"
+  canonical_terms: ["drywall"]
+  trade: "drywall"
+  component: "drywall"
+  allowed_actions: ["install", "replace", "remove_and_replace", "repair"]
+  allowed_units: ["SF"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Drywall"
+  confidence_base: 0.6
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for drywall."]
+
+- mapping_id: "pnt_wall_paint"
+  canonical_terms: ["painted_wall", "paint the wall"]
+  trade: "painting"
+  component: "painted_wall"
+  allowed_actions: ["paint", "prime"]
+  allowed_units: ["SF"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Wall painting"
+  confidence_base: 0.6
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for painting."]
+
+- mapping_id: "flr_carpet"
+  canonical_terms: ["carpet"]
+  trade: "flooring"
+  component: "carpet"
+  allowed_actions: ["install", "replace", "remove_and_replace"]
+  allowed_units: ["SF", "SY"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Carpet"
+  confidence_base: 0.6
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for flooring."]
+
+- mapping_id: "lab_labor_minimum"
+  canonical_terms: ["labor minimum"]
+  trade: "general_labor"
+  component: "labor_minimum"
+  allowed_actions: ["labor_minimum"]
+  allowed_units: ["EA"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Labor minimum charge"
+  confidence_base: 0.55
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for labor minimums."]
+
+- mapping_id: "elc_satellite_detach_reset"
+  canonical_terms: ["satellite system"]
+  trade: "electrical"
+  component: "satellite_system"
+  allowed_actions: ["detach_and_reset", "detach", "reset"]
+  allowed_units: ["EA"]
+  xactimate:
+    category: null
+    selector: null
+    activity: null
+    description: "Satellite dish detach & reset"
+  confidence_base: 0.55
+  requires_review: true
+  notes: ["No verified Xactimate category is available in this repository for satellite systems."]

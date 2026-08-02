@@ -1,0 +1,19 @@
+{
+  "source_filename": "Odom Insurance.pdf",
+  "carrier_detected": "USAA",
+  "claim_number": null,
+  "insured_name": "STEFANIE ODOM",
+  "price_list": "MDSC8X_JUL26",
+  "member_number": "018341865",
+  "lr_number": "801",
+  "minimum_line_items": 25,
+  "minimum_coverages": 3,
+  "minimum_sections": 5,
+  "must_include_descriptions": [
+    "Roofing felt - 15 lb.",
+    "3 tab - 25 yr. - comp. shingle roofing - w/out felt"
+  ],
+  "notes": [
+    "claim_number is legitimately null: USAA's template has no 'Claim Number' label anywhere in the document, only Member Number and L/R Number (both of which ARE populated). This must not be fabricated."
+  ]
+}

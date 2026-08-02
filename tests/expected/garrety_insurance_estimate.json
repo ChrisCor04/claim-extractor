@@ -1,0 +1,14 @@
+{
+  "source_filename": "Garrety Insurance Estimate.pdf",
+  "carrier_detected": "State Farm",
+  "claim_number": "430C5R723",
+  "insured_name": "GARRETY, MICHELLE",
+  "price_list": "TXDF28_APR26",
+  "minimum_line_items": 20,
+  "minimum_coverages": 1,
+  "minimum_sections": 3,
+  "must_include_descriptions": [
+    "Tear off, haul and dispose of comp. shingles - Laminated",
+    "Remove Additional charge for steep roof greater than 12/12 slope"
+  ]
+}

@@ -1,0 +1,1962 @@
+{
+  "$defs": {
+    "AddressValue": {
+      "additionalProperties": false,
+      "properties": {
+        "line1": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line1"
+        },
+        "line2": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line2"
+        },
+        "city": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "City"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        },
+        "postal_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Postal Code"
+        },
+        "country": {
+          "default": "US",
+          "title": "Country",
+          "type": "string"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "source_pages": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Source Pages",
+          "type": "array"
+        },
+        "raw_values": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Raw Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "confidence"
+      ],
+      "title": "AddressValue",
+      "type": "object"
+    },
+    "Area": {
+      "additionalProperties": false,
+      "properties": {
+        "area_id": {
+          "title": "Area Id",
+          "type": "string"
+        },
+        "coverage_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Coverage Id"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "area_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Area Type"
+        },
+        "parent_area_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Area Id"
+        },
+        "source_pages": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Source Pages",
+          "type": "array"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "area_id",
+        "name",
+        "confidence"
+      ],
+      "title": "Area",
+      "type": "object"
+    },
+    "BoundingBox": {
+      "additionalProperties": false,
+      "properties": {
+        "page": {
+          "title": "Page",
+          "type": "integer"
+        },
+        "x0": {
+          "title": "X0",
+          "type": "number"
+        },
+        "y0": {
+          "title": "Y0",
+          "type": "number"
+        },
+        "x1": {
+          "title": "X1",
+          "type": "number"
+        },
+        "y1": {
+          "title": "Y1",
+          "type": "number"
+        }
+      },
+      "required": [
+        "page",
+        "x0",
+        "y0",
+        "x1",
+        "y1"
+      ],
+      "title": "BoundingBox",
+      "type": "object"
+    },
+    "ClaimData": {
+      "additionalProperties": false,
+      "properties": {
+        "claim_number": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "estimate_number": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "policy_number": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "insured_name": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "claimant_name": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "property_address": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AddressValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "mailing_address": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AddressValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "type_of_loss": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cause_of_loss": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "date_of_loss": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "date_contacted": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "date_received": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "date_inspected": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "date_entered": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "date_completed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "price_list": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "insurance_company": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "estimate_name": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "member_number": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "lr_number": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldValue_str_"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ClaimData",
+      "type": "object"
+    },
+    "Contact": {
+      "additionalProperties": false,
+      "properties": {
+        "contact_id": {
+          "title": "Contact Id",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/ContactRole"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "company": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Company"
+        },
+        "phone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phone"
+        },
+        "email": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Email"
+        },
+        "license_number": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "License Number"
+        },
+        "source_pages": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Source Pages",
+          "type": "array"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "contact_id",
+        "role",
+        "confidence"
+      ],
+      "title": "Contact",
+      "type": "object"
+    },
+    "ContactRole": {
+      "enum": [
+        "claim_representative",
+        "estimator",
+        "adjuster",
+        "agent",
+        "claims_professional",
+        "other"
+      ],
+      "title": "ContactRole",
+      "type": "string"
+    },
+    "Coverage": {
+      "additionalProperties": false,
+      "properties": {
+        "coverage_id": {
+          "title": "Coverage Id",
+          "type": "string"
+        },
+        "code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code"
+        },
+        "carrier_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Carrier Code"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "subcoverage": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Subcoverage"
+        },
+        "deductible": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deductible"
+        },
+        "policy_limit": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Policy Limit"
+        },
+        "paid_when_incurred": {
+          "default": false,
+          "title": "Paid When Incurred",
+          "type": "boolean"
+        },
+        "summary": {
+          "$ref": "#/$defs/CoverageSummaryFinancials"
+        },
+        "source_pages": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Source Pages",
+          "type": "array"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "coverage_id",
+        "name",
+        "confidence"
+      ],
+      "title": "Coverage",
+      "type": "object"
+    },
+    "CoverageSummaryFinancials": {
+      "additionalProperties": false,
+      "properties": {
+        "line_item_total": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line Item Total"
+        },
+        "material_sales_tax": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Material Sales Tax"
+        },
+        "cleaning_material_tax": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cleaning Material Tax"
+        },
+        "cleaning_sales_tax": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cleaning Sales Tax"
+        },
+        "other_tax": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Other Tax"
+        },
+        "subtotal": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Subtotal"
+        },
+        "overhead": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Overhead"
+        },
+        "profit": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Profit"
+        },
+        "replacement_cost_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replacement Cost Value"
+        },
+        "recoverable_depreciation": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recoverable Depreciation"
+        },
+        "nonrecoverable_depreciation": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Nonrecoverable Depreciation"
+        },
+        "total_depreciation": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Total Depreciation"
+        },
+        "actual_cash_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Actual Cash Value"
+        },
+        "deductible": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deductible"
+        },
+        "net_claim": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Net Claim"
+        },
+        "net_claim_if_depreciation_recovered": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Net Claim If Depreciation Recovered"
+        }
+      },
+      "title": "CoverageSummaryFinancials",
+      "type": "object"
+    },
+    "DepreciationType": {
+      "enum": [
+        "none",
+        "recoverable",
+        "nonrecoverable",
+        "mixed",
+        "unknown"
+      ],
+      "title": "DepreciationType",
+      "type": "string"
+    },
+    "DocumentMeta": {
+      "additionalProperties": false,
+      "properties": {
+        "source_filename": {
+          "title": "Source Filename",
+          "type": "string"
+        },
+        "source_sha256": {
+          "title": "Source Sha256",
+          "type": "string"
+        },
+        "carrier_detected": {
+          "title": "Carrier Detected",
+          "type": "string"
+        },
+        "carrier_confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Carrier Confidence",
+          "type": "number"
+        },
+        "document_type": {
+          "default": "property_estimate",
+          "title": "Document Type",
+          "type": "string"
+        },
+        "page_count": {
+          "title": "Page Count",
+          "type": "integer"
+        },
+        "estimate_page_numbers": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Estimate Page Numbers",
+          "type": "array"
+        },
+        "excluded_page_numbers": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Excluded Page Numbers",
+          "type": "array"
+        },
+        "extraction_status": {
+          "$ref": "#/$defs/ExtractionStatus"
+        },
+        "created_at_utc": {
+          "format": "date-time",
+          "title": "Created At Utc",
+          "type": "string"
+        },
+        "extractor_version": {
+          "title": "Extractor Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_filename",
+        "source_sha256",
+        "carrier_detected",
+        "carrier_confidence",
+        "page_count",
+        "extraction_status",
+        "extractor_version"
+      ],
+      "title": "DocumentMeta",
+      "type": "object"
+    },
+    "ExtractionStatus": {
+      "enum": [
+        "success",
+        "needs_review",
+        "failed"
+      ],
+      "title": "ExtractionStatus",
+      "type": "string"
+    },
+    "FieldValue_str_": {
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "source_pages": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Source Pages",
+          "type": "array"
+        },
+        "raw_values": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Raw Values",
+          "type": "array"
+        },
+        "normalized": {
+          "default": false,
+          "title": "Normalized",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "value",
+        "confidence"
+      ],
+      "title": "FieldValue[str]",
+      "type": "object"
+    },
+    "LineItem": {
+      "additionalProperties": false,
+      "properties": {
+        "line_item_id": {
+          "title": "Line Item Id",
+          "type": "string"
+        },
+        "source_line_number": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Line Number"
+        },
+        "coverage_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Coverage Id"
+        },
+        "area_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Area Id"
+        },
+        "section_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Section Id"
+        },
+        "category_heading": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Category Heading"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "description_normalized_whitespace": {
+          "title": "Description Normalized Whitespace",
+          "type": "string"
+        },
+        "quantity": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quantity"
+        },
+        "unit_of_measure": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit Of Measure"
+        },
+        "unit_price": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit Price"
+        },
+        "tax": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tax"
+        },
+        "overhead_and_profit": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Overhead And Profit"
+        },
+        "replacement_cost_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replacement Cost Value"
+        },
+        "age": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Age"
+        },
+        "life_expectancy": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Life Expectancy"
+        },
+        "condition": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Condition"
+        },
+        "depreciation_percent": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depreciation Percent"
+        },
+        "depreciation_amount": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depreciation Amount"
+        },
+        "depreciation_type": {
+          "$ref": "#/$defs/DepreciationType",
+          "default": "unknown"
+        },
+        "actual_cash_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Actual Cash Value"
+        },
+        "notes": {
+          "items": {
+            "$ref": "#/$defs/Note"
+          },
+          "title": "Notes",
+          "type": "array"
+        },
+        "flags": {
+          "$ref": "#/$defs/LineItemFlags"
+        },
+        "source": {
+          "$ref": "#/$defs/LineItemSource"
+        },
+        "confidence": {
+          "$ref": "#/$defs/LineItemConfidence"
+        },
+        "needs_review": {
+          "default": false,
+          "title": "Needs Review",
+          "type": "boolean"
+        },
+        "review_reasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Review Reasons",
+          "type": "array"
+        }
+      },
+      "required": [
+        "line_item_id",
+        "description",
+        "description_normalized_whitespace",
+        "source",
+        "confidence"
+      ],
+      "title": "LineItem",
+      "type": "object"
+    },
+    "LineItemConfidence": {
+      "additionalProperties": false,
+      "properties": {
+        "overall": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Overall",
+          "type": "number"
+        },
+        "description": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Description",
+          "type": "number"
+        },
+        "quantity": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Quantity",
+          "type": "number"
+        },
+        "unit_of_measure": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Unit Of Measure",
+          "type": "number"
+        },
+        "unit_price": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Unit Price",
+          "type": "number"
+        },
+        "tax": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Tax",
+          "type": "number"
+        },
+        "replacement_cost_value": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Replacement Cost Value",
+          "type": "number"
+        },
+        "depreciation": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Depreciation",
+          "type": "number"
+        },
+        "actual_cash_value": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Actual Cash Value",
+          "type": "number"
+        }
+      },
+      "required": [
+        "overall",
+        "description",
+        "quantity",
+        "unit_of_measure",
+        "unit_price",
+        "tax",
+        "replacement_cost_value",
+        "depreciation",
+        "actual_cash_value"
+      ],
+      "title": "LineItemConfidence",
+      "type": "object"
+    },
+    "LineItemFlags": {
+      "additionalProperties": false,
+      "properties": {
+        "is_remove_only": {
+          "default": false,
+          "title": "Is Remove Only",
+          "type": "boolean"
+        },
+        "is_replace_only": {
+          "default": false,
+          "title": "Is Replace Only",
+          "type": "boolean"
+        },
+        "is_remove_and_replace": {
+          "default": false,
+          "title": "Is Remove And Replace",
+          "type": "boolean"
+        },
+        "is_detach_and_reset": {
+          "default": false,
+          "title": "Is Detach And Reset",
+          "type": "boolean"
+        },
+        "is_labor_minimum": {
+          "default": false,
+          "title": "Is Labor Minimum",
+          "type": "boolean"
+        },
+        "is_code_upgrade": {
+          "default": false,
+          "title": "Is Code Upgrade",
+          "type": "boolean"
+        }
+      },
+      "title": "LineItemFlags",
+      "type": "object"
+    },
+    "LineItemSource": {
+      "additionalProperties": false,
+      "properties": {
+        "page_start": {
+          "title": "Page Start",
+          "type": "integer"
+        },
+        "page_end": {
+          "title": "Page End",
+          "type": "integer"
+        },
+        "raw_text": {
+          "title": "Raw Text",
+          "type": "string"
+        },
+        "line_ranges": {
+          "items": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "title": "Line Ranges",
+          "type": "array"
+        },
+        "bounding_boxes": {
+          "items": {
+            "$ref": "#/$defs/BoundingBox"
+          },
+          "title": "Bounding Boxes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "page_start",
+        "page_end",
+        "raw_text"
+      ],
+      "title": "LineItemSource",
+      "type": "object"
+    },
+    "Note": {
+      "additionalProperties": false,
+      "properties": {
+        "note_type": {
+          "title": "Note Type",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "source_pages": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Source Pages",
+          "type": "array"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "note_type",
+        "text",
+        "confidence"
+      ],
+      "title": "Note",
+      "type": "object"
+    },
+    "PageClassification": {
+      "enum": [
+        "carrier_letter",
+        "settlement_notice",
+        "instructional_sample",
+        "faq",
+        "claim_metadata",
+        "coverage_summary",
+        "estimate_detail",
+        "estimate_detail_continuation",
+        "roof_diagram",
+        "measurement_summary",
+        "tax_recap",
+        "overhead_profit_recap",
+        "recap_by_room",
+        "depreciation_guide",
+        "replacement_cost_explanation",
+        "attachment",
+        "blank",
+        "unknown"
+      ],
+      "title": "PageClassification",
+      "type": "string"
+    },
+    "PageRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "page": {
+          "title": "Page",
+          "type": "integer"
+        },
+        "classification": {
+          "$ref": "#/$defs/PageClassification"
+        },
+        "include_in_estimate": {
+          "title": "Include In Estimate",
+          "type": "boolean"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reasons",
+          "type": "array"
+        }
+      },
+      "required": [
+        "page",
+        "classification",
+        "include_in_estimate",
+        "confidence"
+      ],
+      "title": "PageRecord",
+      "type": "object"
+    },
+    "Section": {
+      "additionalProperties": false,
+      "properties": {
+        "section_id": {
+          "title": "Section Id",
+          "type": "string"
+        },
+        "coverage_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Coverage Id"
+        },
+        "area_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Area Id"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "section_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Section Type"
+        },
+        "parent_section_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Section Id"
+        },
+        "continued_from_page": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Continued From Page"
+        },
+        "source_pages": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Source Pages",
+          "type": "array"
+        },
+        "measurements": {
+          "$ref": "#/$defs/SectionMeasurements"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "section_id",
+        "name",
+        "confidence"
+      ],
+      "title": "Section",
+      "type": "object"
+    },
+    "SectionMeasurements": {
+      "additionalProperties": false,
+      "properties": {
+        "surface_area_sf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Surface Area Sf"
+        },
+        "wall_area_sf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Wall Area Sf"
+        },
+        "ceiling_area_sf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ceiling Area Sf"
+        },
+        "floor_area_sf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Area Sf"
+        },
+        "walls_and_ceiling_sf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Walls And Ceiling Sf"
+        },
+        "number_of_squares": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Number Of Squares"
+        },
+        "perimeter_lf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perimeter Lf"
+        },
+        "ridge_lf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ridge Lf"
+        },
+        "hip_lf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hip Lf"
+        },
+        "floor_perimeter_lf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Perimeter Lf"
+        },
+        "ceiling_perimeter_lf": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ceiling Perimeter Lf"
+        }
+      },
+      "title": "SectionMeasurements",
+      "type": "object"
+    },
+    "SummaryTotal": {
+      "additionalProperties": false,
+      "properties": {
+        "summary_id": {
+          "title": "Summary Id",
+          "type": "string"
+        },
+        "summary_type": {
+          "$ref": "#/$defs/SummaryType"
+        },
+        "coverage_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Coverage Id"
+        },
+        "area_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Area Id"
+        },
+        "section_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Section Id"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "tax": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tax"
+        },
+        "replacement_cost_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replacement Cost Value"
+        },
+        "depreciation": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depreciation"
+        },
+        "actual_cash_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Actual Cash Value"
+        },
+        "source_page": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Page"
+        }
+      },
+      "required": [
+        "summary_id",
+        "summary_type",
+        "label"
+      ],
+      "title": "SummaryTotal",
+      "type": "object"
+    },
+    "SummaryType": {
+      "enum": [
+        "section_total",
+        "area_total",
+        "coverage_summary",
+        "line_item_total",
+        "grand_total",
+        "tax_recap",
+        "overhead_profit_recap",
+        "recap_by_room",
+        "additional_coverage_recap",
+        "paid_when_incurred_summary"
+      ],
+      "title": "SummaryType",
+      "type": "string"
+    },
+    "ValidationState": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/ExtractionStatus"
+        },
+        "issue_count": {
+          "default": 0,
+          "title": "Issue Count",
+          "type": "integer"
+        },
+        "warning_count": {
+          "default": 0,
+          "title": "Warning Count",
+          "type": "integer"
+        },
+        "error_count": {
+          "default": 0,
+          "title": "Error Count",
+          "type": "integer"
+        },
+        "fatal_count": {
+          "default": 0,
+          "title": "Fatal Count",
+          "type": "integer"
+        },
+        "reconciled": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reconciled"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "ValidationState",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "default": "1.0.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "document": {
+      "$ref": "#/$defs/DocumentMeta"
+    },
+    "claim": {
+      "$ref": "#/$defs/ClaimData"
+    },
+    "contacts": {
+      "items": {
+        "$ref": "#/$defs/Contact"
+      },
+      "title": "Contacts",
+      "type": "array"
+    },
+    "coverages": {
+      "items": {
+        "$ref": "#/$defs/Coverage"
+      },
+      "title": "Coverages",
+      "type": "array"
+    },
+    "areas": {
+      "items": {
+        "$ref": "#/$defs/Area"
+      },
+      "title": "Areas",
+      "type": "array"
+    },
+    "sections": {
+      "items": {
+        "$ref": "#/$defs/Section"
+      },
+      "title": "Sections",
+      "type": "array"
+    },
+    "line_items": {
+      "items": {
+        "$ref": "#/$defs/LineItem"
+      },
+      "title": "Line Items",
+      "type": "array"
+    },
+    "summary_totals": {
+      "items": {
+        "$ref": "#/$defs/SummaryTotal"
+      },
+      "title": "Summary Totals",
+      "type": "array"
+    },
+    "source_pages": {
+      "items": {
+        "$ref": "#/$defs/PageRecord"
+      },
+      "title": "Source Pages",
+      "type": "array"
+    },
+    "validation_state": {
+      "$ref": "#/$defs/ValidationState"
+    }
+  },
+  "required": [
+    "document",
+    "validation_state"
+  ],
+  "title": "CanonicalEstimate",
+  "type": "object"
+}

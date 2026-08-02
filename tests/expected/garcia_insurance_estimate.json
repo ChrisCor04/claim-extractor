@@ -1,0 +1,18 @@
+{
+  "source_filename": "Garcia Insurance estimate.pdf",
+  "carrier_detected": "Farmers",
+  "claim_number": "7010004676-1",
+  "insured_name": "JOSE GARCIA",
+  "price_list": "TXDF8X_MAR26",
+  "minimum_line_items": 18,
+  "minimum_coverages": 1,
+  "minimum_sections": 3,
+  "must_include_descriptions": [
+    "Roofing felt - 15 lb.",
+    "Tear off composition shingles - 3 tab (no haul off)"
+  ],
+  "notes": [
+    "claim_number reflects a genuine two-way conflict in the source PDF: the cover letter (page 1) prints '7010004676-1-1' while the claim-metadata header (page 4) prints '7010004676-1'. The tie-break prefers the claim-metadata page over the narrative cover letter, so '7010004676-1' is selected. Both raw values are preserved in claim.claim_number.raw_values and the conflict is surfaced as a CONFLICTING_CLAIM_NUMBER validation issue rather than silently picked.",
+    "insured_name is tied 1-1 between 'Jose Garcia' (cover letter, page 1) and 'JOSE GARCIA' (claim-metadata header, page 4); the same authority tie-break selects the claim-metadata page's value."
+  ]
+}

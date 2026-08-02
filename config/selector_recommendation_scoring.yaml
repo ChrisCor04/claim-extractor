@@ -1,0 +1,69 @@
+# Deterministic scoring weights + thresholds for the Phase 3.7 selector-
+# recommendation layer. Mirrors the shape of mapping_scoring.yaml: weights
+# sum to 1.0, hard caps override a high weighted score when a real
+# compatibility conflict is present, and no component here is an LLM or
+# external call. See docs/selector-recommendation.md "Scoring".
+
+weights:
+  description_similarity: 0.30
+  category_compatibility: 0.20
+  component_similarity: 0.15
+  material_match: 0.10
+  action_match: 0.10
+  attribute_match: 0.05
+  verified_rule_evidence: 0.05
+  unit_compatibility: 0.05
+
+# Recommendation-state thresholds, applied to the final weighted score
+# AFTER hard caps/penalties. A candidate below weak_candidate_min is
+# dropped entirely (no_candidate territory), never shown as noise.
+thresholds:
+  strong_candidate_min: 0.80
+  possible_candidate_min: 0.55
+  weak_candidate_min: 0.35
+
+# Hard caps: a conflict on any of these ceilings the final score
+# regardless of how high description similarity is, mirroring
+# mapping/scorer.py's conflict-override rules. Never bypassed by a high
+# raw weighted total.
+conflict_caps:
+  category_incompatible: 0.50
+  action_conflict: 0.45
+  unit_incompatible: 0.55
+  negative_keyword_conflict: 0.40
+  distinction_conflict: 0.45  # remove/replace/detach-reset, labor/material, grade, material-type mismatches
+
+# needs_review=1 source records are excluded from candidate generation by
+# default (see query.py); when the reviewer explicitly enables "Include
+# uncertain selector references", surviving candidates from those records
+# receive this additional penalty and are always visibly labeled uncertain
+# -- see build spec "must never be auto-applied".
+uncertain_source_penalty: 0.15
+
+# Low selector-catalog OCR confidence on the source record is a soft
+# quality signal, applied as a penalty scaled by (threshold - confidence)
+# when confidence is below the threshold; never applied when
+# ocr_confidence is missing.
+ocr_confidence_penalty:
+  threshold: 0.85
+  max_penalty: 0.10
+
+# Fuzzy text-similarity backend, same fallback chain as
+# mapping_scoring.yaml (RapidFuzz if installed, difflib otherwise).
+fuzzy_matching:
+  enabled: true
+  library: "rapidfuzz"
+  min_score: 0.35
+
+# Candidate-generation bounds (staged approach -- see build spec "Do not
+# search all 10,088 records with expensive fuzzy logic for every item").
+candidate_limits:
+  max_category_pool: 400  # cap on records pulled per hinted category before fuzzy ranking
+  max_candidates_returned: 8
+  max_categories_searched_when_no_hint: 12  # fallback bound when trade/component gives no category hint
+
+# If the top two candidates' final scores are within this margin, the
+# ranker records a "tied_candidates" match reason (informational only --
+# unlike the Phase 2 mapper, a tie never forces review here, since every
+# recommendation already requires human approval).
+tie_margin: 0.03

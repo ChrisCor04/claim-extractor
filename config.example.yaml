@@ -1,0 +1,22 @@
+extractor:
+  version: "0.1.0"
+  carrier_detection_threshold: 0.70
+  generic_fallback_enabled: true
+
+ocr:
+  enabled: false
+  minimum_native_text_characters: 50
+  engine: "tesseract"
+  dpi: 300
+
+validation:
+  money_absolute_tolerance: "0.05"
+  percentage_tolerance: "0.001"
+  low_confidence_threshold: 0.80
+  fatal_confidence_threshold: 0.40
+
+output:
+  write_raw_text: true
+  write_debug_json: true
+  pretty_json: true
+  redact_debug_output: false

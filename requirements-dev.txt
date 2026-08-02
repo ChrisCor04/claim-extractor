@@ -1,0 +1,9 @@
+-r requirements.txt
+pytest>=8.0
+pytest-cov>=5.0
+
+# Optional OCR fallback (Layer 3) and the Phase 3.6 selector-catalog OCR
+# pipeline both use these. Requires the Tesseract binary to be installed
+# separately on the OS (see README "Optional OCR setup").
+pytesseract>=0.3.10
+Pillow>=10.0

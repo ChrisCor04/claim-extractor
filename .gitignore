@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Environment
+.env
+
+# Fixture PDFs and generated output contain PII / customer data.
+# They must never be committed to a (potentially public) repository.
+fixtures/*.pdf
+fixtures/originals/*.pdf
+fixtures/supplements/*.pdf
+output/
+_inspect/
+
+# Phase 3.6 reference selector-screenshot library: the source ZIP is large
+# (140MB) and Xactimate-proprietary-adjacent; extracted screenshots and
+# generated data/reports are regeneratable from it via `selectors import`.
+fixtures/reference/*.zip
+fixtures/reference/extracted/*
+!fixtures/reference/extracted/.gitkeep
+fixtures/reference/data/*
+!fixtures/reference/data/.gitkeep
+fixtures/reference/reports/*
+!fixtures/reference/reports/.gitkeep
+
+# Phase 3 local review projects contain uploaded PDFs + extracted claim
+# data (PII) and must never be committed.
+projects/*
+!projects/.gitkeep
+config/backups/*
+!config/backups/.gitkeep
+
+# Local overrides
+config.yaml
+config.local.yaml

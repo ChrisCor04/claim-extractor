@@ -1,0 +1,35 @@
+# Deterministic scoring weights for candidate-mapping confidence. Weights
+# sum to 1.0. See docs/mapping-engine.md "Matching logic" for the
+# conflict-override rules (unit/action/trade/component conflicts and
+# near-tied candidates cap confidence regardless of text similarity).
+
+weights:
+  component_match: 0.35
+  trade_match: 0.20
+  action_compatibility: 0.15
+  unit_compatibility: 0.15
+  material_similarity: 0.10
+  context_compatibility: 0.05
+
+thresholds:
+  mapped_min: 0.92
+  partially_mapped_min: 0.80
+  needs_review_min: 0.60
+  # below needs_review_min -> unmapped
+
+# A missing Xactimate selector always forces at least needs_review,
+# regardless of how high the category/component confidence is.
+missing_selector_forces_review: true
+
+# If the top two candidates' scores are within this margin, treat them as
+# tied: cap confidence and force needs_review rather than picking one
+# arbitrarily.
+tie_margin: 0.03
+
+# RapidFuzz-based fuzzy text similarity is optional and only used as the
+# material_similarity component when a candidate's canonical_terms don't
+# contain an exact substring match. No LLM is used anywhere in this stage.
+fuzzy_matching:
+  enabled: true
+  library: "rapidfuzz"
+  min_score: 0.55

@@ -1,0 +1,281 @@
+# Normalization rules: map raw carrier description text to a deterministic
+# action / trade / component / material concept. Rules are matched in file
+# order; for a given field (action, or trade+component+material together),
+# the FIRST rule whose pattern is found in the lowercased description wins.
+# Patterns are plain substrings (not regex) matched case-insensitively.
+#
+# A rule may set `action` alone, or `trade`/`component`/`material` together
+# (a rule may also set more than one field at once). Unmatched fields fall
+# back to "unknown" -- the normalizer never invents a concept that isn't
+# backed by a rule. See docs/mapping-engine.md "How to add mappings".
+
+rules:
+  # --- Actions -------------------------------------------------------
+  - patterns: ["r&r", "r & r", "remove and replace", "remove & replace"]
+    action: "remove_and_replace"
+
+  - patterns: ["detach & reset", "detach and reset", "d&r "]
+    action: "detach_and_reset"
+
+  - patterns: ["detach only", "detach "]
+    action: "detach"
+
+  - patterns: ["reset only"]
+    action: "reset"
+
+  - patterns: ["tear off", "remove "]
+    action: "remove"
+
+  - patterns: ["install ", "additional charge for"]
+    action: "install"
+
+  - patterns: ["replace "]
+    action: "replace"
+
+  - patterns: ["repair "]
+    action: "repair"
+
+  - patterns: ["clean with pressure", "pressure wash", "pressure/chemical spray"]
+    action: "pressure_wash"
+
+  - patterns: ["clean "]
+    action: "clean"
+
+  - patterns: ["paint "]
+    action: "paint"
+
+  - patterns: ["prime & paint", "prime and paint", "prime "]
+    action: "prime"
+
+  - patterns: ["seal "]
+    action: "seal"
+
+  - patterns: ["stain & finish", "stain and finish", "stain "]
+    action: "stain"
+
+  - patterns: ["inspect", "inspection"]
+    action: "inspect"
+
+  - patterns: ["labor minimum"]
+    action: "labor_minimum"
+
+  - patterns: ["haul debris", "haul "]
+    action: "haul"
+
+  - patterns: ["dispose", "dump fees", "dumpster"]
+    action: "dispose"
+
+  # --- Trade / component / material -----------------------------------
+  # NOTE: more specific roofing-accessory rules (ridge cap, starter course,
+  # drip edge, valley metal, vents, flashing) are listed BEFORE the generic
+  # shingle rules below on purpose -- real descriptions like "Hip / Ridge
+  # cap - Standard profile - composition shingles" mention "composition
+  # shingles" only as the cap's *material*, not as the component itself, so
+  # the more specific pattern must win the first-match-wins race.
+  - patterns: ["hip / ridge cap", "hip/ridge cap", "ridge cap"]
+    trade: "roofing"
+    component: "ridge_cap"
+    material: null
+
+  - patterns: ["starter course", "asphalt starter"]
+    trade: "roofing"
+    component: "starter_course"
+    material: null
+
+  - patterns: ["drip edge"]
+    trade: "roofing"
+    component: "drip_edge"
+    material: null
+
+  - patterns: ["valley metal"]
+    trade: "roofing"
+    component: "valley_metal"
+    material: "metal"
+
+  - patterns:
+      - "laminated - comp. shingle"
+      - "laminated comp. shingle"
+      - "laminated composition shingle"
+      - "architectural shingle"
+      - "comp. shingles - laminated"
+      - "shingles - laminated"
+    trade: "roofing"
+    component: "composition_shingles"
+    material: "laminated composition shingles"
+
+  - patterns:
+      - "3 tab"
+      - "3-tab"
+      - "comp. shingle roofing"
+      - "composition shingle"
+      - "comp. shingles"
+      - "comp shng"
+    trade: "roofing"
+    component: "composition_shingles"
+    material: "3-tab composition shingles"
+
+  - patterns: ["roofing felt", "felt - 15 lb", "felt/underlayment"]
+    trade: "roofing"
+    component: "roofing_felt"
+    material: "roofing felt"
+
+  - patterns: ["roof vent", "ridge vent", "turbine type", "turtle type"]
+    trade: "roofing"
+    component: "roof_vent"
+    material: null
+
+  - patterns: ["pipe jack", "flashing - pipe jack"]
+    trade: "roofing"
+    component: "pipe_flashing"
+    material: null
+
+  - patterns: ["chimney flashing"]
+    trade: "roofing"
+    component: "chimney_flashing"
+    material: null
+
+  - patterns: ["sidewall/endwall flashing", "counterflashing", "apron flashing"]
+    trade: "roofing"
+    component: "chimney_flashing"
+    material: null
+
+  - patterns: ["rain cap", "storm collar", "exhaust cap", "roof jack"]
+    trade: "roofing"
+    component: "roof_vent"
+    material: null
+
+  - patterns: ["steep roof", "high roof"]
+    trade: "roofing"
+    component: "roof_surcharge"
+    material: null
+
+  - patterns: ["gutter"]
+    trade: "gutters"
+    component: "gutter"
+    material: "aluminum"
+
+  - patterns: ["downspout"]
+    trade: "gutters"
+    component: "downspout"
+    material: "aluminum"
+
+  - patterns: ["siding"]
+    trade: "siding"
+    component: "siding"
+    material: null
+
+  - patterns: ["house wrap", "air/moisture barrier"]
+    trade: "siding"
+    component: "house_wrap"
+    material: null
+
+  - patterns: ["window screen"]
+    trade: "windows"
+    component: "window_screen"
+    material: null
+
+  - patterns: ["window", "shutters"]
+    trade: "windows"
+    component: "window"
+    material: null
+
+  - patterns: ["overhead door", "garage door"]
+    trade: "doors"
+    component: "garage_door"
+    material: null
+
+  - patterns: ["door & hardware", "door bottom", "door weather", "door opener", "door insulation kit"]
+    trade: "doors"
+    component: "garage_door"
+    material: null
+
+  - patterns: ["drywall", "1/2\" drywall", "1/2 drywall"]
+    trade: "drywall"
+    component: "drywall"
+    material: "1/2 inch drywall"
+
+  - patterns: ["paint the wall", "painted wall", "paint double garage"]
+    trade: "painting"
+    component: "painted_wall"
+    material: null
+
+  - patterns: ["carpet"]
+    trade: "flooring"
+    component: "carpet"
+    material: "carpet"
+
+  - patterns: ["fence", "gate"]
+    trade: "fencing"
+    component: "fence"
+    material: "wood"
+
+  - patterns: ["satellite system"]
+    trade: "electrical"
+    component: "satellite_system"
+    material: null
+
+  - patterns: ["a/c cond", "condenser fins", "hvac"]
+    trade: "hvac"
+    component: "hvac_condenser"
+    material: null
+
+  - patterns: ["debris", "dumpster load", "pickup truck load"]
+    trade: "debris_removal"
+    component: "debris"
+    material: null
+
+  - patterns: ["labor minimum"]
+    trade: "general_labor"
+    component: "labor_minimum"
+    material: null
+
+  - patterns: ["taxes, insurance, permits", "permit fee"]
+    trade: "general_labor"
+    component: "permits_and_fees"
+    material: null
+
+# --- Attribute extraction (regex, applied universally) -----------------
+# `group` names the capture group; `attribute` is the key written into
+# normalized.attributes. `type` controls light coercion (bool/float/str).
+attribute_patterns:
+  - name: felt_excluded
+    pattern: "w/out felt|without felt"
+    attribute: felt_included
+    type: bool
+    value_if_matched: false
+
+  - name: felt_included
+    pattern: "w/ felt|incl\\. felt|including felt"
+    attribute: felt_included
+    type: bool
+    value_if_matched: true
+
+  - name: tab_count
+    pattern: "(\\d+)[\\s-]?tab"
+    attribute: tab_count
+    type: int
+
+  - name: weight_lb
+    pattern: "(\\d+(?:\\.\\d+)?)\\s*lb"
+    attribute: weight_lb
+    type: float
+
+  - name: slope_range
+    pattern: "(\\d+/\\d+\\s*(?:-|to)\\s*\\d+/\\d+)"
+    attribute: slope_range
+    type: str
+
+  - name: size_up_to
+    pattern: "up to (\\d+(?:\\.\\d+)?\"?)"
+    attribute: max_size
+    type: str
+
+  - name: opening_dimensions
+    pattern: "(\\d+'\\s*(?:\\d+(?:\\s*\\d+/\\d+)?\")?\\s*[xX]\\s*\\d+'\\s*(?:\\d+(?:\\s*\\d+/\\d+)?\")?)"
+    attribute: dimensions
+    type: str
+
+  - name: sf_range
+    pattern: "(\\d+\\s*-\\s*\\d+\\s*SF)"
+    attribute: size_range_sf
+    type: str

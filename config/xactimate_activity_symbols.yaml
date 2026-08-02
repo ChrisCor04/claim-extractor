@@ -1,0 +1,20 @@
+# Raw Xactimate selector-browser "Act" column symbols, observed directly
+# in the ACT-category selector-browser screenshot (Phase 3.5 build spec).
+#
+# The spec is explicit: "Do not guess their full semantics in code unless
+# they are already documented or explicitly configured. Preserve the raw
+# symbol exactly and allow a human-readable interpretation field to remain
+# null until verified." `interpretation` therefore starts null for every
+# symbol below -- a reviewer may fill it in later (e.g. via a future
+# config edit reviewed like any other catalog change), but nothing in this
+# codebase infers or guesses it.
+symbols:
+  - symbol: "+"
+    interpretation: null
+    observed_in: "ACT category selector browser (COFC8X_JUL26)"
+  - symbol: "-"
+    interpretation: null
+    observed_in: "ACT category selector browser (COFC8X_JUL26)"
+  - symbol: "&"
+    interpretation: null
+    observed_in: "ACT category selector browser (COFC8X_JUL26)"

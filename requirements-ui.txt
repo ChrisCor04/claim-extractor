@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Phase 3: local review UI (Streamlit). Optional -- extract/map/process/
+# validate/inspect work fully without this file installed.
+streamlit>=1.30,<2
+pandas>=2.0,<3

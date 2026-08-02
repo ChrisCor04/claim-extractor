@@ -1,0 +1,1994 @@
+# Verified Xactimate catalog: stable selector identity records, each
+# optionally carrying multiple price-list observations (price is NEVER
+# part of selector identity -- see docs/verified-catalog-builder.md).
+#
+# verification_status values:
+#   human_verified        -- a reviewer personally confirmed category,
+#                             selector, unit, and price-list context in
+#                             their own licensed Xactimate environment.
+#                             Only these records may make an item
+#                             automation-ready.
+#   screenshot_transcribed -- transcribed from a screenshot supplied
+#                             during Phase 3.5's build spec, to exercise
+#                             the catalog architecture. NOT production
+#                             data and never automation-ready.
+#   placeholder            -- reserved for future use; not currently
+#                             written by any code path in this file.
+#
+# The records below are the ACT (Acoustical Treatments) category rows
+# transcribed from the 'Selectors for ACT (COFC8X_JUL26)' screenshot.
+# They are seed/test data only, are deliberately tagged trade: other /
+# component: unknown, and must never be presented as verified production
+# mappings -- see docs/verified-catalog-builder.md.
+- catalog_record_id: xactimate_act_agp
+  category: ACT
+  selector: AGP
+  description: Acoustical Treatments (Agreed Price)
+  unit: EA
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_agp
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 0.0
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_av
+  category: ACT
+  selector: AV
+  description: Acoustic ceiling tile
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_av
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 5.53
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_av
+  category: ACT
+  selector: AV+
+  description: Acoustic ceiling tile - High grade
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_av
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.39
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_av
+  category: ACT
+  selector: AV++
+  description: Acoustic ceiling tile - Premium grade
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_av
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.9
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_avarmv
+  category: ACT
+  selector: AVARMV
+  description: Tear off asbestos acoustic ceiling tile (no haul off)
+  unit: SF
+  activity_raw: '-'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_avarmv
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.11
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_avm
+  category: ACT
+  selector: AVM
+  description: Ceiling panel - w/battens & staples - mobile home
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_avm
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 4.84
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_avm
+  category: ACT
+  selector: AVM+
+  description: Ceiling panel - High grade w/battens & staples - mobile home
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_avm
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 5.4
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_avm
+  category: ACT
+  selector: AVM++
+  description: Ceiling panel - glued w/no battens & staples - mobile home
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_avm
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.28
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_ball
+  category: ACT
+  selector: BALL++
+  description: Special - ballroom ceiling panels - Premium grade
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_ball
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 18.11
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_biditm
+  category: ACT
+  selector: BIDITM
+  description: Acoustical Treatments (Bid Item)
+  unit: EA
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_biditm
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 0.0
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_btn
+  category: ACT
+  selector: BTN
+  description: Batten for ceiling panel - mobile home
+  unit: LF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_btn
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 3.16
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_drape
+  category: ACT
+  selector: DRAPE
+  description: Acoustical wall treatment - cloth - theater sound
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_drape
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 17.13
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_fur
+  category: ACT
+  selector: FUR
+  description: Acoustical ceiling tile furring
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_fur
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 1.51
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_lab
+  category: ACT
+  selector: LAB
+  description: Acoustical Treatments Installer - per hour
+  unit: HR
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_lab
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 117.24
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_labl
+  category: ACT
+  selector: LABL
+  description: Acoustical Treatments - General Laborer - per hour
+  unit: HR
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_labl
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 65.16
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_lp
+  category: ACT
+  selector: LP
+  description: Light diffusing panel (i.e., cracked ice)
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_lp
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 3.56
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_lp
+  category: ACT
+  selector: LP+
+  description: Light diffusing panel - High grade
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_lp
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 3.76
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_lp
+  category: ACT
+  selector: LP++
+  description: Light diffusing panel - Premium grade
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_lp
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 4.09
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_misc
+  category: ACT
+  selector: MISC
+  description: ACOUSTICAL TREATMENTS
+  unit: EA
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_misc
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 0.0
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_mn
+  category: ACT
+  selector: MN
+  description: Acoustical Ceiling - Labor Minimum
+  unit: EA
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_mn
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 352.07
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_mtray
+  category: ACT
+  selector: MTRAY
+  description: Acoustical ceilings - metal tray type
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_mtray
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 8.39
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_pdb
+  category: ACT
+  selector: PDB
+  description: Acoustical Treatments (Paid Bill)
+  unit: EA
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_pdb
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 0.0
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_sg
+  category: ACT
+  selector: SG
+  description: Suspended ceiling grid - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_sg
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.44
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_sg
+  category: ACT
+  selector: SG+
+  description: Suspended ceiling grid - High grade - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_sg
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.69
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_sg
+  category: ACT
+  selector: SG++
+  description: Suspended ceiling grid - Premium grade - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_sg
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.87
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_sg2
+  category: ACT
+  selector: SG2
+  description: Suspended ceiling grid - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_sg2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.83
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_sg2
+  category: ACT
+  selector: SG2+
+  description: Suspended ceiling grid - High grade - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_sg2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 3.09
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_sg2
+  category: ACT
+  selector: SG2++
+  description: Suspended ceiling grid - Premium grade - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_sg2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 3.4
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_sg2rs
+  category: ACT
+  selector: SG2RS
+  description: Suspended ceiling grid - Detach & reset
+  unit: SF
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_sg2rs
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.24
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_sgrs
+  category: ACT
+  selector: SGRS
+  description: Suspended ceiling grid - Reset/realign
+  unit: SF
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_sgrs
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.08
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_st
+  category: ACT
+  selector: ST
+  description: Suspended ceiling tile - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_st
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.79
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_st
+  category: ACT
+  selector: ST-
+  description: Suspended ceiling tile - Standard grade - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_st
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.3
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_st
+  category: ACT
+  selector: ST+
+  description: Suspended ceiling tile - High grade - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_st
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 3.95
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_st
+  category: ACT
+  selector: ST++
+  description: Suspended ceiling tile - Premium grade - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_st
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 5.35
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_st2
+  category: ACT
+  selector: ST2
+  description: Suspended ceiling tile - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_st2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 3.12
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_st2
+  category: ACT
+  selector: ST2-
+  description: Suspended ceiling tile - Standard grade - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_st2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 2.44
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_st2
+  category: ACT
+  selector: ST2+
+  description: Suspended ceiling tile - High grade - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_st2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 4.08
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_st2
+  category: ACT
+  selector: ST2++
+  description: Suspended ceiling tile - Premium grade - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_st2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.28
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stcl
+  category: ACT
+  selector: STCL
+  description: Suspended ceiling tile for clean room/kitchen - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stcl
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.72
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stcl2
+  category: ACT
+  selector: STCL2
+  description: Suspended ceiling tile for clean room/kitchen - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stcl2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 7.95
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stg
+  category: ACT
+  selector: STG
+  description: Suspended ceiling system - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stg
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 5.19
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stg
+  category: ACT
+  selector: STG-
+  description: Suspended ceiling system - Standard grade - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stg
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 4.7
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stg
+  category: ACT
+  selector: STG+
+  description: Suspended ceiling system - High grade - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stg
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.57
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stg
+  category: ACT
+  selector: STG++
+  description: Suspended ceiling system - Premium grade - 2' x 4'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stg
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 8.18
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stg2
+  category: ACT
+  selector: STG2
+  description: Suspended ceiling system - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stg2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 5.93
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stg2
+  category: ACT
+  selector: STG2-
+  description: Suspended ceiling system - Standard grade - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stg2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 5.23
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stg2
+  category: ACT
+  selector: STG2+
+  description: Suspended ceiling system - High grade - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stg2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 7.17
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stg2
+  category: ACT
+  selector: STG2++
+  description: Suspended ceiling system - Premium grade - 2' x 2'
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stg2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 9.67
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stgf2
+  category: ACT
+  selector: STGF2
+  description: Suspended ceiling system - 2' x 2' fabric covered
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stgf2
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 19.01
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_stglin
+  category: ACT
+  selector: STGLIN
+  description: Suspended ceiling system - Linear metal strip
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_stglin
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 17.34
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_strs
+  category: ACT
+  selector: STRS
+  description: Suspended ceiling tile - Detach & reset
+  unit: SF
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_strs
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 0.96
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_tincc
+  category: ACT
+  selector: TINCC
+  description: Tin ceiling cornice - embossed - unpainted
+  unit: LF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_tincc
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.13
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_tincc
+  category: ACT
+  selector: TINCC+
+  description: Tin ceiling cornice - embossed - factory painted
+  unit: LF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_tincc
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 7.31
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_tincc
+  category: ACT
+  selector: TINCC++
+  description: Tin ceiling cornice - embossed - chrome/brass/copper
+  unit: LF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_tincc
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 12.66
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_tincp
+  category: ACT
+  selector: TINCP
+  description: Tin ceiling panel - embossed - unpainted
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_tincp
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 5.51
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_tincp
+  category: ACT
+  selector: TINCP+
+  description: Tin ceiling panel - embossed - factory painted
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_tincp
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 6.52
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_tincp
+  category: ACT
+  selector: TINCP++
+  description: Tin ceiling panel - embossed - chrome/brass/copper
+  unit: SF
+  activity_raw: '&'
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_tincp
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 11.21
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)
+- catalog_record_id: xactimate_act_tincprs
+  category: ACT
+  selector: TINCPRS
+  description: Tin ceiling panel - embossed - Detach & reset
+  unit: SF
+  activity_raw: +
+  activity_interpretation: null
+  green_indicator: null
+  aliases: []
+  trade: other
+  component: unknown
+  material: null
+  supported_actions: []
+  negative_patterns: []
+  verification_status: screenshot_transcribed
+  verified_at: null
+  verified_by: null
+  verification_method: screenshot_transcription
+  verification_notes: Transcribed directly from a screenshot of the ACT category selector
+    browser (price list COFC8X_JUL26) supplied in the Phase 3.5 build spec. NOT a
+    human_verified production mapping -- see docs/verified-catalog-builder.md 'Verification
+    statuses'. Included only to exercise the verified-catalog architecture end to
+    end; trade/component are deliberately generic ('other'/'unknown') so these rows
+    can never accidentally match a roofing/gutter/siding fixture item.
+  price_observations:
+  - observation_id: obs_seed_xactimate_act_tincprs
+    price_list: COFC8X_JUL26
+    location: Fort Collins, CO
+    price_list_date: '2026-06-30'
+    language: English (US)
+    type: Xactware
+    unit_price: 1.34
+    observed_at: null
+    observed_by: screenshot_transcription (Phase 3.5 build spec)

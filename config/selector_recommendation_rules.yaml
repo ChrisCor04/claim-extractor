@@ -1,0 +1,123 @@
+# Phase 3.7 selector-recommendation rules: trade/component -> likely
+# Xactimate CAT hints, plus positive/negative keyword vocab used by
+# candidate_generation.py and compatibility.py.
+#
+# These are HINTS, not ground truth. The recommendation service never
+# treats a hint as proof -- it only uses it to narrow the search pool
+# before scoring, and an item can still be flagged strong_candidate from a
+# category outside its hinted list if a search/query call finds it. A
+# reviewer can edit this file directly; no code change is required to add,
+# remove, or reweight a hint.
+#
+# `trade_category_hints` were calibrated by directly sampling real
+# description text per category from fixtures/reference/data/
+# master_selectors.db (13,318 records, see docs/selector-catalog.md) --
+# not guessed from category-code naming conventions alone. Several
+# categories in this reference library contain a real, unresolved minority
+# of cross-filed rows (documented in Phase 3.6 QA as uncorroborated
+# category_mismatch noise, e.g. some DOR rows are genuinely electrical
+# wiring); a category is only listed here when the MAJORITY of its sampled
+# rows matched the trade. Trades with no confident majority match in the
+# sampled evidence (e.g. fencing) are deliberately left unmapped rather
+# than guessed -- candidate generation falls back to an unconstrained
+# (but still bounded) search for those.
+
+trade_category_hints:
+  roofing: ["RFG"]
+  gutters: ["SFG"]
+  siding: ["SDG"]
+  windows: ["WDA", "WDP", "WDR", "WDS", "WDT", "WDV", "WDW", "WDY", "WOW"]
+  doors: ["DOR"]
+  drywall: ["DRY", "CWH"]
+  painting: ["PNT"]
+  flooring: ["FCC", "FCV", "FCW", "FCT", "FCR", "FCS"]
+  insulation: ["INS", "INM"]
+  fencing: []  # no confident real-data majority found; left unmapped on purpose
+  carpentry: ["FNC", "FRM"]
+  cabinets: ["CAB"]
+  masonry: ["MAS", "FPL"]
+  concrete: ["CNC"]
+  electrical: ["ELE", "ELS"]
+  plumbing: ["PLM"]
+  hvac: ["HVC"]
+  appliances: ["APP"]
+  contents: ["CON", "CDC", "CHF", "CLM", "CEL", "CGN", "CUP", "CAP", "ARC"]
+  cleaning: ["CLN", "CDC", "CHF", "CLM", "CEL", "CGN", "CUP", "CAP"]
+  demolition: ["DMO"]
+  debris_removal: ["DMO"]
+  general_labor: ["LAB"]
+  # Trades below have no populated selector-catalog evidence in this
+  # reference library (verified absent, not merely unmapped) -- see
+  # docs/selector-recommendation.md "Category hint calibration".
+  # framing rough-carpentry labor:
+  framing: ["FRM", "FAM"]
+
+# Component -> category hints for a handful of components whose real
+# Xactimate category is unambiguous from the normalization rules and the
+# sampled catalog evidence together. Not exhaustive; component hints are
+# additive to (never a replacement for) trade_category_hints.
+component_category_hints:
+  composition_shingles: ["RFG"]
+  ridge_cap: ["RFG"]
+  starter_course: ["RFG"]
+  drip_edge: ["RFG"]
+  valley_metal: ["RFG"]
+  roof_vent: ["RFG"]
+  flashing: ["RFG"]
+  gutter: ["SFG"]
+  downspout: ["SFG"]
+  composition_shingles_underlayment: ["RFG"]
+
+# Grade/quality vocabulary -- observed literally in real selector
+# descriptions (see docs/selector-catalog.md); used as a soft positive/
+# negative signal, never a hard filter, since not every item carries a
+# grade word.
+grade_vocabulary:
+  - "standard grade"
+  - "high grade"
+  - "premium grade"
+  - "economy grade"
+  - "builder grade"
+  - "3-tab"
+  - "laminated"
+
+# Action vocabulary aligned with estimate_extractor.mapping.models.ActionType
+# values, used to detect action wording directly in a selector description
+# for compatibility scoring (compatibility.py). Distinctions here must be
+# preserved verbatim -- never collapsed (see build spec "Important
+# distinctions must be preserved").
+action_vocabulary:
+  remove: ["remove", "tear off", "detach"]
+  install: ["install", "additional charge for"]
+  replace: ["replace"]
+  remove_and_replace: ["r&r", "remove and replace", "remove & replace"]
+  repair: ["repair"]
+  detach: ["detach only", "detach "]
+  reset: ["reset only", "reset"]
+  detach_and_reset: ["detach & reset", "detach and reset", "d&r"]
+  clean: ["clean"]
+  pressure_wash: ["pressure wash", "pressure/chemical spray"]
+  paint: ["paint"]
+  prime: ["prime"]
+  seal: ["seal"]
+  stain: ["stain"]
+  inspect: ["inspect", "inspection"]
+  labor_minimum: ["labor minimum"]
+  haul: ["haul"]
+  dispose: ["dispose", "dump fees", "dumpster"]
+
+# Negative keywords: if present in a candidate's description but ABSENT
+# from the source line item's normalized/original text, this is evidence
+# against the candidate (see build spec "Important distinctions must be
+# preserved" -- remove vs replace vs detach-and-reset, labor vs material,
+# minimum-charge vs ordinary item). Applied symmetrically in
+# compatibility.py: a mismatch on either side is a penalty, never a hard
+# reject on its own (the reviewer always sees the candidate, with the
+# penalty explained).
+distinction_keyword_groups:
+  - ["remove", "replace", "remove and replace", "detach and reset"]
+  - ["labor only", "material only", "per hour"]
+  - ["labor minimum", "minimum charge"]
+  - ["standard grade", "high grade", "premium grade"]
+  - ["3-tab", "laminated"]
+  - ["metal", "wood", "tile", "vinyl", "concrete"]
