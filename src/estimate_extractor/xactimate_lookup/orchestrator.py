@@ -1,0 +1,239 @@
+"""Lookup decision flow: trusted-mapping-first, description-search-
+second, with the safety-stop rules from the build spec. This module is
+the only place that calls into an XactimateAdapter -- ranking.py and
+registry.py know nothing about adapters, and adapter.py knows nothing
+about ranking. See docs/xactimate-lookup.md "Lookup decision flow".
+
+``execute_plan(..., dry_run=True)`` (the CLI/UI default) runs the entire
+pipeline -- search, capture, rank, decide -- but never calls
+``select_candidate`` / ``enter_quantity`` / ``commit_item`` on the
+adapter, regardless of the decision. An explicit ``dry_run=False`` call
+can commit something ONLY when the adapter declares
+``supports_live_execution = True`` -- see build spec "Do not fabricate
+successful automation."  -- this module never constructs a live adapter
+itself.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+from estimate_extractor.xactimate_lookup import registry, signature as signature_mod
+from estimate_extractor.xactimate_lookup.adapter import AdapterError, UnexpectedDialogError, XactimateAdapter
+from estimate_extractor.xactimate_lookup.models import (
+    DECISION_NO_MATCH,
+    DECISION_REVIEW_REQUIRED,
+    MAPPING_STATUS_APPROVED,
+    LOOKUP_PATH_DESCRIPTION_SEARCH,
+    LOOKUP_PATH_TRUSTED,
+    STOP_REASON_ADAPTER_ERROR,
+    STOP_REASON_AMBIGUOUS,
+    STOP_REASON_CONTEXT_UNVERIFIED,
+    STOP_REASON_EXTRACTION_FAILED,
+    STOP_REASON_FIELD_MISMATCH,
+    STOP_REASON_HARD_CONFLICT,
+    STOP_REASON_NO_RESULTS,
+    STOP_REASON_UNEXPECTED_DIALOG,
+    STOP_REASON_UNIT_MISMATCH,
+    STOP_REASON_UNIT_QUANTITY_INVALID,
+    STOP_REASON_UNSUPPORTED_ADAPTER,
+    InternalMappingRecord,
+    LookupOutcome,
+    LookupPlan,
+    RecommendationInput,
+)
+from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, generate_search_phrase
+from estimate_extractor.xactimate_lookup.ranking import RankingConfig, classify_decision, rank_dropdown_results
+
+
+def _verified_catalog_trusted_mapping(item: RecommendationInput, verified_records: list, item_signature: str) -> InternalMappingRecord | None:
+    """A Phase 3.5 human-verified catalog rule counts as trusted too --
+    see build spec step 1 'trusted mapping for that item or item
+    signature'. Constructed transiently (never persisted to the
+    registry) so orchestrator.py has one uniform 'trusted' shape to read
+    from regardless of which store it came from."""
+    if not verified_records:
+        return None
+    from estimate_extractor.ui import verified_catalog_service as vcs
+
+    row_shape = {
+        "normalized_trade": item.trade,
+        "normalized_component": item.component,
+        "unit": item.source_unit,
+        "normalized_action": item.action,
+        "original_description": item.original_description,
+    }
+    matches = [
+        m for m in vcs.find_verified_matches(row_shape, verified_records)
+        if m.record.verification_status == vcs.VERIFICATION_STATUS_HUMAN_VERIFIED
+    ]
+    if not matches:
+        return None
+    v = matches[0].record
+    return InternalMappingRecord(
+        mapping_id=f"verified_catalog:{v.catalog_record_id}",
+        item_signature=item_signature,
+        source_description=item.original_description or "",
+        search_phrase="",
+        category=v.category,
+        selector=v.selector,
+        xactimate_description=v.description,
+        unit=v.unit,
+        action=item.action,
+        reviewer=v.verified_by or "",
+        approval_reason="Phase 3.5 human-verified catalog rule",
+        status=MAPPING_STATUS_APPROVED,
+    )
+
+
+def build_lookup_plan(
+    item: RecommendationInput,
+    registry_conn: sqlite3.Connection,
+    phrase_rules: PhraseRules,
+    verified_records: list | None = None,
+) -> LookupPlan:
+    item_signature = signature_mod.compute_item_signature(
+        item.trade, item.component, item.material, item.action, item.source_unit, item.original_description or "", phrase_rules
+    )
+
+    trusted = registry.find_reusable_mapping(registry_conn, item_signature)
+    if trusted is None:
+        trusted = _verified_catalog_trusted_mapping(item, verified_records or [], item_signature)
+
+    if trusted is not None:
+        return LookupPlan(
+            line_item_id=item.line_item_id,
+            path=LOOKUP_PATH_TRUSTED,
+            item_signature=item_signature,
+            search_input=f"{trusted.category} {trusted.selector}",
+            trusted_mapping=trusted,
+        )
+
+    phrase_result = generate_search_phrase(item.original_description or "", item.component, item.material, item.action, phrase_rules)
+    return LookupPlan(
+        line_item_id=item.line_item_id,
+        path=LOOKUP_PATH_DESCRIPTION_SEARCH,
+        item_signature=item_signature,
+        search_input=phrase_result.phrase,
+        phrase_result=phrase_result,
+    )
+
+
+def _stop(line_item_id: str, plan: LookupPlan, decision: str, reason: str, detail: str, candidates=None, selected=None) -> LookupOutcome:
+    return LookupOutcome(
+        line_item_id=line_item_id, decision=decision, plan=plan, candidates=candidates or [], selected=selected,
+        stop_reason=reason, stop_detail=detail,
+    )
+
+
+def execute_plan(
+    plan: LookupPlan,
+    item: RecommendationInput,
+    adapter: XactimateAdapter,
+    ranking_config: RankingConfig,
+    phrase_rules: PhraseRules,
+    *,
+    dry_run: bool = True,
+) -> LookupOutcome:
+    if not dry_run and not adapter.supports_live_execution:
+        return _stop(
+            item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNSUPPORTED_ADAPTER,
+            f"Adapter {type(adapter).__name__!r} does not declare supports_live_execution=True; "
+            f"refusing to commit anything live (see build spec 'Do not fabricate successful automation.').",
+        )
+
+    if not adapter.verify_application():
+        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_CONTEXT_UNVERIFIED, "Adapter could not verify the Xactimate application is running.")
+    if not adapter.verify_project():
+        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_CONTEXT_UNVERIFIED, "Adapter could not verify the active Xactimate project/estimate context.")
+
+    adapter.focus_search()
+    adapter.clear_search()
+    if plan.path == LOOKUP_PATH_TRUSTED:
+        adapter.search_by_category_selector(plan.trusted_mapping.category, plan.trusted_mapping.selector)
+    else:
+        adapter.search_by_description(plan.search_input)
+
+    try:
+        raw = adapter.capture_dropdown()
+        dropdowns = adapter.parse_dropdown(raw)
+    except UnexpectedDialogError as exc:
+        adapter.recover()
+        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNEXPECTED_DIALOG, str(exc))
+    except AdapterError as exc:
+        adapter.recover()
+        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_EXTRACTION_FAILED, str(exc))
+
+    if not dropdowns:
+        return _stop(item.line_item_id, plan, DECISION_NO_MATCH, STOP_REASON_NO_RESULTS, f"No dropdown results for {plan.search_input!r}.")
+
+    size_key = signature_mod.compute_size_key(item.original_description or "")
+    grade_key = signature_mod.compute_grade_key(item.original_description or "", phrase_rules)
+    candidates = rank_dropdown_results(
+        original_description=item.original_description or "",
+        trade=item.trade, component=item.component, material=item.material, action=item.action,
+        unit=item.source_unit, size_key=size_key, grade_key=grade_key, dropdowns=dropdowns,
+        rules=phrase_rules, config=ranking_config, prior_verified_mapping=(plan.path == LOOKUP_PATH_TRUSTED),
+    )
+    decision = classify_decision(candidates, ranking_config)
+
+    if decision == DECISION_NO_MATCH:
+        return _stop(item.line_item_id, plan, DECISION_NO_MATCH, STOP_REASON_NO_RESULTS, "No candidate scored above the review-required threshold.", candidates=candidates)
+
+    if decision == DECISION_REVIEW_REQUIRED:
+        top = candidates[0]
+        if top.has_hard_conflict:
+            return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_HARD_CONFLICT, "; ".join(top.conflict_reasons), candidates=candidates, selected=top)
+        return _stop(
+            item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_AMBIGUOUS,
+            "Top candidate lacks a clear margin, sufficient score, or reliable extraction confidence.",
+            candidates=candidates, selected=top,
+        )
+
+    # DECISION_AUTO_SELECT
+    top = candidates[0]
+
+    if item.quantity is None or item.quantity <= 0:
+        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_QUANTITY_INVALID, f"Invalid quantity for commit: {item.quantity!r}.", candidates=candidates, selected=top)
+
+    outcome = LookupOutcome(line_item_id=item.line_item_id, decision=decision, plan=plan, candidates=candidates, selected=top)
+
+    if dry_run:
+        outcome.stop_detail = "dry_run: plan only, adapter selection/commit not executed."
+        return outcome
+
+    try:
+        adapter.select_candidate(top.dropdown)
+        populated = adapter.read_populated_fields()
+    except UnexpectedDialogError as exc:
+        adapter.recover()
+        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNEXPECTED_DIALOG, str(exc), candidates=candidates, selected=top)
+    except AdapterError as exc:
+        adapter.recover()
+        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_ADAPTER_ERROR, str(exc), candidates=candidates, selected=top)
+
+    if (populated.category, populated.selector) != (top.dropdown.category, top.dropdown.selector):
+        return _stop(
+            item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_FIELD_MISMATCH,
+            f"Populated fields ({populated.category}/{populated.selector}) differ from the selected "
+            f"candidate ({top.dropdown.category}/{top.dropdown.selector}).",
+            candidates=candidates, selected=top,
+        )
+
+    if item.source_unit and populated.unit and item.source_unit.strip().upper() != populated.unit.strip().upper():
+        return _stop(
+            item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_MISMATCH,
+            f"Populated unit ({populated.unit!r}) differs from the source line item's unit ({item.source_unit!r}).",
+            candidates=candidates, selected=top,
+        )
+
+    try:
+        adapter.enter_quantity(item.quantity)
+        adapter.commit_item()
+    except AdapterError as exc:
+        adapter.recover()
+        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_EXTRACTION_FAILED, str(exc), candidates=candidates, selected=top)
+
+    outcome.committed = True
+    outcome.evidence_reference = adapter.capture_evidence()
+    return outcome

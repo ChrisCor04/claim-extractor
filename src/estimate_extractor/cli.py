@@ -1024,6 +1024,384 @@ def selectors_recommendation_stats(project_dir: Path | None, projects_dir: Path 
     sys.exit(0)
 
 
+@cli.group()
+def lookup() -> None:
+    """Phase 3.8 description-first Xactimate lookup workflow: a trusted
+    internal mapping first (fast CAT/SEL path), a generated description
+    search phrase second. See docs/xactimate-lookup.md. Live desktop
+    execution is never performed by this CLI -- only planning, dry-run,
+    and manual result recording.
+    """
+
+
+@lookup.command(name="phrase")
+@click.argument("description")
+@click.option("--component", default=None)
+@click.option("--material", default=None)
+@click.option("--action", "action_", default=None)
+def lookup_phrase(description: str, component: str | None, material: str | None, action_: str | None) -> None:
+    """Generate a concise, explainable Xactimate search phrase from a description."""
+    from estimate_extractor.xactimate_lookup import phrase_generator
+
+    rules = phrase_generator.load_phrase_rules()
+    result = phrase_generator.generate_search_phrase(description, component, material, action_, rules)
+    click.echo(f"Phrase: {result.phrase!r}")
+    click.echo(f"Terms: {result.terms}")
+    for reason in result.reasons:
+        click.echo(f"  + {reason}")
+    for bucket in result.dropped:
+        click.echo(f"  - dropped bucket: {bucket}")
+
+
+@lookup.command(name="plan")
+@click.argument("mapped_estimate_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+@click.option("--verified-catalog-path", type=click.Path(path_type=Path), default=None)
+def lookup_plan(mapped_estimate_path: Path, registry_db: Path | None, verified_catalog_path: Path | None) -> None:
+    """Print the lookup plan (trusted CAT/SEL vs. description search) for every line item in a project."""
+    from estimate_extractor.xactimate_lookup import service
+
+    project_dir = mapped_estimate_path.parent.parent
+    resolved_registry = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+    resolved_verified = verified_catalog_path or service.DEFAULT_VERIFIED_CATALOG_PATH
+
+    plans = service.plan_for_project(project_dir, resolved_registry, verified_catalog_path=resolved_verified)
+    for p in plans:
+        if p.path == "trusted_cat_sel":
+            click.echo(f"{p.line_item_id}  TRUSTED  {p.search_input}  (mapping_id={p.trusted_mapping.mapping_id})")
+        else:
+            click.echo(f"{p.line_item_id}  DESCRIPTION_SEARCH  {p.search_input!r}")
+    trusted = sum(1 for p in plans if p.path == "trusted_cat_sel")
+    click.echo()
+    click.echo(f"{len(plans)} item(s): {trusted} trusted, {len(plans) - trusted} description search")
+    sys.exit(0)
+
+
+@lookup.command(name="record")
+@click.argument("mapped_estimate_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("line_item_id")
+@click.option("--category", required=True)
+@click.option("--selector", required=True)
+@click.option("--description", "xactimate_description", required=True, help="Authoritative Xactimate description text.")
+@click.option("--unit", default=None)
+@click.option("--action", "action_", default=None)
+@click.option("--item-number", default=None)
+@click.option("--reviewer", required=True)
+@click.option("--reason", required=True, help="Approval reason (required, audited).")
+@click.option("--evidence", default=None, help="Evidence reference (e.g. a screenshot path or log identifier).")
+@click.option("--allow-override", is_flag=True, default=False, help="Explicitly permit changing an already-approved item or mapping.")
+@click.option("--approve", is_flag=True, default=False, help="Also mark the line item approved (subject to the existing can_approve() gate).")
+@click.option("--save-reusable-mapping/--item-only", default=True, help="Also persist this resolution to the internal lookup registry for future reuse (default) vs. apply to this item only.")
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+def lookup_record(
+    mapped_estimate_path: Path, line_item_id: str, category: str, selector: str, xactimate_description: str,
+    unit: str | None, action_: str | None, item_number: str | None, reviewer: str, reason: str,
+    evidence: str | None, allow_override: bool, approve: bool, save_reusable_mapping: bool, registry_db: Path | None,
+) -> None:
+    """Record a manually-resolved Xactimate dropdown result: applies
+    CAT/SEL/description to this line item through the existing audited
+    review_service (never a direct write), and -- unless --item-only is
+    passed -- also saves it as a reusable internal mapping for future
+    line items with the same signature. Always requires --reviewer and
+    --reason; refuses to silently change an already-approved item or
+    mapping unless --allow-override is passed."""
+    from estimate_extractor.xactimate_lookup import phrase_generator, service, signature as signature_mod
+    from estimate_extractor.ui import review_service
+
+    project_dir = mapped_estimate_path.parent.parent
+    resolved_registry = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+
+    rows = review_service.build_effective_rows(project_dir, line_item_ids=[line_item_id])
+    if not rows:
+        click.echo(f"Unknown line_item_id {line_item_id!r} in {project_dir}.", err=True)
+        sys.exit(3)
+    normalized_by_id = service.recommendation_service.load_normalized_items(project_dir)
+    item = service.build_lookup_input(rows[0], normalized_by_id.get(line_item_id))
+
+    rules = phrase_generator.load_phrase_rules()
+    item_signature = signature_mod.compute_item_signature(
+        item.trade, item.component, item.material, item.action, item.source_unit, item.original_description or "", rules
+    )
+    phrase_result = phrase_generator.generate_search_phrase(item.original_description or "", item.component, item.material, item.action, rules)
+
+    try:
+        record = service.record_resolution(
+            project_dir, resolved_registry, service.DEFAULT_BACKUPS_DIR, item, item_signature, phrase_result.phrase,
+            category=category, selector=selector, xactimate_description=xactimate_description, unit=unit,
+            action=action_, xactimate_item_number=item_number, reviewer=reviewer, approval_reason=reason,
+            evidence_reference=evidence, allow_override=allow_override, approve=approve,
+            save_as_reusable_mapping=save_reusable_mapping,
+        )
+    except (service.MappingConflictError, service.LookupApplyBlockedError) as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(2)
+    except service.LookupServiceError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(3)
+    except review_service.ApprovalBlockedError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(2)
+
+    click.echo(f"Applied {category}/{selector} to {line_item_id}.")
+    if record:
+        click.echo(f"Saved reusable mapping {record.mapping_id} (signature={item_signature}).")
+    sys.exit(0)
+
+
+@lookup.command(name="list-mappings")
+@click.option("--active-only/--all", "active_only", default=True)
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+def lookup_list_mappings(active_only: bool, registry_db: Path | None) -> None:
+    """List internal lookup registry mappings (active/approved only by default)."""
+    from estimate_extractor.xactimate_lookup import service
+
+    resolved = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+    if not resolved.exists():
+        click.echo(f"No internal lookup registry found at {resolved}. Run `lookup record` first.", err=True)
+        sys.exit(4)
+    records = service.list_mappings(resolved, active_only=active_only)
+    for r in records:
+        click.echo(
+            f"{r.mapping_id}  {r.category}/{r.selector}  status={r.status}  "
+            f"usage={r.usage_count} success={r.success_count} rejected={r.rejection_count}  -- {r.xactimate_description}"
+        )
+    click.echo(f"\n{len(records)} mapping(s).")
+    sys.exit(0)
+
+
+@lookup.command(name="registry")
+@click.option("--active-only/--all", "active_only", default=True)
+@click.option("--category", "category_filter", default=None)
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+def lookup_registry(active_only: bool, category_filter: str | None, registry_db: Path | None) -> None:
+    """Full-detail registry browser -- every stored field per mapping
+    (signature, normalized description, raw Xactimate activity, evidence,
+    timestamps), unlike the terse one-line `list-mappings` view."""
+    from estimate_extractor.xactimate_lookup import service
+
+    resolved = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+    if not resolved.exists():
+        click.echo(f"No internal lookup registry found at {resolved}. Run `lookup record` first.", err=True)
+        sys.exit(4)
+    records = service.list_mappings(resolved, active_only=active_only)
+    if category_filter:
+        records = [r for r in records if r.category == category_filter]
+    for r in records:
+        click.echo(f"mapping_id:              {r.mapping_id}")
+        click.echo(f"  status:                {r.status}")
+        click.echo(f"  item_signature:        {r.item_signature}")
+        click.echo(f"  CAT/SEL:               {r.category}/{r.selector}")
+        click.echo(f"  xactimate_description: {r.xactimate_description}")
+        click.echo(f"  xactimate_item_number: {r.xactimate_item_number}")
+        click.echo(f"  unit / activity:       {r.unit} / {r.action}  (raw: {r.xactimate_activity_raw})")
+        click.echo(f"  source_description:    {r.source_description}")
+        click.echo(f"  normalized_description:{r.normalized_description}")
+        click.echo(f"  search_phrase:         {r.search_phrase}")
+        click.echo(f"  material/size/grade:   {r.material} / {r.size_key} / {r.grade_key}")
+        click.echo(f"  reviewer / reason:     {r.reviewer} / {r.approval_reason}")
+        click.echo(f"  evidence_reference:    {r.evidence_reference}")
+        click.echo(f"  usage/success/reject:  {r.usage_count}/{r.success_count}/{r.rejection_count}")
+        click.echo(f"  created/updated:       {r.created_at} / {r.updated_at}")
+        click.echo()
+    click.echo(f"{len(records)} mapping(s).")
+    sys.exit(0)
+
+
+@lookup.command(name="disable")
+@click.argument("mapping_id")
+@click.option("--reviewer", required=True)
+@click.option("--reason", required=True)
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+def lookup_disable(mapping_id: str, reviewer: str, reason: str, registry_db: Path | None) -> None:
+    """Disable an internal mapping so it can no longer be reused automatically."""
+    from estimate_extractor.xactimate_lookup import service
+
+    resolved = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+    try:
+        record = service.disable_mapping(resolved, service.DEFAULT_BACKUPS_DIR, mapping_id, reviewer, reason)
+    except service.LookupServiceError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(3)
+    click.echo(f"Disabled {record.mapping_id} ({record.category}/{record.selector}).")
+    sys.exit(0)
+
+
+@lookup.command(name="stats")
+@click.option("--projects-dir", type=click.Path(path_type=Path), default=None)
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+def lookup_stats_cmd(projects_dir: Path | None, registry_db: Path | None) -> None:
+    """Print lookup statistics across every local processed project.
+    review-required rate / no-match rate / description-searches-resolved
+    require live or scripted dropdown data (see `lookup dry-run`) and are
+    reported as N/A here rather than fabricated from static planning."""
+    from estimate_extractor.xactimate_lookup import service
+
+    root = projects_dir or _DEFAULT_PROJECTS_DIR
+    resolved_registry = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+    if not root.exists():
+        click.echo(f"No projects directory found at {root}.", err=True)
+        sys.exit(4)
+    project_dirs = sorted(p for p in root.iterdir() if p.is_dir() and (p / "mapping" / "mapped_estimate.json").exists())
+    if not project_dirs:
+        click.echo(f"No processed projects found under {root}.", err=True)
+        sys.exit(4)
+
+    stats = service.compute_lookup_stats(project_dirs, resolved_registry)
+    click.echo(f"Items evaluated: {stats.items_evaluated}")
+    click.echo(f"Resolved by existing mapping: {stats.items_resolved_by_existing_mapping}")
+    click.echo(f"Requiring description search: {stats.items_requiring_description_search}")
+    click.echo(f"Learned-mapping reuse rate: {stats.learned_mapping_reuse_rate}")
+    click.echo(f"Review-required rate: {stats.review_required_rate}")
+    click.echo(f"No-match rate: {stats.no_match_rate}")
+    click.echo(f"Description searches resolved: {stats.description_searches_resolved}")
+    click.echo(f"Registry records: {stats.total_registry_records} total, {stats.active_registry_records} active")
+    top1 = f"{stats.top1_agreement:.2%}" if stats.top1_agreement is not None else "N/A"
+    top3 = f"{stats.top3_agreement:.2%}" if stats.top3_agreement is not None else "N/A"
+    click.echo(f"Top-1 agreement (real ground truth, n={stats.ground_truth_items}): {top1}")
+    click.echo(f"Top-3 agreement: {top3}")
+    sys.exit(0)
+
+
+@lookup.command(name="dry-run")
+@click.argument("mapped_estimate_path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--dropdown-script", type=click.Path(exists=True, path_type=Path), default=None,
+    help="JSON file: {\"search phrase or 'CAT SEL'\": [{\"raw_text\":..., \"row_position\":0, \"category\":..., \"selector\":..., \"description\":..., \"item_number\":..., \"extraction_confidence\":0.95}, ...]}",
+)
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+def lookup_dry_run(mapped_estimate_path: Path, dropdown_script: Path | None, registry_db: Path | None) -> None:
+    """Dry-run automation planning: runs the full search -> capture ->
+    rank -> decide pipeline against a FakeXactimateAdapter. Never live,
+    never selects or commits anything regardless of decision -- see
+    build spec 'Live desktop execution must remain off by default.'
+    Without --dropdown-script, every item resolves NO_MATCH (no dropdown
+    data configured), which still exercises and validates the full
+    planning pipeline safely."""
+    from estimate_extractor.xactimate_lookup import service
+    from estimate_extractor.xactimate_lookup.adapter import FakeXactimateAdapter
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    project_dir = mapped_estimate_path.parent.parent
+    resolved_registry = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+
+    script: dict[str, list[DropdownResult]] = {}
+    if dropdown_script:
+        raw = json.loads(dropdown_script.read_text(encoding="utf-8"))
+        for query, rows in raw.items():
+            script[query] = [DropdownResult(**row) for row in rows]
+    adapter = FakeXactimateAdapter(dropdown_script=script)
+
+    outcomes = service.dry_run_for_project(project_dir, adapter, resolved_registry)
+    for o in outcomes:
+        selected = f"{o.selected.dropdown.category}/{o.selected.dropdown.selector} (score={o.selected.score:.2f})" if o.selected else "-"
+        click.echo(f"{o.line_item_id}  {o.decision}  path={o.plan.path}  selected={selected}  stop={o.stop_reason or '-'}")
+    click.echo(f"\n{len(outcomes)} item(s) planned. Dry run only -- no live Xactimate interaction, nothing committed.")
+    sys.exit(0)
+
+
+@cli.group()
+def automation() -> None:
+    """Phase 4.0 automation planning/diagnostics over the Phase 3.8
+    lookup pipeline -- no new orchestration logic, richer structured
+    output for `plan`/`dry-run`, plus a read-only `diagnostics` health
+    check. Live desktop execution is never performed by this CLI. See
+    docs/xactimate-lookup.md."""
+
+
+@automation.command(name="plan")
+@click.argument("mapped_estimate_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+@click.option("--verified-catalog-path", type=click.Path(path_type=Path), default=None)
+def automation_plan(mapped_estimate_path: Path, registry_db: Path | None, verified_catalog_path: Path | None) -> None:
+    """Structured per-item automation plan: lookup method, CAT/SEL or
+    search phrase, expected dropdown terms, quantity, the fixed sequence
+    of adapter calls that would run, and every safety-stop condition that
+    could interrupt it. No adapter is touched -- this only describes what
+    WOULD happen (see `automation dry-run` to actually execute against a
+    Fake/real adapter)."""
+    from estimate_extractor.xactimate_lookup import service
+
+    project_dir = mapped_estimate_path.parent.parent
+    resolved_registry = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+    resolved_verified = verified_catalog_path or service.DEFAULT_VERIFIED_CATALOG_PATH
+
+    entries = service.build_automation_plan(project_dir, resolved_registry, verified_catalog_path=resolved_verified)
+    for e in entries:
+        click.echo(f"{e['line_item_id']}  method={e['lookup_method']}  search={e['search_input']!r}  qty={e['quantity']} {e['unit'] or ''}")
+        click.echo(f"  expected dropdown terms: {e['expected_dropdown_terms']}")
+        click.echo(f"  planned adapter actions: {' -> '.join(e['planned_adapter_actions'])}")
+        click.echo(f"  stop conditions: {', '.join(e['stop_conditions'])}")
+    click.echo(f"\n{len(entries)} item(s) planned.")
+    sys.exit(0)
+
+
+@automation.command(name="dry-run")
+@click.argument("mapped_estimate_path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--dropdown-script", type=click.Path(exists=True, path_type=Path), default=None,
+    help="JSON file: {\"search phrase or 'CAT SEL'\": [{\"raw_text\":..., \"row_position\":0, \"category\":..., \"selector\":..., \"description\":..., \"item_number\":..., \"extraction_confidence\":0.95}, ...]}",
+)
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+def automation_dry_run(mapped_estimate_path: Path, dropdown_script: Path | None, registry_db: Path | None) -> None:
+    """Full plan -> search -> capture -> rank -> decide pipeline against
+    a FakeXactimateAdapter, with the richer per-candidate output (scores,
+    match reasons, conflict reasons) `lookup dry-run` omits. Never live,
+    never selects or commits anything regardless of decision."""
+    from estimate_extractor.xactimate_lookup import service
+    from estimate_extractor.xactimate_lookup.adapter import FakeXactimateAdapter
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    project_dir = mapped_estimate_path.parent.parent
+    resolved_registry = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+
+    script: dict[str, list[DropdownResult]] = {}
+    if dropdown_script:
+        raw = json.loads(dropdown_script.read_text(encoding="utf-8"))
+        for query, rows in raw.items():
+            script[query] = [DropdownResult(**row) for row in rows]
+    adapter = FakeXactimateAdapter(dropdown_script=script)
+
+    outcomes = service.dry_run_for_project(project_dir, adapter, resolved_registry)
+    for o in outcomes:
+        click.echo(f"{o.line_item_id}  {o.decision}  path={o.plan.path}  stop={o.stop_reason or '-'}")
+        if o.stop_detail:
+            click.echo(f"  detail: {o.stop_detail}")
+        for c in o.candidates[:5]:
+            flag = " <== selected" if o.selected is c else ""
+            click.echo(f"  candidate {c.dropdown.category}/{c.dropdown.selector} score={c.score:.2f}{flag}")
+            if c.match_reasons:
+                click.echo(f"    + {'; '.join(c.match_reasons)}")
+            if c.conflict_reasons:
+                click.echo(f"    - {'; '.join(c.conflict_reasons)}")
+    click.echo(f"\n{len(outcomes)} item(s). Dry run only -- no live Xactimate interaction, nothing committed.")
+    sys.exit(0)
+
+
+@automation.command(name="diagnostics")
+@click.option("--registry-db", type=click.Path(path_type=Path), default=None)
+def automation_diagnostics(registry_db: Path | None) -> None:
+    """Read-only health check: adapter capability, registry reachability,
+    config loadability. Never attempts to launch or connect to Xactimate
+    -- with no real adapter available, this runs against
+    FakeXactimateAdapter and says so explicitly."""
+    from estimate_extractor.xactimate_lookup import service
+
+    resolved_registry = registry_db or service.DEFAULT_REGISTRY_DB_PATH
+    report = service.run_diagnostics(registry_db_path=resolved_registry)
+
+    click.echo(f"Adapter: {report.adapter_class}  (supports_live_execution={report.supports_live_execution})")
+    click.echo(f"Application verified: {report.application_verified}")
+    click.echo(f"Project verified: {report.project_verified}")
+    click.echo(f"Registry reachable: {report.registry_reachable}  ({report.registry_record_count} record(s))")
+    click.echo(f"Phrase rules loaded: {report.phrase_rules_loaded}")
+    click.echo(f"Ranking config loaded: {report.ranking_config_loaded}")
+    if report.warnings:
+        click.echo("\nWarnings:")
+        for w in report.warnings:
+            click.echo(f"  - {w}")
+    sys.exit(0)
+
+
 def main() -> None:
     try:
         cli()

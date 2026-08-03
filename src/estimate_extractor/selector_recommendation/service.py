@@ -577,7 +577,7 @@ def _is_synthetic_item_state(item_state: dict) -> bool:
     return False
 
 
-def _real_ground_truth(project_dir: Path) -> dict[str, tuple[str, str]]:
+def real_ground_truth(project_dir: Path) -> dict[str, tuple[str, str]]:
     """Returns {line_item_id: (category, selector)} for items that are
     APPROVED and whose approval is not attributable to a synthetic
     benchmark run -- the only rows this module treats as real ground
@@ -632,7 +632,7 @@ def evaluate_project(
         verified_catalog_path=verified_catalog_path,
         include_uncertain=False,
     )
-    ground_truth = _real_ground_truth(project_dir)
+    ground_truth = real_ground_truth(project_dir)
 
     verified_records: list = []
     if verified_catalog_path and verified_catalog_path.exists():

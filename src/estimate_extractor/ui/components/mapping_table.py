@@ -17,6 +17,7 @@ from estimate_extractor.ui.components.selector_recommendation_panel import (
     render_manual_selector_search,
     render_selector_recommendations,
 )
+from estimate_extractor.ui.components.xactimate_lookup_panel import render_lookup_workflow
 from estimate_extractor.ui.review_service import (
     EDITABLE_MAPPING_FIELDS,
     STATUS_APPROVED,
@@ -257,3 +258,5 @@ def _render_item_editor(project_dir: Path, rows: list[dict]) -> None:
 
     st.markdown("---")
     render_selector_recommendations(project_dir, row)
+    st.markdown("---")
+    render_lookup_workflow(project_dir, row)

@@ -1,0 +1,175 @@
+# Phase 3.8 description-first search-phrase generation rules.
+#
+# Design principle (see docs/xactimate-lookup.md "Search phrase
+# generation"): real Xactimate selector descriptions overwhelmingly do
+# NOT contain action verbs like "remove and replace" -- action is a
+# separate Activity-column symbol (see config/xactimate_activity_symbols.yaml),
+# not description text (confirmed against the real Phase 3.6 catalog:
+# "Tear off composition shingles", "Paint toe kick", "Stain - wood
+# fence/gate" -- action words appear only for the small set of trades/
+# actions below, never for generic remove/replace/install/detach/reset/R&R).
+# The generator therefore builds a phrase from FIXED ORDERED BUCKETS
+# (component, material, size, style/grade, action) rather than lightly
+# editing the original sentence -- deterministic, explainable, and
+# reorders "Remove and replace aluminum gutter/downspout up to 5 inches"
+# into "gutter aluminum up to 5".
+
+# Multi-word filler phrases stripped from the working text before any
+# bucket extraction runs (longest-first matters less here since these are
+# checked as plain substrings, not prefixes of each other).
+filler_phrases:
+  - "remove and replace"
+  - "remove & replace"
+  - "r&r"
+  - "detach and reset"
+  - "detach & reset"
+  - "labor and material"
+  - "labor & material"
+  - "labor only"
+  - "material only"
+  - "(no haul off)"
+  - "no haul off"
+  - "(bid item)"
+  - "(agreed price)"
+  - "damaged"
+  - "existing"
+  - "additional charge for"
+
+# (keyword found in the description, canonical term emitted). Checked in
+# order; first match per bucket wins. Multiple keywords may map to the
+# same canonical term (e.g. gutter/downspout collapse to one term, since
+# real Xactimate SFG descriptions use "gutter" alone) -- this is how
+# duplicate/redundant words are removed, not a separate dedupe step.
+component_keywords:
+  - ["composition shingle", "composition shingles"]
+  - ["shingle", "shingles"]
+  - ["ridge cap", "ridge cap"]
+  - ["starter course", "starter course"]
+  - ["drip edge", "drip edge"]
+  - ["roof vent", "roof vent"]
+  - ["flashing", "flashing"]
+  - ["gutter", "gutter"]
+  - ["downspout", "gutter"]
+  - ["siding", "siding"]
+  - ["window", "window"]
+  - ["patio door", "patio door"]
+  - ["door", "door"]
+  - ["drywall", "drywall"]
+  - ["carpet", "carpet"]
+  - ["hardwood floor", "hardwood floor"]
+  - ["wood floor", "wood floor"]
+  - ["vinyl floor", "vinyl floor"]
+  - ["tile floor", "tile floor"]
+  - ["tile", "tile"]
+  - ["cabinet", "cabinet"]
+  - ["countertop", "countertop"]
+  - ["fence", "fence"]
+  - ["gate", "gate"]
+  - ["insulation", "insulation"]
+  - ["outlet", "outlet"]
+  - ["wiring", "wiring"]
+  - ["light fixture", "light fixture"]
+  - ["condenser", "condenser"]
+  - ["air conditioning", "air conditioning"]
+  - ["furnace", "furnace"]
+  - ["water heater", "water heater"]
+  - ["toilet", "toilet"]
+  - ["faucet", "faucet"]
+  - ["baseboard", "baseboard"]
+  - ["ceiling", "ceiling"]
+  - ["stucco", "stucco"]
+  - ["paint", "paint"]
+
+material_keywords:
+  - ["aluminum", "aluminum"]
+  - ["vinyl", "vinyl"]
+  - ["wood", "wood"]
+  - ["composite", "composite"]
+  - ["fiber cement", "fiber cement"]
+  - ["metal", "metal"]
+  - ["steel", "steel"]
+  - ["copper", "copper"]
+  - ["fiberglass", "fiberglass"]
+  - ["laminate", "laminate"]
+  - ["granite", "granite"]
+  - ["marble", "marble"]
+  - ["quartz", "quartz"]
+  - ["ceramic", "ceramic"]
+  - ["porcelain", "porcelain"]
+  - ["oak", "oak"]
+  - ["hickory", "hickory"]
+  - ["stucco", "stucco"]
+
+# Two separate style buckets, split by where real Xactimate descriptions
+# actually place them (confirmed against the real Phase 3.6 catalog --
+# see docs/xactimate-lookup.md "Phrase-generator ordering fix"):
+#
+# leading_style_keywords: TYPE qualifiers that lead a description, e.g.
+# "Laminated - comp. shingle rfg.", "3 tab - 25 yr. - comp. shingle
+# roofing" -- emitted BEFORE component.
+#
+# style_keywords: GRADE qualifiers that trail a description, e.g.
+# "Carpet - High grade", "Tile floor covering - Premium grade" --
+# emitted in their existing (post-size) position.
+#
+# (keyword found in the description, canonical term emitted) -- same
+# shape as component_keywords/material_keywords, so alternate spellings
+# of the same style/grade (e.g. "3-tab" and "3 tab") canonicalize to one
+# term. This matters beyond phrase readability: signature.py uses this
+# canonical form as the grade_key component of an item's identity, so two
+# genuinely identical items spelled differently must produce the same key.
+leading_style_keywords:
+  - ["3-tab", "3 tab"]
+  - ["3 tab", "3 tab"]
+  - ["laminated", "laminated"]
+
+style_keywords:
+  - ["premium grade", "premium grade"]
+  - ["high grade", "high grade"]
+  - ["standard grade", "standard grade"]
+  - ["economy grade", "economy grade"]
+  - ["builder grade", "builder grade"]
+
+# Modifiers that must be preserved even though they're neither
+# component/material/size/style -- confirmed real and recurring in the
+# Phase 3.6 catalog (e.g. WTR category: "Remove wet ceiling tile &
+# drywall and bag - Cat 3"). Emitted right after component/material,
+# before size.
+modifier_keywords:
+  - ["wet", "wet"]
+
+# Action -> search term. Most compound/generic actions are deliberately
+# null (dropped) because they do not appear as literal Xactimate
+# description text; only actions confirmed present as description
+# leading-words in the real Phase 3.6 catalog are kept. See
+# docs/xactimate-lookup.md for the evidence.
+action_search_terms:
+  remove: null
+  install: null
+  replace: null
+  remove_and_replace: null
+  detach: null
+  reset: null
+  detach_and_reset: null
+  repair: "repair"
+  clean: "clean"
+  pressure_wash: "pressure wash"
+  paint: "paint"
+  prime: "prime"
+  seal: "seal"
+  stain: "stain"
+  inspect: "inspect"
+  labor_minimum: "labor minimum"
+  haul: null
+  dispose: null
+  custom: null
+  unknown: null
+
+# Size/dimension patterns are regex, kept in code (not YAML) for
+# reliability -- see phrase_generator.py SIZE_PATTERNS. This list
+# documents them for reviewers editing this file:
+#   "up to N"                  -> "up to N"
+#   "N to M" / "N-M"           -> "N-M"
+#   "N <unit>" (in/ft/sf/lf/") -> "N"   (unit word dropped, number kept)
+
+max_phrase_terms: 6

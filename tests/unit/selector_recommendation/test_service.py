@@ -308,7 +308,7 @@ def test_evaluate_project_treats_benchmark_run_approvals_as_not_ground_truth(tmp
     }
     (project_dir / "review" / "review_state.json").write_text(json.dumps(state), encoding="utf-8")
 
-    ground_truth = service._real_ground_truth(project_dir)
+    ground_truth = service.real_ground_truth(project_dir)
     assert ground_truth == {}
 
 
@@ -328,7 +328,7 @@ def test_evaluate_project_uses_real_non_synthetic_approval_as_ground_truth(tmp_p
     }
     (project_dir / "review" / "review_state.json").write_text(json.dumps(state), encoding="utf-8")
 
-    ground_truth = service._real_ground_truth(project_dir)
+    ground_truth = service.real_ground_truth(project_dir)
     assert ground_truth == {"line_0001": ("RFG", "ARMVN")}
 
 
