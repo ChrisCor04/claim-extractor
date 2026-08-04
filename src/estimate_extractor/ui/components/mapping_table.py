@@ -1,8 +1,16 @@
 """Renders the Mapping Review screen -- the primary reviewer workflow:
-browse/filter/sort every line item's normalization + mapping result,
-bulk-approve/reject/assign, and edit individual fields with a required
-reason (each edit is stored as an override + review-history entry, never
-as an in-place change to mapped_estimate.json -- see review_service.py).
+browse the estimate grouped by Area/Section, filter, bulk-approve/reject/
+assign (per group or across the whole project), and edit individual fields
+with a required reason (each edit is stored as an override + review-history
+entry, never as an in-place change to mapped_estimate.json -- see
+review_service.py).
+
+Phase 5.0 Priority 2: the estimate is grouped by Area/Section (matching the
+canonical Area/Section model, not a new grouping concept -- see
+docs/build-estimate.md), each row shows readiness ("Ready"/"Blocked") and
+the reason it's blocked when it is, and each group offers a one-click
+"approve every ready item in this group" action alongside the existing
+cross-project multiselect bulk actions.
 """
 
 from __future__ import annotations
@@ -25,6 +33,30 @@ from estimate_extractor.ui.review_service import (
     STATUS_REJECTED,
     ApprovalBlockedError,
 )
+
+GROUP_DISPLAY_COLUMNS = [
+    "line_item_id",
+    "source_page",
+    "original_description",
+    "quantity",
+    "unit",
+    "category",
+    "selector",
+    "readiness",
+    "reason",
+    "status",
+]
+
+GROUP_COLUMN_LABELS = {
+    "line_item_id": "Row",
+    "source_page": "Page",
+    "original_description": "Description",
+    "category": "CAT",
+    "selector": "SEL",
+    "readiness": "Readiness",
+    "reason": "Reason",
+    "status": "Status",
+}
 
 DISPLAY_COLUMNS = [
     "line_item_id",
@@ -65,6 +97,8 @@ FILTER_OPTIONS = [
     "Rejected",
 ]
 
+READINESS_OPTIONS = ["All", "Ready to approve", "Blocked"]
+
 SORT_OPTIONS = ["Source order", "Confidence ascending", "Section", "Trade", "Mapping status"]
 
 
@@ -87,6 +121,14 @@ def _apply_filter(rows: list[dict], choice: str) -> list[dict]:
     return [r for r in rows if pred(r)] if pred else rows
 
 
+def _apply_readiness_filter(rows: list[dict], choice: str) -> list[dict]:
+    if choice == "Ready to approve":
+        return [r for r in rows if r["can_approve"] and r["status"] != STATUS_APPROVED]
+    if choice == "Blocked":
+        return [r for r in rows if not r["can_approve"]]
+    return rows
+
+
 def _apply_sort(rows: list[dict], choice: str) -> list[dict]:
     if choice == "Confidence ascending":
         return sorted(rows, key=lambda r: (r["confidence"] if r["confidence"] is not None else -1))
@@ -99,6 +141,36 @@ def _apply_sort(rows: list[dict], choice: str) -> list[dict]:
     return rows  # source order
 
 
+def _reason_for(row: dict) -> str:
+    """One human-readable line combining WHY a row can't be approved yet
+    (approval_block_reasons) and, separately, WHY the mapper itself flagged
+    it (review_reasons) -- both matter to a reviewer deciding what to do
+    with the row, and they are not always the same thing."""
+    parts = []
+    if not row["can_approve"]:
+        parts.extend(row["approval_block_reasons"])
+    elif row["review_reasons"]:
+        parts.extend(row["review_reasons"])
+    return "; ".join(parts)
+
+
+def _group_key(row: dict) -> tuple[str, str]:
+    return (row["area_name"] or "(No area)", row["section_name"] or "(No section)")
+
+
+def _ordered_groups(rows: list[dict]) -> list[tuple[str, str]]:
+    """Groups in first-appearance (source/document) order, not alphabetical
+    -- matches the order the carrier PDF itself presented them in."""
+    seen: list[tuple[str, str]] = []
+    seen_set: set[tuple[str, str]] = set()
+    for row in rows:
+        key = _group_key(row)
+        if key not in seen_set:
+            seen_set.add(key)
+            seen.append(key)
+    return seen
+
+
 def render_mapping_review(project_dir: Path) -> None:
     st.subheader("Mapping Review")
     rows = review_service.build_effective_rows(project_dir)
@@ -106,26 +178,103 @@ def render_mapping_review(project_dir: Path) -> None:
         st.info("This project has no mapped line items yet -- process it from the Upload / Process tab.")
         return
 
-    filter_choice = st.selectbox("Filter", FILTER_OPTIONS, key="mapping_filter")
-    sort_choice = st.selectbox("Sort by", SORT_OPTIONS, key="mapping_sort")
-    filtered = _apply_sort(_apply_filter(rows, filter_choice), sort_choice)
+    c1, c2, c3 = st.columns(3)
+    filter_choice = c1.selectbox("Filter", FILTER_OPTIONS, key="mapping_filter")
+    readiness_choice = c2.selectbox("Readiness", READINESS_OPTIONS, key="mapping_readiness_filter")
+    sort_choice = c3.selectbox("Sort by", SORT_OPTIONS, key="mapping_sort")
 
-    st.caption(f"{len(filtered)} of {len(rows)} line items shown.")
+    all_groups = _ordered_groups(rows)
+    group_labels = [f"{area} / {section}" for area, section in all_groups]
+    group_choice = st.multiselect(
+        "Groups (Area / Section) -- leave empty to show all", group_labels, key="mapping_group_filter"
+    )
+    selected_groups = set(all_groups) if not group_choice else {
+        all_groups[i] for i, label in enumerate(group_labels) if label in group_choice
+    }
 
+    filtered = _apply_sort(
+        _apply_readiness_filter(_apply_filter(rows, filter_choice), readiness_choice), sort_choice
+    )
+    filtered = [r for r in filtered if _group_key(r) in selected_groups]
+
+    ready_count = sum(1 for r in filtered if r["can_approve"] and r["status"] != STATUS_APPROVED)
+    approved_count = sum(1 for r in filtered if r["status"] == STATUS_APPROVED)
+    st.caption(
+        f"{len(filtered)} of {len(rows)} line items shown -- "
+        f"{approved_count} approved, {ready_count} ready to approve, "
+        f"{len(filtered) - ready_count - approved_count} blocked or otherwise not ready."
+    )
+
+    reviewer = ui_state.get_reviewer_name()
+    _render_grouped_view(project_dir, filtered, reviewer)
+
+    st.markdown("---")
+    with st.expander("Advanced: cross-group bulk actions and single-item editor"):
+        _render_bulk_actions(project_dir, filtered)
+        st.markdown("---")
+        _render_item_editor(project_dir, filtered)
+        st.markdown("---")
+        render_manual_selector_search(project_dir)
+
+
+def _render_grouped_view(project_dir: Path, rows: list[dict], reviewer: str) -> None:
     import pandas as pd
 
-    display_df = pd.DataFrame([{k: r.get(k) for k in DISPLAY_COLUMNS} for r in filtered])
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    groups = _ordered_groups(rows)
+    if not groups:
+        st.info("No line items match the current filters.")
+        return
 
-    _render_bulk_actions(project_dir, filtered)
-    st.markdown("---")
-    _render_item_editor(project_dir, filtered)
-    st.markdown("---")
-    render_manual_selector_search(project_dir)
+    rows_by_group: dict[tuple[str, str], list[dict]] = {g: [] for g in groups}
+    for row in rows:
+        rows_by_group[_group_key(row)].append(row)
+
+    for group in groups:
+        group_rows = rows_by_group[group]
+        area, section = group
+        group_ready = [r for r in group_rows if r["can_approve"] and r["status"] != STATUS_APPROVED]
+        group_approved = [r for r in group_rows if r["status"] == STATUS_APPROVED]
+        all_approved = len(group_approved) == len(group_rows)
+
+        header = f"{area} / {section} -- {len(group_rows)} item(s), {len(group_approved)} approved, {len(group_ready)} ready"
+        with st.expander(header, expanded=not all_approved):
+            display_rows = []
+            for r in group_rows:
+                display_rows.append(
+                    {
+                        **{k: r.get(k) for k in GROUP_DISPLAY_COLUMNS if k not in ("readiness", "reason")},
+                        "readiness": "Ready" if (r["can_approve"] and r["status"] != STATUS_APPROVED) else (
+                            "Approved" if r["status"] == STATUS_APPROVED else "Blocked"
+                        ),
+                        "reason": _reason_for(r),
+                    }
+                )
+            df = pd.DataFrame(display_rows)[GROUP_DISPLAY_COLUMNS].rename(columns=GROUP_COLUMN_LABELS)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            gc1, gc2, gc3 = st.columns(3)
+            if gc1.button(f"Approve all ready in this group ({len(group_ready)})", key=f"grp_approve_ready_{area}_{section}", disabled=not group_ready):
+                ids = [r["line_item_id"] for r in group_ready]
+                result = review_service.bulk_set_status(project_dir, ids, STATUS_APPROVED, reviewer)
+                st.success(f"Approved {len(result.applied)} item(s) in {area} / {section}.")
+                if result.blocked:
+                    st.warning(f"{len(result.blocked)} item(s) could not be approved after all -- rechecked and blocked.")
+                st.rerun()
+            if gc2.button(f"Reject all in this group ({len(group_rows)})", key=f"grp_reject_all_{area}_{section}"):
+                ids = [r["line_item_id"] for r in group_rows]
+                review_service.bulk_set_status(project_dir, ids, STATUS_REJECTED, reviewer)
+                st.success(f"Rejected {len(ids)} item(s) in {area} / {section}.")
+                st.rerun()
+            blocked_rows = [r for r in group_rows if not r["can_approve"]]
+            if blocked_rows and gc3.button(f"Mark blocked rows for later review ({len(blocked_rows)})", key=f"grp_needs_info_{area}_{section}"):
+                ids = [r["line_item_id"] for r in blocked_rows]
+                review_service.bulk_set_status(project_dir, ids, STATUS_NEEDS_MORE_INFO, reviewer)
+                st.success(f"Marked {len(ids)} blocked item(s) in {area} / {section} as needing more information.")
+                st.rerun()
 
 
 def _render_bulk_actions(project_dir: Path, rows: list[dict]) -> None:
-    st.markdown("**Bulk actions**")
+    st.markdown("**Bulk actions across the current filtered set (any group)**")
     ids = [r["line_item_id"] for r in rows]
     selected = st.multiselect("Select line items", ids, key="bulk_selected_ids")
     if not selected:
