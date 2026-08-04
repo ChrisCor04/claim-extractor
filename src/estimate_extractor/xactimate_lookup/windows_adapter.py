@@ -231,23 +231,6 @@ def _split_category_selector(code: str) -> tuple[str, str]:
     return code[:3], code[3:]
 
 
-def _levenshtein_distance(a: str, b: str) -> int:
-    """Plain edit distance, no external dependency -- used by
-    ``_click_context_menu_item()`` to catch a stable OCR misread
-    (Phase 4.5: "Delete" read as "betete") that a plain similarity
-    ratio can't safely distinguish from a line that must never match
-    (e.g. "undo delete line item"). See that method's docstring."""
-    if len(a) < len(b):
-        a, b = b, a
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
-
-
 class WindowsXactimateAdapter(XactimateAdapter):
     """Real Windows desktop adapter. See module docstring for the
     validated mechanism. ``supports_live_execution`` is a class
@@ -702,21 +685,51 @@ class WindowsXactimateAdapter(XactimateAdapter):
         value. `--psm 11` ("sparse text, no layout assumed") plus a 2x
         upscale reads every row correctly in the same live state where
         `--psm 6` failed -- swept scale 1x/2x/4x x five PSM modes
-        before finding this combination. See
-        docs/xactimate-lookup.md Phase 4.5."""
+        before finding this combination.
+
+        Third bug (Phase 4.6): the root cause behind both the Phase 4.5
+        fix AND its own failure mode turned out to be the SAME thing --
+        the crop height (a fixed, generous 400px band to accommodate
+        an unknown row count) is mostly blank whenever fewer than ~15
+        rows are present, and Tesseract's layout analysis is sensitive
+        to that blank-space ratio in ways that flip which PSM mode
+        works: `--psm 6` misreads a real "444" as "ast" on the full
+        400px-tall crop, but reads it correctly on the same crop
+        cropped down to just its top 100px; `--psm 11` reads a
+        single row fine on the full crop but returns nothing on a
+        2-row crop where the second row is legible to the eye.
+        Neither a single PSM mode nor a single crop height is reliable
+        across every row count. Fixed by trying multiple (crop height,
+        PSM) combinations and taking the MAXIMUM row count found
+        (not the first non-empty one): undercounting is the dangerous
+        direction here (Phase 4.5's wrong-row mutation), while
+        overcounting fails safe (a later step won't find a row that
+        isn't really there and will raise, rather than silently
+        acting on the wrong one). See docs/xactimate-lookup.md Phase
+        4.6."""
         header = self._shifted_anchor("grid_header", offset)
         col_l, col_r = _GRID_COLUMNS["number"]
         dx, dy = offset
         col_l, col_r = col_l + dx, col_r + dx
-        # scan a generous band below the header for numeric row labels
-        crop_box = (col_l, header[3], col_r, header[3] + 400)
-        crop = image.crop(crop_box)
-        crop = crop.resize((crop.width * 2, crop.height * 2))
-        text = self._ocr_text(crop, psm=11)
         import re
 
-        rows = [line for line in text.splitlines() if re.match(r"^\s*\d+", line)]
-        return len(rows)
+        def rows_at(crop_height, psm, scale):
+            crop = image.crop((col_l, header[3], col_r, header[3] + crop_height))
+            crop = crop.resize((crop.width * scale, crop.height * scale))
+            text = self._ocr_text(crop, psm=psm)
+            return [line for line in text.splitlines() if re.match(r"^\s*\d+", line)]
+
+        # Live-caught (Phase 4.6): even (crop_height, psm) alone isn't
+        # enough -- the specific misread of one row's digits also
+        # varies by upscale factor, non-deterministically producing
+        # different non-digit-leading garbage at 2x vs. 3x on
+        # otherwise-identical crops. Scale is swept alongside crop
+        # height and PSM for the same reason: take the max valid count
+        # across everything tried rather than trust any single
+        # combination.
+        combos = [(100, 6, 2), (100, 6, 3), (400, 11, 2), (400, 6, 2)]
+        counts = [len(rows_at(h, psm, scale)) for h, psm, scale in combos]
+        return max(counts)
 
     # ------------------------------------------------------------------
     # XactimateAdapter contract
@@ -1170,41 +1183,49 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # Live-caught (Phase 4.3): at native resolution Tesseract can drop
         # a decimal point entirely (visually present but sub-pixel at this
         # crop size) -- "2.5" read back as "25" with no punctuation at
-        # all, not a misread character regex could fix. Upscaling 4x
-        # before OCR is a standard mitigation for exactly this failure
-        # mode.
+        # all. Upscaling is a standard mitigation for this failure mode.
         #
-        # Live-caught (Phase 4.5): that same 4x upscale can blur a SHORT
-        # value (a single digit, e.g. "7") into nothing -- reproduced
-        # directly: native resolution read "7" correctly across every PSM
-        # tried, but the 4x-upscaled crop returned an empty string with
-        # the same PSM. Neither scale is reliable alone, so both are
-        # tried: the decimal-preserving upscaled reading is used only
-        # when it actually contains a decimal point the native reading is
-        # missing (the specific failure upscaling exists to fix);
-        # otherwise the native reading is preferred, falling back to
-        # upscaled only if native produced nothing at all. See
-        # docs/xactimate-lookup.md Phase 4.5.
-        text_native = self._ocr_text(crop).replace(",", "").strip()
-        crop_upscaled = crop.resize((crop.width * 4, crop.height * 4))
-        text_upscaled = self._ocr_text(crop_upscaled).replace(",", "").strip()
-        if "." in text_upscaled and "." not in text_native:
-            text = text_upscaled
-        else:
-            text = text_native or text_upscaled
-        # OCR on a cell crop occasionally picks up a stray border/highlight
-        # artifact as a leading non-numeric character (live-observed: "> 10.5"
-        # for a plain "10.5") -- extract the numeric substring rather than
-        # requiring the whole string to already be a clean float.
+        # Live-caught (Phase 4.5): 4x upscale can blur a SHORT value (a
+        # single digit, e.g. "7") into an empty OCR result, while native
+        # resolution reads it correctly.
+        #
+        # Live-caught (Phase 4.6): NEITHER a single fixed scale nor a
+        # native-vs-upscaled preference is safe -- every scale tried
+        # confidently misreads SOME real value to a different, wrong,
+        # non-empty digit (not just "empty" -- there is no reliable
+        # signal to detect the failure from the output alone): native
+        # misread a real "5" as "3"; 2x and 3x misread a real "1" as
+        # "oo"/"ji". No single scale among {1x, 2x, 3x, 4x, 6x} was
+        # correct on every one of "1", "5", "2.5", "7" tested live.
+        # {1x, 4x, 6x} each independently got 3 of those 4 right (never
+        # the same 3), so a majority vote across those three scales gets
+        # all 4 right -- the same "multiple-read agreement" strategy
+        # `read_populated_fields()` already uses across independent
+        # reads, applied here across independent scales instead. A tie
+        # (no value read by 2+ scales) returns None rather than
+        # guessing. See docs/xactimate-lookup.md Phase 4.6.
         import re
 
-        match = re.search(r"-?\d+(?:\.\d+)?", text)
-        if match is None:
+        def numeric_at(scale):
+            im = crop.resize((crop.width * scale, crop.height * scale))
+            text = self._ocr_text(im).replace(",", "").strip()
+            match = re.search(r"-?\d+(?:\.\d+)?", text)
+            if match is None:
+                return None
+            try:
+                return float(match.group())
+            except ValueError:
+                return None
+
+        reads = [numeric_at(s) for s in (1, 4, 6)]
+        votes: dict[float, int] = {}
+        for v in reads:
+            if v is not None:
+                votes[v] = votes.get(v, 0) + 1
+        if not votes:
             return None
-        try:
-            return float(match.group())
-        except ValueError:
-            return None
+        best_value, best_count = max(votes.items(), key=lambda kv: kv[1])
+        return best_value if best_count >= 2 else None
 
     def commit_item(self) -> None:
         VK_S = 0x53
@@ -1212,7 +1233,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         time.sleep(1.5)
 
     def verify_quantity_committed(
-        self, expected_quantity: float, timeout_s: float = 5.0, interval_s: float = 0.25
+        self, expected_quantity: float, timeout_s: float = 3.0
     ) -> QuantityVerificationResult:
         """Not part of the abstract contract -- bounded-polling
         replacement for a single-shot ``read_quantity()`` call used to
@@ -1221,29 +1242,48 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         Live investigation (Phase 4.5) found a single-shot read taken
         immediately after such an action intermittently returns `None`
-        -- reproduced directly: a fresh CAT/SEL selection, quantity
-        entry, and *immediate* `read_quantity()` call (no intervening
-        delay beyond `enter_quantity()`'s own settle sleep) returned
-        `None` on the first live trial, even though the value was
-        correctly present in the grid a moment later and every attempt
-        thereafter. This is not a fixed, predictable delay -- polling
-        with a bounded budget is the correct fix, not a longer sleep
-        (a longer fixed sleep just moves the same race to a different,
-        still-unbounded worst case).
+        or a wrong value. Live timing evidence (Phase 4.6, 5 fresh
+        commits, `read_quantity()` fixed to a majority-vote-across-
+        scales read -- see that method's docstring) found the REAL
+        settle time is near-instant once the OCR itself is reliable:
+        all 5 commits read the correct quantity on the very first poll
+        (sub-millisecond). The `timeout_s` default is set from that
+        evidence with a wide conservative margin (3.0s -- roughly
+        1000x the observed real-world time), not tuned tightly to it,
+        since an occasional genuinely slower render is still possible
+        and this must never become an unbounded wait.
 
-        Polls `read_quantity()` at `interval_s` and terminates on the
-        first of: the observed value equals `expected_quantity`
-        (success), `_unexpected_dialog_present()` is true (wrong
-        context -- aborts immediately rather than continuing to poll
-        past something that needs a human), or `timeout_s` elapses
-        (failure). Every attempt's elapsed time, whether a grid row was
-        located at all, and the observed value are recorded in the
-        returned result's `.samples` for diagnostics. See
-        docs/xactimate-lookup.md Phase 4.5."""
+        Polls with PROGRESSIVE intervals -- five fast attempts at
+        0.1s apart (covers the common near-instant case cheaply),
+        then 0.4s apart afterward (avoids hammering the OCR pipeline
+        during a genuinely slow settle) -- and terminates on the first
+        of:
+        - the observed value equals `expected_quantity` (success,
+          ``stop_reason="matched"``);
+        - the SAME non-matching value is observed twice in a row
+          (``stop_reason="wrong_value"`` -- a stable wrong reading
+          isn't a settle-timing issue polling can fix; surfacing it
+          immediately is more honest than waiting out the full
+          budget);
+        - the row's identity check fails after previously succeeding,
+          i.e. the grid changed under us mid-poll
+          (``stop_reason="conflicting_row"``);
+        - `_unexpected_dialog_present()` is true
+          (``stop_reason="wrong_context"`` -- aborts immediately
+          rather than continuing to poll past something that needs a
+          human);
+        - `timeout_s` elapses (``stop_reason="timeout"``).
+
+        Every attempt's elapsed time, whether a grid row was located,
+        and the observed value are recorded in the returned result's
+        `.samples` for diagnostics. See docs/xactimate-lookup.md
+        Phase 4.5/4.6."""
         start = time.time()
         samples: list[tuple[float, bool, float | None]] = []
         attempts = 0
         observed: float | None = None
+        previous: float | None = None
+        previous_row_found: bool | None = None
         while True:
             attempts += 1
             elapsed = time.time() - start
@@ -1255,6 +1295,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
             hwnd = self._ensure_main_window()
             image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
             row_found = offset is not None and self._last_row_geometry(image, offset) is not None
+            if previous_row_found and not row_found:
+                return QuantityVerificationResult(
+                    matched=False, stop_reason="conflicting_row", expected=expected_quantity,
+                    observed=observed, attempts=attempts, elapsed_s=elapsed, samples=samples,
+                )
             observed = self.read_quantity() if row_found else None
             samples.append((round(elapsed, 3), row_found, observed))
             if observed == expected_quantity:
@@ -1262,134 +1307,263 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     matched=True, stop_reason="matched", expected=expected_quantity,
                     observed=observed, attempts=attempts, elapsed_s=elapsed, samples=samples,
                 )
+            if observed is not None and observed == previous:
+                return QuantityVerificationResult(
+                    matched=False, stop_reason="wrong_value", expected=expected_quantity,
+                    observed=observed, attempts=attempts, elapsed_s=elapsed, samples=samples,
+                )
             if elapsed >= timeout_s:
                 return QuantityVerificationResult(
                     matched=False, stop_reason="timeout", expected=expected_quantity,
                     observed=observed, attempts=attempts, elapsed_s=elapsed, samples=samples,
                 )
-            time.sleep(interval_s)
+            previous = observed
+            previous_row_found = row_found
+            time.sleep(0.1 if attempts < 5 else 0.4)
 
-    def _click_context_menu_item(self, anchor_x: int, anchor_y: int, item_text: str, max_width: int = 500, max_height: int = 700) -> bool:
-        """Locates and clicks a context-menu item by its literal text,
-        via a full DESKTOP screenshot (a context menu is a separate
-        top-level window -- invisible to the client-area PrintWindow
-        capture used everywhere else in this file).
+    #: Fixed 0-based index of the "Delete" item within the row context
+    #: menu's flat UIA child list. Live-caught (Phase 4.6): the menu is
+    #: a Telerik `RadMenuItem` tree whose items expose NO usable name
+    #: via `CurrentName`, `CurrentAutomationId`, or `LegacyIAccessible`
+    #: (all return either empty or a generic `"Telerik.Windows.
+    #: Controls.RadMenuItem Header: Items.Count:N"` ToString() dump) --
+    #: so items cannot be found by text at all, OCR or otherwise. What
+    #: IS reliable: the "Undo ..." slot (index 5) is ALWAYS present as
+    #: an element (it's the only one with a real `CurrentName`, `"Undo
+    #: "`), just collapsed to a (0,0,0,0) rect when there's nothing to
+    #: undo -- so the total flat child count (26) and every other
+    #: item's index are stable regardless of undo-history state,
+    #: confirmed by re-deriving this index twice in the same session
+    #: (once with a fresh add, once after a prior delete) and getting
+    #: identical results both times. `_click_delete_via_uia()` verifies
+    #: this structural invariant (total count + real-item height, not
+    #: a ~7px separator) before ever clicking, and refuses rather than
+    #: guessing if it doesn't hold. See docs/xactimate-lookup.md Phase
+    #: 4.6.
+    _CONTEXT_MENU_DELETE_INDEX = 11
+    _CONTEXT_MENU_EXPECTED_ITEM_COUNT = 26
 
-        Live-caught (Phase 4.4 Stage 3): a FIXED PIXEL OFFSET into this
-        menu is fundamentally unreliable, not just imprecise --
-        "Undo Delete Line Item" appears/disappears depending on
-        whether there's undo history, shifting every item below it by
-        one row (~23px) between calls in the SAME session (confirmed:
-        the offset measured immediately after a delete didn't match
-        the offset measured immediately after a save). OCR-locating
-        the actual text at click time is the robust fix; matches the
-        LINE whose full text equals item_text exactly (case-
-        insensitive) so "Delete" doesn't false-match inside "Undo
-        Delete Line Item". Returns False (never raises) if no
-        matching line is found, so the caller can fail safely rather
-        than click a guessed position. See docs/xactimate-lookup.md
-        Phase 4.4.
+    def _find_context_menu_popup_hwnd(self, main_hwnd: int) -> int | None:
+        """Returns the HWND of the currently-open row context menu (a
+        separate top-level WPF popup window, like the search-results
+        dropdown -- invisible to the client-area PrintWindow capture
+        used elsewhere in this file), or None if no such window is
+        open. Distinguished from an unexpected dialog by size (the
+        context menu is a narrow vertical strip; live-measured at
+        ~300x500px, always taller than wide) rather than title, since
+        this popup -- like the results dropdown -- has an empty
+        title."""
+        win32gui = self._win32gui()
 
-        Live-caught (Phase 4.5): the search region originally only
-        looked below-and-right of the click point, assuming that's
-        always where Windows renders a context menu. It doesn't --
-        Windows flips the menu upward when there isn't enough room
-        below the cursor (observed live on a 1920x1080 screen, a
-        different resolution than Phase 4.4's session, where a
-        right-click low enough in the window pushed the menu entirely
-        above the click point). The search region is now centered on
-        the click point, covering both directions, clamped to the
-        virtual screen so ImageGrab never receives a negative or
-        off-screen bbox.
-
-        That larger, both-directions region exposed a second issue:
-        `--psm 6` ("assume a uniform block of text") merges/loses
-        individual menu lines once the crop is big enough to also
-        contain the busy background grid/panel behind the menu --
-        live-reproduced: the standalone "Delete" line vanished
-        entirely from its output on a crop where "Undo Delete Line
-        Item" (two lines away) still came through correctly. `--psm 4`
-        ("assume a single column of text of variable sizes") reliably
-        isolates "Delete" as its own line on the same crop where
-        `--psm 6` lost it.
-
-        Live-caught (Phase 4.5): even with both fixes above, a single
-        OCR pass can still misread the word itself -- reproduced live:
-        "Delete" read as "betete" on this specific crop, caused by the
-        menu's semi-transparent text blending with the busy background
-        window content directly behind it at this exact pixel
-        position. This is a STABLE misread, not per-attempt noise --
-        confirmed by re-grabbing and re-OCRing the same live state
-        three times and getting "betete" all three times, so retrying
-        the capture alone does not fix it (retry is kept regardless,
-        since a genuinely transient misread is a separate, real
-        failure mode this file has hit elsewhere).
-        The real fix: single-word menu lines within a small edit
-        distance of the target are accepted as a match too, alongside
-        an exact match. A plain fuzzy-ratio match was tried first and
-        rejected -- "betete" vs. "delete" scores similarly low to
-        "undo delete line item" vs. "delete" on difflib's ratio, so
-        ratio alone can't safely distinguish the real misread from the
-        line that must never match. Levenshtein edit distance does:
-        "betete" is 2 edits from "delete", while every other real
-        single-word item in this menu (including "select", the
-        closest) is >= 3 edits away, and multi-word lines are excluded
-        by the single-word restriction regardless of distance -- so
-        "undo delete line item" can never match no matter how close
-        any individual word is. See docs/xactimate-lookup.md Phase
-        4.5."""
-        from PIL import ImageGrab
-
-        pytesseract = self._pytesseract()
-        user32 = self._win32()[0].windll.user32
-        screen_w = user32.GetSystemMetrics(0)
-        screen_h = user32.GetSystemMetrics(1)
-        left = max(0, anchor_x - max_width)
-        top = max(0, anchor_y - max_height)
-        right = min(screen_w, anchor_x + max_width)
-        bottom = min(screen_h, anchor_y + max_height)
-        crop_box = (left, top, right, bottom)
-        target = item_text.strip().lower()
-
-        for attempt in range(3):
-            shot = ImageGrab.grab(bbox=crop_box)
-            data = pytesseract.image_to_data(shot, config="--psm 4", output_type=pytesseract.Output.DICT)
-
-            lines: dict[tuple[int, int, int], list[int]] = {}
-            for i, text in enumerate(data["text"]):
-                if not text.strip():
-                    continue
-                key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-                lines.setdefault(key, []).append(i)
-
-            for indices in lines.values():
-                line_text = " ".join(data["text"][i].strip() for i in indices).strip().lower()
-                is_exact = line_text == target
-                is_close_single_word = " " not in line_text and _levenshtein_distance(line_text, target) <= 2
-                if not (is_exact or is_close_single_word):
-                    continue
-                lefts = [data["left"][i] for i in indices]
-                rights = [data["left"][i] + data["width"][i] for i in indices]
-                tops = [data["top"][i] for i in indices]
-                bottoms = [data["top"][i] + data["height"][i] for i in indices]
-                cx = left + (min(lefts) + max(rights)) // 2
-                cy = top + (min(tops) + max(bottoms)) // 2
-                self._click_screen(cx, cy)
+        def cb(hwnd, acc):
+            try:
+                cls = win32gui.GetClassName(hwnd)
+                visible = win32gui.IsWindowVisible(hwnd)
+                rect = win32gui.GetWindowRect(hwnd)
+            except Exception:
                 return True
-            if attempt < 2:
-                time.sleep(0.3)
-        return False
+            if not visible or hwnd == main_hwnd or _APP_CLASS_MARKER not in cls:
+                return True
+            w, h = rect[2] - rect[0], rect[3] - rect[1]
+            if 0 < w < 500 and h > w:
+                acc.append(hwnd)
+            return True
+
+        found: list[int] = []
+        win32gui.EnumWindows(cb, found)
+        return found[0] if found else None
+
+    def _click_delete_via_uia(self, popup_hwnd: int) -> bool:
+        """Locates the "Delete" item in an already-open row context
+        menu via UI Automation structure (not OCR, not a fixed pixel
+        offset -- see `_CONTEXT_MENU_DELETE_INDEX`'s docstring for why)
+        and clicks its live-read bounding-rectangle center. Verifies
+        the structural invariant (exact expected item count, and that
+        the target index is a real ~24px item, not a ~7px separator)
+        before clicking; returns False without clicking anything if
+        the structure doesn't match, rather than guessing. `Invoke()`
+        and `LegacyIAccessible.DoDefaultAction()` were both tried first
+        and confirmed live to be safe no-ops on this control (neither
+        raises, neither does anything) -- a real mouse click at the
+        UIA-derived coordinate is what actually works. See
+        docs/xactimate-lookup.md Phase 4.6."""
+        uia, UIA = self._uia()
+        element = uia.ElementFromHandle(popup_hwnd)
+        walker = uia.RawViewWalker
+        menu_root = walker.GetFirstChildElement(element)
+        if menu_root is None:
+            return False
+        child = walker.GetFirstChildElement(menu_root)
+        items = []
+        while child:
+            items.append(child)
+            try:
+                child = walker.GetNextSiblingElement(child)
+            except Exception:
+                break
+
+        if len(items) != self._CONTEXT_MENU_EXPECTED_ITEM_COUNT:
+            return False
+        target = items[self._CONTEXT_MENU_DELETE_INDEX]
+        rect = target.CurrentBoundingRectangle
+        height = rect.bottom - rect.top
+        if not (18 <= height <= 30):  # a real item is ~24px; a separator is ~7px
+            return False
+
+        cx = (rect.left + rect.right) // 2
+        cy = (rect.top + rect.bottom) // 2
+        self._click_screen(cx, cy)
+        return True
+
+    def _open_row_context_menu(self, hwnd: int, row_x: int, row_y: int) -> tuple[int, int]:
+        """Right-clicks at the given CLIENT coordinates and returns the
+        (screen_x, screen_y) it clicked at. Split out of
+        cancel_current_item()/delete_existing_item() so both share the
+        exact same right-click mechanics."""
+        ctypes, _ = self._win32()
+        user32 = ctypes.windll.user32
+        ox, oy = self._get_client_origin(hwnd)
+        screen_x, screen_y = ox + row_x, oy + row_y
+        user32.SetCursorPos(screen_x, screen_y)
+        time.sleep(0.1)
+        user32.mouse_event(0x0008, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTDOWN
+        time.sleep(0.05)
+        user32.mouse_event(0x0010, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTUP
+        # Live-caught (Phase 4.4): 0.4s was sometimes too short for the
+        # context menu to be fully rendered before the follow-up
+        # interaction. See docs/xactimate-lookup.md Phase 4.4.
+        time.sleep(1.0)
+        return screen_x, screen_y
+
+    def _read_category_selector_at(self, image, offset: tuple[int, int], row_top: int) -> tuple[str | None, str | None]:
+        """Lighter-weight sibling of `_read_populated_fields_once()` --
+        reads only category/selector at an ARBITRARY row_top (not
+        assumed to be the last row), for identity-based row lookup in
+        a multi-row grid. Same crop/PSM/upscale parameters as the
+        equivalent fields in `_read_populated_fields_once()` (Phase
+        4.4 Stage 3's live-verified settings), applied at a caller-
+        supplied row position instead of the grid's last row."""
+        dx = offset[0]
+
+        def crop_col(col_name):
+            col_l, col_r = _GRID_COLUMNS[col_name]
+            return image.crop((col_l + dx, row_top, col_r + dx, row_top + _GRID_ROW_HEIGHT))
+
+        cat_crop = crop_col("category")
+        cat_crop = cat_crop.resize((cat_crop.width * 4, cat_crop.height * 4))
+        cat = self._ocr_text(cat_crop, psm=6).strip() or None
+        sel_crop = crop_col("selector")
+        sel_crop = sel_crop.resize((sel_crop.width * 4, sel_crop.height * 4))
+        sel = self._ocr_text(sel_crop).strip() or None
+        return cat, sel
+
+    def _snapshot_grid_identities(self) -> list[tuple[str | None, str | None]]:
+        """Returns [(category, selector), ...] top-to-bottom for every
+        row currently in the grid -- used by `delete_existing_item()`
+        to independently verify, before AND after, that exactly the
+        targeted row changed and nothing else did."""
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd)
+        if offset is None:
+            return []
+        geom = self._last_row_geometry(image, offset)
+        if geom is None:
+            return []
+        row_count, _ = geom
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        return [
+            self._read_category_selector_at(image, offset, row_1_top + i * _GRID_ROW_HEIGHT)
+            for i in range(row_count)
+        ]
+
+    def delete_existing_item(self, category: str, selector: str) -> None:
+        """Not part of the abstract contract. Targeted deletion of a
+        SPECIFIC row by CAT/SEL identity, anywhere in the grid -- not
+        just the last row (`cancel_current_item()`'s scope). Required
+        because a real recovery/cleanup pass may need to remove one
+        row out of several without disturbing the others (see
+        docs/xactimate-lookup.md Phase 4.6, Stage 3's multi-row
+        trials). A context menu opened for one row is never reused for
+        another -- every call re-locates the target fresh and opens
+        its own menu.
+
+        Verifies, independently of the click succeeding without an
+        exception: the target identity is no longer present, exactly
+        one row disappeared (not more, not fewer), and every other
+        row's identity is unchanged and in the same relative order."""
+        before = self._snapshot_grid_identities()
+        target_positions = [i for i, (c, s) in enumerate(before) if c == category and s == selector]
+        if not target_positions:
+            raise AdapterError(f"delete_existing_item(): no row matching {category}/{selector} found in the grid.")
+        target_index = target_positions[0]
+
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd)
+        if offset is None:
+            raise AdapterError("delete_existing_item(): could not locate the grid.")
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        row_top = row_1_top + target_index * _GRID_ROW_HEIGHT
+        dx = offset[0]
+
+        # Re-verify the target is still at this exact position
+        # immediately before acting -- the grid may have changed
+        # between the snapshot above and now.
+        cat_now, sel_now = self._read_category_selector_at(image, offset, row_top)
+        if cat_now != category or sel_now != selector:
+            raise AdapterError(
+                f"delete_existing_item(): row at index {target_index} changed between locating "
+                f"{category}/{selector} and acting on it (now reads {cat_now}/{sel_now}) -- refusing to act."
+            )
+
+        col_l, col_r = _GRID_COLUMNS["description"]
+        row_x = (col_l + col_r) // 2 + dx
+        row_y = row_top + _GRID_ROW_HEIGHT // 2
+        self._open_row_context_menu(hwnd, row_x, row_y)
+
+        popup_hwnd = self._find_context_menu_popup_hwnd(hwnd)
+        if popup_hwnd is None or not self._click_delete_via_uia(popup_hwnd):
+            self._press_key(0x1B)  # VK_ESCAPE -- dismiss whatever menu is open
+            raise AdapterError(f"delete_existing_item(): could not invoke Delete for {category}/{selector}.")
+        time.sleep(1.2)
+
+        if self._unexpected_dialog_present():
+            self.close_transient_dialogs()
+            raise AdapterError(
+                f"delete_existing_item(): an unexpected window appeared after deleting {category}/{selector} "
+                f"-- refusing to trust the result until this is resolved."
+            )
+
+        after = self._snapshot_grid_identities()
+        expected = before[:target_index] + before[target_index + 1 :]
+        if len(after) != len(before) - 1:
+            raise AdapterError(
+                f"delete_existing_item(): row count changed by {len(before) - len(after)}, expected exactly 1 "
+                f"(before={len(before)}, after={len(after)})."
+            )
+        if any(c == category and s == selector for c, s in after):
+            raise AdapterError(f"delete_existing_item(): {category}/{selector} still present after deletion.")
+        if after != expected:
+            raise AdapterError(
+                f"delete_existing_item(): unexpected change to other rows -- expected {expected}, got {after}."
+            )
 
     def cancel_current_item(self) -> None:
         """Not part of the abstract contract -- used by the
-        non-destructive and assisted-selection trials to remove a
-        just-selected row WITHOUT ever calling commit_item(). Live
-        investigation found the Delete key alone does NOT remove a
-        grid row (an earlier version of this method wrongly assumed it
-        did, and its row-count check had a bug that let it silently
-        report success without actually deleting anything -- see
-        docs/xactimate-lookup.md Phase 4.3). The real mechanism is the
-        row's right-click context menu's "Delete" item."""
+        non-destructive and assisted-selection trials to remove the
+        LAST row WITHOUT ever calling commit_item(). For removing a
+        specific row out of several, use `delete_existing_item()`
+        instead.
+
+        Live investigation found the Delete key alone does NOT remove
+        a grid row (an earlier version of this method wrongly assumed
+        it did -- see docs/xactimate-lookup.md Phase 4.3). The real
+        mechanism is the row's right-click context menu's "Delete"
+        item, invoked via `_click_delete_via_uia()` (Phase 4.6) -- see
+        that method's docstring for why OCR-based menu-item location
+        (Phase 4.4/4.5) was retired rather than patched further: three
+        rounds of conservative fixes each closed one OCR failure mode
+        and exposed a new one, which is a structural fragility of that
+        approach, not a bug count converging on zero."""
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
@@ -1404,42 +1578,27 @@ class WindowsXactimateAdapter(XactimateAdapter):
         row_x = (col_l + col_r) // 2 + dx
         row_y = last_row_top + _GRID_ROW_HEIGHT // 2
 
-        ctypes, _ = self._win32()
-        user32 = ctypes.windll.user32
-        ox, oy = self._get_client_origin(hwnd)
-        screen_x, screen_y = ox + row_x, oy + row_y
-        user32.SetCursorPos(screen_x, screen_y)
-        time.sleep(0.1)
-        user32.mouse_event(0x0008, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTDOWN
-        time.sleep(0.05)
-        user32.mouse_event(0x0010, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTUP
-        # Live-caught: 0.4s was sometimes too short for the context menu
-        # to be fully rendered and interactive before the follow-up
-        # click, causing that click to land on the wrong thing (silently
-        # missing "Delete" and hitting whatever was underneath instead)
-        # -- manual, deliberately-paced testing at ~1s between right-click
-        # and the follow-up click was reliable every time; this was not.
-        # See docs/xactimate-lookup.md Phase 4.4.
-        time.sleep(1.0)
+        self._open_row_context_menu(hwnd, row_x, row_y)
 
-        if not self._click_context_menu_item(screen_x, screen_y, "Delete"):
+        popup_hwnd = self._find_context_menu_popup_hwnd(hwnd)
+        if popup_hwnd is None or not self._click_delete_via_uia(popup_hwnd):
             # Best-effort: dismiss whatever menu is open rather than
             # leaving it hanging over the next call.
             self._press_key(0x1B)  # VK_ESCAPE
-            raise AdapterError("cancel_current_item(): could not locate the 'Delete' context-menu item.")
+            raise AdapterError("cancel_current_item(): could not invoke the 'Delete' context-menu item.")
         time.sleep(1.2)  # empirically: 0.5s was too short and produced a false-negative verification once
 
         # Live-caught false-positive bug (see docs/xactimate-lookup.md
-        # Phase 4.4): if the click at _CONTEXT_MENU_DELETE_OFFSET misses
-        # "Delete" and instead lands on something that opens a different
-        # window (observed live: an unrelated "P.L. Categories" picker),
-        # that window can visually obscure the grid row at the moment of
-        # the post-click capture, making row_count_after read as lower
-        # than it really is -- a false "success" that doesn't actually
-        # delete anything. Checking for an unexpected window FIRST, and
-        # treating its mere presence as a hard failure (not just closing
-        # it and re-checking), catches this rather than trusting a
-        # row-count read that could have been taken while occluded.
+        # Phase 4.4): if the click misses "Delete" and instead lands on
+        # something that opens a different window, that window can
+        # visually obscure the grid row at the moment of the post-click
+        # capture, making row_count_after read as lower than it really
+        # is -- a false "success" that doesn't actually delete
+        # anything. Checking for an unexpected window FIRST, and
+        # treating its mere presence as a hard failure (not just
+        # closing it and re-checking), catches this rather than
+        # trusting a row-count read that could have been taken while
+        # occluded.
         if self._unexpected_dialog_present():
             self.close_transient_dialogs()
             raise AdapterError(

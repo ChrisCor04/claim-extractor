@@ -1798,3 +1798,332 @@ settle time exceeded 5.0s in full-pilot conditions when isolated
 testing never observed more than a fraction of a second; (3) once both
 close, re-run this same 10-item pilot a third time and require 100%
 autonomous cleanup success before flipping the flag.
+
+## Phase 4.6: deterministic recovery replaces OCR-click deletion, quantity-verification root-caused as an OCR bug not a timing bug -- `supports_live_execution` stays `False`, single blocker: intermittent quantity-verification timeout despite correct data
+
+Phase 4.6 retired the OCR-located context-menu click entirely (three
+rounds of conservative fixes in Phase 4.4/4.5 each closed one failure
+mode and exposed another -- treated as evidence of structural
+fragility, not a bug count converging on zero) and replaced it with a
+deterministic, non-OCR mechanism. It also root-caused Phase 4.5's
+"quantity verification times out" finding down to its real cause.
+
+### Stage 1: recovery methods investigated, in the requested order
+
+1. **Xactimate Undo (Ctrl+Z) after a commit** -- tested live, twice
+   (once unfocused, once with the row explicitly clicked/focused
+   first): no effect either time, row count unchanged, "Saved" status
+   unchanged. The row context menu's "Undo ..." item is genuinely
+   scoped to reverting a *deletion* (its live-observed label was
+   always "Undo Delete Line Item", never "Undo Add"), and a fresh
+   add's context menu shows no "Undo" entry at all in some states --
+   consistent with Undo not applying to a fresh commit. **Not viable.**
+2. **A documented/discoverable Delete Item command** -- exists (the
+   context menu's "Delete" item, same one Phase 4.4/4.5 targeted via
+   OCR); the gap was never its existence, only how to invoke it
+   reliably.
+3. **Context-menu keyboard mnemonic** -- not separately pursued once
+   method 4 succeeded; the menu items have no visible underlined
+   mnemonic characters in any captured screenshot.
+4. **UIA/MSAA access to the open context menu** -- the context menu
+   IS a real top-level WPF popup window (same `HwndWrapper[Xactimate
+   online Estimate Writer-...]` class marker as the main window and
+   the search-results dropdown) and DOES expose a full UI Automation
+   tree. But its items are `Telerik.Windows.Controls.RadMenuItem`
+   controls whose `CurrentName`, `CurrentAutomationId`, and
+   `LegacyIAccessible.CurrentName` all return either empty or a
+   generic `"Telerik.Windows.Controls.RadMenuItem Header:
+   Items.Count:N"` ToString() dump -- text-based lookup isn't just
+   unreliable here, it's **not available at all** (confirmed by
+   dumping every item's Name/AutomationId/ClassName/HelpText/Legacy
+   properties live). `IUIAutomationInvokePattern.Invoke()` raised
+   ("NULL COM pointer access" -- not implemented on this control);
+   `LegacyIAccessiblePattern.DoDefaultAction()` ran without error but
+   was confirmed live to be a safe no-op (matches this adapter's
+   already-documented finding for dropdown rows). What UIA DOES give
+   reliably: **structural position**. The "Undo " slot (index 5 in the
+   flat child list) is always present as an element -- collapsed to a
+   `(0,0,0,0)` rect when inapplicable, never removed from the tree --
+   so the menu's total item count (26) and every other item's index
+   are stable regardless of undo-history state. "Delete" is reliably
+   at index 11 (a ~24px-tall real item, immediately before a ~7px
+   separator) -- confirmed identical across two independently-measured
+   live states (a fresh add, and after a prior delete).
+5. **Keyboard navigation through the menu** -- not pursued; method 4's
+   structural-index + real-mouse-click combination worked and is
+   simpler.
+6. **Stable visual interaction (OCR)** -- explicitly not attempted
+   further per this phase's brief; superseded by method 4.
+
+### Selected recovery strategy
+
+`_click_delete_via_uia()`: right-click the target row (as before) to
+open the context menu, locate its popup HWND by window class + shape
+(narrow, tall, empty title -- not by title, since like the dropdown
+popup this window has none), walk its flat UIA child list, verify the
+structural invariant (exactly 26 items; index 11 is ~24px tall, not a
+~7px separator -- refuses to click rather than guess if this doesn't
+hold), read that item's LIVE `CurrentBoundingRectangle` (never a
+cached/guessed position), and issue a real mouse click at its center
+via the same `_click_screen()` primitive used everywhere else in this
+file. No OCR, no text matching, no pixel-offset guessing -- UIA
+supplies the coordinate, a plain click performs the action (since
+semantic invocation doesn't work on this control).
+
+`cancel_current_item()` (last row) and the new `delete_existing_item(category,
+selector)` (a specific row anywhere in the grid, by identity --
+required for the multi-row trials below, not previously possible since
+the old mechanism only ever computed the *last* row's position) both
+use this. `delete_existing_item()` independently verifies, after the
+click, that: the target identity is gone, exactly one row disappeared,
+and every other row's identity and relative order is unchanged --
+comparing full before/after grid snapshots, not just a row count.
+
+### Why the prior OCR-click strategy was retired, not patched again
+
+Phase 4.4 fixed a directional-crop bug and a PSM-segmentation bug.
+Phase 4.5 fixed a stable character misread ("Delete" read as
+"betete"). Re-testing that same OCR mechanism fresh at the start of
+this phase found it **still** failed 100% of the time on a live
+retry -- this session's screen state produced a *fourth*, different
+failure (the standalone "Delete" line merged into an unrelated
+background line, `"Misc. Item Attachments Delete]"`). Four rounds of
+"root-cause and fix" across two phases, each closing exactly the one
+failure mode reproduced and exposing a new one on the next real
+session, is the definition of a structurally fragile approach, not a
+converging bug count -- OCR-reading a semi-transparent menu overlaid
+on a busy, content-dependent background is inherently unstable in a
+way pixel/text tuning cannot fully close. The UIA-structural approach
+has no OCR step at all in its critical path, eliminating this entire
+class of failure.
+
+### Five single-row recovery trials
+
+Clean start (0 rows) -> add one disposable item -> commit -> verify
+-> `cancel_current_item()` -> verify 0 rows / $0.00 / Saved.
+
+| Trial | Item | Delete result | Delete time | Final rows |
+|---|---|---|---|---|
+| 1 | SFG/GUTA qty 5 | OK | 3.48s | 0 |
+| 2 | SFG/GUTC qty 2 | OK | 3.48s | 0 |
+| 3 | SFG/GUTG qty 3 | OK | 3.47s | 0 |
+| 4 | RFG/ARMVN qty 1 | OK | 3.49s | 0 |
+| 5 | SFG/GUTHRA< qty 4 | OK (after an unrelated row-count bug found+fixed mid-trial -- see below) | -- | 0 |
+
+**5/5 deletions succeeded**, each in a consistent ~3.5s (right-click
+settle + UIA walk + click + post-click settle + verification --
+matches the fixed timing budget in `cancel_current_item()`, not
+variable OCR retry time).
+
+### Three multi-row targeted-delete trials
+
+Clean start -> add three distinct disposable rows -> `delete_existing_item()`
+on the MIDDLE row's identity -> verify the other two are unchanged and
+in the same order -> verify count decreased by exactly one -> clean up
+all remaining rows -> verify 0 rows / $0.00 / Saved.
+
+| Trial | Rows added | Deleted (middle) | Other rows intact | Count -1 exactly | Final rows |
+|---|---|---|---|---|---|
+| 1 | GUTA, GUTC, ARMVN | SFG/GUTC | yes | yes | 0 |
+| 2 | GUTG, GUTHRA<, GUTAB | SFG/GUTHRA< | yes | yes | 0 |
+| 3 | GUTA>, ARMVN, GUTC> | RFG/ARMVN | yes | yes | 0 |
+
+**3/3 trials passed. Zero wrong-row deletions** -- every trial's
+"before" and "after" full-grid identity snapshots matched exactly
+(target removed, both others present, unchanged, same relative order).
+
+### New defects found and fixed while running these trials
+
+Two new, previously-unknown bugs surfaced live during Stage 3 (not
+anticipated, found by exercising realistic multi-step sequences):
+
+1. **`_count_grid_rows()` fails in BOTH directions depending on
+   content density.** Phase 4.5 fixed a dense-grid (4+ row) misread by
+   switching to `--psm 11`. This session found the same function
+   returns an EMPTY result on a single-row grid with the same fixed
+   400px-tall crop (mostly blank space below one line of text) --
+   `--psm 6` reads that same sparse case correctly. Then, investigating
+   further, a 2-row crop was found where NEITHER `--psm 6` nor `--psm
+   11` read the second row correctly at any single scale tried (1x-6x)
+   -- the specific misread of one row's digits varied by scale
+   (empty, "ast", "a2", "4-4", "acd" -- different garbage each time).
+   Root cause: crop height and blank-space ratio measurably change
+   which PSM mode Tesseract's layout analysis prefers, and no single
+   (height, PSM, scale) combination was correct across every density
+   tested. Fixed by trying four combinations --
+   `(100px, psm 6, 2x)`, `(100px, psm 6, 3x)`, `(400px, psm 11, 2x)`,
+   `(400px, psm 6, 2x)` -- and taking the MAXIMUM row count found
+   across all four, not the first non-empty one: undercounting is the
+   dangerous direction (it already caused a real wrong-row mutation,
+   below), while overcounting fails safe.
+2. **This undercounting directly caused a live wrong-row mutation**
+   during Stage 3 root-cause testing (in throwaway diagnostic rows,
+   *before* Stage 5's clean pilot -- not during the pilot itself, and
+   fully cleaned up before Stage 5 began): `enter_quantity()` computed
+   the "new row" position from an undercounted total (3 instead of 4)
+   and entered a quantity into an existing, already-correct row
+   instead of the newly-selected one, silently overwriting `SFG/GUTG`'s
+   quantity from `2` to `6`. This is the same class of bug Phase 4.5
+   fixed once already (a different root cause, same consequence);
+   `enter_quantity()`'s own new-row-count check (already a bounded poll
+   since Phase 4.5) benefits directly from the `_count_grid_rows()` fix
+   above, since it shares that function.
+
+### Stage 4: post-commit quantity-verification timing
+
+Live timestamped polling immediately after `enter_quantity()` (not
+`commit_item()` -- Phase 4.5's addendum imprecisely described the call
+context; corrected here) found `read_quantity()` returning a
+**confidently wrong, non-empty, stable value** -- a real "5" read as
+"3" at native resolution, every attempt, not an occasional misread.
+Separately, a real "1" was misread as "oo"/"ji" at 2x-3x scale but
+read correctly at 1x/4x/6x. **No single fixed OCR scale was correct
+for every digit value tried** (1, 5, 2.5, 7 each failed at a different
+scale). This reframes Phase 4.5's finding entirely: the "quantity
+verification times out" symptom was never primarily a SETTLE-TIMING
+problem -- it was `read_quantity()` confidently returning wrong
+answers that just happened to never equal the expected value within
+the old timeout budget. Fixed with the same "multiple independent
+reads, majority vote" strategy `read_populated_fields()` already uses
+across repeat captures, applied here across three scales (1x, 4x, 6x)
+of the SAME capture instead: `{1x, 4x, 6x}` each independently got 3
+of the 4 test values right (never the same 3), so a majority vote
+across those three scales got all 4 right.
+
+**Timing evidence after the fix** (5 fresh commits, fine-grained
+polling from the instant `commit_item()`/`enter_quantity()` returned):
+
+| Item | Row appears | Quantity readable+correct |
+|---|---|---|
+| SFG/GUTA qty 5 | t+0.00s | t+0.00s |
+| SFG/GUTC qty 2.5 | t+0.00s | t+0.00s |
+| SFG/GUTG qty 3 | t+0.00s | t+0.00s |
+| RFG/ARMVN qty 1 | t+0.00s | t+0.00s |
+| SFG/GUTHRA< qty 4 | t+0.00s | t+0.00s |
+
+All 5 commits read the correct quantity on the very first poll
+(sub-millisecond) once the OCR itself was fixed -- confirming there is
+effectively no real settle delay; the earlier multi-second waits were
+entirely the polling loop retrying a consistently-wrong OCR read, not
+waiting out a real render delay.
+
+### Final polling configuration
+
+`verify_quantity_committed(expected_quantity, timeout_s=3.0)` (down
+from Phase 4.5's `5.0` -- the new default is a ~1000x conservative
+margin over the ~0s observed real-world time, not a tight fit to it,
+since an occasional genuinely slower render remains possible and this
+must never become an unbounded wait). Progressive intervals: five
+attempts at 0.1s apart, then 0.4s apart afterward. Terminates on the
+first of:
+
+- observed value matches (`stop_reason="matched"`)
+- the SAME non-matching value observed twice in a row
+  (`stop_reason="wrong_value"` -- a stable wrong reading isn't a
+  settle-timing issue polling can fix; surfacing it immediately is
+  more honest than burning the full budget)
+- the row that was previously found stops being found
+  (`stop_reason="conflicting_row"` -- the grid changed under the poll)
+- an unexpected dialog appears (`stop_reason="wrong_context"`)
+- timeout (`stop_reason="timeout"`)
+
+Three new regression tests (via monkeypatched internals -- the
+progressive-interval and termination-condition LOGIC is pure Python
+and testable without a live session, unlike the OCR itself) cover:
+delayed-but-eventually-correct (the scenario the whole mechanism
+exists for), stable-wrong-value early termination, and bounded timeout
+on persistent `None`.
+
+### Stage 5: focused pilot rerun (same approved 10-item plan, unmodified)
+
+TEST project confirmed at 0 rows before starting.
+
+| # | Decision | Outcome | Qty verify | Elapsed |
+|---|---|---|---|---|
+| 1-5, 7, 10 | REVIEW_REQUIRED | safe stop (genuine catalog near-ties/ambiguous -- same as Phase 4.4/4.5, confirms repeatability) | -- | 3.8-7.3s |
+| 6 | AUTO_SELECT | selected correctly (SFG/GUTAB>), fields matched, committed | **timeout** (3 attempts, 3.81s) | 19.5s |
+| 8 | NO_MATCH | safe stop (expected) | -- | 5.9s |
+| 9 | AUTO_SELECT | selected correctly (RFG/ARMVN), fields matched, committed | **matched** (1 attempt, 0.000s) | 17.2s |
+
+Zero wrong selections. Zero unintended mutations within this pilot run
+(the mutation noted above happened during earlier Stage 3 diagnostic
+testing, in disposable rows, fully cleaned up before this pilot
+started). Item 9 committed and verified cleanly, exactly matching
+Stage 4's timing evidence. **Item 6's quantity verification timed out**
+despite `select_candidate`/`read_populated_fields` both succeeding --
+inspected immediately afterward, the row's actual committed quantity
+was correct (`1`, confirmed by both a fresh `read_quantity()` call and
+visual inspection), but the automated verification did not confirm it
+within the 3.0s/3-attempt budget during the live poll itself. Not
+further root-caused this session (budget) -- this is the one gate
+criterion that did not cleanly pass.
+
+### Cleanup: fully autonomous, zero manual intervention
+
+Both remaining rows (item 6's committed `SFG/GUTAB>`, item 9's
+committed `RFG/ARMVN`) were removed via repeated `cancel_current_item()`
+calls with no manual coordinate-click fallback -- unlike Phase 4.4 AND
+Phase 4.5, both of which required at least one manual, out-of-band
+click to finish cleanup. 4 attempts total: 2 failed
+(`"could not invoke the 'Delete' context-menu item"`, then
+`"row count did not decrease"` -- not further root-caused this
+session), 2 succeeded, ending at 0 rows / $0.00 / "Saved", matching
+the TEST project's starting state exactly. **This is the headline
+result of this phase**: recovery is no longer 100%-manual-fallback-
+dependent the way it was at the end of Phase 4.5.
+
+### Full test suite
+
+581 passed, 12 skipped (pre-existing, unrelated), 0 failed. Three more
+tests than Phase 4.5's 578-passed baseline, matching the three new
+`verify_quantity_committed()` regression tests. No regressions.
+
+### `supports_live_execution`
+
+Stays **`False`**.
+
+| Gate criterion | Status |
+|---|---|
+| 1. Five single-row recovery trials pass | **met** (5/5) |
+| 2. Three multi-row targeted-delete trials pass | **met** (3/3) |
+| 3. Zero wrong rows deleted | **met** |
+| 4. Post-commit quantity verification succeeds within the bounded timeout | **not met** -- item 6 timed out in the Stage 5 pilot |
+| 5. Focused pilot has zero wrong selections | **met** |
+| 6. No unintended mutations (within the pilot) | **met** |
+| 7. Ambiguous/no-result cases stop safely | **met** |
+| 8. All committed rows independently verified | **not met** -- item 6's commit was correct but not independently confirmed within budget |
+| 9. TEST project ends empty/$0.00/Saved without manual cleanup | **met** -- first time this has been achieved in this project |
+| 10. All tests pass | **met** -- 581 passed, 12 skipped (pre-existing), 0 failed |
+
+**Single remaining blocker:** intermittent post-commit quantity-
+verification timeout. The underlying committed data has been correct
+in every case checked this session (including item 6's, confirmed
+immediately after its timeout) -- this is a verification-confirmation
+gap, not a data-integrity gap -- but the gate requires verification to
+actually succeed within budget for every commit, and it didn't for one
+of two committed items in the Stage 5 pilot. Given Stage 4's isolated
+timing evidence showed 5/5 clean instant successes, the failure
+appears to be a genuine residual intermittency (not yet reproduced
+in a way that supports a further targeted fix) rather than a
+systematic, always-reproducible defect -- but "usually works, verified
+correct after the fact" does not meet this gate's bar of "verification
+succeeds within the bounded timeout, every time, in the pilot."
+
+### Recommendation
+
+The primary objective of this phase -- deterministic, non-OCR recovery
+-- succeeded clearly: 9/9 recovery trials, zero wrong-row deletions,
+and the first fully-autonomous pilot cleanup in this project's history.
+The remaining gap is narrower and more isolated than any prior phase's:
+one intermittent verification timeout, on data that was actually
+correct. Before revisiting `supports_live_execution`: (1) collect more
+timing/OCR samples specifically around item 6-like cases (CAT/SEL
+trusted-path items) to determine whether the intermittency correlates
+with that path specifically or is genuinely random; (2) consider
+whether `verify_quantity_committed()` should retry the ENTIRE
+select-enter-commit sequence (not just re-poll a read) on a stable
+`wrong_value`/`timeout`, since Stage 4 showed the underlying commit is
+reliable even when verification isn't; (3) once quantity verification
+is confirmed reliable across a larger sample, re-run this same 10-item
+pilot once more and require both gate criteria 4 and 8 to pass cleanly
+before flipping the flag.

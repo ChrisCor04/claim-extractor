@@ -25,7 +25,6 @@ from estimate_extractor.xactimate_lookup.windows_adapter import (
     _GRID_COLUMNS,
     _GRID_ROW_HEIGHT,
     _RawDropdownRow,
-    _levenshtein_distance,
     _split_category_selector,
 )
 
@@ -202,32 +201,29 @@ def test_grid_columns_selector_and_activity_do_not_overlap_and_fit_long_codes():
     assert sel_r - sel_l >= 45, "selector column must be wide enough for a 6+ character code like 'GUTAB>'"
 
 
-def test_levenshtein_distance_catches_the_live_misread_without_matching_the_exclusion():
-    """Regression guard (Phase 4.5): _click_context_menu_item() uses
-    edit distance <= 2 (restricted to single-word lines) to catch a
-    stable OCR misread of "Delete" as "betete" -- reproduced live on a
-    real context menu, not random noise (three fresh screenshots of
-    the same live state all misread it identically). A plain
-    similarity ratio couldn't safely distinguish that misread from
-    "undo delete line item", which must never match; edit distance
-    can, because every other real single-word item in that menu
-    (closest: "select") is >= 3 edits from "delete"."""
-    assert _levenshtein_distance("betete", "delete") == 2
-    assert _levenshtein_distance("delete", "delete") == 0
-    assert _levenshtein_distance("select", "delete") == 3
-    # "undo delete line item" is excluded by the single-word check in
-    # the caller, not by distance -- but it's worth confirming this
-    # helper itself has no special-case awareness of that; the caller
-    # is responsible for the word-count guard.
-    assert _levenshtein_distance("undo delete line item", "delete") > 2
+def test_context_menu_delete_index_is_within_the_expected_item_count():
+    """Regression guard (Phase 4.6): _click_delete_via_uia() locates
+    "Delete" by a fixed structural index into the row context menu's
+    flat UIA child list (26 items; Delete at index 11) rather than by
+    OCR text match -- the menu's Telerik RadMenuItem controls expose
+    no usable name via CurrentName/AutomationId/LegacyIAccessible, so
+    text-based lookup (the Phase 4.4/4.5 approach) isn't available at
+    all here, not just unreliable. This doesn't replay the live UIA
+    walk (that needs a real open context menu -- see
+    docs/xactimate-lookup.md Phase 4.6), but it locks in the two
+    constants together so a future edit can't silently move one
+    without the other and pass this test by accident."""
+    idx = WindowsXactimateAdapter._CONTEXT_MENU_DELETE_INDEX
+    total = WindowsXactimateAdapter._CONTEXT_MENU_EXPECTED_ITEM_COUNT
+    assert 0 <= idx < total
 
 
 def test_quantity_verification_result_records_match_and_samples():
     """Regression guard (Phase 4.5): verify_quantity_committed()'s
     bounded poll must be able to report both a successful match and
     the full attempt history for timing diagnostics -- exercised here
-    via direct construction since the method itself requires a live
-    Windows/Xactimate session."""
+    via direct construction, complementing the monkeypatched
+    polling-logic tests below."""
     result = QuantityVerificationResult(
         matched=True, stop_reason="matched", expected=2.5, observed=2.5,
         attempts=3, elapsed_s=0.75, samples=[(0.0, True, None), (0.25, True, None), (0.5, True, 2.5)],
@@ -236,6 +232,75 @@ def test_quantity_verification_result_records_match_and_samples():
     assert result.stop_reason == "matched"
     assert result.attempts == len(result.samples)
     assert result.samples[-1] == (0.5, True, 2.5)
+
+
+def _adapter_with_fake_grid(monkeypatch, readings, row_found_seq=None):
+    """Builds a WindowsXactimateAdapter with every internal dependency
+    verify_quantity_committed() touches monkeypatched to a fake, so the
+    polling logic itself (progressive intervals, termination
+    conditions) can be exercised without a live Windows/Xactimate
+    session -- `readings` is consumed one value per read_quantity()
+    call. Uses a fake, manually-advanced clock (time.sleep() advances
+    it instead of truly sleeping) so timeout behavior is deterministic
+    and these tests run instantly regardless of the configured
+    timeout_s."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=1, delay_s=0: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    found_iter = iter(row_found_seq) if row_found_seq is not None else None
+    monkeypatch.setattr(
+        adapter, "_last_row_geometry",
+        lambda image, offset: (None if (found_iter and not next(found_iter, True)) else (1, 100)),
+    )
+    reads = iter(readings)
+    monkeypatch.setattr(adapter, "read_quantity", lambda: next(reads))
+
+    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(wa_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    return adapter
+
+
+def test_verify_quantity_committed_succeeds_on_delayed_but_correct_value(monkeypatch):
+    """Regression test (Phase 4.6 Stage 4): the bounded poll must
+    succeed once the value becomes correct even if it takes a few
+    attempts to appear (a delayed-but-correct settle), not only on an
+    immediate first read -- this is the scenario the whole polling
+    mechanism exists for."""
+    adapter = _adapter_with_fake_grid(monkeypatch, readings=[None, None, 2.5])
+    result = adapter.verify_quantity_committed(2.5, timeout_s=3.0)
+    assert result.matched is True
+    assert result.stop_reason == "matched"
+    assert result.attempts == 3
+    assert result.observed == 2.5
+    assert len(result.samples) == 3
+
+
+def test_verify_quantity_committed_stops_early_on_stable_wrong_value(monkeypatch):
+    """Regression test (Phase 4.6 Stage 4): a wrong value that repeats
+    identically twice in a row is a stable misread, not a settle-
+    timing issue -- polling must surface it as `wrong_value` rather
+    than burning the full timeout budget waiting for it to change."""
+    adapter = _adapter_with_fake_grid(monkeypatch, readings=[3.0, 3.0, 2.5, 2.5])
+    result = adapter.verify_quantity_committed(2.5, timeout_s=3.0)
+    assert result.matched is False
+    assert result.stop_reason == "wrong_value"
+    assert result.observed == 3.0
+    assert result.attempts == 2
+
+
+def test_verify_quantity_committed_times_out_on_persistent_none(monkeypatch):
+    """Regression test (Phase 4.6 Stage 4): if the row never becomes
+    readable at all, the poll must still terminate (never an unbounded
+    wait) and report `timeout`, not silently succeed or hang."""
+    adapter = _adapter_with_fake_grid(monkeypatch, readings=[None] * 200)
+    result = adapter.verify_quantity_committed(2.5, timeout_s=0.5)
+    assert result.matched is False
+    assert result.stop_reason == "timeout"
+    assert result.observed is None
 
 
 def test_quantity_verification_result_defaults_to_empty_samples():
