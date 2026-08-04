@@ -207,6 +207,89 @@ def test_live_run_commits_on_auto_select_with_matching_fields(tmp_path, phrase_r
     assert outcome.evidence_reference is not None
 
 
+class _VerifyingFakeAdapter(FakeXactimateAdapter):
+    """A FakeXactimateAdapter extended with the Phase 4.8 duck-typed
+    verification hooks (snapshot_grid_identities/verify_commit), so
+    execute_plan()'s wiring to them can be tested without a real Windows
+    adapter -- see orchestrator.execute_plan()'s before_snapshot logic."""
+
+    def __init__(self, *args, verification_result=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.verification_result = verification_result
+        self.snapshot_calls = 0
+        self.verify_commit_calls: list[tuple] = []
+
+    def snapshot_grid_identities(self):
+        self.snapshot_calls += 1
+        return [("EXISTING", "ROW")]
+
+    def verify_commit(self, before_snapshot, category, selector, expected_quantity, *, source_unit=None, expected_xactimate_unit=None):
+        self.verify_commit_calls.append((before_snapshot, category, selector, expected_quantity, source_unit, expected_xactimate_unit))
+        return self.verification_result
+
+
+class _FakeCommitVerification:
+    def __init__(self, trust_state):
+        self.trust_state = trust_state
+
+
+def test_verify_commit_called_on_live_commit_when_adapter_supports_it(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    verification = _FakeCommitVerification("VERIFIED")
+    adapter = _VerifyingFakeAdapter(dropdown_script={plan.search_input: [d]}, verification_result=verification)
+    adapter.supports_live_execution = True
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.committed is True
+    assert adapter.snapshot_calls == 1
+    assert len(adapter.verify_commit_calls) == 1
+    before_snapshot, category, selector, quantity, source_unit, expected_unit = adapter.verify_commit_calls[0]
+    assert before_snapshot == [("EXISTING", "ROW")]
+    assert (category, selector) == (d.category, d.selector)
+    assert quantity == item.quantity
+    assert source_unit == item.source_unit
+    assert outcome.verification is verification
+    assert outcome.to_dict()["verification_trust_state"] == "VERIFIED"
+
+
+def test_verify_commit_not_called_on_dry_run(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    adapter = _VerifyingFakeAdapter(dropdown_script={plan.search_input: [d]})
+    adapter.supports_live_execution = True
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+
+    assert outcome.committed is False
+    assert adapter.snapshot_calls == 0
+    assert adapter.verify_commit_calls == []
+    assert outcome.verification is None
+
+
+def test_verify_commit_not_called_when_adapter_does_not_support_it(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]})  # plain Fake, no verify_commit
+    adapter.supports_live_execution = True
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.committed is True
+    assert outcome.verification is None
+    assert outcome.to_dict()["verification_trust_state"] is None
+
+
 def test_field_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phrase_rules, ranking_config, monkeypatch):
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item()

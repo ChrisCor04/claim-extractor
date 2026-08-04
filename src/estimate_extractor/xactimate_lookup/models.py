@@ -238,6 +238,14 @@ class LookupOutcome:
     stop_detail: str | None = None
     evidence_reference: str | None = None
     committed: bool = False
+    #: The adapter's independent post-commit verification result (Phase
+    #: 4.8's `CommitVerification`, from `WindowsXactimateAdapter.
+    #: verify_commit()`), when the adapter supports it. Deliberately
+    #: untyped here (duck-typed via `.trust_state` in to_dict()) --
+    #: xactimate_lookup stays adapter-agnostic and must not import a
+    #: concrete adapter's types. None whenever the adapter doesn't
+    #: support commit verification, or nothing was committed.
+    verification: object | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -261,4 +269,5 @@ class LookupOutcome:
             "stop_detail": self.stop_detail,
             "evidence_reference": self.evidence_reference,
             "committed": self.committed,
+            "verification_trust_state": getattr(self.verification, "trust_state", None),
         }

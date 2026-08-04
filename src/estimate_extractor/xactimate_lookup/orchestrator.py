@@ -202,6 +202,18 @@ def execute_plan(
         outcome.stop_detail = "dry_run: plan only, adapter selection/commit not executed."
         return outcome
 
+    # Phase 4.8: a before-commit grid snapshot must be taken BEFORE
+    # select_candidate() -- the pending row is already present in the
+    # grid as soon as a candidate is selected, well before commit_item()
+    # (see windows_adapter.py's verify_commit() docstring). Taken
+    # unconditionally here, before we know whether this candidate will
+    # actually reach a commit, since that's the only point in this
+    # function where "before" is still true. Duck-typed: only adapters
+    # that implement snapshot_grid_identities()/verify_commit() (today,
+    # WindowsXactimateAdapter) get independent post-commit verification;
+    # everything else behaves exactly as before this change.
+    before_snapshot = adapter.snapshot_grid_identities() if hasattr(adapter, "snapshot_grid_identities") else None
+
     try:
         adapter.select_candidate(top.dropdown)
         populated = adapter.read_populated_fields()
@@ -236,4 +248,9 @@ def execute_plan(
 
     outcome.committed = True
     outcome.evidence_reference = adapter.capture_evidence()
+    if before_snapshot is not None and hasattr(adapter, "verify_commit"):
+        outcome.verification = adapter.verify_commit(
+            before_snapshot, top.dropdown.category, top.dropdown.selector, item.quantity,
+            source_unit=item.source_unit, expected_xactimate_unit=item.source_unit,
+        )
     return outcome
