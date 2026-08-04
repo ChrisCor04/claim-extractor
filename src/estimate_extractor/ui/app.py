@@ -21,6 +21,7 @@ import streamlit as st
 from estimate_extractor.config import Config
 from estimate_extractor.mapping.pipeline import load_mapping_engine_config
 from estimate_extractor.ui import state as ui_state
+from estimate_extractor.ui.components.build_estimate_panel import render_build_estimate_panel
 from estimate_extractor.ui.components.catalog_editor import render_catalog_editor
 from estimate_extractor.ui.components.export_panel import render_export_panel
 from estimate_extractor.ui.components.extraction_panel import render_claim_summary, render_extraction_review
@@ -82,6 +83,7 @@ def main() -> None:
             "Claim Summary",
             "Extraction Review",
             "Mapping Review",
+            "Build Estimate",
             "Catalog Changes",
             "Verified Catalog",
             "Export",
@@ -121,15 +123,21 @@ def main() -> None:
         if project_dir is None:
             st.info("Open a project from the Projects tab first.")
         else:
-            render_catalog_editor(project_dir)
+            render_build_estimate_panel(project_dir, active_slug)
 
     with tabs[6]:
         if project_dir is None:
             st.info("Open a project from the Projects tab first.")
         else:
-            render_verified_catalog_tab(project_dir)
+            render_catalog_editor(project_dir)
 
     with tabs[7]:
+        if project_dir is None:
+            st.info("Open a project from the Projects tab first.")
+        else:
+            render_verified_catalog_tab(project_dir)
+
+    with tabs[8]:
         if project_dir is None:
             st.info("Open a project from the Projects tab first.")
         else:
