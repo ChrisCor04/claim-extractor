@@ -19,11 +19,13 @@ import pytest
 from estimate_extractor.xactimate_lookup.models import DropdownResult
 from estimate_extractor.xactimate_lookup.windows_adapter import (
     PopupNotFoundError,
+    QuantityVerificationResult,
     StaleCandidateError,
     WindowsXactimateAdapter,
     _GRID_COLUMNS,
     _GRID_ROW_HEIGHT,
     _RawDropdownRow,
+    _levenshtein_distance,
     _split_category_selector,
 )
 
@@ -198,6 +200,49 @@ def test_grid_columns_selector_and_activity_do_not_overlap_and_fit_long_codes():
     act_l, act_r = _GRID_COLUMNS["activity"]
     assert sel_r <= act_l, "selector column must not extend into the activity column"
     assert sel_r - sel_l >= 45, "selector column must be wide enough for a 6+ character code like 'GUTAB>'"
+
+
+def test_levenshtein_distance_catches_the_live_misread_without_matching_the_exclusion():
+    """Regression guard (Phase 4.5): _click_context_menu_item() uses
+    edit distance <= 2 (restricted to single-word lines) to catch a
+    stable OCR misread of "Delete" as "betete" -- reproduced live on a
+    real context menu, not random noise (three fresh screenshots of
+    the same live state all misread it identically). A plain
+    similarity ratio couldn't safely distinguish that misread from
+    "undo delete line item", which must never match; edit distance
+    can, because every other real single-word item in that menu
+    (closest: "select") is >= 3 edits from "delete"."""
+    assert _levenshtein_distance("betete", "delete") == 2
+    assert _levenshtein_distance("delete", "delete") == 0
+    assert _levenshtein_distance("select", "delete") == 3
+    # "undo delete line item" is excluded by the single-word check in
+    # the caller, not by distance -- but it's worth confirming this
+    # helper itself has no special-case awareness of that; the caller
+    # is responsible for the word-count guard.
+    assert _levenshtein_distance("undo delete line item", "delete") > 2
+
+
+def test_quantity_verification_result_records_match_and_samples():
+    """Regression guard (Phase 4.5): verify_quantity_committed()'s
+    bounded poll must be able to report both a successful match and
+    the full attempt history for timing diagnostics -- exercised here
+    via direct construction since the method itself requires a live
+    Windows/Xactimate session."""
+    result = QuantityVerificationResult(
+        matched=True, stop_reason="matched", expected=2.5, observed=2.5,
+        attempts=3, elapsed_s=0.75, samples=[(0.0, True, None), (0.25, True, None), (0.5, True, 2.5)],
+    )
+    assert result.matched is True
+    assert result.stop_reason == "matched"
+    assert result.attempts == len(result.samples)
+    assert result.samples[-1] == (0.5, True, 2.5)
+
+
+def test_quantity_verification_result_defaults_to_empty_samples():
+    result = QuantityVerificationResult(
+        matched=False, stop_reason="timeout", expected=5.0, observed=None, attempts=0, elapsed_s=5.0,
+    )
+    assert result.samples == []
 
 
 def test_stale_candidate_error_is_an_adapter_error_subclass():

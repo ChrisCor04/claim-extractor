@@ -1575,3 +1575,226 @@ genuinely distinguishable line items don't structurally collapse into
 `REVIEW_REQUIRED` -- out of scope for this adapter-only phase, but
 worth flagging since it affects the SFG category broadly, not just
 this pilot; then (5) revisit `supports_live_execution`.
+
+## Phase 4.5: production-readiness pass -- bounded quantity-verification polling built, four more live bugs found and fixed, clean pilot repeated -- `supports_live_execution` stays `False`, single blocker: `cancel_current_item()` reliability
+
+Phase 4.5 was scoped narrowly: close Phase 4.4's two open gate items
+(the post-commit quantity-readback timing gap, and the thin pilot
+evidence from bugs being found mid-run) and decide production
+readiness. No redesign, no new features, no refactor of working code.
+
+### Gate 1: quantity-readback timing -- root-caused, bounded polling built
+
+Live timestamped polling immediately after `enter_quantity()` (the
+adapter's actual pre-Phase-4.5 call context for a readback, not
+`commit_item()` as Phase 4.4's addendum imprecisely described it --
+corrected here) reproduced a genuine transient `None` on the first
+live trial. Root cause, once isolated: **not** a settle-timing issue
+alone -- `read_quantity()`'s 4x upscale (added in Phase 4.3 to recover
+a decimal point native resolution can drop) blurs a *short* value (a
+single digit, e.g. `"7"`) into an empty OCR result, while native
+resolution reads the same short value correctly. Fixed by reading both
+scales and preferring whichever contains a decimal point the other is
+missing, otherwise preferring native. Verified live: single-digit ("7")
+and decimal ("2.5") cases both read correctly after the fix.
+
+Built `verify_quantity_committed(expected_quantity, timeout_s=5.0,
+interval_s=0.25)`: polls `read_quantity()`, terminating on the first
+of -- observed value matches (success), `_unexpected_dialog_present()`
+(wrong context, aborts immediately), or timeout. Every attempt's
+elapsed time, whether a grid row was located, and the observed value
+are recorded in `.samples` for diagnostics. This is a genuine bounded
+poll, not a longer fixed sleep -- a fixed sleep just moves the same
+race to a different, still-unbounded worst case.
+
+### Three more live bugs found and fixed while root-causing Gate 1
+
+None were anticipated; all were found by exercising the adapter
+through realistic multi-row, multi-action live sequences that Phase
+4.4's pilot hadn't happened to hit:
+
+1. **`_count_grid_rows()` misreads a 4+ row grid at `--psm 6`.** A
+   real, clearly-legible `"422"` was read as `"a2"` or `"ry"` --
+   non-randomly, confirmed by re-testing the same crop at five PSM
+   modes and three scales. This directly caused a **live wrong-row
+   mutation**: `enter_quantity()` computed the "last row" from an
+   undercounted total and entered a quantity into an existing,
+   already-correct row instead of the newly-selected one, silently
+   overwriting its value (`SFG/GUTG`'s quantity corrupted from `2` to
+   `6` mid-session). Fixed: `--psm 11` (sparse text, no layout
+   assumed) plus 2x upscale reads every row correctly in the same live
+   state where `--psm 6` failed.
+2. **`enter_quantity()`'s new-row check was a single-shot
+   check-and-raise, not a poll.** The row count it read immediately
+   after `select_candidate()`'s click could be transiently stale for
+   the same reason as (1) above (before that fix) -- reproduced live:
+   a correctly-added third row raised `AdapterError("... row count did
+   not increase")` even though the row was visibly present and
+   correctly counted moments later. Replaced with a bounded poll
+   (3.0s timeout, 0.3s interval) that also aborts immediately on an
+   unexpected dialog, matching the Gate 1 polling philosophy.
+3. **`_click_context_menu_item()` (the OCR-based "Delete" click added
+   in Phase 4.4) broke on a different screen resolution.** This
+   session ran on a 1920x1080 screen, versus Phase 4.4's 2560x1440;
+   Windows flips a context menu upward when there isn't enough room
+   below the cursor, and the original crop only ever looked
+   below-and-right of the click point. Fixed: the search region is now
+   centered on the click point (clamped to the virtual screen).
+   Fixing this exposed two further layers in the same mechanism,
+   fixed in the same pass: `--psm 6` merges/loses the standalone
+   "Delete" line once the (now larger) crop also contains the busy
+   background grid behind the menu -- `--psm 4` ("single column of
+   text") isolates it reliably where `--psm 6` didn't; and even with
+   both fixes, a single OCR pass can still flatly misread the word
+   itself (`"Delete"` read as `"betete"` -- confirmed *stable*, not
+   per-attempt noise, by re-grabbing and re-OCRing the same live state
+   three times and getting `"betete"` all three times). A plain
+   fuzzy-ratio match couldn't safely distinguish that misread from
+   `"undo delete line item"` (which must never match) -- both score
+   similarly low. Levenshtein edit distance can: `"betete"` is 2 edits
+   from `"delete"`, every other real single-word item in that menu
+   (closest: `"select"`) is >= 3 edits away, and multi-word lines are
+   excluded by a single-word restriction regardless of distance.
+
+All four fixes (the read_quantity dual-scale fix plus these three)
+are individually live-verified. See `windows_adapter.py`'s inline
+docstrings at each fix site for the exact reproduction evidence.
+
+### Gate 2: TEST project reset, exact same 10-item pilot repeated clean
+
+TEST project confirmed at 0 rows / $0.00 / "Saved" before starting.
+The identical Phase 4.4 pilot plan (same 10 items, same search
+inputs/CAT-SEL, same expected quantities) was re-run unmodified through
+the real ranker, with `verify_quantity_committed()` replacing the
+single-shot post-commit read.
+
+| # | Mode | Decision | Outcome | Elapsed |
+|---|---|---|---|---|
+| 1 | Description | REVIEW_REQUIRED | safe stop (genuine near-tie) | 5.5s |
+| 2 | Description | REVIEW_REQUIRED | safe stop (same) | 4.7s |
+| 3 | Description | REVIEW_REQUIRED | safe stop (same) | 5.2s |
+| 4 | Description | REVIEW_REQUIRED | safe stop (same) | 5.7s |
+| 5 | Description | REVIEW_REQUIRED | safe stop (same) | 6.8s |
+| 6 | CAT/SEL direct | AUTO_SELECT | selected correctly (SFG/GUTAB>), safe stop on unit mismatch | 7.6s |
+| 7 | Description (ambiguous) | REVIEW_REQUIRED | safe stop (expected) | 3.4s |
+| 8 | Description (no-result) | NO_MATCH | safe stop (expected) | 5.3s |
+| 9 | Description (different category) | AUTO_SELECT | selected+committed (RFG/ARMVN, qty 3); **quantity verification timed out** | 20.2s |
+| 10 | Description | REVIEW_REQUIRED | safe stop (genuine near-tie) | 5.1s |
+
+Total elapsed 69.5s, average 7.0s/item. Zero wrong selections. Zero
+unintended mutations within the pilot itself (the wrong-row mutation
+in bug #1 above happened during Gate 1 root-causing, in throwaway
+diagnostic rows, *before* the TEST project was reset for this clean
+run). Items 1-5, 7, 10 reproduce Phase 4.4's finding exactly: the SFG
+gutter catalog has multiple genuine near-duplicate selectors this
+ranking config's signals can't distinguish -- correct, repeatable,
+conservative ranker behavior, not an adapter defect. Items 6 and 9
+reached `AUTO_SELECT` again, exactly as in Phase 4.4, confirming that
+result is repeatable rather than a fluke.
+
+**Item 9's quantity verification timed out** (`stop_reason="timeout"`,
+5 attempts, 5.63s, `observed=None` on every attempt) despite the
+underlying data being entered correctly -- confirmed both by a later
+re-query (`read_quantity()` returned `3.0` moments after the pilot
+finished) and visually (`RCV $158.85`, matching `3 x $52.95`). This
+means `verify_quantity_committed()`'s bounded-polling *mechanism*
+worked exactly as designed -- it never silently reported success on
+unconfirmed data, and it produced a fully diagnosable timing record --
+but the real-world settle time after `commit_item()` can exceed the
+5.0s default budget on at least one occasion, which the isolated Gate
+1 root-cause testing (which found sub-second settle times every time,
+30 samples across two different single/two-row states) did not
+surface. Not further tuned this session; flagged as a real, measured
+gap between isolated root-cause testing and full-pilot conditions.
+
+### Cleanup: `cancel_current_item()` required manual intervention on both rows
+
+Both pilot rows (item 6's uncommitted `SFG/GUTAB>` selection, item 9's
+committed `RFG/ARMVN` row) needed to be removed to return the TEST
+project to its starting state. `cancel_current_item()` -- using the
+Phase 4.4 mechanism plus this session's three additional context-menu
+fixes -- was retried 20 times per row and failed 100% of the time on
+both (`"could not locate the 'Delete' context-menu item"`). Live
+diagnosis on each failure found a *different* underlying cause each
+time (further OCR misreads/segmentation issues distinct from the three
+already fixed this session), consistent with a pattern rather than a
+single remaining bug: this application's rendering makes OCR-located
+context-menu clicking inherently fragile in a way conservative,
+targeted fixes keep narrowing but haven't closed. Both rows were
+removed via a one-off manual coordinate click (visually confirmed
+"Delete" position, not an adapter code path) so the pilot's cleanup
+requirement could be verified independently of this specific
+mechanism's reliability. The TEST project's final state was visually
+confirmed identical to its starting state: 0 rows, $0.00, "Saved".
+
+This is the same class of gap Phase 4.4 already flagged honestly
+("`cancel_current_item()` retains residual automation-timing
+unreliability") -- narrowed by three real fixes this session (a
+directional-crop bug and a segmentation bug that were unconditional
+failures, plus a stable-misread case), but not eliminated. A durable
+fix would OCR-locate menu item text with a fundamentally different
+strategy (e.g. UI Automation against the menu's own window, if it
+exposes one, rather than a screenshot) -- out of scope for a
+conservative fix, flagged as a follow-up.
+
+### Regression tests added
+
+`tests/unit/xactimate_lookup/test_windows_adapter.py` gained 3 tests
+(24 total, up from 21): `_levenshtein_distance()`'s behavior on the
+live-reproduced misread and its exclusion case (extracted from
+`_click_context_menu_item()` to a module-level function specifically
+so it's unit-testable), and `QuantityVerificationResult`'s shape
+(match/sample recording, default empty samples). The four live
+pixel/OCR fixes themselves are verified live, not via unit test, per
+this file's established testing philosophy (deep live behavior is
+validated manually against a real session, not mocked) -- consistent
+with how Phase 4.4's equivalent fixes were handled.
+
+### Full test suite
+
+578 passed, 12 skipped (pre-existing, unrelated), 0 failed. Three more
+tests than Phase 4.4's 575-passed baseline, matching the three new
+regression tests. No regressions.
+
+### `supports_live_execution`
+
+Stays **`False`**.
+
+| Validation criterion | Status |
+|---|---|
+| Zero wrong selections | **met** |
+| Zero unintended mutations (within the clean pilot) | **met** |
+| Quantity verification succeeds | **not met** -- item 9 timed out (data was correct; verification wasn't confirmed within budget) |
+| Cleanup succeeds | **not met** -- 0/2 rows removed autonomously; both needed manual intervention |
+| Commit verification succeeds | **partially** -- field-level (category/selector) verification succeeded; quantity verification did not |
+| Ambiguous cases stop safely | **met** |
+| No-result cases stop safely | **met** |
+| Evidence exists for every item | **met** |
+| TEST project ends exactly where it started | **met** (after manual cleanup) |
+
+**Single blocker:** `cancel_current_item()`'s OCR-located context-menu
+click is not yet reliable enough for unattended production use. It
+failed 100% autonomously (0/2, 20 retries each) in this session's
+clean pilot, after three additional conservative fixes this same
+session each closed one failure mode and exposed another. This is the
+one gate criterion that failed outright rather than partially; the
+quantity-verification timeout is a secondary, lower-severity finding
+(the underlying data was correct; only the confirmation step was slow)
+that would also need to close, but cleanup reliability is the harder,
+more clearly disqualifying blocker -- an adapter that cannot reliably
+remove/correct a line item without a human watching every context-menu
+click cannot be trusted for unattended live execution.
+
+### Recommendation
+
+Do not enable `supports_live_execution` yet. Before revisiting it: (1)
+replace `cancel_current_item()`'s screenshot-OCR menu click with a
+fundamentally different location strategy (UI Automation against the
+context menu's own window, if Windows exposes one for a WPF native
+menu -- not confirmed either way this session) rather than continuing
+to patch the OCR approach one failure mode at a time; (2) raise
+`verify_quantity_committed()`'s default timeout or investigate why
+settle time exceeded 5.0s in full-pilot conditions when isolated
+testing never observed more than a fraction of a second; (3) once both
+close, re-run this same 10-item pilot a third time and require 100%
+autonomous cleanup success before flipping the flag.

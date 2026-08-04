@@ -204,6 +204,24 @@ class _AdapterDiagnostics:
     timestamp: str
 
 
+@dataclass(slots=True)
+class QuantityVerificationResult:
+    """Result of verify_quantity_committed()'s bounded poll -- see that
+    method's docstring. ``samples`` records every attempt (elapsed
+    seconds since the poll started, whether a grid row was found that
+    attempt, and the quantity value observed, if any) for timing
+    diagnostics and regression assertions; never used for control flow
+    itself, which is decided attempt-by-attempt as the poll runs."""
+
+    matched: bool
+    stop_reason: str  # "matched" | "timeout" | "wrong_context"
+    expected: float
+    observed: float | None
+    attempts: int
+    elapsed_s: float
+    samples: list[tuple[float, bool, float | None]] = field(default_factory=list)
+
+
 def _split_category_selector(code: str) -> tuple[str, str]:
     """Xactimate catalog codes are always a fixed 3-letter category
     prefix followed by a variable-length selector, e.g. "SFGGUTA" ->
@@ -211,6 +229,23 @@ def _split_category_selector(code: str) -> tuple[str, str]:
     (SFG/GUTA, SFG/GUTA>, SFG/GUTC, SFG/GUTG, SFG/GUTHRA<, ...)."""
     code = code.strip()
     return code[:3], code[3:]
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    """Plain edit distance, no external dependency -- used by
+    ``_click_context_menu_item()`` to catch a stable OCR misread
+    (Phase 4.5: "Delete" read as "betete") that a plain similarity
+    ratio can't safely distinguish from a line that must never match
+    (e.g. "undo delete line item"). See that method's docstring."""
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
 
 
 class WindowsXactimateAdapter(XactimateAdapter):
@@ -653,7 +688,22 @@ class WindowsXactimateAdapter(XactimateAdapter):
         by repeatedly observing a "cleaned up" adapter call followed by
         the row still being visibly present on screen. Fixed by
         extracting the leading digit run from each line instead of
-        requiring the whole line to be clean digits."""
+        requiring the whole line to be clean digits.
+
+        Second, more serious bug (Phase 4.5): at 4+ rows, `--psm 6`
+        (a "uniform block of text" assumption) misreads this narrow
+        (~32px-wide) numeric column badly and non-randomly -- e.g. a
+        real, clearly-legible "422" consistently read as "a2" or "ry",
+        silently undercounting the grid by one or more rows. This
+        directly caused a live wrong-row mutation: `enter_quantity()`
+        computed the "last row" position from an undercounted total
+        and entered a quantity into an existing, already-correct row
+        instead of the newly-selected one, silently overwriting its
+        value. `--psm 11` ("sparse text, no layout assumed") plus a 2x
+        upscale reads every row correctly in the same live state where
+        `--psm 6` failed -- swept scale 1x/2x/4x x five PSM modes
+        before finding this combination. See
+        docs/xactimate-lookup.md Phase 4.5."""
         header = self._shifted_anchor("grid_header", offset)
         col_l, col_r = _GRID_COLUMNS["number"]
         dx, dy = offset
@@ -661,7 +711,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # scan a generous band below the header for numeric row labels
         crop_box = (col_l, header[3], col_r, header[3] + 400)
         crop = image.crop(crop_box)
-        text = self._ocr_text(crop, psm=6)
+        crop = crop.resize((crop.width * 2, crop.height * 2))
+        text = self._ocr_text(crop, psm=11)
         import re
 
         rows = [line for line in text.splitlines() if re.match(r"^\s*\d+", line)]
@@ -1041,17 +1092,42 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def enter_quantity(self, quantity: float) -> None:
         hwnd = self._ensure_main_window()
-        image, offset = self._capture_and_locate(hwnd)
-        if offset is None:
-            raise AdapterError("Could not locate the grid to enter quantity.")
 
-        geom = self._last_row_geometry(image, offset)
-        if geom is None:
-            raise AdapterError("No grid row found to enter quantity into.")
+        # Live-caught (Phase 4.5): a single-shot read of the grid
+        # immediately after select_candidate()'s click can transiently
+        # undercount rows -- reproduced live: a correctly-added third
+        # row was reported as "row count did not increase" (raising
+        # AdapterError) even though the row was visibly present and
+        # correctly counted a moment later. Same class of post-
+        # mutation render/OCR settle-timing gap as
+        # verify_quantity_committed() below; bounded polling replaces
+        # what was previously a single-shot check-and-raise. See
+        # docs/xactimate-lookup.md Phase 4.5.
+        start = time.time()
+        geom = None
+        while True:
+            image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+            if offset is not None:
+                geom = self._last_row_geometry(image, offset)
+                if geom is not None:
+                    row_count, _ = geom
+                    if self._last_selected_row_count_before is None or row_count > self._last_selected_row_count_before:
+                        break
+            if self._unexpected_dialog_present():
+                raise AdapterError("enter_quantity(): an unexpected dialog appeared while waiting for the new grid row.")
+            if time.time() - start >= 3.0:
+                if offset is None:
+                    raise AdapterError("Could not locate the grid to enter quantity.")
+                if geom is None:
+                    raise AdapterError("No grid row found to enter quantity into.")
+                raise AdapterError(
+                    f"Expected a new grid row after selection but row count did not increase "
+                    f"within 3.0s (last observed row_count={geom[0]}, "
+                    f"expected > {self._last_selected_row_count_before})."
+                )
+            time.sleep(0.3)
+
         row_count, last_row_top = geom
-        if self._last_selected_row_count_before is not None and row_count <= self._last_selected_row_count_before:
-            raise AdapterError("Expected a new grid row after selection but row count did not increase.")
-
         col_l, col_r = _GRID_COLUMNS["quantity"]
         dx = offset[0]
         qx = (col_l + col_r) // 2 + dx
@@ -1091,14 +1167,31 @@ class WindowsXactimateAdapter(XactimateAdapter):
         col_l, col_r = _GRID_COLUMNS["quantity"]
         dx = offset[0]
         crop = image.crop((col_l + dx, last_row_top, col_r + dx, last_row_top + _GRID_ROW_HEIGHT))
-        # Live-caught: at native resolution Tesseract can drop a decimal
-        # point entirely (visually present but sub-pixel at this crop
-        # size) -- "2.5" read back as "25" with no punctuation at all,
-        # not a misread character regex could fix. Upscaling 4x before
-        # OCR is a standard mitigation for exactly this failure mode; a
-        # fresh test confirmed it. See docs/xactimate-lookup.md Phase 4.3.
-        crop = crop.resize((crop.width * 4, crop.height * 4))
-        text = self._ocr_text(crop).replace(",", "").strip()
+        # Live-caught (Phase 4.3): at native resolution Tesseract can drop
+        # a decimal point entirely (visually present but sub-pixel at this
+        # crop size) -- "2.5" read back as "25" with no punctuation at
+        # all, not a misread character regex could fix. Upscaling 4x
+        # before OCR is a standard mitigation for exactly this failure
+        # mode.
+        #
+        # Live-caught (Phase 4.5): that same 4x upscale can blur a SHORT
+        # value (a single digit, e.g. "7") into nothing -- reproduced
+        # directly: native resolution read "7" correctly across every PSM
+        # tried, but the 4x-upscaled crop returned an empty string with
+        # the same PSM. Neither scale is reliable alone, so both are
+        # tried: the decimal-preserving upscaled reading is used only
+        # when it actually contains a decimal point the native reading is
+        # missing (the specific failure upscaling exists to fix);
+        # otherwise the native reading is preferred, falling back to
+        # upscaled only if native produced nothing at all. See
+        # docs/xactimate-lookup.md Phase 4.5.
+        text_native = self._ocr_text(crop).replace(",", "").strip()
+        crop_upscaled = crop.resize((crop.width * 4, crop.height * 4))
+        text_upscaled = self._ocr_text(crop_upscaled).replace(",", "").strip()
+        if "." in text_upscaled and "." not in text_native:
+            text = text_upscaled
+        else:
+            text = text_native or text_upscaled
         # OCR on a cell crop occasionally picks up a stray border/highlight
         # artifact as a leading non-numeric character (live-observed: "> 10.5"
         # for a plain "10.5") -- extract the numeric substring rather than
@@ -1117,6 +1210,64 @@ class WindowsXactimateAdapter(XactimateAdapter):
         VK_S = 0x53
         self._press_ctrl(VK_S)
         time.sleep(1.5)
+
+    def verify_quantity_committed(
+        self, expected_quantity: float, timeout_s: float = 5.0, interval_s: float = 0.25
+    ) -> QuantityVerificationResult:
+        """Not part of the abstract contract -- bounded-polling
+        replacement for a single-shot ``read_quantity()`` call used to
+        confirm a quantity actually landed after a grid-mutating
+        action (selection, quantity entry, or commit).
+
+        Live investigation (Phase 4.5) found a single-shot read taken
+        immediately after such an action intermittently returns `None`
+        -- reproduced directly: a fresh CAT/SEL selection, quantity
+        entry, and *immediate* `read_quantity()` call (no intervening
+        delay beyond `enter_quantity()`'s own settle sleep) returned
+        `None` on the first live trial, even though the value was
+        correctly present in the grid a moment later and every attempt
+        thereafter. This is not a fixed, predictable delay -- polling
+        with a bounded budget is the correct fix, not a longer sleep
+        (a longer fixed sleep just moves the same race to a different,
+        still-unbounded worst case).
+
+        Polls `read_quantity()` at `interval_s` and terminates on the
+        first of: the observed value equals `expected_quantity`
+        (success), `_unexpected_dialog_present()` is true (wrong
+        context -- aborts immediately rather than continuing to poll
+        past something that needs a human), or `timeout_s` elapses
+        (failure). Every attempt's elapsed time, whether a grid row was
+        located at all, and the observed value are recorded in the
+        returned result's `.samples` for diagnostics. See
+        docs/xactimate-lookup.md Phase 4.5."""
+        start = time.time()
+        samples: list[tuple[float, bool, float | None]] = []
+        attempts = 0
+        observed: float | None = None
+        while True:
+            attempts += 1
+            elapsed = time.time() - start
+            if self._unexpected_dialog_present():
+                return QuantityVerificationResult(
+                    matched=False, stop_reason="wrong_context", expected=expected_quantity,
+                    observed=observed, attempts=attempts, elapsed_s=elapsed, samples=samples,
+                )
+            hwnd = self._ensure_main_window()
+            image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+            row_found = offset is not None and self._last_row_geometry(image, offset) is not None
+            observed = self.read_quantity() if row_found else None
+            samples.append((round(elapsed, 3), row_found, observed))
+            if observed == expected_quantity:
+                return QuantityVerificationResult(
+                    matched=True, stop_reason="matched", expected=expected_quantity,
+                    observed=observed, attempts=attempts, elapsed_s=elapsed, samples=samples,
+                )
+            if elapsed >= timeout_s:
+                return QuantityVerificationResult(
+                    matched=False, stop_reason="timeout", expected=expected_quantity,
+                    observed=observed, attempts=attempts, elapsed_s=elapsed, samples=samples,
+                )
+            time.sleep(interval_s)
 
     def _click_context_menu_item(self, anchor_x: int, anchor_y: int, item_text: str, max_width: int = 500, max_height: int = 700) -> bool:
         """Locates and clicks a context-menu item by its literal text,
@@ -1137,34 +1288,96 @@ class WindowsXactimateAdapter(XactimateAdapter):
         Delete Line Item". Returns False (never raises) if no
         matching line is found, so the caller can fail safely rather
         than click a guessed position. See docs/xactimate-lookup.md
-        Phase 4.4."""
+        Phase 4.4.
+
+        Live-caught (Phase 4.5): the search region originally only
+        looked below-and-right of the click point, assuming that's
+        always where Windows renders a context menu. It doesn't --
+        Windows flips the menu upward when there isn't enough room
+        below the cursor (observed live on a 1920x1080 screen, a
+        different resolution than Phase 4.4's session, where a
+        right-click low enough in the window pushed the menu entirely
+        above the click point). The search region is now centered on
+        the click point, covering both directions, clamped to the
+        virtual screen so ImageGrab never receives a negative or
+        off-screen bbox.
+
+        That larger, both-directions region exposed a second issue:
+        `--psm 6` ("assume a uniform block of text") merges/loses
+        individual menu lines once the crop is big enough to also
+        contain the busy background grid/panel behind the menu --
+        live-reproduced: the standalone "Delete" line vanished
+        entirely from its output on a crop where "Undo Delete Line
+        Item" (two lines away) still came through correctly. `--psm 4`
+        ("assume a single column of text of variable sizes") reliably
+        isolates "Delete" as its own line on the same crop where
+        `--psm 6` lost it.
+
+        Live-caught (Phase 4.5): even with both fixes above, a single
+        OCR pass can still misread the word itself -- reproduced live:
+        "Delete" read as "betete" on this specific crop, caused by the
+        menu's semi-transparent text blending with the busy background
+        window content directly behind it at this exact pixel
+        position. This is a STABLE misread, not per-attempt noise --
+        confirmed by re-grabbing and re-OCRing the same live state
+        three times and getting "betete" all three times, so retrying
+        the capture alone does not fix it (retry is kept regardless,
+        since a genuinely transient misread is a separate, real
+        failure mode this file has hit elsewhere).
+        The real fix: single-word menu lines within a small edit
+        distance of the target are accepted as a match too, alongside
+        an exact match. A plain fuzzy-ratio match was tried first and
+        rejected -- "betete" vs. "delete" scores similarly low to
+        "undo delete line item" vs. "delete" on difflib's ratio, so
+        ratio alone can't safely distinguish the real misread from the
+        line that must never match. Levenshtein edit distance does:
+        "betete" is 2 edits from "delete", while every other real
+        single-word item in this menu (including "select", the
+        closest) is >= 3 edits away, and multi-word lines are excluded
+        by the single-word restriction regardless of distance -- so
+        "undo delete line item" can never match no matter how close
+        any individual word is. See docs/xactimate-lookup.md Phase
+        4.5."""
         from PIL import ImageGrab
 
         pytesseract = self._pytesseract()
-        crop_box = (anchor_x, anchor_y, anchor_x + max_width, anchor_y + max_height)
-        shot = ImageGrab.grab(bbox=crop_box)
-        data = pytesseract.image_to_data(shot, config="--psm 6", output_type=pytesseract.Output.DICT)
-
-        lines: dict[tuple[int, int, int], list[int]] = {}
-        for i, text in enumerate(data["text"]):
-            if not text.strip():
-                continue
-            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-            lines.setdefault(key, []).append(i)
-
+        user32 = self._win32()[0].windll.user32
+        screen_w = user32.GetSystemMetrics(0)
+        screen_h = user32.GetSystemMetrics(1)
+        left = max(0, anchor_x - max_width)
+        top = max(0, anchor_y - max_height)
+        right = min(screen_w, anchor_x + max_width)
+        bottom = min(screen_h, anchor_y + max_height)
+        crop_box = (left, top, right, bottom)
         target = item_text.strip().lower()
-        for indices in lines.values():
-            line_text = " ".join(data["text"][i].strip() for i in indices).strip().lower()
-            if line_text != target:
-                continue
-            lefts = [data["left"][i] for i in indices]
-            rights = [data["left"][i] + data["width"][i] for i in indices]
-            tops = [data["top"][i] for i in indices]
-            bottoms = [data["top"][i] + data["height"][i] for i in indices]
-            cx = anchor_x + (min(lefts) + max(rights)) // 2
-            cy = anchor_y + (min(tops) + max(bottoms)) // 2
-            self._click_screen(cx, cy)
-            return True
+
+        for attempt in range(3):
+            shot = ImageGrab.grab(bbox=crop_box)
+            data = pytesseract.image_to_data(shot, config="--psm 4", output_type=pytesseract.Output.DICT)
+
+            lines: dict[tuple[int, int, int], list[int]] = {}
+            for i, text in enumerate(data["text"]):
+                if not text.strip():
+                    continue
+                key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+                lines.setdefault(key, []).append(i)
+
+            for indices in lines.values():
+                line_text = " ".join(data["text"][i].strip() for i in indices).strip().lower()
+                is_exact = line_text == target
+                is_close_single_word = " " not in line_text and _levenshtein_distance(line_text, target) <= 2
+                if not (is_exact or is_close_single_word):
+                    continue
+                lefts = [data["left"][i] for i in indices]
+                rights = [data["left"][i] + data["width"][i] for i in indices]
+                tops = [data["top"][i] for i in indices]
+                bottoms = [data["top"][i] + data["height"][i] for i in indices]
+                cx = left + (min(lefts) + max(rights)) // 2
+                cy = top + (min(tops) + max(bottoms)) // 2
+                self._click_screen(cx, cy)
+                return True
+            if attempt < 2:
+                time.sleep(0.3)
         return False
 
     def cancel_current_item(self) -> None:
