@@ -50,6 +50,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     save_execution_plan,
     utc_now_iso,
 )
+from estimate_extractor.xactimate_lookup.execution_reports import write_all_execution_reports
 from estimate_extractor.xactimate_lookup.models import (
     DECISION_AUTO_SELECT,
     DECISION_NO_MATCH,
@@ -220,6 +221,7 @@ def run_execution_plan(
             if not (adapter.verify_application() and adapter.verify_project()):
                 plan.run_state = RUN_STATE_PAUSED
                 save_execution_plan(plan, project_dir)
+                write_all_execution_reports(plan, project_dir)
                 return plan
 
             group.state = GROUP_IN_PROGRESS
@@ -260,6 +262,7 @@ def run_execution_plan(
     if not dry_run:
         plan.run_state = RUN_STATE_COMPLETED if all(t.state != TASK_PENDING for t in plan.tasks) else RUN_STATE_PAUSED
         save_execution_plan(plan, project_dir)
+        write_all_execution_reports(plan, project_dir)
 
     return plan
 

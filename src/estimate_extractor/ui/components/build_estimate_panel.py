@@ -170,8 +170,12 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
             phrase_rules = phrase_generator.load_phrase_rules()
             ranking_config = ranking.load_ranking_config()
             executed_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, project_dir, dry_run=False)
+            reports_dir = project_dir / "execution" / "reports"
             if executed_plan.run_state == RUN_STATE_COMPLETED:
-                st.success("Run completed.")
+                st.success(f"Run completed. Reports written to {reports_dir}.")
             else:
-                st.warning(f"Run paused (run_state={executed_plan.run_state}) -- see the group/task tables above for why.")
+                st.warning(
+                    f"Run paused (run_state={executed_plan.run_state}) -- see the group/task tables above for why. "
+                    f"Reports for progress so far were written to {reports_dir}. Click Execute again to resume."
+                )
             st.rerun()

@@ -130,6 +130,12 @@ def test_happy_path_all_groups_verified_all_tasks_completed(tmp_path, phrase_rul
     assert adapter.ensure_group_calls == ["Dwelling Roof", "Fence"]
     assert adapter.verify_commit_calls == 3
 
+    reports_dir = tmp_path / "execution" / "reports"
+    assert (reports_dir / "execution_report.json").exists()
+    assert (reports_dir / "execution_report.csv").exists()
+    assert (reports_dir / "unresolved_row_summary.json").exists()
+    assert (reports_dir / "structured_audit.json").exists()
+
 
 def test_group_verification_failure_marks_only_that_groups_tasks_review_required(tmp_path, phrase_rules, ranking_config):
     plan = _plan_two_groups()
