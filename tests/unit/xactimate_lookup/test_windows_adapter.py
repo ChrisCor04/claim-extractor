@@ -18,14 +18,22 @@ import pytest
 
 from estimate_extractor.xactimate_lookup.models import DropdownResult
 from estimate_extractor.xactimate_lookup.windows_adapter import (
+    CommittedRowVerification,
     PopupNotFoundError,
     QuantityVerificationResult,
     StaleCandidateError,
+    UnitVerificationResult,
     WindowsXactimateAdapter,
     _GRID_COLUMNS,
     _GRID_ROW_HEIGHT,
     _RawDropdownRow,
+    _UNIT_OCR_CONFUSIONS,
+    _UNIT_SYNONYMS,
+    _VERIFIED_UNIT_CONVERSIONS,
+    _normalize_unit_text,
+    _resolve_observed_unit_vocab,
     _split_category_selector,
+    check_unit_compatibility,
 )
 
 
@@ -351,3 +359,274 @@ def test_orchestrator_never_touches_adapter_when_live_execution_unsupported(tmp_
 
     assert outcome.stop_reason == STOP_REASON_UNSUPPORTED_ADAPTER
     assert outcome.committed is False
+
+
+# ---------------------------------------------------------------------
+# Phase 4.7: unit/quantity verification -- pure logic, no live session
+# ---------------------------------------------------------------------
+
+
+def test_raw_versus_normalized_unit_are_independently_tracked():
+    """Regression guard (Phase 4.7 Stage 1): the raw OCR value must
+    never be overwritten by normalization -- both are present, and
+    differ, on a corrected read."""
+    result = check_unit_compatibility("LF", "LF", "(uF")
+    assert result.observed_xactimate_unit == "(uF"  # untouched raw OCR
+    assert result.unit_normalized == "LF"  # only the normalized field changes
+
+
+def test_safe_unit_synonym_ea_and_each():
+    """Regression guard (Phase 4.7 Stage 2): EA/EACH is an explicitly
+    approved synonym pair -- expected is spelled "EACH" (as a source-
+    side extraction might write it) while Xactimate's own observed
+    code is the short "EA"; these normalize to the same canonical unit
+    without being byte-identical, which is exactly what
+    "normalized_synonym" (as distinct from "exact_match") means."""
+    result = check_unit_compatibility("EACH", "EACH", "EA")
+    assert result.unit_match_state == "normalized_synonym"
+    assert result.unit_match_reason
+
+
+def test_safe_unit_synonym_day_and_da():
+    result = check_unit_compatibility("DAY", "DAY", "DA")
+    assert result.unit_match_state == "normalized_synonym"
+
+
+def test_incompatible_units_sf_and_sq_are_not_synonyms():
+    """Regression guard (Phase 4.7 Stage 2): the build spec explicitly
+    lists SF/SQ as NOT synonyms -- must resolve to incompatible /
+    hard_stop, never silently pass."""
+    result = check_unit_compatibility("SF", "SF", "SQ")
+    assert result.unit_match_state == "incompatible"
+
+
+def test_incompatible_units_lf_and_sf_are_not_synonyms():
+    result = check_unit_compatibility("LF", "LF", "SF")
+    assert result.unit_match_state == "incompatible"
+
+
+def test_incompatible_units_hard_stop_classification():
+    result = check_unit_compatibility("EA", "EA", "SQ")
+    assert result.unit_match_state == "incompatible"
+    assert WindowsXactimateAdapter._UNIT_STATE_TO_COMPATIBILITY[result.unit_match_state] == "hard_stop"
+
+
+def test_missing_source_unit_is_review_required_even_when_observed_matches_expected():
+    """Regression guard (Phase 4.7 Stage 8): source_unit_missing is an
+    unconditional review_required trigger, checked even when observed
+    and expected already agree."""
+    result = check_unit_compatibility(None, "LF", "LF")
+    assert result.unit_match_state == "source_unit_missing"
+    assert WindowsXactimateAdapter._UNIT_STATE_TO_COMPATIBILITY[result.unit_match_state] == "review_required"
+
+
+def test_missing_observed_unit_is_review_required():
+    result = check_unit_compatibility("LF", "LF", None)
+    assert result.unit_match_state == "observed_unit_missing"
+    assert WindowsXactimateAdapter._UNIT_STATE_TO_COMPATIBILITY[result.unit_match_state] == "review_required"
+
+
+def test_ambiguous_ocr_unit_is_unreadable_not_a_guess():
+    """Regression guard (Phase 4.7 Stage 6): OCR text that doesn't
+    resolve to any known real Xactimate unit must be reported as
+    unreadable, never coerced into whatever was expected."""
+    result = check_unit_compatibility("LF", "LF", "??%")
+    assert result.unit_match_state == "unreadable"
+    assert result.unit_normalized is None
+    assert WindowsXactimateAdapter._UNIT_STATE_TO_COMPATIBILITY[result.unit_match_state] == "review_required"
+
+
+def test_lf_uf_ocr_confusion_corrects_without_unsafe_coercion():
+    """Regression guard (Phase 4.7 Stage 6): the narrow "UF"->"LF" OCR-
+    confusion rule fires only for that literal stripped string, and
+    must not be reachable from any other real unit's OCR output --
+    confirms the rule cannot misfire against SQ/EA/HR/DA/SF."""
+    assert _resolve_observed_unit_vocab("(uF") == "LF"
+    assert _resolve_observed_unit_vocab("uF") == "LF"
+    for real_unit in ("SQ", "EA", "HR", "DA", "SF"):
+        # None of the other evidence-backed units should ever resolve
+        # via the UF->LF confusion table.
+        assert _UNIT_OCR_CONFUSIONS.get(real_unit) is None
+
+
+def test_conversions_disabled_by_default():
+    """Regression guard (Phase 4.7 Stage 3): no conversions are
+    pre-populated -- a genuine unit mismatch with no exact/synonym
+    match must be incompatible, not silently converted."""
+    assert _VERIFIED_UNIT_CONVERSIONS == {}
+    result = check_unit_compatibility("SF", "SF", "SQ")
+    assert result.unit_match_state == "incompatible"
+
+
+def test_explicit_verified_conversion_is_used_when_present():
+    """Regression guard (Phase 4.7 Stage 3): the conversion mechanism
+    itself works when a rule IS explicitly present -- proves the
+    machinery, not just its disabled-by-default state. Does not
+    mutate the real (empty) module-level map."""
+    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
+
+    original = dict(_VERIFIED_UNIT_CONVERSIONS)
+    try:
+        wa_mod._VERIFIED_UNIT_CONVERSIONS[("SQ", "SF")] = 100.0
+        result = check_unit_compatibility("SF", "SF", "SQ")
+        assert result.unit_match_state == "verified_conversion"
+        assert WindowsXactimateAdapter._UNIT_STATE_TO_COMPATIBILITY[result.unit_match_state] == "compatible"
+    finally:
+        wa_mod._VERIFIED_UNIT_CONVERSIONS.clear()
+        wa_mod._VERIFIED_UNIT_CONVERSIONS.update(original)
+
+
+def test_quantity_match_does_not_override_unit_conflict():
+    """Regression guard (Phase 4.7 Stage 8): compatibility is derived
+    purely from the unit outcome -- a CommittedRowVerification with a
+    quantity match but an incompatible unit must still report
+    hard_stop compatibility."""
+    unit_result = check_unit_compatibility("EA", "EA", "SQ")
+    verification = CommittedRowVerification(
+        stop_reason="verified", row_identified=True, row_index=0,
+        category="SFG", selector="GUTA", description="desc",
+        quantity_expected=5.0, quantity_observed=5.0, quantity_matched=True,
+        unit=unit_result, compatibility="hard_stop", compatibility_reason=unit_result.unit_match_reason,
+        attempts=1, elapsed_s=0.1,
+    )
+    assert verification.quantity_matched is True
+    assert verification.compatibility == "hard_stop"
+
+
+def test_wrong_row_identity_reported_as_conflicting_row():
+    """Regression guard (Phase 4.7 Stage 5): CommittedRowVerification
+    must be able to represent "more than one row matched" distinctly
+    from a clean verification -- exercised via direct construction,
+    complementing the live row-identification logic (needs a real
+    session)."""
+    verification = CommittedRowVerification(
+        stop_reason="conflicting_row", row_identified=False, row_index=None,
+        category="SFG", selector="GUTA", description=None,
+        quantity_expected=5.0, quantity_observed=None, quantity_matched=False,
+        unit=None, compatibility="not_evaluated", compatibility_reason="2 rows matched SFG/GUTA",
+        attempts=1, elapsed_s=0.1,
+    )
+    assert verification.stop_reason == "conflicting_row"
+    assert verification.row_identified is False
+
+
+def _adapter_with_fake_verification_grid(monkeypatch, row_sequence, unit_reads=None, quantity_reads=None):
+    """Builds a WindowsXactimateAdapter with every internal dependency
+    `verify_committed_row()` touches monkeypatched to a fake, so its
+    polling/identification logic can be exercised without a live
+    Windows/Xactimate session. `row_sequence` is a list of "grids" (one
+    per poll attempt), each a list of (category, selector) tuples
+    top-to-bottom. Uses a fake, manually-advanced clock so timing is
+    deterministic and tests run instantly."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=1, delay_s=0: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    monkeypatch.setattr(adapter, "_shifted_anchor", lambda name, offset: (0, 0, 0, 0))
+
+    grids = iter(row_sequence)
+    state = {"grid": []}
+
+    def last_row_geometry(image, offset):
+        state["grid"] = next(grids, state["grid"])
+        return (len(state["grid"]), 0) if state["grid"] else None
+
+    monkeypatch.setattr(adapter, "_last_row_geometry", last_row_geometry)
+    monkeypatch.setattr(
+        adapter, "_read_category_selector_at",
+        lambda image, offset, row_top: state["grid"][row_top // _GRID_ROW_HEIGHT],
+    )
+    monkeypatch.setattr(adapter, "_read_description_at", lambda image, offset, row_top: "desc")
+    qty_iter = iter(quantity_reads or [])
+    monkeypatch.setattr(adapter, "_read_quantity_at", lambda image, offset, row_top: next(qty_iter, None))
+    unit_iter = iter(unit_reads or [])
+    monkeypatch.setattr(adapter, "_read_unit_at", lambda image, offset, row_top: next(unit_iter, (None, None)))
+
+    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(wa_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    return adapter
+
+
+def test_verify_committed_row_identifies_row_after_delayed_rendering(monkeypatch):
+    """Regression test (Phase 4.7 Stages 4/5): the target row doesn't
+    appear until the third poll attempt (simulating delayed repaint) --
+    verify_committed_row() must keep polling and succeed once it does,
+    not give up on the first empty/non-matching grid."""
+    adapter = _adapter_with_fake_verification_grid(
+        monkeypatch,
+        row_sequence=[[], [("SFG", "OTHER")], [("SFG", "GUTA")]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[5.0],
+    )
+    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    assert result.stop_reason == "verified"
+    assert result.row_identified is True
+    assert result.quantity_matched is True
+    assert result.compatibility == "compatible"
+
+
+def test_verify_committed_row_temporal_consensus_requires_stable_match(monkeypatch):
+    """Regression test (Phase 4.7 Stage 6): a transient wrong unit
+    read on an early poll must not be trusted -- only once the row is
+    identified is a single unit read taken (reads at multiple scales
+    internally), so this exercises that the FINAL read at
+    identification time is what's reported, not an early transient
+    one."""
+    adapter = _adapter_with_fake_verification_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTA")]],
+        unit_reads=[("SQ", "SQ")],  # stable read once identified: SQ, not LF
+        quantity_reads=[5.0],
+    )
+    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    assert result.unit.observed_xactimate_unit == "SQ"
+    assert result.compatibility == "hard_stop"
+
+
+def test_verify_committed_row_wrong_row_identity_conflict(monkeypatch):
+    """Regression test (Phase 4.7 Stage 5): two rows matching the same
+    CAT/SEL must never be silently resolved by picking one -- reports
+    conflicting_row instead."""
+    adapter = _adapter_with_fake_verification_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTA"), ("SFG", "GUTA")]],
+    )
+    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, timeout_s=3.0)
+    assert result.stop_reason == "conflicting_row"
+    assert result.row_identified is False
+
+
+def test_verify_committed_row_times_out_when_row_never_appears(monkeypatch):
+    """Regression test (Phase 4.7 Stage 5): if the target identity
+    never appears in the grid within budget, reports
+    commit_verification_failed -- never an unbounded wait, never a
+    guess."""
+    adapter = _adapter_with_fake_verification_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "OTHER")]] * 20,
+    )
+    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, timeout_s=0.5)
+    assert result.stop_reason == "commit_verification_failed"
+    assert result.row_identified is False
+
+
+def test_verify_committed_row_cleanup_after_unit_verification_failure(monkeypatch):
+    """Regression guard (Phase 4.7): a hard_stop unit outcome still
+    returns a fully-formed result (row identified, quantity read) so a
+    caller can proceed to clean up the row -- verification failing
+    must not prevent cleanup from having the information it needs
+    (category/selector) to act on."""
+    adapter = _adapter_with_fake_verification_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTA")]],
+        unit_reads=[("SQ", "SQ")],
+        quantity_reads=[5.0],
+    )
+    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    assert result.compatibility == "hard_stop"
+    # cleanup-relevant identity is still available despite the failure
+    assert result.category == "SFG"
+    assert result.selector == "GUTA"

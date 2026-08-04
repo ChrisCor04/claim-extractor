@@ -2127,3 +2127,240 @@ reliable even when verification isn't; (3) once quantity verification
 is confirmed reliable across a larger sample, re-run this same 10-item
 pilot once more and require both gate criteria 4 and 8 to pass cleanly
 before flipping the flag.
+
+## Phase 4.7: reliable unit + quantity verification -- full framework built and live-validated, `supports_live_execution` stays `False`, single blocker: category+selector OCR reliability outside SFG/RFG
+
+Phase 4.7 built the unit-verification framework Phase 4.6 didn't have
+(independent unit tracking, normalization, a disabled-by-default
+conversion policy, identity-based row lookup before reading anything)
+and found/fixed a blocking prerequisite bug plus two new OCR bugs
+along the way. The deliberate incompatible-unit safety stop worked
+correctly. The remaining gap is precisely diagnosed: row identification
+by category+selector OCR is not yet reliable enough within the bounded
+polling window, most severely for catalog categories never exercised
+before this phase.
+
+### Blocking prerequisite: search navigation was broken all session
+
+Before any unit work could start, every search failed with a
+misleading "no results popup" error. Root cause: this session's
+window rendered with a real ~62px vertical drift, and
+`focus_search()`/`_reset_scroll_state()` used RAW, uncorrected pixel
+anchors for both the tab-bar click and the search-box click -- unlike
+every grid-reading path in this file, which always applies
+`_anchor_offset()`'s live-measured correction first. Investigation
+found the two clicks needed OPPOSITE treatment: the tab bar
+(Items/Components/.../Labor Summary) is fixed window chrome and must
+stay uncorrected (applying the grid's offset to it overshot and
+literally landed on a different tab, "Labor Minimums," reproduced
+live); the search box IS part of the scrollable grid pane and DOES
+need the correction (confirmed live: search failed with the raw
+anchor, succeeded with the corrected one). Fixed accordingly -- not a
+uniform rule, a per-element determination based on what each element
+actually is.
+
+### Stage 1-3: unit data model, normalization, conversion policy
+
+`UnitVerificationResult` keeps `source_unit`, `expected_xactimate_unit`,
+`observed_xactimate_unit` (raw OCR, never overwritten), and
+`unit_normalized` as independent fields, with `unit_match_state` one
+of `exact_match` / `normalized_synonym` / `verified_conversion` /
+`source_unit_missing` / `expected_unit_missing` / `observed_unit_missing`
+/ `incompatible` / `unreadable`. `_UNIT_SYNONYMS` contains only the
+build spec's own evidence-backed examples (EA/EACH, HR/HOUR, DA/DAY,
+WK/WEEK, MO/MONTH); SF/SQ, LF/SF, EA/LF, HR/EA are deliberately absent.
+`_VERIFIED_UNIT_CONVERSIONS` is an empty dict by default (Stage 3
+policy: conversions disabled by default) -- populated only transiently
+by one test proving the mechanism works, never by production code
+this phase. `check_unit_compatibility()` is a pure, module-level
+function (directly unit-testable) implementing Stage 8's priority
+order; a quantity match never overrides a unit conflict --
+`CommittedRowVerification.compatibility` is derived from the unit
+outcome alone.
+
+### Stage 5/6/7: row identification, unit reading, quantity reading
+
+`verify_committed_row(category, selector, expected_quantity,
+source_unit, expected_xactimate_unit)` replaces reading from a
+presumed last-row index with identity-based lookup: it polls the grid,
+reads CAT+SEL at every row via `_read_category_selector_at()`, and
+only proceeds to read quantity/unit once EXACTLY one row matches.
+Zero matches within the timeout -> `commit_verification_failed`. More
+than one match -> `conflicting_row` (refuses to guess). This is a real
+behavior change from Phase 4.6's `verify_quantity_committed()`, which
+always read the last row unconditionally regardless of whether that
+was actually the row in question.
+
+**New unit-reading strategy** (`_read_unit_at()`): tries 5 (scale,
+PSM) combinations, applies a narrow, evidence-backed OCR-confusion
+correction (`"UF"` -> `"LF"` -- Tesseract consistently misreads a real
+"LF" as lowercase "u" at several scales; confirmed live, and safe
+because none of the 6 evidence-backed real units start with "U"), and
+requires 2+ combinations to agree on a real, known unit
+(`_KNOWN_XACTIMATE_UNITS`) before returning a normalized value --
+otherwise returns the raw text with no normalized value, surfaced as
+`unreadable` rather than a guess. Investigation found the unit
+column's ACTUAL position varies by row-highlight state MORE than
+previously documented -- a THIRD real position (`x=1078-1089`) was
+found live immediately after `commit_item()`, in addition to Phase
+4.4's two ("highlighted-by-quantity-click" and "static"). The column
+boundary was widened to `(1070, 1122)` to cover all three, relying on
+the multi-scale/vocabulary strategy to extract the real word from
+whatever margin surrounds it rather than a zero-tolerance tight crop.
+
+**Live-caught, fixed**: the `selector` column crop can visually
+include the neighboring `activity` symbol for a SHORT code (reproduced
+live: real "GUTA" OCR'd as "GUTA &") -- both
+`_read_category_selector_at()` and `_read_populated_fields_once()`
+now keep only the first whitespace-separated OCR token, since a real
+selector never legitimately contains a space.
+
+### Stage 8: the deliberate incompatible-unit test -- passed
+
+One of the 10-trial matrix's items (SFG/GUTAB>, a real LF item)
+was deliberately given a wrong declared unit (`source_unit=
+expected_xactimate_unit="EA"`). The pre-commit compatibility check
+correctly classified this as `incompatible` / `hard_stop` and the
+trial script stopped BEFORE `enter_quantity()` or `commit_item()` were
+ever called -- exactly Stage 8/9's required behavior, confirmed live,
+not just in the pure-logic unit tests.
+
+### Stage 9/10: 10-trial live matrix across 6 evidence-backed units
+
+Real Xactimate items confirmed live for each unit, beyond the
+long-established SFG(LF)/RFG(SQ): `PLM/TLT` "Toilet" (EA),
+`PNT/LAB` "Painter - per hour" (HR), `TMP/GEN` "Generator ... per
+day" (DA), `CLN/FCC` "Clean and deodorize carpet" (SF).
+
+| # | CAT/SEL | Unit | Qty | Outcome |
+|---|---|---|---|---|
+| 1 | SFG/GUTA | LF | 5 | committed, verified (quantity+unit both matched) |
+| 2 | SFG/GUTC | LF | 2.5 | committed; unit read as `unreadable` post-commit |
+| 3 | RFG/ARMVN | SQ | 3 | committed; row identification failed post-commit (`commit_verification_failed`) |
+| 4 | PLM/TLT | EA | 1 | committed; row identification failed (category OCR: "PLM" read as "PLN") |
+| 5 | PNT/LAB | HR | 7 | committed; row identified but quantity did not match within budget |
+| 6 | TMP/GEN | DA | 2 | committed; row identification failed (category OCR: "TMP" read as "TMI") |
+| 7 | CLN/FCC | SF | 10.5 | committed; row identification failed (category OCR: "CLN" read as "CLM") |
+| 8 | SFG/GUTG | LF | 0.25 | pre-commit populated-fields read badly garbled; committed anyway, verification failed |
+| 9 | SFG/GUTAB> | LF (declared EA) | 3 | **correctly hard-stopped before commit** (deliberate incompatible-unit test) |
+| 10 | SFG/GUTA> | LF | 6 | committed, verified (quantity+unit both matched) |
+
+Cleanup succeeded on every trial (10/10, zero manual intervention).
+Zero wrong selections. Zero unintended mutations.
+
+**Root cause of the identification failures, investigated per this
+phase's explicit checklist**: NOT wrong-row identification (in every
+case independently re-checked afterward, the correct row's data was
+present and correct), NOT stale geometry, NOT duplicate CAT/SEL rows,
+NOT save-state timing. It IS OCR inconsistency in category reading,
+and it splits into two distinct sub-causes:
+
+1. **New-category OCR is unvalidated and shows STABLE, deterministic
+   misreads**: "PLM"->"PLN", "TMP"->"TMI", "CLN"->"CLM" reproduced
+   across every scale/PSM tried (1x-6x, 4 PSM modes each) -- not
+   per-attempt noise a multi-scale vote can out-vote. Critically, a
+   narrow character-substitution fix (the same class of fix that
+   safely corrected "UF"->"LF" for units) is NOT safe here: "M" and
+   "N" are confused in BOTH directions across different real
+   categories in the SAME session ("PLM" misread as "PLN", but "CLN"
+   misread as "CLM") -- a blind "N"->"M" correction would fix one and
+   break the other. This was investigated and deliberately NOT
+   applied, per this phase's own conservative-correction rule ("a
+   narrow OCR-confusion rule that cannot transform another valid
+   [category] incorrectly").
+2. **Even SFG/RFG -- the categories every prior phase validated --
+   still show intermittent identification misses** under real timing
+   pressure (item 3/RFG failed in the matrix; item 9/RFG failed again
+   in the Stage 11 pilot below), though a manual re-check moments
+   later always found the correct data present. This matches Phase
+   4.6's already-documented residual timing/OCR intermittency, now
+   shown to affect the NEW identity-based lookup the same way it
+   affected the old last-row lookup.
+
+### Stage 11: focused pilot rerun (same approved 10-item plan, unmodified)
+
+TEST project confirmed at 0 rows before starting. Items 1-5, 7, 10
+again correctly `REVIEW_REQUIRED` (genuine catalog near-ties,
+reproduces Phase 4.4/4.5/4.6 exactly). Item 8 correctly `NO_MATCH`.
+
+Items 6 (SFG/GUTAB>) and 9 (RFG/ARMVN) both reached `AUTO_SELECT`,
+selected correctly, passed the pre-commit unit compatibility check
+(`compatible`), and committed. Item 6's row WAS correctly identified
+post-commit and its unit verified `compatible` -- but its quantity did
+not match within the polling budget (`quantity_matched=False`),
+though a direct re-read of that exact row moments later returned the
+correct value (`1.0`, matching what was entered). Item 9's row
+identification itself failed within budget
+(`commit_verification_failed`) -- a direct re-check afterward found
+`RFG/ARMVN` present with the correct quantity (`3.0`). In both cases
+the underlying committed data was correct every time it was
+independently checked; only the bounded, live verification call
+failed to confirm it in time.
+
+Cleanup succeeded fully autonomously (2 of 4 attempts failed with the
+same class of transient error `cancel_current_item()` has shown since
+Phase 4.6, 2 succeeded, zero manual intervention) -- final state
+visually confirmed identical to the start: 0 rows, $0.00, "Saved".
+
+### Full test suite
+
+600 passed, 12 skipped (pre-existing, unrelated), 0 failed -- 19 more
+tests than Phase 4.6's 581-passed baseline, matching the 19 new
+regression tests (pure-logic unit-compatibility tests plus
+monkeypatched `verify_committed_row()` polling-logic tests: delayed-
+but-correct identification, stable wrong-unit detection, conflicting-
+row, timeout, and post-failure cleanup information availability). No
+regressions.
+
+### `supports_live_execution`
+
+Stays **`False`**.
+
+| Gate criterion | Status |
+|---|---|
+| 1. Committed rows identified by stable identity | **not met** -- failed for RFG/ARMVN in both the matrix and the pilot, and for every new-category item |
+| 2. Committed quantities independently verified | **not met** -- correct data, but verification itself failed to confirm within budget on multiple trials |
+| 3. Committed units independently verified | **met when row identification succeeded**; not reachable when it didn't |
+| 4. Source/observed units compatible or verified-conversion | **met** whenever reached |
+| 5. Unit mismatches stop before unsafe entry/commit | **met** -- the deliberate incompatible-unit trial stopped correctly, live |
+| 6. 10-trial matrix passes | **not met** -- 2/10 cleanly verified, 1/10 correctly safety-stopped, 7/10 committed with correct data but unconfirmed verification |
+| 7. Cleanup succeeds without manual intervention | **met** -- 10/10 in the matrix, 1/1 in the pilot |
+| 8. Zero wrong selections | **met** |
+| 9. No unintended mutations | **met** |
+| 10. Ambiguous/no-result cases stop safely | **met** |
+| 11. TEST project ends empty/$0.00/Saved | **met** |
+| 12. All tests pass | **met** -- 600 passed, 12 skipped (pre-existing), 0 failed |
+
+**Single remaining blocker:** category+selector OCR reliability for
+row identification, within the bounded polling window, is not yet
+sufficient for `verify_committed_row()` to consistently confirm a
+correct commit -- most severely for catalog categories this project
+has never exercised before this phase (PLM, TMP, CLN show stable,
+deterministic misreads that cannot be safely auto-corrected without
+risking a DIFFERENT real category), and still intermittently even for
+the two categories (SFG, RFG) every prior phase validated. This is a
+verification-confirmation gap, not a data-integrity gap: every
+committed row's actual data was correct in 100% of cases independently
+re-checked this session.
+
+### Recommendation
+
+The unit-verification framework itself is complete and working:
+normalization, disabled-by-default conversions, identity-first
+lookup, and the pre-commit incompatibility safety stop all passed
+live, not just in isolated tests. The remaining gap is narrower and
+more specific than any prior phase's: category-column OCR accuracy,
+not the surrounding verification machinery. Before revisiting
+`supports_live_execution`: (1) build a proper evidence-backed
+category vocabulary (beyond the 6 categories this project has now
+touched) with a disambiguation strategy that accounts for the
+bidirectional M/N-style confusion found this session (e.g. weighting
+by which candidate correction is closer to text ALSO confirmed present
+elsewhere on the same row, not category text in isolation); (2)
+investigate whether `verify_committed_row()`'s polling budget or
+attempt cadence needs adjustment specifically for the identification
+step (distinct from the quantity-specific tuning Phase 4.6 already
+did); (3) once row identification is reliably confirmed across a
+larger, more diverse sample, re-run both the unit matrix and the
+focused pilot and require all twelve gate criteria before flipping the
+flag.

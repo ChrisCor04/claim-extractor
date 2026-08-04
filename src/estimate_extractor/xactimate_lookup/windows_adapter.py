@@ -158,8 +158,22 @@ _GRID_COLUMNS = {
     # select_candidate(), BEFORE enter_quantity() ever runs, i.e.
     # against the STATIC (unhighlighted) row. OCR word-position
     # measurement in that real state placed "SQ" at x=1095-1110, mostly
-    # outside the old boundary. See docs/xactimate-lookup.md Phase 4.4.
-    "unit": (1090, 1120),
+    # outside the old boundary -- widened to (1090, 1120).
+    #
+    # Live-caught (Phase 4.7): a row read immediately after
+    # `commit_item()` (Ctrl+S) is back in something close to the
+    # HIGHLIGHTED position -- live word-position measurement placed
+    # "LF" at x=1078-1089, almost entirely to the LEFT of (1090, 1120)
+    # (missed it by 1px, reading pure gridline instead of any text).
+    # There are now three observed real-world states (highlighted-by-
+    # quantity-click, static, highlighted-by-recent-commit) with
+    # different unit positions and no reliable way to know which one
+    # applies at read time -- widened to (1070, 1122) to cover all
+    # three, relying on the unit-reading code to extract the real word
+    # from whatever whitespace/gridline noise surrounds it rather than
+    # a tight crop with zero margin for error. See
+    # docs/xactimate-lookup.md Phase 4.7.
+    "unit": (1070, 1122),
     "unit_price": (1131, 1197),
 }
 
@@ -220,6 +234,203 @@ class QuantityVerificationResult:
     attempts: int
     elapsed_s: float
     samples: list[tuple[float, bool, float | None]] = field(default_factory=list)
+
+
+#: Known real Xactimate unit codes -- evidence-backed only, each one
+#: live-confirmed this phase (or an earlier one) against a real
+#: catalog item's populated Unit cell: LF (SFG/GUTA), SQ (RFG/ARMVN),
+#: EA (PLM/TLT, "Toilet"), HR (PNT/LAB, "Painter - per hour"), DA
+#: (TMP/GEN, "Generator ... per day"), SF (CLN/FCC, "Clean and
+#: deodorize carpet"). Used to validate/vote among noisy OCR reads
+#: (Phase 4.7 Stage 6) -- never to invent a value with no OCR support.
+#: See docs/xactimate-lookup.md Phase 4.7.
+_KNOWN_XACTIMATE_UNITS = frozenset({"LF", "SQ", "EA", "HR", "DA", "SF"})
+
+#: A narrow, evidence-backed OCR-confusion correction applied ONLY to
+#: raw OCR text before vocabulary matching -- NOT a semantic synonym
+#: (see `_UNIT_SYNONYMS` for those). Live-caught (Phase 4.6/4.7):
+#: Tesseract consistently misreads a real "LF" as "uF" (lowercase "u"
+#: visually close to uppercase "L" at this font size) -- reproduced
+#: live, stable across 5 of 6 (scale, PSM) combinations on the same
+#: real cell. Scoped as narrowly as possible: only the literal
+#: stripped string "UF" maps to "LF"; nothing else is in this map, and
+#: none of the evidence-backed real units above start with "U", so
+#: this cannot misfire against a genuinely different valid unit. See
+#: docs/xactimate-lookup.md Phase 4.7 Stage 6.
+_UNIT_OCR_CONFUSIONS = {"UF": "LF"}
+
+#: Unit-normalization synonym map (Phase 4.7 Stage 2) -- semantically
+#: identical spellings of the SAME unit, not OCR-noise correction and
+#: not a dimensional conversion (see `_VERIFIED_UNIT_CONVERSIONS` for
+#: that). Deliberately small and evidence/spec-backed only: each entry
+#: normalizes to the real Xactimate-observed code confirmed live this
+#: phase. Explicitly NOT included, per the build spec's own examples
+#: of unsafe merges: SF/SQ, LF/SF, EA/LF, HR/EA -- these are genuinely
+#: different units and must never normalize to each other.
+_UNIT_SYNONYMS: dict[str, str] = {
+    "EA": "EA", "EACH": "EA",
+    "HR": "HR", "HOUR": "HR", "HOURS": "HR",
+    "DA": "DA", "DAY": "DA",
+    "WK": "WK", "WEEK": "WK",
+    "MO": "MO", "MONTH": "MO",
+    "LF": "LF", "SQ": "SQ", "SF": "SF",
+}
+
+#: Explicit, reviewer-approved unit conversions -- (from_unit,
+#: to_unit) -> multiplicative factor. EMPTY BY DEFAULT (Phase 4.7
+#: Stage 3 policy: conversions are disabled by default; a conversion
+#: may be used ONLY when an explicit rule exists here, identifies
+#: source and target units, and has been reviewer-approved). Nothing
+#: in this phase populates this map -- no broad automatic conversions
+#: are added. A converted quantity must always be recorded separately
+#: from the original (see `verify_committed_row()`), never overwriting
+#: it. See docs/xactimate-lookup.md Phase 4.7 Stage 3.
+_VERIFIED_UNIT_CONVERSIONS: dict[tuple[str, str], float] = {}
+
+
+@dataclass(slots=True)
+class UnitVerificationResult:
+    """Phase 4.7 Stage 1: unit concepts kept independent and never
+    overwritten -- `observed_xactimate_unit` is the raw OCR text
+    (whitespace-stripped only), `unit_normalized` is only ever set
+    after synonym/OCR-confusion resolution, and neither is derived
+    from or overwrites the other. `unit_match_state` is one of:
+    "exact_match", "normalized_synonym", "verified_conversion",
+    "source_unit_missing", "observed_unit_missing", "incompatible",
+    "unreadable", "ambiguous". See docs/xactimate-lookup.md Phase
+    4.7."""
+
+    source_unit: str | None
+    expected_xactimate_unit: str | None
+    observed_xactimate_unit: str | None
+    unit_normalized: str | None
+    unit_match_state: str
+    unit_match_reason: str
+
+
+@dataclass(slots=True)
+class CommittedRowVerification:
+    """Phase 4.7 Stages 4/5/8: the full result of identifying a
+    committed row by identity and independently verifying its
+    quantity AND unit -- see `verify_committed_row()`. `compatibility`
+    is one of "compatible", "review_required", "hard_stop" (Stage 8);
+    a quantity match never overrides a unit conflict -- `compatibility`
+    reflects the unit outcome regardless of `quantity_matched`.
+    `samples` holds one dict per polling attempt with the raw
+    instrumentation Stage 4 requires (elapsed time, row count, raw
+    OCR at every scale/PSM tried, etc.) for diagnostics."""
+
+    stop_reason: str  # "verified" | "conflicting_row" | "commit_verification_failed" | "wrong_context" | "timeout"
+    row_identified: bool
+    row_index: int | None
+    category: str | None
+    selector: str | None
+    description: str | None
+    quantity_expected: float | None
+    quantity_observed: float | None
+    quantity_matched: bool
+    unit: UnitVerificationResult | None
+    compatibility: str  # "compatible" | "review_required" | "hard_stop" | "not_evaluated"
+    compatibility_reason: str
+    attempts: int
+    elapsed_s: float
+    samples: list[dict] = field(default_factory=list)
+    evidence_path: str | None = None
+
+
+def _normalize_unit_text(raw: str | None) -> str | None:
+    """Strips OCR noise (gridline bleed, parens, pipes, whitespace) and
+    uppercases -- shared by the OCR-confusion and synonym lookups so
+    both operate on the same cleaned form. Returns None for empty
+    input; never guesses content that isn't there."""
+    if not raw:
+        return None
+    import re
+
+    cleaned = re.sub(r"[^A-Za-z]", "", raw).upper()
+    return cleaned or None
+
+
+def _resolve_observed_unit_vocab(observed_xactimate_unit: str | None) -> str | None:
+    """Cleans raw OCR text, applies the narrow `_UNIT_OCR_CONFUSIONS`
+    correction, and returns the result ONLY if it lands on a real,
+    evidence-backed unit in `_KNOWN_XACTIMATE_UNITS` -- otherwise None
+    (Phase 4.7 Stage 6: "otherwise return unit_unreadable", never a
+    guessed value)."""
+    cleaned = _normalize_unit_text(observed_xactimate_unit)
+    if cleaned is None:
+        return None
+    corrected = _UNIT_OCR_CONFUSIONS.get(cleaned, cleaned)
+    return corrected if corrected in _KNOWN_XACTIMATE_UNITS else None
+
+
+def check_unit_compatibility(
+    source_unit: str | None, expected_xactimate_unit: str | None, observed_xactimate_unit: str | None,
+) -> UnitVerificationResult:
+    """Phase 4.7 Stage 8: pure compatibility logic over three
+    independently-tracked unit concepts (module-level and side-effect
+    free so it's directly unit-testable without a live session). A
+    quantity match must never override a unit conflict -- callers
+    evaluate this result independently of quantity verification.
+
+    Priority order (most-blocking first, matching the build spec's own
+    "Review required" / "Hard stop" bullet lists in Stage 8):
+    1. observed unit missing (no OCR text at all) -> review_required
+    2. observed unit unreadable (OCR text present but doesn't
+       confidently resolve to a real unit) -> review_required
+    3. expected unit missing -> review_required
+    4. source unit missing -> review_required (checked even when
+       observed/expected already agree -- Stage 8 lists this as an
+       unconditional trigger, not one only reached on disagreement)
+    5. exact match / configured synonym -> compatible
+    6. explicit verified conversion exists
+       (`_VERIFIED_UNIT_CONVERSIONS`, empty by default) -> compatible
+    7. otherwise -> hard_stop (incompatible)
+
+    See docs/xactimate-lookup.md Phase 4.7 Stage 8."""
+
+    def result(state: str, reason: str, normalized: str | None = None) -> UnitVerificationResult:
+        return UnitVerificationResult(
+            source_unit=source_unit, expected_xactimate_unit=expected_xactimate_unit,
+            observed_xactimate_unit=observed_xactimate_unit, unit_normalized=normalized,
+            unit_match_state=state, unit_match_reason=reason,
+        )
+
+    observed_vocab = _resolve_observed_unit_vocab(observed_xactimate_unit)
+    if observed_xactimate_unit is None:
+        return result("observed_unit_missing", "no unit text was read from the committed row")
+    if observed_vocab is None:
+        return result(
+            "unreadable",
+            f"raw OCR {observed_xactimate_unit!r} did not confidently resolve to a known Xactimate unit "
+            f"({sorted(_KNOWN_XACTIMATE_UNITS)}) -- refusing to guess",
+        )
+    if not expected_xactimate_unit:
+        return result("expected_unit_missing", "no expected Xactimate unit was supplied for comparison", normalized=observed_vocab)
+    if not source_unit:
+        return result("source_unit_missing", "no source unit was supplied for comparison", normalized=observed_vocab)
+
+    expected_clean = _normalize_unit_text(expected_xactimate_unit)
+    expected_norm = _UNIT_SYNONYMS.get(expected_clean, expected_clean) if expected_clean else None
+
+    if observed_vocab == expected_norm:
+        state = "exact_match" if observed_vocab == expected_clean else "normalized_synonym"
+        return result(state, f"observed unit {observed_vocab!r} matches expected unit {expected_norm!r}", normalized=observed_vocab)
+
+    conversion_factor = _VERIFIED_UNIT_CONVERSIONS.get((observed_vocab, expected_norm))
+    if conversion_factor is not None:
+        return result(
+            "verified_conversion",
+            f"explicit verified conversion {observed_vocab}->{expected_norm} (factor {conversion_factor}) applies",
+            normalized=observed_vocab,
+        )
+
+    return result(
+        "incompatible",
+        f"observed unit {observed_vocab!r} is not the same as, a configured synonym of, or an explicitly "
+        f"verified conversion of expected unit {expected_norm!r}",
+        normalized=observed_vocab,
+    )
 
 
 def _split_category_selector(code: str) -> tuple[str, str]:
@@ -768,18 +979,47 @@ class WindowsXactimateAdapter(XactimateAdapter):
         """Clicking the always-visible 'Items' tab (outside the
         scrollable content pane) re-selects the current tab and, per
         live testing, returns the content pane to its top scroll
-        position -- the state _ANCHORS was calibrated against."""
+        position -- the state _ANCHORS was calibrated against.
+
+        Live-caught (Phase 4.7): the tab bar (Items/Components/
+        Supporting Events/Labor Minimums/Labor Summary) is FIXED
+        window chrome, not part of the scrollable grid content pane --
+        confirmed live by comparing a screenshot's actual tab
+        position (consistently at the raw, uncorrected `_ANCHORS[
+        "items_tab"]` coordinates) against `_anchor_offset()`'s
+        measurement (a real dy=-62px this session, but that offset
+        describes the GRID's drift, not the tab bar's). Applying the
+        grid's offset to this click overshoots and can land on a
+        different tab entirely (reproduced live: landed on "Labor
+        Minimums" instead of "Items", silently breaking every
+        subsequent search until manually corrected). Left
+        uncorrected, matching this method's original, live-verified
+        behavior across every prior phase. See
+        docs/xactimate-lookup.md Phase 4.7."""
         hwnd = self._ensure_main_window()
         l, t, r, b = _ANCHORS["items_tab"]
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
         time.sleep(0.3)
 
     def focus_search(self) -> None:
+        """Live-caught (Phase 4.7): unlike the tab bar, the search box
+        IS part of the scrollable grid content pane and DOES share its
+        drift -- confirmed live (a real dy=-62px session where the
+        uncorrected click missed the search box entirely, breaking
+        every search with a misleading "no results popup" error; the
+        drift-corrected click landed on it correctly). Captured fresh
+        AFTER `_reset_scroll_state()`'s click, since that click can
+        itself change the drift state. See docs/xactimate-lookup.md
+        Phase 4.7."""
         hwnd = self._ensure_main_window()
         if not self._force_foreground(hwnd):
             raise AdapterError("Could not bring Xactimate window to the foreground.")
         self._reset_scroll_state()
-        l, t, r, b = _ANCHORS["search_box"]
+        image, offset = self._capture_and_locate(hwnd)
+        if offset is None:
+            l, t, r, b = _ANCHORS["search_box"]
+        else:
+            l, t, r, b = self._shifted_anchor("search_box", offset)
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
         time.sleep(0.2)
 
@@ -1071,7 +1311,14 @@ class WindowsXactimateAdapter(XactimateAdapter):
         cat = self._ocr_text(cat_crop, psm=6)
         sel_crop = crop_col("selector")
         sel_crop = sel_crop.resize((sel_crop.width * 4, sel_crop.height * 4))
-        sel = self._ocr_text(sel_crop)
+        # Live-caught (Phase 4.7): the selector crop can visually
+        # include the neighboring activity symbol for a short code
+        # (e.g. real "GUTA" OCR'd as "GUTA &") -- see
+        # `_read_category_selector_at()`'s docstring for the full
+        # explanation. Keeping only the first whitespace-separated
+        # token is safe since a real selector never contains a space.
+        sel_raw = self._ocr_text(sel_crop).strip()
+        sel = sel_raw.split()[0] if sel_raw else ""
         act_crop = crop_col("activity")
         act_crop = act_crop.resize((act_crop.width * 4, act_crop.height * 4))
         act = self._ocr_text(act_crop)
@@ -1168,7 +1415,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         """Not part of the abstract XactimateAdapter contract -- an
         adapter-specific helper used by the quantity validation trials
         and available to callers that want an independent read-back
-        without going through read_populated_fields()."""
+        without going through read_populated_fields(). Reads the
+        LAST row; see `_read_quantity_at()` for reading a specific,
+        identity-verified row (Phase 4.7)."""
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
@@ -1177,9 +1426,17 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if geom is None:
             return None
         _row_count, last_row_top = geom
+        return self._read_quantity_at(image, offset, last_row_top)
+
+    def _read_quantity_at(self, image, offset: tuple[int, int], row_top: int) -> float | None:
+        """Crops and reads the Quantity cell at an ARBITRARY row_top --
+        extracted from `read_quantity()` (Phase 4.7) so the same
+        live-verified reading strategy can be applied to a specific,
+        identity-verified row (`verify_committed_row()`), not just
+        "whatever the last row is"."""
         col_l, col_r = _GRID_COLUMNS["quantity"]
         dx = offset[0]
-        crop = image.crop((col_l + dx, last_row_top, col_r + dx, last_row_top + _GRID_ROW_HEIGHT))
+        crop = image.crop((col_l + dx, row_top, col_r + dx, row_top + _GRID_ROW_HEIGHT))
         # Live-caught (Phase 4.3): at native resolution Tesseract can drop
         # a decimal point entirely (visually present but sub-pixel at this
         # crop size) -- "2.5" read back as "25" with no punctuation at
@@ -1226,6 +1483,44 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return None
         best_value, best_count = max(votes.items(), key=lambda kv: kv[1])
         return best_value if best_count >= 2 else None
+
+    def _read_unit_at(self, image, offset: tuple[int, int], row_top: int) -> tuple[str | None, str | None]:
+        """Crops and reads the Unit cell at an ARBITRARY row_top,
+        returning (raw_ocr_text, normalized_unit_or_None) -- Phase 4.7
+        Stage 6. Tries multiple (scale, PSM) combinations (live
+        investigation found the real unit position/rendering varies
+        by row highlight state -- see the `unit` entry in
+        `_GRID_COLUMNS` -- and that "LF" specifically misreads as "uF"
+        at several scales), applies the narrow `_UNIT_OCR_CONFUSIONS`
+        correction, and votes among results that resolve to a real,
+        evidence-backed unit in `_KNOWN_XACTIMATE_UNITS`. Requires at
+        least 2 agreeing votes before returning a normalized value --
+        below that, returns (first_raw_read, None) rather than
+        guessing (the caller/`check_unit_compatibility()` surfaces
+        this as `unreadable`). The raw text is ALWAYS the literal
+        first OCR attempt, never overwritten by normalization (Stage
+        1's 'preserve raw OCR' requirement). See
+        docs/xactimate-lookup.md Phase 4.7 Stage 6."""
+        col_l, col_r = _GRID_COLUMNS["unit"]
+        dx = offset[0]
+        crop = image.crop((col_l + dx, row_top, col_r + dx, row_top + _GRID_ROW_HEIGHT))
+
+        combos = [(1, 6), (2, 6), (2, 7), (4, 6), (6, 6)]
+        raw_reads: list[str] = []
+        votes: dict[str, int] = {}
+        for scale, psm in combos:
+            im = crop.resize((crop.width * scale, crop.height * scale))
+            text = self._ocr_text(im, psm=psm).strip()
+            raw_reads.append(text)
+            vocab = _resolve_observed_unit_vocab(text)
+            if vocab is not None:
+                votes[vocab] = votes.get(vocab, 0) + 1
+
+        raw = next((r for r in raw_reads if r), None)
+        if not votes:
+            return raw, None
+        best_unit, best_count = max(votes.items(), key=lambda kv: kv[1])
+        return raw, (best_unit if best_count >= 2 else None)
 
     def commit_item(self) -> None:
         VK_S = 0x53
@@ -1442,7 +1737,21 @@ class WindowsXactimateAdapter(XactimateAdapter):
         a multi-row grid. Same crop/PSM/upscale parameters as the
         equivalent fields in `_read_populated_fields_once()` (Phase
         4.4 Stage 3's live-verified settings), applied at a caller-
-        supplied row position instead of the grid's last row."""
+        supplied row position instead of the grid's last row.
+
+        Live-caught (Phase 4.7): the `selector` column boundary (563,
+        620), widened in Phase 4.4 to fit a 6-character code like
+        "GUTAB>", visually overlaps the neighboring `activity` column
+        for a SHORT code -- reproduced live: a real "GUTA" cell OCR'd
+        as "GUTA &", the trailing "&" being the activity symbol
+        bleeding in from real pixel content, not an OCR misread this
+        time. Rather than re-narrow the boundary (which would risk
+        re-truncating the long codes Phase 4.4 widened it for -- the
+        two failure modes trade off against the same pixel range),
+        the selector OCR result is split on whitespace and only the
+        first token kept, since a real selector code never legitimately
+        contains a space itself. See docs/xactimate-lookup.md Phase
+        4.7."""
         dx = offset[0]
 
         def crop_col(col_name):
@@ -1454,7 +1763,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         cat = self._ocr_text(cat_crop, psm=6).strip() or None
         sel_crop = crop_col("selector")
         sel_crop = sel_crop.resize((sel_crop.width * 4, sel_crop.height * 4))
-        sel = self._ocr_text(sel_crop).strip() or None
+        sel_raw = self._ocr_text(sel_crop).strip()
+        sel = sel_raw.split()[0] if sel_raw else None
         return cat, sel
 
     def _snapshot_grid_identities(self) -> list[tuple[str | None, str | None]]:
@@ -1475,6 +1785,143 @@ class WindowsXactimateAdapter(XactimateAdapter):
             self._read_category_selector_at(image, offset, row_1_top + i * _GRID_ROW_HEIGHT)
             for i in range(row_count)
         ]
+
+    def _read_description_at(self, image, offset: tuple[int, int], row_top: int) -> str | None:
+        """Lighter-weight description-only read at an ARBITRARY
+        row_top, same crop/PSM as `_read_populated_fields_once()`.
+        Used by `verify_committed_row()` for informational/
+        instrumentation purposes (Phase 4.7 Stage 4) -- row identity
+        itself is decided by CAT+SEL, not description."""
+        col_l, col_r = _GRID_COLUMNS["description"]
+        dx = offset[0]
+        crop = image.crop((col_l + dx, row_top, col_r + dx, row_top + _GRID_ROW_HEIGHT))
+        return self._normalize_inch_mark(self._ocr_text(crop, psm=6)) or None
+
+    #: Maps `UnitVerificationResult.unit_match_state` to Stage 8's
+    #: three-tier compatibility outcome. A quantity match never
+    #: overrides this -- `verify_committed_row()` sets `compatibility`
+    #: from this table alone, regardless of `quantity_matched`. See
+    #: docs/xactimate-lookup.md Phase 4.7 Stage 8.
+    _UNIT_STATE_TO_COMPATIBILITY = {
+        "exact_match": "compatible",
+        "normalized_synonym": "compatible",
+        "verified_conversion": "compatible",
+        "source_unit_missing": "review_required",
+        "expected_unit_missing": "review_required",
+        "observed_unit_missing": "review_required",
+        "unreadable": "review_required",
+        "ambiguous": "review_required",
+        "incompatible": "hard_stop",
+    }
+
+    def verify_committed_row(
+        self,
+        category: str,
+        selector: str,
+        expected_quantity: float,
+        source_unit: str | None = None,
+        expected_xactimate_unit: str | None = None,
+        timeout_s: float = 3.0,
+    ) -> CommittedRowVerification:
+        """Not part of the abstract contract -- Phase 4.7's integrated
+        committed-row verification: identifies the committed row by
+        CAT+SEL identity (Stage 5) BEFORE reading anything from it
+        (never a presumed row index -- `verify_quantity_committed()`'s
+        `_last_row_geometry()`-based approach assumed the target was
+        always the last row, which Phase 4.6's pilot showed is not
+        reliable once more than one row exists), then independently
+        verifies both quantity (Stage 7) and unit (Stage 6), and
+        evaluates unit compatibility (Stage 8) -- a quantity match
+        never overrides a unit conflict; `compatibility` is set purely
+        from the unit outcome.
+
+        Bounded polling (progressive intervals, matching
+        `verify_quantity_committed()`) terminates on the first of:
+        - exactly one row matches CAT+SEL and both quantity and unit
+          were read (``stop_reason="verified"`` -- NOT the same as
+          "quantity matched" or "unit compatible"; those are separate
+          fields on the result, checked by the caller);
+        - MORE than one row matches CAT+SEL
+          (``stop_reason="conflicting_row"`` -- refuses to guess which
+          is the committed one);
+        - `_unexpected_dialog_present()` (``stop_reason="wrong_context"``);
+        - `timeout_s` elapses with zero or ambiguous matches
+          (``stop_reason="commit_verification_failed"``).
+
+        Every attempt's full instrumentation (elapsed time, row count,
+        which row indices matched, raw unit OCR at every scale/PSM
+        tried) is recorded in `.samples` (Stage 4). See
+        docs/xactimate-lookup.md Phase 4.7."""
+        start = time.time()
+        samples: list[dict] = []
+        attempts = 0
+
+        def fail(stop_reason: str, reason: str) -> CommittedRowVerification:
+            return CommittedRowVerification(
+                stop_reason=stop_reason, row_identified=False, row_index=None,
+                category=category, selector=selector, description=None,
+                quantity_expected=expected_quantity, quantity_observed=None, quantity_matched=False,
+                unit=None, compatibility="not_evaluated", compatibility_reason=reason,
+                attempts=attempts, elapsed_s=time.time() - start, samples=samples,
+            )
+
+        while True:
+            attempts += 1
+            elapsed = time.time() - start
+            if self._unexpected_dialog_present():
+                return fail("wrong_context", "an unexpected dialog appeared while identifying the committed row")
+
+            hwnd = self._ensure_main_window()
+            image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+            sample: dict = {"elapsed_s": round(elapsed, 3), "row_count": None, "matched_row_indices": []}
+
+            if offset is not None:
+                geom = self._last_row_geometry(image, offset)
+                row_count = geom[0] if geom else 0
+                sample["row_count"] = row_count
+                row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+                matches = []
+                for i in range(row_count):
+                    row_top = row_1_top + i * _GRID_ROW_HEIGHT
+                    cat, sel = self._read_category_selector_at(image, offset, row_top)
+                    if cat == category and sel == selector:
+                        matches.append((i, row_top))
+                sample["matched_row_indices"] = [m[0] for m in matches]
+                samples.append(sample)
+
+                if len(matches) > 1:
+                    return fail(
+                        "conflicting_row",
+                        f"{len(matches)} rows matched {category}/{selector} (indices {[m[0] for m in matches]}) "
+                        f"-- refusing to guess which is the committed one",
+                    )
+
+                if len(matches) == 1:
+                    row_index, row_top = matches[0]
+                    description = self._read_description_at(image, offset, row_top)
+                    quantity_observed = self._read_quantity_at(image, offset, row_top)
+                    unit_raw, _unit_norm_unused = self._read_unit_at(image, offset, row_top)
+                    sample["unit_raw"] = unit_raw
+                    sample["quantity_observed"] = quantity_observed
+                    unit_result = check_unit_compatibility(source_unit, expected_xactimate_unit, unit_raw)
+                    compatibility = self._UNIT_STATE_TO_COMPATIBILITY.get(unit_result.unit_match_state, "review_required")
+                    return CommittedRowVerification(
+                        stop_reason="verified", row_identified=True, row_index=row_index,
+                        category=category, selector=selector, description=description,
+                        quantity_expected=expected_quantity, quantity_observed=quantity_observed,
+                        quantity_matched=(quantity_observed == expected_quantity),
+                        unit=unit_result, compatibility=compatibility, compatibility_reason=unit_result.unit_match_reason,
+                        attempts=attempts, elapsed_s=time.time() - start, samples=samples,
+                    )
+            else:
+                samples.append(sample)
+
+            if elapsed >= timeout_s:
+                return fail(
+                    "commit_verification_failed",
+                    f"no row matching {category}/{selector} found within {timeout_s}s ({attempts} attempts)",
+                )
+            time.sleep(0.1 if attempts < 5 else 0.4)
 
     def delete_existing_item(self, category: str, selector: str) -> None:
         """Not part of the abstract contract. Targeted deletion of a
