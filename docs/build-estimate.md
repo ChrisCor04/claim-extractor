@@ -181,3 +181,128 @@ column changed); (2) find the group-creation mechanism (right-click
 context menu was the leading hypothesis, not yet tried); (3) find a
 reliable way to read back which group is currently active, independent of
 having just clicked it.
+
+## Phase 5.1 — Finish Live Xactimate Group Control
+
+Picks up exactly where Phase 5.0 left off: live-validate group selection,
+discover group creation, and implement `ensure_group()`/`select_group()`/
+`verify_group()` on `WindowsXactimateAdapter`.
+
+### Stage 1-2: environment restored, group selection ground-truthed
+
+The Windows Firewall dialog that blocked Phase 5.0's session was gone;
+Xactimate had foreground focus with the TEST project's Estimate Items
+screen open, baseline clean (0 rows, `TEST` → `Utility Room`). Group
+selection was ground-truthed 5/5 times (alternating `TEST`/`Utility Room`,
+committing one disposable item each time and reading the tree's Subtotal
+column as independent evidence) -- click-to-select is real and reliable.
+
+### Stage 3: group creation, and two real mechanism bugs found live
+
+**Creation**, discovered via the tree's right-click context menu (a
+*different* menu from the grid row's, despite an identical 26-item flat
+count): `Cut, Copy, Paste, [sep], Select>, Deselect>, [sep], Expand>,
+Collapse>, [sep], Filter Options..., Tree View, List View, Grouping
+Selection>, [sep], New..., Edit..., Delete, Dimension, [sep], Grouping...,
+Global Changes..., Global Item Sort by>, [sep], Save Macro..., Retrieve
+Macro...` -- "New..." (index 15) opens a "New Group" dialog (Name field +
+Coverage dropdown + Append/Insert/Attach buttons, only "Attach" enabled
+when right-clicking an existing node); typing a name and clicking Attach
+creates it as a child, live-confirmed multiple times.
+
+**Bug 1 -- the tree does not preserve insertion order.** A row index
+computed once and reused after other actions is not trustworthy; two
+independent attempts to delete a specific just-created row by a presumed
+index instead deleted the pre-existing baseline group (`Utility Room`),
+confirmed by direct visual/OCR inspection both times, and recovered by
+recreating it. Fixed by requiring every group-tree action to re-locate its
+target row fresh, by OCR text match, immediately before acting -- never a
+cached or presumed index.
+
+**Bug 2 -- Delete does not reliably target the right-clicked row.** Even
+with fresh row-lookup, a right-click alone, or a left-click followed only
+by `time.sleep()` (tried up to 1.5s), did not make Delete operate on the
+intended row -- reproduced live multiple times, always removing the
+*previous* row instead. What worked, reproduced twice: forcing a real
+window repaint (a screenshot capture, not a sleep) between the left-click
+and the right-click. The selection change apparently only commits
+internally once the window processes a paint cycle. `delete_group()` is
+additionally self-verifying (checks which group actually vanished after
+each attempt and restores anything wrongly removed before retrying) as a
+second line of defense, since even the repaint fix is not proven perfectly
+reliable across every tree size.
+
+### Stage 4: implementation, and a precise miscalibration found live
+
+`ensure_group()`, `select_group()`, `verify_group()` implemented using the
+tree's own "Group" column header as a self-contained OCR anchor (not the
+grid's "Cat" anchor, which is unreliable whenever the grid has zero
+rows -- the common case group operations run in).
+
+Live testing surfaced a real, precise bug: the row-to-row pixel spacing
+used for click positioning was calibrated at 15px early in Stage 3, close
+enough that `row_index=1` clicks happened to land correctly but
+`row_index=2` clicks did not (confirmed live: a click computed for
+"Dwelling Roof" landed on "Utility Room" instead, proven by where a
+committed probe item's cost actually appeared). Remeasured precisely via
+OCR word-level top-positions on a real 3-row tree: 22-23px between child
+rows, not 15. Fixed, and reproduced live afterward: `select_group()`
+correctly distinguished `row_index=1` from `row_index=2` and the
+committed-item ground truth landed in the intended group both times.
+
+`verify_group()` was designed first as a passive, non-mutating check (a
+blue-pixel selection-highlight count). Live testing found the highlight
+did not reliably track which group item entry actually targets --
+confirmed twice: `select_group()` provably changed the real target (per
+ground-truth commit) while the highlight-based read reported the old
+group, or nothing confidently selected. Replaced with the same
+ground-truth method Stage 2 established: commit one disposable, known
+item, confirm the *target* group's Subtotal cell gained content, then
+always clean up (`_cleanup_probe_item()`, bounded, best-effort, matches
+every other cleanup helper in this file). OCR on the small Subtotal crop
+itself proved unreliable even after locating the real column position
+fresh; a non-white-pixel-count comparison against a known-blank row
+(the project root) proved reliable instead. Live-confirmed for the
+positive case (`verify_group("Dwelling Roof")` → `True` right after
+`select_group("Dwelling Roof")`) before the session's live-testing window
+closed (see below) -- the symmetric negative-direction case
+(`select_group("Utility Room")` → `verify_group("Utility Room")`) had not
+yet been re-confirmed with the final pixel-comparison implementation.
+
+### Session end: Xactimate closed unexpectedly
+
+Partway through re-confirming `verify_group()`'s second direction, the
+Xactimate process was found to have exited entirely (no window, no
+process, no crash dialog) -- not initiated by any action this session
+took. Relaunching Xactimate and reopening the TEST project was outside
+this session's authorized scope ("use" an already-open session was
+authorized; launching a new one was not). The multi-group live pilot
+(Stage 5), Build Estimate UI live validation (Stage 6), and final cleanup
+verification (Stage 7) could not run as a result.
+
+**Last confirmed live state:** TEST project, `TEST` → `Utility Room` +
+`Dwelling Roof` (the latter a leftover disposable test group), 0 grid
+rows. Cleanup of `Dwelling Roof` to fully restore the original baseline
+did not complete before the process exited.
+
+### What's proven vs. not, precisely
+
+- Proven live, repeatedly: group creation, group selection (including in
+  a 3-row tree), and one full ground-truth verification cycle.
+- Proven live once, not yet re-confirmed: `verify_group()`'s negative
+  case with the final (pixel-comparison) implementation.
+- Not run this session: the multi-group pilot, Build Estimate UI live
+  execution, and automated end-of-session cleanup verification.
+- 7 new unit tests (pure logic + mocked application/project-state error
+  paths) pass; these do not substitute for the live multi-group pilot.
+
+### Next session, first step
+
+Confirm Xactimate is running with the TEST project open (relaunch if
+authorized), then: (1) delete the leftover `Dwelling Roof` group to
+restore the exact original baseline; (2) re-run `verify_group()`'s
+negative-direction case once to close out Stage 4; (3) run the Stage 5
+multi-group pilot (Exterior / Dwelling Roof / Front Elevation, mixed
+units, a REVIEW_REQUIRED item, a NO_MATCH item); (4) Stage 6 Build
+Estimate UI validation against the Aranda project; (5) Stage 7 cleanup
+verification.
