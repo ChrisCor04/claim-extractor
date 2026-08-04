@@ -1658,6 +1658,54 @@ class WindowsXactimateAdapter(XactimateAdapter):
     _CONTEXT_MENU_DELETE_INDEX = 11
     _CONTEXT_MENU_EXPECTED_ITEM_COUNT = 26
 
+    #: Phase 5.1: the group tree's OWN right-click context menu is a
+    #: DIFFERENT menu from the grid row's (different real actions,
+    #: different structural indices) despite coincidentally having the
+    #: same total flat item count. Live-measured (docs/build-estimate.md
+    #: Phase 5.1 Stage 3): Cut, Copy, Paste, [sep], Select>, Deselect>,
+    #: [sep], Expand>, Collapse>, [sep], Filter Options..., Tree View,
+    #: List View, Grouping Selection>, [sep], New..., Edit..., Delete,
+    #: Dimension, [sep], Grouping..., Global Changes..., Global Item Sort
+    #: by>, [sep], Save Macro..., Retrieve Macro... -- "New..." and
+    #: "Delete" are the two real indices used here.
+    _GROUP_MENU_EXPECTED_ITEM_COUNT = 26
+    _GROUP_MENU_NEW_INDEX = 15
+    _GROUP_MENU_DELETE_INDEX = 17
+
+    #: Live-measured, self-contained relative to the group tree's own
+    #: "Group" column header text (NOT the grid's "Cat" anchor -- that
+    #: anchor was found live-unreliable whenever the grid has zero rows,
+    #: which is exactly the common case group operations run in; see
+    #: docs/build-estimate.md Phase 5.1). Row 0 is always the project
+    #: root; child groups start at row 1.
+    #: Live-caught (Phase 5.1 Stage 4): an earlier calibration (15px)
+    #: was close enough to make row_index=1 clicks land correctly (the
+    #: error was within that row's clickable tolerance) but NOT
+    #: row_index=2 -- confirmed live, a click computed with the wrong
+    #: height landed on row_index=1 ("Utility Room") instead of
+    #: row_index=2 ("Dwelling Roof") even though OCR text-reading
+    #: (which uses a taller, more forgiving crop) still read both rows
+    #: correctly. Remeasured directly via OCR word-level top-position on
+    #: a real 3-row tree: TEST~125, Utility Room~153, Dwelling Roof~175
+    #: (relative to client origin) -- 22-23px between child rows, not
+    #: 15. See docs/build-estimate.md Phase 5.1.
+    _GROUP_TREE_ROW1_DY = 27
+    _GROUP_TREE_ROW_HEIGHT = 23
+    _GROUP_TREE_CLICK_DX = 79
+    #: OCR text crops use a separate, shorter row-height constant from
+    #: the click positioning above -- the crop's own generous height
+    #: (_GROUP_TREE_TEXT_HEIGHT=22) tolerates the resulting cumulative
+    #: offset well enough to still read the right text (confirmed live
+    #: across every OCR read this phase), even though that same 15px
+    #: value is NOT precise enough for a click, which has no such
+    #: margin. Kept deliberately distinct rather than "fixed" to match,
+    #: since the OCR path is proven working as-is.
+    _GROUP_TREE_TEXT_DX = 35
+    _GROUP_TREE_TEXT_DY = 25
+    _GROUP_TREE_TEXT_ROW_HEIGHT = 15
+    _GROUP_TREE_TEXT_WIDTH = 245
+    _GROUP_TREE_TEXT_HEIGHT = 22
+
     def _find_context_menu_popup_hwnd(self, main_hwnd: int) -> int | None:
         """Returns the HWND of the currently-open row context menu (a
         separate top-level WPF popup window, like the search-results
@@ -2288,3 +2336,407 @@ class WindowsXactimateAdapter(XactimateAdapter):
             "supports_live_execution": self.supports_live_execution,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+
+    # ------------------------------------------------------------------
+    # Group control (Phase 5.1) -- not part of the abstract contract.
+    # The group tree's own content is NOT UI-Automation-accessible (same
+    # `NULL COM pointer access` limitation as the main window's grid --
+    # see docs/build-estimate.md Phase 5.1 Stage 3), so this uses the
+    # same pixel/OCR methodology as everything else in this file, with
+    # its own self-contained anchor (the tree's "Group" column header),
+    # never the grid's "Cat" anchor -- that one was found live-unreliable
+    # whenever the grid has zero rows, which is exactly the common case
+    # group operations run in.
+    # ------------------------------------------------------------------
+
+    def _locate_group_tree_header(self, image) -> tuple[int, int, int, int] | None:
+        return self._locate_label(image, "Group", prefer="topmost")
+
+    def _group_tree_row_xy(self, header_pos: tuple[int, int], row_index: int) -> tuple[int, int]:
+        left, top = header_pos[0], header_pos[1]
+        return (
+            left + self._GROUP_TREE_CLICK_DX,
+            top + self._GROUP_TREE_ROW1_DY + row_index * self._GROUP_TREE_ROW_HEIGHT,
+        )
+
+    def snapshot_group_names(self, max_rows: int = 8) -> list[str]:
+        """Not part of the abstract contract. Returns the group tree's
+        rows top-to-bottom, OCR'd -- row 0 is always the project root
+        (returned as `expected_project_name` verbatim, never OCR'd: it's
+        immutable and OCR noise on it is not informative), rows 1+ are
+        child groups, read fresh every call (never cached -- matches
+        `snapshot_grid_identities()`'s own contract). Returns `[]` if the
+        tree header can't be located."""
+        hwnd = self._ensure_main_window()
+        image = self._capture_client_image(hwnd)
+        header = self._locate_group_tree_header(image)
+        if header is None:
+            return []
+        left, top = header[0], header[1]
+        rows = [self.expected_project_name]
+        for i in range(1, max_rows):
+            row_top = top + self._GROUP_TREE_TEXT_DY + i * self._GROUP_TREE_TEXT_ROW_HEIGHT
+            crop = image.crop((
+                left + self._GROUP_TREE_TEXT_DX, row_top,
+                left + self._GROUP_TREE_TEXT_DX + self._GROUP_TREE_TEXT_WIDTH, row_top + self._GROUP_TREE_TEXT_HEIGHT,
+            ))
+            rows.append(self._ocr_text(crop, psm=7).strip())
+        return rows
+
+    @staticmethod
+    def _group_name_matches(ocr_text: str, group_name: str) -> bool:
+        """OCR on the group tree is noisy (icons/gridlines bleed into
+        the crop -- see docs/build-estimate.md Phase 5.1 Stage 3), so
+        this is a whitespace-insensitive substring match, not equality
+        -- the same tolerance level established for every other
+        OCR'd label in this file."""
+        needle = group_name.strip().lower().replace(" ", "")
+        return bool(needle) and needle in ocr_text.strip().lower().replace(" ", "")
+
+    def _find_group_row(self, rows: list[str], group_name: str) -> int | None:
+        for i, text in enumerate(rows):
+            if self._group_name_matches(text, group_name):
+                return i
+        return None
+
+    def _open_group_tree_context_menu(self, hwnd: int, header_pos: tuple[int, int], row_index: int) -> list:
+        """Left-clicks the row (to select/focus it), forces a repaint
+        (a screenshot capture -- NOT a plain sleep), then right-clicks
+        the SAME position and returns the raw UIA menu item elements.
+        Live-caught (Phase 5.1 Stage 3): a right-click alone, or a
+        left-click followed only by `time.sleep()` (tried up to 1.5s),
+        do NOT reliably make Delete operate on the right-clicked row --
+        two independent reproducible live failures each way. What DOES
+        work, twice reproduced: force a real repaint (PrintWindow via a
+        screenshot) between the two clicks. The selection change
+        apparently only commits internally once the window processes a
+        paint cycle; idle sleeping never forces that on its own.
+        Raises AdapterError if the menu doesn't appear or doesn't have
+        the expected structural shape (never guesses)."""
+        xy = self._group_tree_row_xy(header_pos, row_index)
+        last_count = None
+        for attempt in range(6):
+            self._click_client(hwnd, *xy)
+            time.sleep(0.3)
+            self._capture_client_image(hwnd)  # force the repaint -- see docstring
+            time.sleep(0.3)
+            self._open_row_context_menu(hwnd, *xy)
+            time.sleep(0.5)
+            popup_hwnd = self._find_context_menu_popup_hwnd(hwnd)
+            if popup_hwnd is None:
+                raise AdapterError("Group tree context menu did not appear.")
+            uia, UIA = self._uia()
+            element = uia.ElementFromHandle(popup_hwnd)
+            walker = uia.RawViewWalker
+            menu_root = walker.GetFirstChildElement(element)
+            items = []
+            child = walker.GetFirstChildElement(menu_root) if menu_root else None
+            while child is not None:
+                items.append(child)
+                try:
+                    child = walker.GetNextSiblingElement(child)
+                except Exception:
+                    break
+            # Live-caught (Phase 5.1): the raw UIA walk occasionally
+            # yields one extra child with the SAME bounding rectangle as
+            # another real item (a phantom/duplicate node -- the popup
+            # window's own pixel size is identical whether this happens
+            # or not, confirming it's a UIA enumeration artifact, not a
+            # real extra menu entry). Deduplicating by exact rect before
+            # counting makes the structural-index check robust to it.
+            deduped = []
+            seen_rects = set()
+            for it in items:
+                try:
+                    r = it.CurrentBoundingRectangle
+                except Exception:
+                    continue  # stale/invalid COM reference -- same class of phantom node
+                key = (r.left, r.top, r.right, r.bottom)
+                if key in seen_rects:
+                    continue
+                seen_rects.add(key)
+                deduped.append(it)
+            items = deduped
+            if len(items) == self._GROUP_MENU_EXPECTED_ITEM_COUNT:
+                return items
+            # Live-caught (Phase 5.1): a transient wrong item count (seen
+            # once: 27 instead of 26) self-corrected on the very next
+            # fresh open -- dismiss and retry a bounded number of times
+            # before refusing to guess.
+            last_count = len(items)
+            self._press_key(0x1B)
+            time.sleep(0.8)
+        raise AdapterError(
+            f"Group tree context menu had {last_count} items, expected "
+            f"{self._GROUP_MENU_EXPECTED_ITEM_COUNT} -- refusing to guess which one is which."
+        )
+
+    def _click_group_menu_item(self, items: list, index: int) -> None:
+        target = items[index]
+        rect = target.CurrentBoundingRectangle
+        height = rect.bottom - rect.top
+        if not (18 <= height <= 30):
+            self._press_key(0x1B)
+            raise AdapterError(f"Group menu index {index} doesn't look like a real item (height={height}px).")
+        cx = (rect.left + rect.right) // 2
+        cy = (rect.top + rect.bottom) // 2
+        self._click_screen(cx, cy)
+
+    def _find_window_by_title(self, title: str) -> int | None:
+        win32gui = self._win32gui()
+        found: list[int] = []
+
+        def cb(h, acc):
+            try:
+                if win32gui.IsWindowVisible(h) and win32gui.GetWindowText(h) == title:
+                    acc.append(h)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(cb, found)
+        return found[0] if found else None
+
+    def ensure_group(self, group_name: str) -> None:
+        """Not part of the abstract contract. Creates `group_name` as a
+        child of the project root if it doesn't already exist (a no-op,
+        verified via a fresh snapshot, if it does). Never guesses:
+        raises AdapterError if the "New Group" dialog doesn't appear, or
+        if the group still can't be found after the creation sequence
+        completes. Verifies the project before mutating anything (Phase
+        5.1 requirement: "verify project before every mutation")."""
+        if not self.verify_application() or not self.verify_project():
+            raise AdapterError(f"ensure_group({group_name!r}): could not verify the expected project is active.")
+
+        hwnd = self._ensure_main_window()
+        self._force_foreground(hwnd)
+        rows = self.snapshot_group_names()
+        if self._find_group_row(rows, group_name) is not None:
+            return  # already exists -- nothing to do
+
+        image = self._capture_client_image(hwnd)
+        header = self._locate_group_tree_header(image)
+        if header is None:
+            raise AdapterError(f"ensure_group({group_name!r}): could not locate the group tree.")
+
+        items = self._open_group_tree_context_menu(hwnd, header, 0)  # right-click the project root
+        self._click_group_menu_item(items, self._GROUP_MENU_NEW_INDEX)
+        time.sleep(0.8)
+
+        dialog_hwnd = self._find_window_by_title("New Group")
+        if dialog_hwnd is None:
+            raise AdapterError(f"ensure_group({group_name!r}): the 'New Group' dialog did not appear.")
+
+        NAME_FIELD = (185, 18)
+        ATTACH_BUTTON = (305, 75)
+        self._click_client(dialog_hwnd, *NAME_FIELD)
+        time.sleep(0.3)
+        self._select_all_and_delete()
+        time.sleep(0.2)
+        self._type_keybdevent(group_name)
+        time.sleep(0.3)
+        self._click_client(dialog_hwnd, *ATTACH_BUTTON)
+        time.sleep(1.0)
+
+        rows_after = self.snapshot_group_names()
+        if self._find_group_row(rows_after, group_name) is None:
+            raise AdapterError(
+                f"ensure_group({group_name!r}): group still not found after the creation sequence completed."
+            )
+
+    def select_group(self, group_name: str) -> None:
+        """Not part of the abstract contract. Left-clicks the row for
+        `group_name`, found fresh by OCR (never a presumed index -- the
+        tree does not preserve insertion order, see docs/build-estimate.md
+        Phase 5.1 Stage 3). Raises AdapterError if the group doesn't
+        exist -- select_group() never creates one; call ensure_group()
+        first."""
+        if not self.verify_application() or not self.verify_project():
+            raise AdapterError(f"select_group({group_name!r}): could not verify the expected project is active.")
+
+        hwnd = self._ensure_main_window()
+        self._force_foreground(hwnd)
+        image = self._capture_client_image(hwnd)
+        header = self._locate_group_tree_header(image)
+        if header is None:
+            raise AdapterError(f"select_group({group_name!r}): could not locate the group tree.")
+
+        rows = self.snapshot_group_names()
+        row_index = self._find_group_row(rows, group_name)
+        if row_index is None:
+            raise AdapterError(f"select_group({group_name!r}): group not found in the tree (rows: {rows!r}).")
+
+        xy = self._group_tree_row_xy(header, row_index)
+        self._click_client(hwnd, *xy)
+        time.sleep(0.3)
+        # Force a repaint before returning -- see
+        # `_open_group_tree_context_menu()`'s docstring: the selection
+        # change only reliably commits internally once the window
+        # processes a paint cycle, which idle sleeping alone does not
+        # force. verify_group() relies on this having already happened.
+        self._capture_client_image(hwnd)
+        time.sleep(0.3)
+
+    #: Cheapest, always-present catalog item used as a disposable probe
+    #: by verify_group() -- the same CAT/SEL relied on throughout every
+    #: prior phase's live trials.
+    _VERIFY_GROUP_PROBE_CATEGORY = "SFG"
+    _VERIFY_GROUP_PROBE_SELECTOR = "GUTA"
+
+    def _group_subtotal_has_content(self, image, header_pos: tuple[int, int], row_index: int, blank_row_index: int) -> bool:
+        """Live-caught (Phase 5.1): OCR on the Subtotal cell was tried
+        first and found unreliable at this crop size (garbled text even
+        with the correct crop region located via a fresh "Subtotal"
+        header search). A pixel-presence comparison is more robust here:
+        a populated currency cell ("$11.56") has substantially more
+        non-white pixels than an empty one -- confirmed live (populated:
+        ~2450 non-white pixels; empty rows: ~1200-1800, including the
+        project root row's own icon/arrow noise). Compares against
+        `blank_row_index` (a row already independently known to be
+        empty) rather than a fixed absolute threshold, since the
+        "empty" baseline itself is not zero (gridline/icon noise)."""
+        left, top = header_pos[0], header_pos[1]
+        subtotal_header = self._locate_label(image, "Subtotal", prefer="topmost")
+        subtotal_left = subtotal_header[0] if subtotal_header is not None else left + 168
+
+        def non_white_count(row_index: int) -> int:
+            row_top = top + self._GROUP_TREE_TEXT_DY + row_index * self._GROUP_TREE_ROW_HEIGHT
+            crop = image.crop((subtotal_left, row_top, subtotal_left + 130, row_top + self._GROUP_TREE_TEXT_HEIGHT))
+            return sum(1 for p in crop.getdata() if p[:3] != (255, 255, 255))
+
+        target_count = non_white_count(row_index)
+        blank_count = non_white_count(blank_row_index)
+        return target_count > blank_count + 400
+
+    def verify_group(self, group_name: str) -> bool:
+        """Not part of the abstract contract. Independently confirms
+        `group_name` is the group new items actually land in -- via the
+        SAME ground-truth method Phase 5.1 Stage 2 established (commit
+        one disposable, known-cheap item, read the target group's
+        Subtotal cell, clean up): a passive pixel/visual-highlight
+        check was tried first and found live-unreliable (the visible
+        selection highlight does not always track which group item
+        entry actually targets -- two reproducible live mismatches, see
+        docs/build-estimate.md Phase 5.1 Stage 4). This DOES mutate the
+        estimate transiently; it always cleans up before returning,
+        including on failure. Returns False, never raises, on anything
+        short of a confident match -- callers must never silently
+        proceed on an unverified group."""
+        try:
+            if not self.verify_application() or not self.verify_project():
+                return False
+            hwnd = self._ensure_main_window()
+            rows = self.snapshot_group_names()
+            target_index = self._find_group_row(rows, group_name)
+            if target_index is None:
+                return False
+
+            image, offset = self._capture_and_locate(hwnd)
+            row_count_before = self._count_grid_rows(image, offset) if offset is not None else None
+
+            self.focus_search()
+            self.clear_search()
+            time.sleep(0.4)
+            self.search_by_category_selector(self._VERIFY_GROUP_PROBE_CATEGORY, self._VERIFY_GROUP_PROBE_SELECTOR)
+            raw = self.capture_dropdown()
+            candidates = self.parse_dropdown(raw)
+            target = next(
+                (c for c in candidates
+                 if c.category == self._VERIFY_GROUP_PROBE_CATEGORY and c.selector == self._VERIFY_GROUP_PROBE_SELECTOR),
+                None,
+            )
+            if target is None:
+                return False
+            self.select_candidate(target)
+            self.enter_quantity(1)
+            self.commit_item()
+            time.sleep(1.0)
+
+            image2 = self._capture_client_image(hwnd)
+            header2 = self._locate_group_tree_header(image2)
+            if header2 is None:
+                return False
+            return self._group_subtotal_has_content(image2, header2, target_index, blank_row_index=0)
+        except Exception:
+            return False
+        finally:
+            try:
+                self._cleanup_probe_item()
+            except Exception:
+                pass
+
+    def _cleanup_probe_item(self) -> None:
+        """Removes whatever verify_group()'s disposable probe item left
+        behind -- bounded, best-effort, never raises (matches every
+        other cleanup helper in this file)."""
+        hwnd = self._ensure_main_window()
+        for _attempt in range(6):
+            image, offset = self._capture_and_locate(hwnd)
+            row_count = self._count_grid_rows(image, offset) if offset is not None else None
+            if row_count == 0:
+                break
+            try:
+                self.cancel_current_item()
+            except Exception:
+                pass
+            time.sleep(0.3)
+        self.commit_item()
+        time.sleep(0.3)
+
+    def delete_group(self, group_name: str, *, keep_names: list[str] | None = None, max_attempts: int = 5) -> bool:
+        """Not part of the abstract contract, and NOT required by the
+        execution-runner contract (ensure/select/verify are) -- provided
+        only as a disposable-test/cleanup helper. Live-caught (Phase 5.1
+        Stage 3): a single Delete attempt is NOT always reliable when
+        more than one child group exists -- it can remove a DIFFERENT
+        row than the one right-clicked (reproduced live even with the
+        repaint-settle fix applied). Self-verifying and defensive: after
+        each attempt, checks which group actually disappeared; if it
+        was the wrong one, immediately recreates it (never leaves
+        `keep_names` groups missing) before retrying. Bounded retries --
+        never loops forever, never silently gives up either (returns
+        False, does not raise, if it exhausts `max_attempts`)."""
+        keep_names = keep_names or []
+        if not self.verify_application() or not self.verify_project():
+            return False
+        hwnd = self._ensure_main_window()
+        self._force_foreground(hwnd)
+
+        for _attempt in range(max_attempts):
+            rows_before = self.snapshot_group_names()
+            target_index = self._find_group_row(rows_before, group_name)
+            if target_index is None:
+                return True  # already gone
+
+            image = self._capture_client_image(hwnd)
+            header = self._locate_group_tree_header(image)
+            if header is None:
+                return False
+            try:
+                items = self._open_group_tree_context_menu(hwnd, header, target_index)
+                self._click_group_menu_item(items, self._GROUP_MENU_DELETE_INDEX)
+                time.sleep(0.8)
+                dialog_hwnd = self._find_window_by_title("Delete Options")
+                if dialog_hwnd is None:
+                    continue
+                OK_BUTTON = (55, 111)  # default radio: "Grouping member(s)"
+                self._click_client(dialog_hwnd, *OK_BUTTON)
+                time.sleep(1.0)
+            except AdapterError:
+                continue
+
+            rows_after = self.snapshot_group_names()
+            if self._find_group_row(rows_after, group_name) is not None:
+                continue  # delete had no effect -- retry
+
+            missing_keep = [k for k in keep_names if self._find_group_row(rows_after, k) is None]
+            if not missing_keep:
+                return True
+            # wrong group vanished -- restore it before retrying
+            for k in missing_keep:
+                try:
+                    self.ensure_group(k)
+                except AdapterError:
+                    pass
+
+        return False

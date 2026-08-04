@@ -672,3 +672,88 @@ def test_verify_commit_identity_available_for_cleanup_after_unit_mismatch(monkey
     assert result.row_index == 0
     assert result.category_expected == "SFG"
     assert result.selector_expected == "GUTA"
+
+
+# ---------------------------------------------------------------------------
+# Group control (Phase 5.1): ensure_group / select_group / verify_group
+# ---------------------------------------------------------------------------
+
+
+def test_group_name_matches_is_whitespace_and_case_insensitive():
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    assert adapter._group_name_matches("fy DwellingRoofl Ss", "Dwelling Roof") is True
+    assert adapter._group_name_matches("& Utility Room || Simila", "Utility Room") is True
+    assert adapter._group_name_matches("", "Dwelling Roof") is False
+    assert adapter._group_name_matches("Front Elevation", "Dwelling Roof") is False
+
+
+def test_find_group_row_returns_first_match_index():
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = ["TEST", "Utility Room", "Dwelling Roof", ""]
+    assert adapter._find_group_row(rows, "Dwelling Roof") == 2
+    assert adapter._find_group_row(rows, "Utility Room") == 1
+    assert adapter._find_group_row(rows, "Front Elevation") is None
+
+
+def test_select_group_raises_when_group_not_found(monkeypatch):
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Utility Room"])
+
+    with pytest.raises(AdapterError, match="not found"):
+        adapter.select_group("Dwelling Roof")
+
+
+def test_select_group_raises_when_application_unverified(monkeypatch):
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: False)
+
+    with pytest.raises(AdapterError, match="could not verify"):
+        adapter.select_group("Dwelling Roof")
+
+
+def test_ensure_group_is_a_no_op_when_group_already_exists(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Utility Room", "Dwelling Roof"])
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("ensure_group must not attempt creation when the group already exists")
+
+    monkeypatch.setattr(adapter, "_capture_client_image", _fail_if_called)
+
+    adapter.ensure_group("Dwelling Roof")  # must return without raising
+
+
+def test_verify_group_returns_false_when_group_not_in_tree(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Utility Room"])
+
+    assert adapter.verify_group("Dwelling Roof") is False
+
+
+def test_verify_group_never_raises_on_unexpected_error(monkeypatch):
+    """verify_group() must return False, never propagate an exception --
+    callers rely on a boolean, not a try/except, to decide whether a
+    group is safe to execute against (Phase 5.1: "never silently use
+    the currently active group")."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    def _boom():
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(adapter, "verify_application", _boom)
+    assert adapter.verify_group("Dwelling Roof") is False
