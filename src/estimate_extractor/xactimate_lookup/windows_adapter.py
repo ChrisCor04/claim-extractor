@@ -283,8 +283,8 @@ _UNIT_SYNONYMS: dict[str, str] = {
 #: source and target units, and has been reviewer-approved). Nothing
 #: in this phase populates this map -- no broad automatic conversions
 #: are added. A converted quantity must always be recorded separately
-#: from the original (see `verify_committed_row()`), never overwriting
-#: it. See docs/xactimate-lookup.md Phase 4.7 Stage 3.
+#: from the original (see `verify_commit()`), never overwriting it.
+#: See docs/xactimate-lookup.md Phase 4.7 Stage 3.
 _VERIFIED_UNIT_CONVERSIONS: dict[tuple[str, str], float] = {}
 
 
@@ -309,24 +309,44 @@ class UnitVerificationResult:
 
 
 @dataclass(slots=True)
-class CommittedRowVerification:
-    """Phase 4.7 Stages 4/5/8: the full result of identifying a
-    committed row by identity and independently verifying its
-    quantity AND unit -- see `verify_committed_row()`. `compatibility`
-    is one of "compatible", "review_required", "hard_stop" (Stage 8);
-    a quantity match never overrides a unit conflict -- `compatibility`
-    reflects the unit outcome regardless of `quantity_matched`.
-    `samples` holds one dict per polling attempt with the raw
-    instrumentation Stage 4 requires (elapsed time, row count, raw
-    OCR at every scale/PSM tried, etc.) for diagnostics."""
+class CommitVerification:
+    """Phase 4.8: the full result of `verify_commit()` -- identifies
+    the committed row STRUCTURALLY (row-count delta from a
+    before-commit snapshot, plus the deterministic "insertions always
+    append at the end" behavior observed throughout this project),
+    never by searching OCR text across every row (Phase 4.7's
+    `verify_committed_row()`/`CommittedRowVerification`, retired --
+    see docs/xactimate-lookup.md Phase 4.7 and 4.8). WHAT was intended
+    is already certain before this ever runs (`select_candidate()`
+    acts on UIA-exact dropdown text, `extraction_confidence=1.0`);
+    this only answers WHERE it landed and whether the data there is
+    correct.
 
-    stop_reason: str  # "verified" | "conflicting_row" | "commit_verification_failed" | "wrong_context" | "timeout"
-    row_identified: bool
+    `trust_state` is one of "VERIFIED", "REVIEW_REQUIRED",
+    "VERIFICATION_FAILED", "CONFLICTING_ROW", "UNIT_MISMATCH",
+    "QUANTITY_MISMATCH" -- see `verify_commit()`'s docstring for the
+    exact precedence rules. A quantity or unit conflict is always a
+    dedicated hard trust_state; it is never downgraded to
+    "supporting" evidence. `category_observed`/`selector_observed`/
+    `description_observed` are corroborating OCR reads at the
+    structurally-identified row ONLY -- they never decide row
+    identity, and an unreadable category/selector never blocks
+    "VERIFIED" when the structural and quantity/unit evidence agree.
+    `samples` holds one dict per polling attempt for diagnostics."""
+
+    trust_state: str
+    reason: str
+    row_count_before: int
+    row_count_after: int | None
     row_index: int | None
-    category: str | None
-    selector: str | None
-    description: str | None
-    quantity_expected: float | None
+    preexisting_rows_unchanged: bool | None
+    category_expected: str
+    selector_expected: str
+    category_observed: str | None
+    selector_observed: str | None
+    category_selector_ocr_agrees: bool | None
+    description_observed: str | None
+    quantity_expected: float
     quantity_observed: float | None
     quantity_matched: bool
     unit: UnitVerificationResult | None
@@ -1432,8 +1452,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         """Crops and reads the Quantity cell at an ARBITRARY row_top --
         extracted from `read_quantity()` (Phase 4.7) so the same
         live-verified reading strategy can be applied to a specific,
-        identity-verified row (`verify_committed_row()`), not just
-        "whatever the last row is"."""
+        identity-verified row (`verify_commit()`), not just "whatever
+        the last row is"."""
         col_l, col_r = _GRID_COLUMNS["quantity"]
         dx = offset[0]
         crop = image.crop((col_l + dx, row_top, col_r + dx, row_top + _GRID_ROW_HEIGHT))
@@ -1767,11 +1787,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
         sel = sel_raw.split()[0] if sel_raw else None
         return cat, sel
 
-    def _snapshot_grid_identities(self) -> list[tuple[str | None, str | None]]:
+    def snapshot_grid_identities(self) -> list[tuple[str | None, str | None]]:
         """Returns [(category, selector), ...] top-to-bottom for every
-        row currently in the grid -- used by `delete_existing_item()`
-        to independently verify, before AND after, that exactly the
-        targeted row changed and nothing else did."""
+        row currently in the grid. Used by `delete_existing_item()` to
+        independently verify, before AND after, that exactly the
+        targeted row changed and nothing else did; and by callers of
+        `verify_commit()` (Phase 4.8), which requires a snapshot taken
+        BEFORE `select_candidate()` -- the pending row is already
+        present in the grid as soon as a candidate is selected, well
+        before `commit_item()` -- so the committed row can be
+        identified structurally (row-count delta across the whole
+        select-through-commit sequence) rather than by searching OCR
+        text across every row."""
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
@@ -1789,9 +1816,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
     def _read_description_at(self, image, offset: tuple[int, int], row_top: int) -> str | None:
         """Lighter-weight description-only read at an ARBITRARY
         row_top, same crop/PSM as `_read_populated_fields_once()`.
-        Used by `verify_committed_row()` for informational/
-        instrumentation purposes (Phase 4.7 Stage 4) -- row identity
-        itself is decided by CAT+SEL, not description."""
+        Used by `verify_commit()` for corroborating/instrumentation
+        purposes only -- row identity itself is decided structurally
+        (row-count delta), not by description text (Phase 4.8)."""
         col_l, col_r = _GRID_COLUMNS["description"]
         dx = offset[0]
         crop = image.crop((col_l + dx, row_top, col_r + dx, row_top + _GRID_ROW_HEIGHT))
@@ -1799,8 +1826,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     #: Maps `UnitVerificationResult.unit_match_state` to Stage 8's
     #: three-tier compatibility outcome. A quantity match never
-    #: overrides this -- `verify_committed_row()` sets `compatibility`
-    #: from this table alone, regardless of `quantity_matched`. See
+    #: overrides this -- `verify_commit()` sets `compatibility` from
+    #: this table alone, regardless of `quantity_matched`. See
     #: docs/xactimate-lookup.md Phase 4.7 Stage 8.
     _UNIT_STATE_TO_COMPATIBILITY = {
         "exact_match": "compatible",
@@ -1814,52 +1841,106 @@ class WindowsXactimateAdapter(XactimateAdapter):
         "incompatible": "hard_stop",
     }
 
-    def verify_committed_row(
+    def verify_commit(
         self,
+        before_snapshot: list[tuple[str | None, str | None]],
         category: str,
         selector: str,
         expected_quantity: float,
         source_unit: str | None = None,
         expected_xactimate_unit: str | None = None,
         timeout_s: float = 3.0,
-    ) -> CommittedRowVerification:
-        """Not part of the abstract contract -- Phase 4.7's integrated
-        committed-row verification: identifies the committed row by
-        CAT+SEL identity (Stage 5) BEFORE reading anything from it
-        (never a presumed row index -- `verify_quantity_committed()`'s
-        `_last_row_geometry()`-based approach assumed the target was
-        always the last row, which Phase 4.6's pilot showed is not
-        reliable once more than one row exists), then independently
-        verifies both quantity (Stage 7) and unit (Stage 6), and
-        evaluates unit compatibility (Stage 8) -- a quantity match
-        never overrides a unit conflict; `compatibility` is set purely
-        from the unit outcome.
+    ) -> CommitVerification:
+        """Not part of the abstract contract -- Phase 4.8's row
+        identification and verification strategy, replacing Phase
+        4.7's `verify_committed_row()` (retired; its approach of
+        searching for a CAT+SEL OCR text match across every row was
+        found unreliable within the bounded polling window for
+        catalog categories never exercised before Phase 4.7, and
+        still intermittently for categories every prior phase
+        validated -- see docs/xactimate-lookup.md Phase 4.7 and 4.8).
 
-        Bounded polling (progressive intervals, matching
-        `verify_quantity_committed()`) terminates on the first of:
-        - exactly one row matches CAT+SEL and both quantity and unit
-          were read (``stop_reason="verified"`` -- NOT the same as
-          "quantity matched" or "unit compatible"; those are separate
-          fields on the result, checked by the caller);
-        - MORE than one row matches CAT+SEL
-          (``stop_reason="conflicting_row"`` -- refuses to guess which
-          is the committed one);
-        - `_unexpected_dialog_present()` (``stop_reason="wrong_context"``);
-        - `timeout_s` elapses with zero or ambiguous matches
-          (``stop_reason="commit_verification_failed"``).
+        Callers MUST call `snapshot_grid_identities()` BEFORE
+        `select_candidate()` -- NOT merely before `commit_item()` --
+        and pass the result as `before_snapshot`. Live validation
+        (Phase 4.8) found the pending row is already present in the
+        grid as soon as a candidate is selected (well before Ctrl+S);
+        `commit_item()` finalizes/saves that row rather than
+        inserting a new one, so a snapshot taken right before
+        `commit_item()` sees a row count that has already incremented
+        and never observes the delta this method depends on. Row
+        identity is established STRUCTURALLY, never by searching OCR
+        text across rows:
 
-        Every attempt's full instrumentation (elapsed time, row count,
-        which row indices matched, raw unit OCR at every scale/PSM
-        tried) is recorded in `.samples` (Stage 4). See
-        docs/xactimate-lookup.md Phase 4.7."""
+        1. Poll (bounded by `timeout_s`) until the grid's row count
+           differs from `len(before_snapshot)`.
+        2. `delta == 1` (exactly one row appended) is the only
+           structurally trustworthy outcome -- every row insertion
+           observed anywhere in this project has always appended at
+           the end, so the new row is deterministically
+           `row_index = row_count_after - 1`. No text match is needed
+           to find it.
+        3. The first `len(before_snapshot)` rows after commit must
+           equal `before_snapshot` exactly (`preexisting_rows_
+           unchanged`). If not, the state is not trustworthy even
+           though the count delta looks right.
+        4. `delta` not in `{0, 1}`, or pre-existing rows changed ->
+           `trust_state="CONFLICTING_ROW"` (refuses to guess which
+           row is the committed one).
+        5. `delta == 0` through `timeout_s` ->
+           `trust_state="VERIFICATION_FAILED"` (commit not detected
+           in the grid within the bounded window).
+        6. Once the row is structurally identified, quantity and unit
+           are read AT THAT KNOWN POSITION and remain load-bearing,
+           exactly as in Phase 4.7 (a quantity match never overrides
+           a unit conflict): unreadable quantity or a unit state of
+           "review_required" -> `trust_state="REVIEW_REQUIRED"`; a
+           quantity that was read but disagrees ->
+           `trust_state="QUANTITY_MISMATCH"`; an incompatible unit ->
+           `trust_state="UNIT_MISMATCH"` (checked after quantity, but
+           neither ever downgrades to merely "supporting").
+        7. Category and selector OCR at the known position (Phase
+           4.8's explicit directive: category OCR becomes supporting
+           evidence whenever stronger evidence exists, and this phase
+           does not add new OCR correction rules) are read too, but
+           ONLY as corroboration. Unreadable category/selector OCR
+           does NOT prevent `trust_state="VERIFIED"`. Category/
+           selector OCR that IS readable but contradicts the expected
+           identity downgrades the result to
+           `trust_state="REVIEW_REQUIRED"`, even though nothing
+           structural or numeric disagreed. Description OCR is read
+           and recorded (`description_observed`) for the evidence
+           record but is not used in any automated pass/fail decision
+           -- fuzzy-matching noisy OCR description text reliably is
+           exactly the kind of new OCR-tuning work this phase does
+           not do.
+        8. `trust_state="VERIFIED"` requires ALL of: delta==1,
+           pre-existing rows unchanged, quantity read and matched
+           exactly, unit compatible, and category/selector OCR either
+           agrees or is unreadable (never contradicts).
+
+        `_unexpected_dialog_present()` at any point during polling ->
+        `trust_state="VERIFICATION_FAILED"` (wrong context).
+
+        Every attempt's instrumentation is recorded in `.samples`,
+        matching Phase 4.7 Stage 4's precedent. See
+        docs/xactimate-lookup.md Phase 4.8."""
         start = time.time()
         samples: list[dict] = []
         attempts = 0
+        row_count_before = len(before_snapshot)
 
-        def fail(stop_reason: str, reason: str) -> CommittedRowVerification:
-            return CommittedRowVerification(
-                stop_reason=stop_reason, row_identified=False, row_index=None,
-                category=category, selector=selector, description=None,
+        def fail(
+            trust_state: str, reason: str, row_count_after: int | None = None,
+            preexisting_rows_unchanged: bool | None = None,
+        ) -> CommitVerification:
+            return CommitVerification(
+                trust_state=trust_state, reason=reason,
+                row_count_before=row_count_before, row_count_after=row_count_after, row_index=None,
+                preexisting_rows_unchanged=preexisting_rows_unchanged,
+                category_expected=category, selector_expected=selector,
+                category_observed=None, selector_observed=None, category_selector_ocr_agrees=None,
+                description_observed=None,
                 quantity_expected=expected_quantity, quantity_observed=None, quantity_matched=False,
                 unit=None, compatibility="not_evaluated", compatibility_reason=reason,
                 attempts=attempts, elapsed_s=time.time() - start, samples=samples,
@@ -1869,57 +1950,126 @@ class WindowsXactimateAdapter(XactimateAdapter):
             attempts += 1
             elapsed = time.time() - start
             if self._unexpected_dialog_present():
-                return fail("wrong_context", "an unexpected dialog appeared while identifying the committed row")
+                return fail("VERIFICATION_FAILED", "an unexpected dialog appeared while verifying the commit")
 
-            hwnd = self._ensure_main_window()
-            image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
-            sample: dict = {"elapsed_s": round(elapsed, 3), "row_count": None, "matched_row_indices": []}
+            after = self.snapshot_grid_identities()
+            row_count_after = len(after)
+            delta = row_count_after - row_count_before
+            sample: dict = {"elapsed_s": round(elapsed, 3), "row_count_after": row_count_after, "delta": delta}
+            samples.append(sample)
 
-            if offset is not None:
-                geom = self._last_row_geometry(image, offset)
-                row_count = geom[0] if geom else 0
-                sample["row_count"] = row_count
-                row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
-                matches = []
-                for i in range(row_count):
-                    row_top = row_1_top + i * _GRID_ROW_HEIGHT
-                    cat, sel = self._read_category_selector_at(image, offset, row_top)
-                    if cat == category and sel == selector:
-                        matches.append((i, row_top))
-                sample["matched_row_indices"] = [m[0] for m in matches]
-                samples.append(sample)
-
-                if len(matches) > 1:
+            if delta == 1:
+                preexisting_unchanged = after[:row_count_before] == before_snapshot
+                if not preexisting_unchanged:
                     return fail(
-                        "conflicting_row",
-                        f"{len(matches)} rows matched {category}/{selector} (indices {[m[0] for m in matches]}) "
-                        f"-- refusing to guess which is the committed one",
+                        "CONFLICTING_ROW",
+                        f"row count increased by exactly 1 but the first {row_count_before} rows no longer match "
+                        f"the pre-commit snapshot -- refusing to trust which row is the committed one",
+                        row_count_after=row_count_after,
+                        preexisting_rows_unchanged=False,
                     )
 
-                if len(matches) == 1:
-                    row_index, row_top = matches[0]
-                    description = self._read_description_at(image, offset, row_top)
-                    quantity_observed = self._read_quantity_at(image, offset, row_top)
-                    unit_raw, _unit_norm_unused = self._read_unit_at(image, offset, row_top)
-                    sample["unit_raw"] = unit_raw
-                    sample["quantity_observed"] = quantity_observed
-                    unit_result = check_unit_compatibility(source_unit, expected_xactimate_unit, unit_raw)
-                    compatibility = self._UNIT_STATE_TO_COMPATIBILITY.get(unit_result.unit_match_state, "review_required")
-                    return CommittedRowVerification(
-                        stop_reason="verified", row_identified=True, row_index=row_index,
-                        category=category, selector=selector, description=description,
-                        quantity_expected=expected_quantity, quantity_observed=quantity_observed,
-                        quantity_matched=(quantity_observed == expected_quantity),
-                        unit=unit_result, compatibility=compatibility, compatibility_reason=unit_result.unit_match_reason,
-                        attempts=attempts, elapsed_s=time.time() - start, samples=samples,
+                row_index = row_count_after - 1
+                hwnd = self._ensure_main_window()
+                image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+                if offset is None:
+                    return fail(
+                        "VERIFICATION_FAILED", "could not re-locate the grid to read the committed row",
+                        row_count_after=row_count_after,
                     )
-            else:
-                samples.append(sample)
+                row_top = self._shifted_anchor("grid_row_1", offset)[1] + row_index * _GRID_ROW_HEIGHT
+
+                cat_observed, sel_observed = self._read_category_selector_at(image, offset, row_top)
+                description_observed = self._read_description_at(image, offset, row_top)
+                quantity_observed = self._read_quantity_at(image, offset, row_top)
+                unit_raw, _unit_norm_unused = self._read_unit_at(image, offset, row_top)
+
+                # Live-caught (Phase 4.8): immediately after the
+                # row-count delta is first observed, the row's own
+                # cell content can still be mid-repaint -- quantity or
+                # unit occasionally read back empty on the very first
+                # attempt even though the row identity itself (row
+                # count, position) is already solid. One bounded
+                # settle-and-reread (not an unbounded retry, not a new
+                # OCR rule) mirrors the polling pattern used
+                # everywhere else in this method.
+                if quantity_observed is None or unit_raw is None:
+                    time.sleep(0.4)
+                    image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+                    if offset is not None:
+                        row_top = self._shifted_anchor("grid_row_1", offset)[1] + row_index * _GRID_ROW_HEIGHT
+                        if quantity_observed is None:
+                            quantity_observed = self._read_quantity_at(image, offset, row_top)
+                        if unit_raw is None:
+                            unit_raw, _unit_norm_unused = self._read_unit_at(image, offset, row_top)
+
+                sample["category_observed"] = cat_observed
+                sample["selector_observed"] = sel_observed
+                sample["description_observed"] = description_observed
+                sample["quantity_observed"] = quantity_observed
+                sample["unit_raw"] = unit_raw
+
+                quantity_matched = quantity_observed is not None and quantity_observed == expected_quantity
+                unit_result = check_unit_compatibility(source_unit, expected_xactimate_unit, unit_raw)
+                compatibility = self._UNIT_STATE_TO_COMPATIBILITY.get(unit_result.unit_match_state, "review_required")
+
+                cat_sel_present = cat_observed is not None or sel_observed is not None
+                cat_sel_agrees = (cat_observed == category and sel_observed == selector) if cat_sel_present else None
+                cat_sel_contradicts = cat_sel_present and not cat_sel_agrees
+
+                if quantity_observed is None:
+                    trust_state = "REVIEW_REQUIRED"
+                    reason = "quantity could not be read at the structurally-identified row"
+                elif not quantity_matched:
+                    trust_state = "QUANTITY_MISMATCH"
+                    reason = f"expected quantity {expected_quantity}, observed {quantity_observed!r} at the structurally-identified row"
+                elif compatibility == "hard_stop":
+                    trust_state = "UNIT_MISMATCH"
+                    reason = unit_result.unit_match_reason
+                elif compatibility == "review_required":
+                    trust_state = "REVIEW_REQUIRED"
+                    reason = unit_result.unit_match_reason
+                elif cat_sel_contradicts:
+                    trust_state = "REVIEW_REQUIRED"
+                    reason = (
+                        f"structural evidence (row-count delta and unchanged pre-existing rows) and quantity/unit "
+                        f"both agree, but category/selector OCR at the committed row read "
+                        f"{cat_observed}/{sel_observed}, which contradicts the expected {category}/{selector} "
+                        f"-- a human should confirm"
+                    )
+                else:
+                    trust_state = "VERIFIED"
+                    reason = (
+                        "exactly one row appended at the deterministic last position, pre-existing rows unchanged, "
+                        "quantity matched, unit compatible, and category/selector OCR "
+                        + ("agrees" if cat_sel_agrees else "was unreadable (not treated as a conflict)")
+                    )
+
+                return CommitVerification(
+                    trust_state=trust_state, reason=reason,
+                    row_count_before=row_count_before, row_count_after=row_count_after, row_index=row_index,
+                    preexisting_rows_unchanged=preexisting_unchanged,
+                    category_expected=category, selector_expected=selector,
+                    category_observed=cat_observed, selector_observed=sel_observed,
+                    category_selector_ocr_agrees=cat_sel_agrees,
+                    description_observed=description_observed,
+                    quantity_expected=expected_quantity, quantity_observed=quantity_observed, quantity_matched=quantity_matched,
+                    unit=unit_result, compatibility=compatibility, compatibility_reason=unit_result.unit_match_reason,
+                    attempts=attempts, elapsed_s=time.time() - start, samples=samples,
+                )
+
+            if delta != 0:
+                return fail(
+                    "CONFLICTING_ROW",
+                    f"row count changed by {delta} (expected exactly 1) -- refusing to guess which row is the committed one",
+                    row_count_after=row_count_after,
+                )
 
             if elapsed >= timeout_s:
                 return fail(
-                    "commit_verification_failed",
-                    f"no row matching {category}/{selector} found within {timeout_s}s ({attempts} attempts)",
+                    "VERIFICATION_FAILED",
+                    f"row count did not change within {timeout_s}s ({attempts} attempts) -- commit not detected",
+                    row_count_after=row_count_after,
                 )
             time.sleep(0.1 if attempts < 5 else 0.4)
 
@@ -1938,7 +2088,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         exception: the target identity is no longer present, exactly
         one row disappeared (not more, not fewer), and every other
         row's identity is unchanged and in the same relative order."""
-        before = self._snapshot_grid_identities()
+        before = self.snapshot_grid_identities()
         target_positions = [i for i, (c, s) in enumerate(before) if c == category and s == selector]
         if not target_positions:
             raise AdapterError(f"delete_existing_item(): no row matching {category}/{selector} found in the grid.")
@@ -1980,7 +2130,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 f"-- refusing to trust the result until this is resolved."
             )
 
-        after = self._snapshot_grid_identities()
+        after = self.snapshot_grid_identities()
         expected = before[:target_index] + before[target_index + 1 :]
         if len(after) != len(before) - 1:
             raise AdapterError(

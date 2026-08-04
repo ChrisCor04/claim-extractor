@@ -18,7 +18,7 @@ import pytest
 
 from estimate_extractor.xactimate_lookup.models import DropdownResult
 from estimate_extractor.xactimate_lookup.windows_adapter import (
-    CommittedRowVerification,
+    CommitVerification,
     PopupNotFoundError,
     QuantityVerificationResult,
     StaleCandidateError,
@@ -477,47 +477,37 @@ def test_explicit_verified_conversion_is_used_when_present():
 
 
 def test_quantity_match_does_not_override_unit_conflict():
-    """Regression guard (Phase 4.7 Stage 8): compatibility is derived
-    purely from the unit outcome -- a CommittedRowVerification with a
-    quantity match but an incompatible unit must still report
-    hard_stop compatibility."""
+    """Regression guard (Phase 4.7 Stage 8, carried into Phase 4.8): a
+    CommitVerification with a quantity match but an incompatible unit
+    must still report hard_stop compatibility and a UNIT_MISMATCH
+    trust_state -- a quantity match never overrides a unit conflict."""
     unit_result = check_unit_compatibility("EA", "EA", "SQ")
-    verification = CommittedRowVerification(
-        stop_reason="verified", row_identified=True, row_index=0,
-        category="SFG", selector="GUTA", description="desc",
+    verification = CommitVerification(
+        trust_state="UNIT_MISMATCH", reason=unit_result.unit_match_reason,
+        row_count_before=0, row_count_after=1, row_index=0, preexisting_rows_unchanged=True,
+        category_expected="SFG", selector_expected="GUTA",
+        category_observed="SFG", selector_observed="GUTA", category_selector_ocr_agrees=True,
+        description_observed="desc",
         quantity_expected=5.0, quantity_observed=5.0, quantity_matched=True,
         unit=unit_result, compatibility="hard_stop", compatibility_reason=unit_result.unit_match_reason,
         attempts=1, elapsed_s=0.1,
     )
     assert verification.quantity_matched is True
     assert verification.compatibility == "hard_stop"
+    assert verification.trust_state == "UNIT_MISMATCH"
 
 
-def test_wrong_row_identity_reported_as_conflicting_row():
-    """Regression guard (Phase 4.7 Stage 5): CommittedRowVerification
-    must be able to represent "more than one row matched" distinctly
-    from a clean verification -- exercised via direct construction,
-    complementing the live row-identification logic (needs a real
-    session)."""
-    verification = CommittedRowVerification(
-        stop_reason="conflicting_row", row_identified=False, row_index=None,
-        category="SFG", selector="GUTA", description=None,
-        quantity_expected=5.0, quantity_observed=None, quantity_matched=False,
-        unit=None, compatibility="not_evaluated", compatibility_reason="2 rows matched SFG/GUTA",
-        attempts=1, elapsed_s=0.1,
-    )
-    assert verification.stop_reason == "conflicting_row"
-    assert verification.row_identified is False
-
-
-def _adapter_with_fake_verification_grid(monkeypatch, row_sequence, unit_reads=None, quantity_reads=None):
+def _adapter_with_fake_commit_grid(monkeypatch, row_sequence, unit_reads=None, quantity_reads=None):
     """Builds a WindowsXactimateAdapter with every internal dependency
-    `verify_committed_row()` touches monkeypatched to a fake, so its
-    polling/identification logic can be exercised without a live
-    Windows/Xactimate session. `row_sequence` is a list of "grids" (one
-    per poll attempt), each a list of (category, selector) tuples
-    top-to-bottom. Uses a fake, manually-advanced clock so timing is
-    deterministic and tests run instantly."""
+    `verify_commit()` touches (via `snapshot_grid_identities()` and its
+    own follow-up reads at the structurally-identified row)
+    monkeypatched to a fake, so its polling/identification logic can
+    be exercised without a live Windows/Xactimate session.
+    `row_sequence` is a list of "grids" (one per poll attempt), each a
+    list of (category, selector) tuples top-to-bottom -- i.e. what
+    `snapshot_grid_identities()` would read on that attempt. Uses a
+    fake, manually-advanced clock so timing is deterministic and tests
+    run instantly."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=1, delay_s=0: (object(), (0, 0)))
@@ -550,83 +540,135 @@ def _adapter_with_fake_verification_grid(monkeypatch, row_sequence, unit_reads=N
     return adapter
 
 
-def test_verify_committed_row_identifies_row_after_delayed_rendering(monkeypatch):
-    """Regression test (Phase 4.7 Stages 4/5): the target row doesn't
-    appear until the third poll attempt (simulating delayed repaint) --
-    verify_committed_row() must keep polling and succeed once it does,
-    not give up on the first empty/non-matching grid."""
-    adapter = _adapter_with_fake_verification_grid(
+def test_verify_commit_identifies_row_after_delayed_rendering(monkeypatch):
+    """Regression test (Phase 4.8): the row count doesn't increase
+    until the third poll attempt (simulating delayed repaint) --
+    verify_commit() must keep polling and succeed once it does, not
+    give up on the first unchanged grid."""
+    adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
-        row_sequence=[[], [("SFG", "OTHER")], [("SFG", "GUTA")]],
+        row_sequence=[[], [], [("SFG", "GUTA")]],
         unit_reads=[("LF", "LF")],
         quantity_reads=[5.0],
     )
-    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
-    assert result.stop_reason == "verified"
-    assert result.row_identified is True
+    result = adapter.verify_commit([], "SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    assert result.trust_state == "VERIFIED"
+    assert result.row_index == 0
     assert result.quantity_matched is True
     assert result.compatibility == "compatible"
 
 
-def test_verify_committed_row_temporal_consensus_requires_stable_match(monkeypatch):
-    """Regression test (Phase 4.7 Stage 6): a transient wrong unit
-    read on an early poll must not be trusted -- only once the row is
-    identified is a single unit read taken (reads at multiple scales
-    internally), so this exercises that the FINAL read at
-    identification time is what's reported, not an early transient
-    one."""
-    adapter = _adapter_with_fake_verification_grid(
+def test_verify_commit_unreadable_category_does_not_block_verified(monkeypatch):
+    """Regression test (Phase 4.8's central claim): category/selector
+    OCR is corroborating evidence only -- when it's unreadable but
+    structural evidence (row-count delta, unchanged pre-existing rows)
+    plus quantity and unit all agree, the commit is still VERIFIED."""
+    adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
-        row_sequence=[[("SFG", "GUTA")]],
-        unit_reads=[("SQ", "SQ")],  # stable read once identified: SQ, not LF
+        row_sequence=[[(None, None)]],
+        unit_reads=[("LF", "LF")],
         quantity_reads=[5.0],
     )
-    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
-    assert result.unit.observed_xactimate_unit == "SQ"
-    assert result.compatibility == "hard_stop"
+    result = adapter.verify_commit([], "SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    assert result.trust_state == "VERIFIED"
+    assert result.category_observed is None
+    assert result.category_selector_ocr_agrees is None
 
 
-def test_verify_committed_row_wrong_row_identity_conflict(monkeypatch):
-    """Regression test (Phase 4.7 Stage 5): two rows matching the same
-    CAT/SEL must never be silently resolved by picking one -- reports
-    conflicting_row instead."""
-    adapter = _adapter_with_fake_verification_grid(
+def test_verify_commit_category_ocr_contradiction_downgrades_to_review_required(monkeypatch):
+    """Regression test (Phase 4.8): category/selector OCR that IS
+    readable but contradicts the expected identity must not be
+    silently ignored either -- it downgrades to REVIEW_REQUIRED even
+    though structural evidence and quantity/unit all agree, since
+    category OCR is supporting evidence, not proof of a wrong
+    commit."""
+    adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
-        row_sequence=[[("SFG", "GUTA"), ("SFG", "GUTA")]],
+        row_sequence=[[("SFG", "GUTC")]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[5.0],
     )
-    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, timeout_s=3.0)
-    assert result.stop_reason == "conflicting_row"
-    assert result.row_identified is False
+    result = adapter.verify_commit([], "SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    assert result.trust_state == "REVIEW_REQUIRED"
+    assert result.category_selector_ocr_agrees is False
 
 
-def test_verify_committed_row_times_out_when_row_never_appears(monkeypatch):
-    """Regression test (Phase 4.7 Stage 5): if the target identity
-    never appears in the grid within budget, reports
-    commit_verification_failed -- never an unbounded wait, never a
-    guess."""
-    adapter = _adapter_with_fake_verification_grid(
+def test_verify_commit_row_count_delta_other_than_one_is_conflicting_row(monkeypatch):
+    """Regression test (Phase 4.8): a row-count delta that isn't
+    exactly 1 (here: 2 rows appeared instead of 1) must never be
+    silently resolved by guessing which one is the committed row --
+    reports CONFLICTING_ROW instead, immediately, without waiting for
+    timeout."""
+    adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
-        row_sequence=[[("SFG", "OTHER")]] * 20,
+        row_sequence=[[("SFG", "GUTA"), ("SFG", "GUTB")]],
     )
-    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, timeout_s=0.5)
-    assert result.stop_reason == "commit_verification_failed"
-    assert result.row_identified is False
+    result = adapter.verify_commit([], "SFG", "GUTA", 5.0, timeout_s=3.0)
+    assert result.trust_state == "CONFLICTING_ROW"
+    assert result.row_index is None
 
 
-def test_verify_committed_row_cleanup_after_unit_verification_failure(monkeypatch):
-    """Regression guard (Phase 4.7): a hard_stop unit outcome still
-    returns a fully-formed result (row identified, quantity read) so a
-    caller can proceed to clean up the row -- verification failing
-    must not prevent cleanup from having the information it needs
-    (category/selector) to act on."""
-    adapter = _adapter_with_fake_verification_grid(
+def test_verify_commit_preexisting_rows_changed_is_conflicting_row(monkeypatch):
+    """Regression test (Phase 4.8): even when the row count increases
+    by exactly 1, if the pre-existing rows no longer match the
+    before-commit snapshot, the state is not trustworthy -- reports
+    CONFLICTING_ROW rather than trusting the last row is really the
+    new one."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("PLM", "OTHER"), ("SFG", "GUTA")]],
+    )
+    result = adapter.verify_commit([("PLM", "TLT")], "SFG", "GUTA", 5.0, timeout_s=3.0)
+    assert result.trust_state == "CONFLICTING_ROW"
+    assert result.preexisting_rows_unchanged is False
+
+
+def test_verify_commit_times_out_when_row_count_never_changes(monkeypatch):
+    """Regression test (Phase 4.8): if the row count never changes
+    within budget, reports VERIFICATION_FAILED -- never an unbounded
+    wait, never a guess."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[]] * 20,
+    )
+    result = adapter.verify_commit([], "SFG", "GUTA", 5.0, timeout_s=0.5)
+    assert result.trust_state == "VERIFICATION_FAILED"
+    assert result.row_index is None
+
+
+def test_verify_commit_quantity_mismatch_reported_distinctly(monkeypatch):
+    """Regression test (Phase 4.8): a quantity that was successfully
+    read but disagrees with what was entered is QUANTITY_MISMATCH, not
+    a generic failure -- the row is still structurally identified
+    (row_index set) so a caller can act on it."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTA")]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[3.0],
+    )
+    result = adapter.verify_commit([], "SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    assert result.trust_state == "QUANTITY_MISMATCH"
+    assert result.row_index == 0
+    assert result.quantity_matched is False
+
+
+def test_verify_commit_identity_available_for_cleanup_after_unit_mismatch(monkeypatch):
+    """Regression guard (Phase 4.8): a hard_stop unit outcome still
+    returns a fully-formed result (row_index, expected category/
+    selector) so a caller can proceed to clean up the row --
+    verification failing must not prevent cleanup from having the
+    information it needs to act on."""
+    adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
         row_sequence=[[("SFG", "GUTA")]],
         unit_reads=[("SQ", "SQ")],
         quantity_reads=[5.0],
     )
-    result = adapter.verify_committed_row("SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    result = adapter.verify_commit([], "SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
+    assert result.trust_state == "UNIT_MISMATCH"
     assert result.compatibility == "hard_stop"
     # cleanup-relevant identity is still available despite the failure
-    assert result.category == "SFG"
-    assert result.selector == "GUTA"
+    assert result.row_index == 0
+    assert result.category_expected == "SFG"
+    assert result.selector_expected == "GUTA"

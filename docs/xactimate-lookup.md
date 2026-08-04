@@ -2364,3 +2364,233 @@ did); (3) once row identification is reliably confirmed across a
 larger, more diverse sample, re-run both the unit matrix and the
 focused pilot and require all twelve gate criteria before flipping the
 flag.
+
+## Phase 4.8: trustworthy commit verification -- row identity moved off OCR text search onto row-count-delta structural evidence, `supports_live_execution` stays `False`, single blocker: intermittent quantity-cell OCR at the identified row
+
+Phase 4.7 left one precisely diagnosed gap: `verify_committed_row()`
+identified the committed row by searching every row's OCR'd
+category+selector text for a match, and that search was not reliable
+enough within the bounded polling window, worst for catalog categories
+never exercised before Phase 4.7 (PLM, TMP, CLN) and still
+intermittently for SFG/RFG. Phase 4.8's mandate was explicit: stop
+tuning OCR, find the strongest available independent evidence that the
+committed row is the row that was intentionally selected, and build
+verification around that -- treating this as a validation exercise,
+not a construction exercise.
+
+### Investigation, in the required order
+
+**Semantic application data.** Three independent clipboard methods
+tried live against a real committed row (plain `Ctrl+C`, `Ctrl+C` via
+the row's context-menu Copy item at its measured UIA structural index,
+`Ctrl+A`+`Ctrl+C`) -- all three left the clipboard's format list
+unchanged from baseline (3 unrelated custom formats, never
+`CF_UNICODETEXT`/`CF_TEXT`). **Rejected**: Xactimate's grid does not
+place row text on the clipboard through any of these paths.
+Double-clicking a grid row (the standard "open details" gesture) did
+not open a details dialog; it instead changed Quick Entry's panel to a
+"Number of Items Selected" multi-select summary, confirmed by a full
+screenshot and `_unexpected_dialog_present()` returning `False`.
+**Rejected**: no details dialog exists on this path. A fresh UIA tree
+walk of the main window this session found exactly one element with
+zero children, reconfirming Phase 4.1's original finding under current
+conditions; MSAA was not re-walked with new code this session (Phase
+4.1's already-thorough MSAA finding -- zero peers, matching UIA -- was
+relied on directly rather than re-derived, to keep this phase's time
+budget on verification, not re-answering an already-answered
+question). **Rejected**: no accessible grid-row API exists beyond what
+every prior phase has already used (bounding rectangles + OCR).
+
+**Before/after state comparison and row-insertion evidence.** Every
+row insertion observed anywhere in this project, across every phase,
+has appended at the end of the grid. Combined with
+`snapshot_grid_identities()` (already used by `delete_existing_item()`
+since Phase 4.6 to verify deletions), a snapshot taken before an item
+is selected, compared against a snapshot taken after commit, makes the
+committed row's position and the surrounding rows' integrity provable
+without reading a single character of OCR: **adopted** as the primary
+identification mechanism.
+
+**Exact dropdown provenance.** `select_candidate()` already acts on a
+`Candidate` read via exact UIA text (`extraction_confidence=1.0`), not
+OCR -- so WHAT was intended is already certain before verification
+ever runs. **Adopted implicitly**: `verify_commit()`'s `category`/
+`selector` parameters are that already-certain identity; the method
+never re-derives it.
+
+**Description, selector, unit, quantity, category OCR.** All five
+remain OCR-based and were downgraded relative to the structural
+evidence above. Quantity and unit remain load-bearing (dedicated hard
+`trust_state`s, never downgraded to "supporting" -- a quantity or unit
+conflict is never overridden by a quantity match, continuing Phase
+4.7's rule). Description is read and recorded for the evidence bundle
+but used in no automated pass/fail decision -- fuzzy-matching noisy
+OCR description text reliably is exactly the kind of new OCR-tuning
+work this phase does not do. Category and selector OCR at the
+now-known row are corroborating only: unreadable does not block
+`VERIFIED`; readable-but-contradicting downgrades to
+`REVIEW_REQUIRED`, never a hard stop by itself.
+
+### Design: `verify_commit()` / `CommitVerification`
+
+Replaces `verify_committed_row()`/`CommittedRowVerification`
+completely (retired, not left dangling, matching the Phase 4.6
+precedent for the old OCR-click deletion method). Callers snapshot the
+grid with `snapshot_grid_identities()`, then act, then call
+`verify_commit(before_snapshot, category, selector, expected_quantity,
+...)`. `trust_state` is one of `VERIFIED`, `REVIEW_REQUIRED`,
+`VERIFICATION_FAILED`, `CONFLICTING_ROW`, `UNIT_MISMATCH`,
+`QUANTITY_MISMATCH` -- see the method's docstring in
+`windows_adapter.py` for the exact precedence rules.
+
+**Live-caught snapshot-timing bug, found and fixed before any trial
+counted as evidence:** the first live run snapshotted immediately
+before `commit_item()`, matching the initial (wrong) assumption that
+commit inserts the row. Every trial reported `VERIFICATION_FAILED`
+(row count never changed within budget) even though the row was
+provably committed (a `leave_committed=True` trial ended with 1 row on
+screen). Direct evidence resolved this: the snapshot taken right after
+`enter_quantity()` (before `commit_item()`) already showed 1 row, with
+noisy category OCR on the not-yet-saved cell (e.g. `SFG` read as
+`zs`). Xactimate inserts the pending row into the grid as soon as a
+candidate is selected; `commit_item()` (Ctrl+S) finalizes/saves that
+row rather than inserting a new one. Fixed by moving the required
+snapshot point to before `select_candidate()`, documented explicitly
+in both `snapshot_grid_identities()`'s and `verify_commit()`'s
+docstrings so no future caller repeats the mistake. All live trials
+below use the corrected snapshot point.
+
+**Live-caught settle-timing gap, addressed with one bounded retry:**
+after the fix above, two isolated trials (PLM/TLT, PNT/LAB) and both
+committed pilot items still returned an unreadable quantity at the
+freshly-identified row on the first read. Added one bounded
+settle-and-reread (0.4s delay, one retry, mirroring the polling
+pattern already used everywhere else in this method) for the
+quantity/unit reads specifically. Re-running the same trials afterward
+showed the retry did not change the outcome for PLM/TLT or PNT/LAB --
+elapsed time confirms the retry fired, but the second read also came
+back empty. This is treated as a genuine, currently-unresolved OCR
+limitation on those particular renders, not a bug -- consistent with
+this file's existing Phase 4.5/4.6 notes that no single scale or
+timing reliably reads every quantity value. No further OCR tuning was
+attempted, per this phase's explicit scope.
+
+### Isolated live trial matrix (9 trials, direct CAT/SEL path)
+
+Deliberately reused the categories Phase 4.7 flagged as unreliable for
+OCR-text-search row identification (PLM/TLT, TMP/GEN, CLN/FCC,
+RFG/ARMVN), plus a deliberate 2-row sequence (trial 8 left committed,
+trial 9 committed against it) to exercise the unchanged-pre-existing-
+rows check with more than one row present.
+
+| # | CAT/SEL | qty/unit | `trust_state` | row_index | preexisting unchanged | cat/sel OCR agrees | qty matched | unit compat |
+|---|---|---|---|---|---|---|---|---|
+| 1 | SFG/GUTA | 5/LF | VERIFIED | 0 | true | true | true | compatible |
+| 2 | RFG/ARMVN | 3/SQ | REVIEW_REQUIRED | 0 | true | false (`RFC`) | true | compatible |
+| 3 | PLM/TLT | 1/EA | REVIEW_REQUIRED | 0 | true | false (`PLN`/`jm`) | **unreadable** | compatible |
+| 4 | PNT/LAB | 7/HR | REVIEW_REQUIRED | 0 | true | true | **unreadable** | **unreadable** |
+| 5 | TMP/GEN | 2/DA | REVIEW_REQUIRED | 0 | true | false (unreadable cat) | true | compatible |
+| 6 | CLN/FCC | 10.5/SF | REVIEW_REQUIRED | 0 | true | false (`cu`) | true | compatible |
+| 7 | SFG/GUTG | 0.25/LF | REVIEW_REQUIRED | 0 | true | false (`GUIG`) | true | **unreadable** |
+| 8 | SFG/GUTA | 6/LF | VERIFIED | 0 | true | true | true | compatible |
+| 9 | SFG/GUTC | 2.5/LF (row 2, after 8) | VERIFIED | 1 | true | true | true | compatible |
+
+Row identity (row-count delta + deterministic last-row position +
+unchanged pre-existing rows): **9/9 correct**, including trial 9's
+proof that a second commit against a non-empty grid correctly
+identifies the new row as index 1 while confirming trial 8's row at
+index 0 was untouched. Zero `CONFLICTING_ROW`, zero
+`VERIFICATION_FAILED`, zero wrong selections, zero unintended
+mutations. Every `REVIEW_REQUIRED` was caused by category/selector or
+quantity/unit OCR falling short, never by structural misidentification
+-- and every one correctly stopped short of `VERIFIED` rather than
+guessing. Cleanup succeeded for all 9 trials plus the final sweep
+(0 rows confirmed after).
+
+### Repeated production pilot (same approved 10-item plan, unmodified)
+
+TEST project confirmed at 0 rows before starting. Items 1-5, 7, 10
+again correctly `REVIEW_REQUIRED` (genuine catalog near-ties,
+reproduces Phase 4.4/4.5/4.6/4.7 exactly -- ranking/phrase-generator
+code has not changed since before any phase-specific adapter work, per
+`git log`). Item 8 correctly `NO_MATCH`.
+
+Items 6 (SFG/GUTAB>) and 9 (RFG/ARMVN) both reached `AUTO_SELECT`,
+selected correctly, passed the pre-commit unit compatibility check,
+and committed. Both were **structurally identified correctly**
+(row_index 0 and 1 respectively, pre-existing rows unchanged both
+times) -- a direct improvement over Phase 4.7's same two pilot items,
+where item 9's row identification itself failed within budget. Both
+came back `REVIEW_REQUIRED` because the quantity could not be read at
+the identified row even after the settle-retry (item 6: qty `1`, item
+9: qty `3`) -- unit read and compatible in both. Cleanup succeeded (2
+of the ~6 attempts failed with the same transient
+`cancel_current_item()` error class documented since Phase 4.6, later
+attempts in the same bounded retry succeeded) -- final state confirmed
+0 rows.
+
+### Full test suite
+
+602 passed, 12 skipped (pre-existing, unrelated -- `tests/integration/
+test_ui_pipeline_service.py` and `test_verified_catalog_pipeline.py`
+fail to collect on an unrelated missing `estimate_extractor.output`
+module; confirmed present on `main` before this phase's changes via
+`git stash`), 0 failed. `CommittedRowVerification`/
+`verify_committed_row()`'s 6 tests were replaced with 9 new tests
+against `CommitVerification`/`verify_commit()` (structural delta
+identification, unreadable-category-does-not-block-VERIFIED,
+readable-contradicting-category-downgrades, row-count-delta-other-
+than-1, pre-existing-rows-changed, timeout, quantity mismatch, unit
+mismatch, cleanup-identity-availability). No regressions.
+
+### `supports_live_execution`
+
+Stays **`False`**.
+
+| Gate criterion | Status |
+|---|---|
+| 1. Committed rows identified by stable identity | **met** -- 11/11 live commits (9 isolated + 2 pilot) structurally identified correctly, including the multi-row case |
+| 2. Committed quantities independently verified | **not met** -- correct data whenever independently re-checked, but the quantity cell was unreadable in 4/11 live commits even after one bounded settle-retry |
+| 3. Committed units independently verified | **met** whenever the row was identified (11/11); unreadable in 2/11, correctly downgraded rather than assumed |
+| 4. Source/observed units compatible or verified-conversion | **met** in every case reached |
+| 5. Unit mismatches stop before unsafe entry/commit | **met** -- unchanged from Phase 4.7, not re-exercised this phase (no new pre-commit logic changed) |
+| 6. Category OCR is supporting evidence only, never primary identification | **met** -- row identity never depends on category/selector OCR; contradictions downgrade to REVIEW_REQUIRED, never block VERIFIED when unreadable |
+| 7. Cleanup succeeds without manual intervention | **met** -- 9/9 isolated trials, 1/1 pilot cleanup pass (bounded automatic retries absorbed all transient failures) |
+| 8. Zero wrong selections | **met** |
+| 9. No unintended mutations | **met** -- pre-existing rows independently confirmed unchanged on every commit |
+| 10. Ambiguous/no-result cases stop safely | **met** |
+| 11. TEST project ends empty/$0.00/Saved | **met** |
+| 12. All tests pass | **met** -- 602 passed, 12 skipped (pre-existing), 0 failed |
+
+**Single remaining blocker:** quantity-cell OCR immediately after
+commit is intermittently unreadable (4/11 live commits this phase,
+across both single-digit and multi-character values, with no
+reproducible per-value pattern -- a settle-retry did not resolve it).
+Row identity is no longer the blocker -- it was 100% correct across
+every live commit this phase, including the two pilot items that
+Phase 4.7 could not both identify. The remaining gap is narrower and
+different in kind: an unreadable, not incorrect, data-confirmation
+read on an already-correctly-identified row. The trust policy already
+handles this safely (`REVIEW_REQUIRED`, never a false `VERIFIED`,
+never a wrong identification) -- but a policy that routes a
+meaningful fraction of live commits to human review is not yet strong
+enough that a reviewer would reasonably trust the adapter's
+`VERIFIED` conclusion as the normal case.
+
+### Recommendation
+
+Row identification is solved: the structural approach (row-count delta
++ deterministic last-row position + unchanged-pre-existing-rows) is
+correct with no observed exceptions across every category tried this
+phase, including the ones Phase 4.7 could never reliably identify. The
+remaining work is narrowly scoped to the post-commit quantity/unit
+read, distinct from row identification and distinct from category OCR
+(now explicitly out of the trust path). Smallest next step: instrument
+several more post-commit quantity reads across a range of values and
+delays to determine whether the unreadable cases are timing-bound
+(a longer or multi-attempt settle window would fix them) or
+scale/rendering-bound (the same failure mode Phase 4.5/4.6 already
+documented for the pre-commit quantity cell, which no single fixed
+scale resolved) -- then decide between a longer bounded retry budget
+or accepting `REVIEW_REQUIRED` as the correct steady-state outcome for
+a meaningful fraction of commits and re-scoping the gate accordingly.

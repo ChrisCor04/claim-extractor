@@ -22,10 +22,16 @@ htmlcov/
 
 # Fixture PDFs and generated output contain PII / customer data.
 # They must never be committed to a (potentially public) repository.
+# NOTE (Phase 5.0): this MUST stay anchored to the repo root. An earlier,
+# unanchored "output/" here matched ANY directory named "output" anywhere in
+# the tree -- including src/estimate_extractor/output/, the real source
+# package cli.py and ui/pipeline_service.py both import from. That package
+# was silently untracked as a result and, per `git log`, never existed in
+# any commit -- the root cause of both entry points being unimportable.
 fixtures/*.pdf
 fixtures/originals/*.pdf
 fixtures/supplements/*.pdf
-output/
+/output/
 _inspect/
 
 # Phase 3.6 reference selector-screenshot library: the source ZIP is large
