@@ -817,10 +817,26 @@ class WindowsXactimateAdapter(XactimateAdapter):
         from pytesseract import Output
 
         data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
-        needle_clean = needle.strip().lower().rstrip(":")
+        # Live-caught (Phase 5.3): PSM 11 reads the main grid's narrow
+        # "Cat" column header with a bleeding column-divider artifact --
+        # observed live as "Cat|" on one capture and "Cat," on the very
+        # next capture of the SAME unchanged screen -- often enough to
+        # make an exact-after-colon-strip match silently fail and leave
+        # ONLY Quick Entry's "Cat:" label as a candidate, even with
+        # prefer="bottommost" (there is nothing else to prefer over).
+        # Since the artifact character itself is not stable, stripping
+        # ALL trailing non-alphanumeric characters (not a fixed set) is
+        # what actually closes this -- still exact-equality on the core
+        # word, so this cannot match a genuinely different word.
+        import re
+
+        def _clean(word: str) -> str:
+            return re.sub(r"[^a-z0-9]+$", "", word.strip().lower())
+
+        needle_clean = _clean(needle)
         matches = []
         for i, word in enumerate(data["text"]):
-            if word.strip().lower().rstrip(":") == needle_clean:
+            if _clean(word) == needle_clean:
                 matches.append((data["top"][i], data["left"][i], data["width"][i], data["height"][i]))
         if not matches:
             return None
