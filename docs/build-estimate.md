@@ -306,3 +306,129 @@ multi-group pilot (Exterior / Dwelling Roof / Front Elevation, mixed
 units, a REVIEW_REQUIRED item, a NO_MATCH item); (4) Stage 6 Build
 Estimate UI validation against the Aranda project; (5) Stage 7 cleanup
 verification.
+
+## Phase 5.2: Safe Autofill, live bug fixes, and a launch-mechanism blocker
+
+Continued directly from the state above. Stage 1 (restore TEST baseline)
+and Stage 2 (finish group-control validation) both completed live and
+cleanly. Stage 3 (multi-group pilot) started live, surfaced and fixed
+three real bugs (below), then was cut short when Xactimate closed again
+and could not be relaunched by this session -- see "Launch-mechanism
+finding" below. Everything not requiring a live Xactimate session (Safe
+Autofill wiring, capability flags, the display-profile gate, the
+unresolved-rows UI, and Aranda Pass A) was completed and tested against
+the Fake adapter / the real on-disk Aranda project fixture.
+
+### Three real bugs found live and fixed
+
+1. **`verify_group()`'s Subtotal check compared against the wrong
+   baseline.** The original (Phase 5.1) implementation compared the
+   target row's Subtotal-cell pixel count against the project ROOT
+   row's count as a "known blank" baseline. Live testing found
+   different rows have different inherent icon/gridline noise (a
+   genuinely-blank child row read ~1775px, already past a
+   root-row-based "blank+400" threshold) -- a reproducible false
+   positive. Fixed by comparing each row's Subtotal cell against its
+   OWN pixel count before vs. after the probe commit, never against a
+   different row.
+2. **The group tree's click/OCR-text/subtotal row-position formulas
+   disagreed with each other once more than ~4 groups existed.** Three
+   different constant pairs (a click-tuned (27, 23), a separately-tuned
+   OCR-text (25, 15)) were each "close enough" to work by margin alone
+   at low row indices, but diverged from each other as rows piled up --
+   confirmed live: `_find_group_row()` (via the OCR-text formula)
+   returned index 5 for a row the click/subtotal formula would have
+   read as index 4, so `verify_group()` measured the WRONG physical
+   row's pixels and returned false negatives. Fixed by re-measuring
+   real row positions directly via OCR word-level top coordinates on a
+   live 5-row tree (exactly 20px apart, 23px below the header, dead
+   consistent) and using that ONE formula everywhere a row's vertical
+   position is needed.
+3. **A single, consistently-dropped OCR character silently defeated
+   `delete_group()`.** OCR read "Front Elevation" as "frontelevaion"
+   (missing the 't') on every one of 5 consecutive fresh captures --
+   not transient noise. `_group_name_matches()`'s substring-only check
+   never matched, so `delete_group()` concluded the group didn't exist
+   and returned `True` ("already gone") without deleting anything.
+   Fixed with a fuzzy (`difflib.SequenceMatcher` ratio ≥ 0.75) fallback
+   after substring containment fails -- calibrated live against both
+   the real miss (~0.87) and genuinely different group names (~0.3).
+
+Also added two bounded-retry fixes for real timing issues: a
+newly-created group occasionally wasn't found by the very next
+snapshot (`ensure_group()` now retries up to 3 times, 0.8s apart), and
+`select_group()` immediately after `ensure_group()` on a brand-new
+(auto-selected) group could leave the tree in a transient inline-rename
+focus state that destabilized `verify_group()`'s pixel baseline
+(`verify_group()` now presses Escape before capturing, and retries the
+whole probe once).
+
+All three bugs and both timing fixes were found via a genuine live
+Stage 3 pilot run failing, root-caused with targeted diagnostic
+screenshots and pixel measurements (not guessed), fixed, and
+re-confirmed live before moving on -- see the session's evidence
+screenshots under the (gitignored) automation-evidence directory.
+
+### Launch-mechanism finding: Xactimate requires a Xactimate.com session
+
+Xactimate closed again during Stage 3 (same unexplained-exit class as
+Phase 5.1's session end). This session is authorized to start Xactimate
+if it isn't running, so two launch attempts were made: the Start Menu's
+generic AppsFolder shell path, and the proper `.appref-ms` ClickOnce
+shortcut at `Verisk Analytics, Inc\Xactimate online Estimate Writer-G0
+.appref-ms`. **Both produced the same result**: a window titled
+`OEW_Incorrect_App_Launch` showing "Xactimate Warning: This application
+can only be launched from Xactimate.com. If you have encountered this
+warning otherwise, please contact your administrator for further
+assistance." Two pre-existing "Xactimate - Google Chrome" browser
+windows were found (not touched) that are almost certainly the correct
+entry point -- Xactimate Online Estimate Writer is apparently normally
+launched from a logged-in xactimate.com web session, not directly from
+a desktop/Start Menu shortcut. Since that requires an active user login
+session, and this session's explicit authorization is "do not attempt
+to bypass login or authentication," live automation stopped here per
+the Stage 1 constraint ("if the TEST project cannot be positively
+identified, stop live execution") rather than guessing further. The
+harmless warning dialog was dismissed (a simple OK click, no auth
+interaction); the stray launch process was left alone.
+
+**For the next live session**: relaunch Xactimate from the
+xactimate.com web portal (likely via one of the existing Chrome
+windows), confirm the TEST project loads, then resume at Stage 3's next
+task list below.
+
+### Safe Autofill: design and current gating
+
+"Safe Autofill" is implemented as a UI-level opt-in, not a new
+execution engine -- `execution_runner.run_execution_plan()` already ran
+continuously through all groups/tasks without pausing on ordinary
+successful items (Phase 5.0's design). The only thing gating live
+commits is `WindowsXactimateAdapter.supports_live_execution`, a class
+attribute that defaults to `False` and is deliberately never flipped
+globally by this phase (the multi-group pilot that would justify that
+was interrupted -- see above). Instead, Build Estimate's new "Confirm
+project" step constructs a real adapter, independently verifies
+application/project state, computes capability flags
+(`service.compute_capability_flags()`) and a display-profile check
+(`adapter.verify_display_profile()`), and only if
+`safe_autofill_available` is True (real adapter + verified live state +
+group control + `supports_live_execution=True`) does it offer a "Safe
+Autofill" checkbox. Checking it sets `supports_live_execution=True` on
+that ONE constructed adapter instance, for that ONE run -- never the
+class default. `production_project_allowed` and `unattended_mode_
+allowed` are hard-pinned `False` in code (not just by convention) and
+have no live-diagnostics path that can turn them `True`.
+
+### Remaining work for the next live session
+
+Stage 3 (cross-group commit verification with the fixed formulas),
+Stage 4 (a real live Safe Autofill run against Build Estimate), Stage 7
+(live pause/resume/application-interruption), Stage 8 Passes B/C
+(controlled-subset and expanded Aranda execution), and Stage 11 (final
+TEST-project cleanup) all require a live Xactimate session and did not
+run this phase. The TEST project's last confirmed state (after Stage
+2's cleanup) was baseline-clean (`Utility Room` + `Dwelling Roof` only,
+0 grid rows); Stage 3's interrupted pilot may have left `Exterior` and/
+or `Front Elevation` groups present (both empty, 0 committed rows,
+confirmed via live screenshot) -- clean these up as the very first step
+of the next live session before anything else.
