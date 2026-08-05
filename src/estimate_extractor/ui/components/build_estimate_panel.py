@@ -329,9 +329,13 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
         else:
             phrase_rules = phrase_generator.load_phrase_rules()
             ranking_config = ranking.load_ranking_config()
-            preview_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, project_dir, dry_run=True)
-            st.info("Dry run complete -- no task states were changed, nothing was entered into Xactimate.")
-            st.dataframe(pd.DataFrame(_task_table_rows(preview_plan.tasks)), use_container_width=True, hide_index=True)
+            try:
+                preview_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, project_dir, dry_run=True)
+            except Exception as exc:  # pragma: no cover -- exercised live on Windows only
+                st.error(f"Preview failed unexpectedly ({exc!r}) -- no task states were changed.")
+            else:
+                st.info("Dry run complete -- no task states were changed, nothing was entered into Xactimate.")
+                st.dataframe(pd.DataFrame(_task_table_rows(preview_plan.tasks)), use_container_width=True, hide_index=True)
 
     execute_label = "Execute (Safe Autofill)" if safe_autofill_enabled else "Execute"
     if c2.button(execute_label, disabled=not project_confirmed or pending_count == 0, type="primary"):
@@ -350,20 +354,32 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
                 adapter.supports_live_execution = True
             phrase_rules = phrase_generator.load_phrase_rules()
             ranking_config = ranking.load_ranking_config()
-            executed_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, project_dir, dry_run=False)
             reports_dir = project_dir / "execution" / "reports"
-            if executed_plan.run_state == RUN_STATE_COMPLETED:
-                st.success(f"Run completed. Reports written to {reports_dir}.")
-            elif executed_plan.run_state == RUN_STATE_PAUSED:
-                app_ok = adapter.verify_application() and adapter.verify_project()
-                if not app_ok:
-                    st.warning(f"Run paused -- Xactimate is unavailable or the wrong project is active. {_resume_instructions(xactimate_project_name.strip())}")
-                else:
-                    st.warning(
-                        f"Run paused (run_state={executed_plan.run_state}) -- see the group/task tables above for why. "
-                        f"Reports for progress so far were written to {reports_dir}. Click Execute again to resume."
-                    )
-            st.rerun()
+            try:
+                executed_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, project_dir, dry_run=False)
+            except Exception as exc:  # pragma: no cover -- exercised live on Windows only
+                # Hard stop: something failed outside the per-task safety
+                # net (e.g. state could not be persisted to disk). Never
+                # claim success -- whatever WAS persisted before this is
+                # still on disk and safe to inspect/resume from; this
+                # panel does not guess further.
+                st.error(
+                    f"Execution stopped unexpectedly ({exc!r}). Any tasks already completed before this point were "
+                    f"already persisted and are safe. Reload this page to see the plan's actual current state before retrying."
+                )
+            else:
+                if executed_plan.run_state == RUN_STATE_COMPLETED:
+                    st.success(f"Run completed. Reports written to {reports_dir}.")
+                elif executed_plan.run_state == RUN_STATE_PAUSED:
+                    app_ok = adapter.verify_application() and adapter.verify_project()
+                    if not app_ok:
+                        st.warning(f"Run paused -- Xactimate is unavailable or the wrong project is active. {_resume_instructions(xactimate_project_name.strip())}")
+                    else:
+                        st.warning(
+                            f"Run paused (run_state={executed_plan.run_state}) -- see the group/task tables above for why. "
+                            f"Reports for progress so far were written to {reports_dir}. Click Execute again to resume."
+                        )
+                st.rerun()
 
     st.markdown("---")
     st.markdown("**Unresolved rows**")

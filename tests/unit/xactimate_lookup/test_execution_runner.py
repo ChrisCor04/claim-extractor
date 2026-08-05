@@ -14,6 +14,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     ExecutionTask,
     GROUP_COMPLETED,
     GROUP_FAILED,
+    GROUP_PENDING,
     GROUP_VERIFIED,
     GroupExecutionState,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
@@ -305,3 +306,106 @@ def test_skip_task_marks_skipped_and_persists(tmp_path, phrase_rules, ranking_co
     reloaded = load_execution_plan(tmp_path)
     assert reloaded.task_by_id("task_2").state == TASK_SKIPPED
     assert "exclude" in reloaded.task_by_id("task_2").stop_detail
+
+
+# ---------------------------------------------------------------------
+# Phase 5.2 Stage 6: exactly the recoverable-vs-hard-stop classification
+# the build spec names. Each "recoverable" condition must route its own
+# task to REVIEW_REQUIRED/FAILED and let the run continue to every
+# other task/group; each "hard stop" condition must pause the WHOLE run
+# and leave not-yet-reached tasks untouched.
+# ---------------------------------------------------------------------
+
+
+def test_no_match_is_recoverable_run_continues_to_other_tasks(tmp_path, phrase_rules, ranking_config):
+    """NO_MATCH (empty dropdown for one task's CAT/SEL) must fail only
+    that task -- every other task, including later ones in the SAME
+    group, must still run."""
+    plan = _plan_two_groups()
+    script = _dropdown_script(*plan.tasks)
+    del script["SFG GUTA"]  # task_1's CAT/SEL now returns no dropdown results at all
+    adapter = GroupAwareFakeAdapter(dropdown_script=script)
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.run_state == RUN_STATE_COMPLETED
+    assert result.task_by_id("task_1").state == TASK_FAILED
+    assert result.task_by_id("task_1").stop_reason == "no_results"
+    assert result.task_by_id("task_2").state == TASK_COMPLETED  # same group, later task -- still ran
+    assert result.task_by_id("task_3").state == TASK_COMPLETED  # different group -- unaffected
+
+
+def test_ambiguous_ranking_is_recoverable_run_continues_to_other_tasks(tmp_path, phrase_rules, ranking_config):
+    """A REVIEW_REQUIRED ranking outcome (multiple similarly-plausible
+    candidates, no clear margin -- live-reproduced in Phase 5.2 Stage 3
+    with a real RFG/ARMVN search) must fail only that task."""
+    plan = _plan_two_groups()
+    script = _dropdown_script(*plan.tasks)
+    # Two candidates for task_1's query -- ambiguous, no single clear winner.
+    script["SFG GUTA"] = [
+        DropdownResult(raw_text="Gutter A", row_position=0, category="SFG", selector="GUTA", description="Gutter - aluminum", extraction_confidence=1.0),
+        DropdownResult(raw_text="Gutter A steel", row_position=1, category="SFG", selector="GUTAS", description="Gutter - steel", extraction_confidence=1.0),
+    ]
+    adapter = GroupAwareFakeAdapter(dropdown_script=script)
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.run_state == RUN_STATE_COMPLETED
+    assert result.task_by_id("task_1").state == TASK_REVIEW_REQUIRED
+    assert result.task_by_id("task_1").stop_reason == "ambiguous_candidates"
+    assert result.task_by_id("task_2").state == TASK_COMPLETED
+    assert result.task_by_id("task_3").state == TASK_COMPLETED
+
+
+def test_missing_quantity_is_recoverable_run_continues_to_other_tasks(tmp_path, phrase_rules, ranking_config):
+    """A task with no usable quantity (source_quantity<=0, and no
+    entered_quantity override) must fail only that task -- never abort
+    the run, never guess a quantity."""
+    plan = _plan_two_groups()
+    plan.tasks[0].source_quantity = 0
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.run_state == RUN_STATE_COMPLETED
+    assert result.task_by_id("task_1").state == TASK_REVIEW_REQUIRED
+    assert result.task_by_id("task_1").stop_reason == "unit_or_quantity_invalid"
+    assert result.task_by_id("task_2").state == TASK_COMPLETED
+    assert result.task_by_id("task_3").state == TASK_COMPLETED
+
+
+def test_project_lost_between_groups_is_a_hard_stop_for_the_whole_run(tmp_path, phrase_rules, ranking_config):
+    """Losing the verified project identity partway through (Xactimate
+    closes, wrong project becomes active, etc.) must PAUSE the entire
+    run before the next group -- never proceed to execute against an
+    unverified context, even though the FIRST group already succeeded."""
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    call_count = {"n": 0}
+
+    def flaky_verify_project():
+        call_count["n"] += 1
+        # verify_project() is called at the run's initial check, before
+        # each group, AND inside orchestrator.execute_plan() for each
+        # individual task -- succeed through all of "Dwelling Roof"'s
+        # checks (initial + group-entry + its 2 tasks' own internal
+        # checks = 4 calls), then report project identity lost from the
+        # "Fence" group-entry check onward.
+        return call_count["n"] <= 4
+
+    adapter.verify_project = flaky_verify_project
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.run_state == RUN_STATE_PAUSED
+    assert result.task_by_id("task_1").state == TASK_COMPLETED
+    assert result.task_by_id("task_2").state == TASK_COMPLETED
+    # "Fence" was never reached -- the whole run stopped before it, not
+    # just that one group's tasks routed to review.
+    assert result.task_by_id("task_3").state == TASK_PENDING
+    assert result.group_by_id("Fence").state == GROUP_PENDING
