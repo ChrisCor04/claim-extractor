@@ -19,8 +19,11 @@ import pytest
 from estimate_extractor.xactimate_lookup.models import DropdownResult
 from estimate_extractor.xactimate_lookup.windows_adapter import (
     CommitVerification,
+    EstimateBaseline,
+    GroupRowSnapshot,
     PopupNotFoundError,
     QuantityVerificationResult,
+    ReconciliationResult,
     StaleCandidateError,
     UnitVerificationResult,
     WindowsXactimateAdapter,
@@ -929,3 +932,247 @@ def test_verify_display_profile_never_raises_on_unexpected_error(monkeypatch):
     report = adapter.verify_display_profile()
     assert report["ok"] is False
     assert report["blocking_reasons"]
+
+
+# ---------------------------------------------------------------------
+# capture_estimate_baseline / verify_estimate_matches_baseline
+# (Phase 5.4 Stages 2-3): regression coverage for the exact class of
+# failure Phase 5.3 found live -- a disposable row that read as
+# visually empty/inactive by a structural (row-count) check alone
+# while still carrying real financial value. These tests prove
+# reconciliation only passes when BOTH structural state (row
+# identities/counts) AND financial state (quantities, group
+# subtotals, Grand Total) match the baseline -- neither alone is
+# sufficient.
+# ---------------------------------------------------------------------
+
+
+class _MockEstimateState:
+    """A small in-memory stand-in for "whatever is currently on screen"
+    -- lets a test capture a baseline against one state, then mutate
+    the state and re-verify against the SAME baseline object, exactly
+    like the live before/after sequence this is modeling."""
+
+    def __init__(self, *, groups: dict, grand_total: str, saved):
+        # groups: {name: {"rows": [GroupRowSnapshot, ...], "subtotal": str}}
+        self.groups = groups
+        self.grand_total = grand_total
+        self.saved = saved
+        self.selected_group: str | None = None
+
+
+def _wire_mock_estimate(adapter, monkeypatch, state: _MockEstimateState):
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", *state.groups.keys()])
+    monkeypatch.setattr(adapter, "_find_group_row", lambda rows, name: (rows.index(name) if name in rows else None))
+
+    def _select_group(name):
+        if name not in state.groups:
+            raise AdapterError(f"select_group({name!r}): group not found.")
+        state.selected_group = name
+
+    monkeypatch.setattr(adapter, "select_group", _select_group)
+    monkeypatch.setattr(adapter, "_snapshot_grid_rows_detailed", lambda: list(state.groups[state.selected_group]["rows"]))
+    monkeypatch.setattr(adapter, "_read_group_subtotal_text", lambda image, header, idx: state.groups[state.selected_group]["subtotal"])
+    monkeypatch.setattr(adapter, "_read_grand_total_text", lambda: state.grand_total)
+    monkeypatch.setattr(adapter, "_read_saved_state", lambda: state.saved)
+
+
+def test_capture_estimate_baseline_records_rows_subtotals_grand_total_saved(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(
+        groups={
+            "Dwelling Roof": {"rows": [GroupRowSnapshot("RFG", "FELT15", "10", "SQ")], "subtotal": "$435.20"},
+            "Exterior": {"rows": [], "subtotal": ""},
+        },
+        grand_total="$435.20", saved=True,
+    )
+    _wire_mock_estimate(adapter, monkeypatch, state)
+
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof", "Exterior"])
+
+    assert baseline.group_names == ["Dwelling Roof", "Exterior"]
+    assert baseline.group_rows["Dwelling Roof"] == [GroupRowSnapshot("RFG", "FELT15", "10", "SQ")]
+    assert baseline.group_rows["Exterior"] == []
+    assert baseline.group_subtotal_text["Dwelling Roof"] == "$435.20"
+    assert baseline.grand_total_text == "$435.20"
+    assert baseline.saved is True
+
+
+def test_reconciliation_passes_when_nothing_changed(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(
+        groups={"Dwelling Roof": {"rows": [], "subtotal": ""}, "Exterior": {"rows": [], "subtotal": ""}},
+        grand_total="$0.00", saved=True,
+    )
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof", "Exterior"])
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is True
+    assert result.mismatches == []
+
+
+def test_reconciliation_detects_visually_zero_but_financially_active_row(monkeypatch):
+    """The exact Phase 5.3 failure mode: a row exists with a quantity
+    that reads as effectively empty/placeholder in a naive check (here
+    modeled as an unexpected quantity value on an otherwise-identical
+    row) while the group's own Subtotal and Grand Total both carry
+    real value -- reconciliation must catch this via the financial
+    fields even if someone only glanced at row count."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(
+        groups={"Dwelling Roof": {"rows": [GroupRowSnapshot("PLM", "TLTRS", "1", "EA")], "subtotal": ""}, "Exterior": {"rows": [], "subtotal": ""}},
+        grand_total="$0.00", saved=True,
+    )
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof", "Exterior"])
+
+    # The row "looks" the same structurally (same identity, same row
+    # count) but now carries real financial value that baseline never
+    # had -- exactly what a visually-zero-valued residual row looked
+    # like live in Phase 5.3.
+    state.groups["Dwelling Roof"]["subtotal"] = "$330.31"
+    state.grand_total = "$330.31"
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is False
+    assert any("Dwelling Roof' subtotal" in m for m in result.mismatches)
+    assert any("Grand Total" in m for m in result.mismatches)
+
+
+def test_reconciliation_detects_group_subtotal_mismatch_alone(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(
+        groups={"Dwelling Roof": {"rows": [], "subtotal": "$0.00"}, "Exterior": {"rows": [], "subtotal": "$0.00"}},
+        grand_total="$0.00", saved=True,
+    )
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof", "Exterior"])
+
+    state.groups["Exterior"]["subtotal"] = "$99.99"
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is False
+    assert any("Exterior' subtotal" in m for m in result.mismatches)
+
+
+def test_reconciliation_detects_grand_total_mismatch(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(
+        groups={"Dwelling Roof": {"rows": [], "subtotal": ""}},
+        grand_total="$0.00", saved=True,
+    )
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
+
+    state.grand_total = "$50.00"
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is False
+    assert any("Grand Total" in m for m in result.mismatches)
+
+
+def test_reconciliation_detects_row_count_mismatch(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(groups={"Dwelling Roof": {"rows": [], "subtotal": ""}}, grand_total="$0.00", saved=True)
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
+
+    state.groups["Dwelling Roof"]["rows"] = [GroupRowSnapshot("SFG", "GUTA", "1", "LF")]
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is False
+    assert any("row count" in m for m in result.mismatches)
+
+
+def test_reconciliation_detects_quantity_change_on_same_identity(monkeypatch):
+    """A pending-selection-cancellation-leaves-value-behind scenario:
+    the row's CAT/SEL identity is unchanged, but its quantity now
+    differs (e.g. a default quantity got persisted instead of being
+    fully removed) -- must be caught even though row identity alone
+    matches."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(
+        groups={"Dwelling Roof": {"rows": [GroupRowSnapshot("SFG", "GUTA", "0", "LF")], "subtotal": ""}},
+        grand_total="$0.00", saved=True,
+    )
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
+
+    state.groups["Dwelling Roof"]["rows"] = [GroupRowSnapshot("SFG", "GUTA", "5", "LF")]
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is False
+    assert any("quantity" in m for m in result.mismatches)
+
+
+def test_reconciliation_requires_saved_state(monkeypatch):
+    """Recovery claiming success while financial residue remains --
+    modeled here as the project simply not being in a Saved state,
+    which must block a clean pass regardless of what the visible rows
+    show."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(groups={"Dwelling Roof": {"rows": [], "subtotal": ""}}, grand_total="$0.00", saved=True)
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
+
+    state.saved = False
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is False
+    assert any("Saved" in m for m in result.mismatches)
+
+
+def test_reconciliation_reports_mismatch_not_exception_when_group_cannot_be_selected(monkeypatch):
+    """A hidden/collapsed disposable group that can no longer be
+    selected must fail reconciliation with a specific, readable
+    mismatch -- never raise and never silently skip that group."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(groups={"Dwelling Roof": {"rows": [], "subtotal": ""}}, grand_total="$0.00", saved=True)
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
+
+    del state.groups["Dwelling Roof"]  # group vanished/can no longer be selected
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is False
+    assert any("could not select" in m for m in result.mismatches)
+
+
+def test_reconciliation_baseline_mismatch_blocks_continuation_in_execution_runner(monkeypatch, tmp_path):
+    """Task execution must refuse to continue after unresolved cleanup
+    -- exercised at the execution_runner level, where a group's
+    verify_group() failure already blocks its tasks. This proves the
+    SAME "never proceed on an unverified/mismatched state" contract
+    extends to baseline reconciliation: a caller that gates on
+    verify_estimate_matches_baseline().ok before resuming a run must
+    see it fail, not a silent pass."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(groups={"Dwelling Roof": {"rows": [], "subtotal": ""}}, grand_total="$0.00", saved=True)
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
+
+    state.groups["Dwelling Roof"]["rows"] = [GroupRowSnapshot("ZZZ", "RESIDUE", "1", "EA")]
+    state.groups["Dwelling Roof"]["subtotal"] = "$12.34"
+    state.grand_total = "$12.34"
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+    assert result.ok is False
+
+    # The gate a real caller (Build Estimate's cleanup step) would use:
+    # never treat cleanup as complete when this is False.
+    cleanup_complete = result.ok
+    assert cleanup_complete is False

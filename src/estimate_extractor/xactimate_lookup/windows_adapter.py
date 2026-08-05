@@ -2739,20 +2739,29 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     @staticmethod
     def _text_fields_match(a: str, b: str) -> bool:
-        """Fuzzy-tolerant comparison for two OCR reads of what should
-        be the SAME on-screen field at two points in time -- exact
-        equality would be too strict given this file's own documented
-        OCR instability (the same unchanged text reading differently
-        across consecutive captures), but a genuine content change
-        must still be caught. Both empty is a match (nothing there,
-        both times)."""
+        """EXACT (whitespace/case-normalized only) comparison for two
+        OCR reads of what should be the SAME financial/quantity field
+        at two points in time.
+
+        Live-caught (Phase 5.4): a fuzzy sliding-window comparison --
+        the right tool for longer labels like group names, where a
+        single dropped/garbled character in an 8+ character word is
+        the documented failure mode -- is dangerously lenient on the
+        SHORT strings financial fields actually are: `"$0.00"` vs.
+        `"$50.00"` scored 0.91 against the same 0.75 threshold used
+        for group names, well above it, because a short target gives a
+        sliding window too much room to find a coincidentally-close
+        overlap. That would have silently passed reconciliation on
+        exactly the class of bug this feature exists to catch (Phase
+        5.3's real, undetected financial residue). For a
+        cleanup-verification gate, a false POSITIVE (flagging an
+        unchanged field as different, e.g. from a one-off OCR misread)
+        is far cheaper than a false NEGATIVE (missing a real financial
+        change) -- so this is deliberately strict, not fuzzy. Both
+        empty is a match (nothing there, both times)."""
         a_norm = a.strip().lower().replace(" ", "")
         b_norm = b.strip().lower().replace(" ", "")
-        if a_norm == b_norm:
-            return True
-        if not a_norm or not b_norm:
-            return False
-        return WindowsXactimateAdapter._best_window_fuzzy_ratio(a_norm, b_norm) >= WindowsXactimateAdapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD
+        return a_norm == b_norm
 
     def verify_estimate_matches_baseline(self, baseline: EstimateBaseline) -> ReconciliationResult:
         """Not part of the abstract contract (Phase 5.4). Re-captures
