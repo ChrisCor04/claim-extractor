@@ -142,13 +142,27 @@ def _cancel_pending_selection(adapter: XactimateAdapter) -> None:
     never went through this module's own commit path at all. Not part
     of the abstract adapter contract (duck-typed, like every other
     Windows-only capability here) -- best-effort and silent on failure,
-    since a cleanup failure must never mask the original stop reason."""
+    since a cleanup failure must never mask the original stop reason.
+
+    Live-caught (Phase 5.4): a SINGLE `cancel_current_item()` call is
+    not reliable enough on its own -- confirmed live, reproducibly,
+    that the very first attempt can fail with "row count did not
+    decrease" even though a second immediate attempt succeeds (the
+    same flakiness `_cleanup_probe_item()`/`ensure_group()` already
+    retry around elsewhere in this codebase). A single try-and-swallow
+    here silently left real financial residue behind (confirmed live:
+    a $330.31 row survived a field-mismatch stop). Bounded retry --
+    never unbounded -- closes this without weakening the "never let
+    cleanup mask the original stop reason" contract: it still never
+    raises."""
     if not hasattr(adapter, "cancel_current_item"):
         return
-    try:
-        adapter.cancel_current_item()
-    except Exception:
-        pass
+    for _attempt in range(3):
+        try:
+            adapter.cancel_current_item()
+            return
+        except Exception:
+            continue
 
 
 def execute_plan(

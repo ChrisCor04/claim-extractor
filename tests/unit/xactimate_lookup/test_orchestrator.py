@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from estimate_extractor.xactimate_lookup import orchestrator, registry
-from estimate_extractor.xactimate_lookup.adapter import FakeXactimateAdapter
+from estimate_extractor.xactimate_lookup.adapter import AdapterError, FakeXactimateAdapter
 from estimate_extractor.xactimate_lookup.models import (
     DECISION_AUTO_SELECT,
     DECISION_NO_MATCH,
@@ -334,6 +334,60 @@ def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phras
     assert outcome.committed is False
     assert not any(name == "commit_item" for name, _a, _k in adapter.log.calls)
     assert cancel_calls == [1]  # Phase 5.3: pending row must be cancelled, not left dangling
+
+
+def test_cancel_pending_selection_retries_when_the_first_attempt_fails(tmp_path, phrase_rules, ranking_config, monkeypatch):
+    """Phase 5.4 (critical, live-caught): a single cancel_current_item()
+    call is not reliable enough on its own -- the real adapter's first
+    attempt can fail with "row count did not decrease" even though an
+    immediate second attempt succeeds. Live-reproduced consequence of
+    NOT retrying: a real $330.31 row survived a field-mismatch stop.
+    This proves the retry closes it without ever raising out of
+    execute_plan()."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(source_unit="SQ")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]}, populated_unit="LF")
+    adapter.supports_live_execution = True
+
+    attempts = []
+
+    def _flaky_cancel():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise AdapterError("cancel_current_item(): row count did not decrease (before=1, after=1).")
+
+    monkeypatch.setattr(adapter, "cancel_current_item", _flaky_cancel, raising=False)
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
+    assert len(attempts) == 2  # first attempt failed, second succeeded -- no residue left behind
+
+
+def test_cancel_pending_selection_gives_up_after_bounded_retries_without_raising(tmp_path, phrase_rules, ranking_config, monkeypatch):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(source_unit="SQ")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]}, populated_unit="LF")
+    adapter.supports_live_execution = True
+
+    attempts = []
+
+    def _always_fails():
+        attempts.append(1)
+        raise AdapterError("simulated persistent failure")
+
+    monkeypatch.setattr(adapter, "cancel_current_item", _always_fails, raising=False)
+
+    # Must not raise -- a cleanup failure must never mask the original stop reason.
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+    assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
+    assert len(attempts) == 3  # bounded -- never unbounded
 
 
 def test_cancel_pending_selection_is_a_no_op_when_adapter_lacks_the_method(tmp_path, phrase_rules, ranking_config):
