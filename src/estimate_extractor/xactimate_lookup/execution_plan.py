@@ -106,6 +106,12 @@ class ExecutionTask:
     started_at: str | None = None
     completed_at: str | None = None
     error: str | None = None
+    #: Set only when a task-level adapter error was hit (see
+    #: execution_runner.py's per-task exception handler) -- "recovered"
+    #: if adapter.recover() then completed without raising, "recovery_
+    #: failed" if it also raised. None means no adapter-error recovery
+    #: was ever attempted for this task.
+    recovery_outcome: str | None = None
 
     @property
     def row_label(self) -> str:

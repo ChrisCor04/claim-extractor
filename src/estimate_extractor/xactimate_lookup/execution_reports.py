@@ -49,6 +49,7 @@ TASK_CSV_COLUMNS = [
     "started_at",
     "completed_at",
     "error",
+    "recovery_outcome",
 ]
 
 
@@ -84,6 +85,7 @@ def _task_row(task: ExecutionTask) -> dict:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "error": task.error,
+        "recovery_outcome": task.recovery_outcome,
     }
 
 

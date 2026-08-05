@@ -1,39 +1,62 @@
-"""Renders the "Build Estimate" screen (Phase 5.0 Priority 4): builds a
-persisted ExecutionPlan from every APPROVED line item, displays it grouped
-by Section exactly like Mapping Review, and offers a dry-run preview and a
-live execute -- both reusing execution_runner.run_execution_plan()
-unchanged. A real WindowsXactimateAdapter is only ever constructed here
-(lazy import, matching windows_adapter.py's own platform-safety
-convention) -- nothing above this file touches desktop automation.
+"""Renders the "Build Estimate" screen (Phase 5.0 Priority 4; Phase 5.2
+Safe Autofill): builds a persisted, group-by-group ExecutionPlan from
+every APPROVED line item, displays it grouped by Section exactly like
+Mapping Review, and offers a dry-run preview and a live execute -- both
+reusing execution_runner.run_execution_plan() unchanged. A real
+WindowsXactimateAdapter is only ever constructed here (lazy import,
+matching windows_adapter.py's own platform-safety convention) --
+nothing above this file touches desktop automation.
 
 Live execution stays gated by WindowsXactimateAdapter.supports_live_
-execution (False as of Phase 4.8 -- see docs/xactimate-lookup.md): every
-task will safely come back REVIEW_REQUIRED with stop_reason=
-"unsupported_adapter" until that gate is deliberately flipped after
-further live validation. This panel does not, and must not, override
-that gate itself.
+execution, which defaults to False at the class level and is NEVER
+flipped globally by this panel. "Safe Autofill" here means: the user
+explicitly confirms the target project (constructing a real adapter and
+independently verifying application/project/display-profile state),
+then explicitly opts in via a checkbox that is only offered when
+service.compute_capability_flags() reports safe_autofill_available --
+which itself requires a positively-verified live adapter with working
+group control. Only THEN does this panel set supports_live_execution=
+True on that one constructed adapter INSTANCE, for that one run. See
+docs/build-estimate.md.
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 from pathlib import Path
 
 import streamlit as st
 
 from estimate_extractor.mapping.pipeline import DEFAULT_CONFIG_DIR
-from estimate_extractor.xactimate_lookup import phrase_generator, ranking
+from estimate_extractor.xactimate_lookup import phrase_generator, ranking, service
 from estimate_extractor.xactimate_lookup.execution_plan import (
     ExecutionPlanError,
     GROUP_COMPLETED,
     RUN_STATE_COMPLETED,
+    RUN_STATE_PAUSED,
+    TASK_FAILED,
     TASK_PENDING,
+    TASK_REVIEW_REQUIRED,
+    TASK_SKIPPED,
     build_execution_plan,
     load_execution_plan,
     save_execution_plan,
 )
+from estimate_extractor.xactimate_lookup.execution_reports import (
+    TASK_CSV_COLUMNS,
+    _task_row,
+    write_all_execution_reports,
+)
 from estimate_extractor.xactimate_lookup.execution_runner import run_execution_plan, skip_task
 
 EVIDENCE_DIR = DEFAULT_CONFIG_DIR.parent / "automation_evidence"
+
+#: Task states a human still needs to look at -- never conflated with
+#: TASK_COMPLETED (Phase 5.2 Stage 9: "never present 'completed' when a
+#: task only reached REVIEW_REQUIRED").
+UNRESOLVED_TASK_STATES = (TASK_REVIEW_REQUIRED, TASK_FAILED, TASK_SKIPPED)
 
 
 def _construct_windows_adapter(xactimate_project_name: str):
@@ -64,6 +87,83 @@ def _task_table_rows(tasks) -> list[dict]:
         }
         for t in tasks
     ]
+
+
+def _unresolved_table_rows(tasks) -> list[dict]:
+    """The exact column set Phase 5.2 Stage 9 requires -- source row,
+    source page, group, description, source/entered/observed quantity
+    and unit, CAT/SEL, lookup method, result, reason, evidence, recovery
+    outcome. Built from `_task_row()` (execution_reports.py) so this
+    table and the JSON/CSV export always describe a task identically."""
+    rows = []
+    for t in tasks:
+        r = _task_row(t)
+        rows.append(
+            {
+                "Source row": r["row_label"],
+                "Source page": r["source_page"],
+                "Group": r["section_name"],
+                "Description": r["description"],
+                "Source qty": r["source_quantity"],
+                "Source unit": r["source_unit"],
+                "Entered qty": r["entered_quantity"],
+                "Observed qty": r["observed_quantity"],
+                "Expected unit": r["expected_unit"],
+                "Observed unit": r["observed_unit"],
+                "CAT": r["category"],
+                "SEL": r["selector"],
+                "Lookup method": r["lookup_strategy"],
+                "Result": r["state"],
+                "Reason": r["stop_detail"] or r["stop_reason"] or r["error"] or "",
+                "Evidence": r["evidence_path"] or "",
+                "Recovery": r["recovery_outcome"] or "",
+            }
+        )
+    return rows
+
+
+def _capability_flags_rows(flags) -> list[dict]:
+    return [
+        {"Capability": "Planning available", "Value": flags.planning_available},
+        {"Capability": "Live adapter available", "Value": flags.live_adapter_available},
+        {"Capability": "Group control available", "Value": flags.group_control_available},
+        {"Capability": "Safe Autofill available", "Value": flags.safe_autofill_available},
+        {"Capability": "Resume available", "Value": flags.resume_available},
+        {"Capability": "Production project allowed", "Value": flags.production_project_allowed},
+        {"Capability": "Unattended mode allowed", "Value": flags.unattended_mode_allowed},
+    ]
+
+
+def _resume_instructions(project_name: str) -> str:
+    return (
+        f"Open Xactimate / Open project {project_name!r} / Return to the Estimate Items screen / "
+        f"Click 'Confirm project' above, then Execute to resume."
+    )
+
+
+def _execution_report_csv_bytes(plan) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(TASK_CSV_COLUMNS)
+    for task in plan.tasks:
+        row = _task_row(task)
+        writer.writerow([row[col] for col in TASK_CSV_COLUMNS])
+    return buf.getvalue().encode("utf-8")
+
+
+def _execution_report_json_bytes(plan) -> bytes:
+    summary = plan.summary()
+    data = {
+        **plan.to_dict(),
+        "summary": {
+            "completed": summary.completed,
+            "review_required_count": len(summary.review_required_labels),
+            "skipped": summary.skipped,
+            "failed_count": len(summary.failed_labels),
+            "total": summary.total,
+        },
+    }
+    return json.dumps(data, indent=2, default=str).encode("utf-8")
 
 
 def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
@@ -131,25 +231,97 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
                         st.success(f"Skipped {len(skip_ids)} row(s).")
                         st.rerun()
 
-    if summary.review_required_labels:
-        with st.expander(f"Review required ({len(summary.review_required_labels)})", expanded=True):
-            for label in summary.review_required_labels:
-                st.caption(label)
-    if summary.failed_labels:
-        with st.expander(f"Failed ({len(summary.failed_labels)})", expanded=True):
-            for label in summary.failed_labels:
-                st.caption(label)
+    pending_count = sum(1 for t in plan.tasks if t.state == TASK_PENDING)
+
+    st.markdown("---")
+    st.markdown("**Target Xactimate project**")
+    xactimate_project_name = st.text_input(
+        "Xactimate project name (must match the project currently open in Xactimate)",
+        key="build_estimate_xactimate_project_name",
+    )
+    st.caption(f"{pending_count} task(s) still pending.")
+
+    if st.button("Confirm project", key="build_estimate_confirm_project", disabled=not xactimate_project_name.strip()):
+        try:
+            adapter = _construct_windows_adapter(xactimate_project_name.strip())
+        except Exception as exc:  # pragma: no cover -- exercised live on Windows only
+            st.session_state["build_estimate_confirmation"] = {"project_name": xactimate_project_name.strip(), "error": str(exc)}
+        else:
+            diagnostics = service.run_diagnostics(adapter)
+            flags = service.compute_capability_flags(adapter, diagnostics)
+            display_profile = adapter.verify_display_profile() if hasattr(adapter, "verify_display_profile") else None
+            st.session_state["build_estimate_confirmation"] = {
+                "project_name": xactimate_project_name.strip(),
+                "application_verified": diagnostics.application_verified,
+                "project_verified": diagnostics.project_verified,
+                "flags": flags,
+                "display_profile": display_profile,
+                "error": None,
+            }
+        st.rerun()
+
+    confirmation = st.session_state.get("build_estimate_confirmation")
+    project_confirmed = False
+    safe_autofill_ready = False
+    if confirmation and confirmation.get("project_name") == xactimate_project_name.strip():
+        if confirmation.get("error"):
+            st.error(f"Could not construct the Xactimate adapter: {confirmation['error']}")
+        else:
+            flags = confirmation["flags"]
+            display_profile = confirmation["display_profile"]
+            project_confirmed = bool(confirmation["application_verified"] and confirmation["project_verified"])
+
+            if project_confirmed:
+                st.success(f"Confirmed: Xactimate is open on project {xactimate_project_name.strip()!r}, Estimate Items screen.")
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("Groups in plan", len(plan.groups))
+                cc2.metric("Ready (pending)", pending_count)
+                cc3.metric("Uncertain (review/failed)", len(summary.review_required_labels) + len(summary.failed_labels))
+            else:
+                st.error(
+                    "Could not positively identify the target Xactimate project -- refusing to proceed. "
+                    + _resume_instructions(xactimate_project_name.strip())
+                )
+
+            # Shown regardless of confirmation outcome -- exactly when a
+            # user needs "why isn't this available" visibility most.
+            with st.expander("Capability flags", expanded=not project_confirmed):
+                st.dataframe(pd.DataFrame(_capability_flags_rows(flags)), use_container_width=True, hide_index=True)
+                for note in flags.notes:
+                    st.caption(note)
+
+            display_profile_ok = display_profile is None or display_profile["ok"]
+            if display_profile is not None:
+                with st.expander("Display / calibration check", expanded=not display_profile["ok"]):
+                    for c in display_profile["checks"]:
+                        st.caption(c)
+                    if display_profile["ok"]:
+                        st.success("Display profile matches the validated calibration -- safe to run live.")
+                    else:
+                        st.error("Display profile check failed -- live execution is blocked:")
+                        for r in display_profile["blocking_reasons"]:
+                            st.caption(f"- {r}")
+
+            safe_autofill_ready = project_confirmed and flags.safe_autofill_available and display_profile_ok
 
     st.markdown("---")
     st.markdown("**Run against Xactimate**")
-    xactimate_project_name = st.text_input(
-        "Xactimate project name (must match the project currently open in Xactimate)", key="build_estimate_xactimate_project_name"
-    )
-    pending_count = sum(1 for t in plan.tasks if t.state == TASK_PENDING)
-    st.caption(f"{pending_count} task(s) still pending.")
+
+    safe_autofill_enabled = False
+    if project_confirmed:
+        if safe_autofill_ready:
+            safe_autofill_enabled = st.checkbox(
+                "Enable Safe Autofill (continuous live execution of safe tasks -- see docs/build-estimate.md)",
+                key="build_estimate_safe_autofill_enabled",
+            )
+        else:
+            st.info(
+                "Safe Autofill is not available for this session -- see Capability flags / Display check above. "
+                "Preview (dry run) is still available."
+            )
 
     c1, c2 = st.columns(2)
-    if c1.button("Preview (dry run -- never touches Xactimate's data)", disabled=not xactimate_project_name.strip() or pending_count == 0):
+    if c1.button("Preview (dry run -- never touches Xactimate's data)", disabled=not project_confirmed or pending_count == 0):
         try:
             adapter = _construct_windows_adapter(xactimate_project_name.strip())
         except Exception as exc:  # pragma: no cover -- exercised live on Windows only
@@ -161,21 +333,91 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
             st.info("Dry run complete -- no task states were changed, nothing was entered into Xactimate.")
             st.dataframe(pd.DataFrame(_task_table_rows(preview_plan.tasks)), use_container_width=True, hide_index=True)
 
-    if c2.button("Execute", disabled=not xactimate_project_name.strip() or pending_count == 0, type="primary"):
+    execute_label = "Execute (Safe Autofill)" if safe_autofill_enabled else "Execute"
+    if c2.button(execute_label, disabled=not project_confirmed or pending_count == 0, type="primary"):
         try:
             adapter = _construct_windows_adapter(xactimate_project_name.strip())
         except Exception as exc:  # pragma: no cover -- exercised live on Windows only
             st.error(f"Could not construct the Xactimate adapter: {exc}")
         else:
+            if safe_autofill_enabled:
+                # Explicit, scoped opt-in for THIS run's adapter instance
+                # only -- WindowsXactimateAdapter's class default stays
+                # False. Gated above on compute_capability_flags()
+                # reporting safe_autofill_available (a real, positively-
+                # verified adapter with working group control) and a
+                # clean display-profile check.
+                adapter.supports_live_execution = True
             phrase_rules = phrase_generator.load_phrase_rules()
             ranking_config = ranking.load_ranking_config()
             executed_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, project_dir, dry_run=False)
             reports_dir = project_dir / "execution" / "reports"
             if executed_plan.run_state == RUN_STATE_COMPLETED:
                 st.success(f"Run completed. Reports written to {reports_dir}.")
-            else:
-                st.warning(
-                    f"Run paused (run_state={executed_plan.run_state}) -- see the group/task tables above for why. "
-                    f"Reports for progress so far were written to {reports_dir}. Click Execute again to resume."
-                )
+            elif executed_plan.run_state == RUN_STATE_PAUSED:
+                app_ok = adapter.verify_application() and adapter.verify_project()
+                if not app_ok:
+                    st.warning(f"Run paused -- Xactimate is unavailable or the wrong project is active. {_resume_instructions(xactimate_project_name.strip())}")
+                else:
+                    st.warning(
+                        f"Run paused (run_state={executed_plan.run_state}) -- see the group/task tables above for why. "
+                        f"Reports for progress so far were written to {reports_dir}. Click Execute again to resume."
+                    )
             st.rerun()
+
+    st.markdown("---")
+    st.markdown("**Unresolved rows**")
+    unresolved_tasks = [t for t in plan.tasks if t.state in UNRESOLVED_TASK_STATES]
+    if not unresolved_tasks:
+        st.caption("No unresolved rows.")
+    else:
+        row_numbers = ", ".join(str(t.source_order + 1) for t in unresolved_tasks)
+        st.warning(f"Rows requiring review: {row_numbers}")
+        st.dataframe(pd.DataFrame(_unresolved_table_rows(unresolved_tasks)), use_container_width=True, hide_index=True)
+
+        ac1, ac2, ac3 = st.columns(3)
+        selected_id = ac1.selectbox(
+            "Select a row to resolve / retry / skip",
+            [t.task_id for t in unresolved_tasks],
+            format_func=lambda tid: next(t.row_label for t in unresolved_tasks if t.task_id == tid),
+            key="unresolved_row_selector",
+        )
+        if ac2.button("Retry selected row (Resolve)", key="unresolved_retry"):
+            task = plan.task_by_id(selected_id)
+            task.state = TASK_PENDING
+            task.stop_reason = None
+            task.stop_detail = None
+            task.error = None
+            save_execution_plan(plan, project_dir)
+            st.success(f"{task.row_label} reset to pending -- click Execute above to retry it.")
+            st.rerun()
+        skip_reason = ac3.text_input("Reason (for Skip)", key="unresolved_skip_reason")
+        if ac3.button("Skip selected row", key="unresolved_skip", disabled=not skip_reason.strip()):
+            skip_task(plan, selected_id, skip_reason, project_dir)
+            st.success("Row skipped.")
+            st.rerun()
+
+        st.caption("Resume remaining: click Execute above -- it always resumes from the persisted plan and never re-runs a completed task.")
+
+    st.markdown("**Export results**")
+    ec1, ec2, ec3 = st.columns(3)
+    if ec1.button("Write reports to project folder", key="write_reports_now"):
+        reports_dir = write_all_execution_reports(plan, project_dir)
+        st.success(f"Reports written to {reports_dir}")
+    ec2.download_button(
+        "Download JSON", _execution_report_json_bytes(plan), file_name=f"{plan.plan_id}_execution_report.json",
+        mime="application/json", key="download_json",
+    )
+    ec3.download_button(
+        "Download CSV", _execution_report_csv_bytes(plan), file_name=f"{plan.plan_id}_execution_report.csv",
+        mime="text/csv", key="download_csv",
+    )
+
+    if summary.review_required_labels:
+        with st.expander(f"Review required ({len(summary.review_required_labels)})", expanded=False):
+            for label in summary.review_required_labels:
+                st.caption(label)
+    if summary.failed_labels:
+        with st.expander(f"Failed ({len(summary.failed_labels)})", expanded=False):
+            for label in summary.failed_labels:
+                st.caption(label)

@@ -249,8 +249,9 @@ def run_execution_plan(
                 task.completed_at = utc_now_iso()
                 try:
                     adapter.recover()
+                    task.recovery_outcome = "recovered"
                 except Exception:
-                    pass
+                    task.recovery_outcome = "recovery_failed"
 
             if not dry_run:
                 plan.resume_cursor = plan.tasks.index(task) + 1

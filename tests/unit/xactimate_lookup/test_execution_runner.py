@@ -239,8 +239,30 @@ def test_task_level_exception_does_not_abort_the_whole_run(tmp_path, phrase_rule
     task3 = result.task_by_id("task_3")
     assert task1.state == TASK_FAILED
     assert "simulated unexpected crash" in task1.error
+    assert task1.recovery_outcome == "recovered"
     assert task2.state == TASK_COMPLETED  # same group, later task, still ran
     assert task3.state == TASK_COMPLETED  # different group, unaffected
+
+
+def test_task_level_exception_records_recovery_failure_when_recover_itself_raises(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    def failing_select(candidate):
+        raise RuntimeError("simulated unexpected crash")
+
+    def failing_recover():
+        raise RuntimeError("simulated recovery failure")
+
+    adapter.select_candidate = failing_select
+    adapter.recover = failing_recover
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task1 = result.task_by_id("task_1")
+    assert task1.state == TASK_FAILED
+    assert task1.recovery_outcome == "recovery_failed"
 
 
 def test_application_unverified_pauses_without_touching_any_task(tmp_path, phrase_rules, ranking_config):
