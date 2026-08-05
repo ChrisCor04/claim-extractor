@@ -48,10 +48,15 @@ def test_module_imports_without_windows_dependencies():
     assert hasattr(mod, "WindowsXactimateAdapter")
 
 
-def test_supports_live_execution_defaults_false():
-    assert WindowsXactimateAdapter.supports_live_execution is False
+def test_supports_live_execution_reflects_the_phase_5_4_pilot_gate_sign_off():
+    """Phase 5.4: flipped to True after a clean pilot-gate sign-off
+    (see docs/build-estimate.md Phase 5.4) -- still overridable per-
+    instance, and still deliberately independent of
+    production_project_allowed/unattended_mode_allowed, which stay
+    False as separate gates (see service.py)."""
+    assert WindowsXactimateAdapter.supports_live_execution is True
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    assert adapter.supports_live_execution is False
+    assert adapter.supports_live_execution is True
 
 
 @pytest.mark.parametrize(
@@ -161,7 +166,13 @@ def test_select_candidate_without_prior_capture_raises():
 
 
 def test_get_adapter_diagnostics_reports_not_found_state():
+    """Diagnostics must report whatever supports_live_execution
+    ACTUALLY is on this instance -- set explicitly here so the
+    assertion is independent of the class default (Phase 5.4: True
+    after pilot-gate sign-off, but that's not what this test is
+    about)."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter.supports_live_execution = False
     diag = adapter.get_adapter_diagnostics()
     assert diag["main_window_found"] is False
     assert diag["main_window_hwnd"] is None
@@ -342,7 +353,11 @@ def test_orchestrator_never_touches_adapter_when_live_execution_unsupported(tmp_
         raise AssertionError("adapter method invoked despite unsupported_adapter refusal")
 
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=exploding_finder)
-    assert adapter.supports_live_execution is False
+    # Explicit instance override -- the class default is True since
+    # Phase 5.4's pilot-gate sign-off, but this test is specifically
+    # about the refusal behavior for an adapter that does NOT support
+    # live execution.
+    adapter.supports_live_execution = False
 
     conn = registry.create_database(tmp_path / "reg.db")
     item = RecommendationInput(

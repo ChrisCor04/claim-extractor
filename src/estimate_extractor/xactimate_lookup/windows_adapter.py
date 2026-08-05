@@ -515,12 +515,22 @@ def _split_category_selector(code: str) -> tuple[str, str]:
 
 class WindowsXactimateAdapter(XactimateAdapter):
     """Real Windows desktop adapter. See module docstring for the
-    validated mechanism. ``supports_live_execution`` is a class
-    default of False, overridable per-instance only by the pilot-gate
-    process described in docs/xactimate-lookup.md -- never flip it in
-    code without that evidence existing."""
+    validated mechanism.
 
-    supports_live_execution = False
+    ``supports_live_execution = True`` as of Phase 5.4's pilot-gate
+    sign-off -- see docs/build-estimate.md Phase 5.4 for the exact
+    evidence: a fresh structural+financial baseline established live,
+    3/3 residue-free cancellation trials (after fixing a real retry gap
+    that had left a $330.31 row behind), 2 real AUTO_SELECT commits
+    landing correctly in 2 distinct groups with zero wrong-group
+    writes, and a full cleanup reconciliation back to the original
+    baseline. `production_project_allowed` and `unattended_mode_
+    allowed` are separate, still-False gates -- this flag alone does
+    NOT authorize either. Any future regression in the underlying
+    mechanism should flip this back to False with the same rigor it
+    took to earn -- never silently."""
+
+    supports_live_execution = True
 
     def __init__(
         self,
