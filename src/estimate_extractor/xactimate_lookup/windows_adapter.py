@@ -2501,6 +2501,44 @@ class WindowsXactimateAdapter(XactimateAdapter):
             - self._GROUP_TREE_ROW_CROP_MARGIN_TOP
         )
 
+    #: Wheel-scroll "clicks" (each WHEEL_DELTA=120) sent to scroll the
+    #: group tree panel back to its top -- enough to clear any drift
+    #: observed live (a handful of rows), bounded so this never becomes
+    #: an unbounded scroll loop.
+    _GROUP_TREE_SCROLL_RESET_CLICKS = 6
+
+    def _scroll_group_tree_to_top(self, hwnd: int) -> None:
+        """Not part of the abstract contract. Live-caught (Phase 5.3):
+        unlike the main grid (reset via `_reset_scroll_state()`'s Items-
+        tab click), the group tree panel has its OWN, independent
+        vertical scroll position that nothing else resets -- observed
+        live scrolled far enough down mid-pilot-run (after several
+        groups existed) that the "Group"/"Subtotal" header scrolled
+        completely out of the captured client area, making every
+        group-tree operation fail with "could not locate the group
+        tree" even though the tree itself was fine. A real mouse-wheel-
+        up, sent to the tree panel's approximate screen position, is
+        what actually resets it (confirmed live) -- there is no
+        pixel-free alternative since the tree is not UI-Automation-
+        accessible (see this class's module docstring). Called
+        defensively at the start of every group-tree entry point, never
+        assumed unnecessary."""
+        ctypes, _ = self._win32()
+        user32 = ctypes.windll.user32
+        ox, oy = self._get_client_origin(hwnd)
+        # Anywhere over the tree panel's known horizontal/vertical
+        # range is sufficient -- the wheel event targets whatever
+        # control is under the cursor, not a click target needing
+        # pixel precision.
+        user32.SetCursorPos(ox + 350, oy + 150)
+        time.sleep(0.05)
+        MOUSEEVENTF_WHEEL = 0x0800
+        WHEEL_DELTA = 120
+        for _ in range(self._GROUP_TREE_SCROLL_RESET_CLICKS):
+            user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, WHEEL_DELTA, 0)
+            time.sleep(0.05)
+        time.sleep(0.2)
+
     def snapshot_group_names(self, max_rows: int = 8) -> list[str]:
         """Not part of the abstract contract. Returns the group tree's
         rows top-to-bottom, OCR'd -- row 0 is always the project root
@@ -2708,6 +2746,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         hwnd = self._ensure_main_window()
         self._force_foreground(hwnd)
+        self._scroll_group_tree_to_top(hwnd)
         rows = self.snapshot_group_names()
         if self._find_group_row(rows, group_name) is not None:
             return  # already exists -- nothing to do
@@ -2763,6 +2802,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         hwnd = self._ensure_main_window()
         self._force_foreground(hwnd)
+        self._scroll_group_tree_to_top(hwnd)
         image = self._capture_client_image(hwnd)
         header = self._locate_group_tree_header(image)
         if header is None:
@@ -2893,6 +2933,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if not self.verify_application() or not self.verify_project():
                 return False
             hwnd = self._ensure_main_window()
+            self._scroll_group_tree_to_top(hwnd)
             rows = self.snapshot_group_names()
             target_index = self._find_group_row(rows, group_name)
             if target_index is None:
@@ -2985,6 +3026,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return False
         hwnd = self._ensure_main_window()
         self._force_foreground(hwnd)
+        self._scroll_group_tree_to_top(hwnd)
 
         for _attempt in range(max_attempts):
             rows_before = self.snapshot_group_names()
