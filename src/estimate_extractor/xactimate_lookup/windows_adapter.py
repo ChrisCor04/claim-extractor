@@ -2929,6 +2929,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         including on failure. Returns False, never raises, on anything
         short of a confident match -- callers must never silently
         proceed on an unverified group."""
+        row_count_before = 0
         try:
             if not self.verify_application() or not self.verify_project():
                 return False
@@ -2958,6 +2959,20 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 return False
             subtotal_count_before = self._group_subtotal_pixel_count(image_before, header_before, target_index)
 
+            # Live-caught (Phase 5.3): a group being re-verified on
+            # resume can already hold real, previously-committed rows
+            # from an earlier task in the SAME group (execution_runner
+            # re-verifies the group once per group-entry, which happens
+            # again on resume even when some of that group's tasks are
+            # already terminal). The probe's cleanup must never assume
+            # the grid started empty -- it must restore exactly this
+            # count, not zero, or it will cancel real committed work
+            # along with its own disposable probe row. Confirmed live:
+            # without this, a resumed group's real committed item was
+            # wiped out by the next task's group re-verification.
+            grid_image_before, grid_offset_before = self._capture_and_locate(hwnd)
+            row_count_before = self._count_grid_rows(grid_image_before, grid_offset_before) if grid_offset_before is not None else 0
+
             self.focus_search()
             self.clear_search()
             time.sleep(0.4)
@@ -2986,19 +3001,26 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return False
         finally:
             try:
-                self._cleanup_probe_item()
+                self._cleanup_probe_item(row_count_before)
             except Exception:
                 pass
 
-    def _cleanup_probe_item(self) -> None:
+    def _cleanup_probe_item(self, target_row_count: int = 0) -> None:
         """Removes whatever verify_group()'s disposable probe item left
         behind -- bounded, best-effort, never raises (matches every
-        other cleanup helper in this file)."""
+        other cleanup helper in this file).
+
+        `target_row_count` is the grid's row count BEFORE the probe was
+        entered -- this cancels down to exactly that count, never
+        unconditionally to zero, so a group that already held real
+        committed rows (a resumed group re-verified after an earlier
+        task in it already completed) keeps them. Defaults to 0 for any
+        caller that genuinely started from an empty grid."""
         hwnd = self._ensure_main_window()
         for _attempt in range(6):
             image, offset = self._capture_and_locate(hwnd)
             row_count = self._count_grid_rows(image, offset) if offset is not None else None
-            if row_count == 0:
+            if row_count is not None and row_count <= target_row_count:
                 break
             try:
                 self.cancel_current_item()

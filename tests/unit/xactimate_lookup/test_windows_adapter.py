@@ -759,6 +759,53 @@ def test_verify_group_never_raises_on_unexpected_error(monkeypatch):
     assert adapter.verify_group("Dwelling Roof") is False
 
 
+def test_cleanup_probe_item_preserves_pre_existing_rows(monkeypatch):
+    """Phase 5.3: a group being re-verified on resume can already hold
+    real, previously-committed rows from an earlier task in the SAME
+    group. _cleanup_probe_item() must cancel down to the row count that
+    existed BEFORE the probe (target_row_count), never unconditionally
+    to zero -- otherwise it wipes out real committed work along with
+    its own disposable probe row. Live-caught: without this, a resumed
+    group's real committed item was destroyed by the next task's group
+    re-verification."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+
+    # Grid starts at 2 rows (1 pre-existing real commit + 1 probe row
+    # just added) -- must cancel exactly once, down to 1, and stop.
+    row_counts = iter([2, 1])
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: next(row_counts))
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda: cancel_calls.append(1))
+    commit_calls = []
+    monkeypatch.setattr(adapter, "commit_item", lambda: commit_calls.append(1))
+
+    adapter._cleanup_probe_item(target_row_count=1)
+
+    assert cancel_calls == [1]  # cancelled exactly once -- never past the pre-existing row
+    assert commit_calls == [1]
+
+
+def test_cleanup_probe_item_defaults_to_fully_empty_grid(monkeypatch):
+    """The default target_row_count=0 preserves the original
+    unconditional-cleanup behavior for a caller that genuinely started
+    from an empty grid."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+
+    row_counts = iter([1, 0])
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: next(row_counts))
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda: cancel_calls.append(1))
+    monkeypatch.setattr(adapter, "commit_item", lambda: None)
+
+    adapter._cleanup_probe_item()
+
+    assert cancel_calls == [1]
+
+
 # ---------------------------------------------------------------------
 # verify_display_profile (Phase 5.2 Stage 10)
 # ---------------------------------------------------------------------
