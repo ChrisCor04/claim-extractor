@@ -93,6 +93,7 @@ class ExecutionTask:
     source_quantity: float
     source_unit: str | None
     expected_unit: str | None
+    source_page: int | None = None
     entered_quantity: float | None = None
     observed_quantity: float | None = None
     observed_unit: str | None = None
@@ -326,6 +327,7 @@ def build_execution_plan(
             source_order=order_by_id[row["line_item_id"]],
             area_name=area_name,
             section_name=section_name,
+            source_page=row.get("source_page"),
             description=row.get("mapped_description") or row.get("original_description") or "",
             category=category,
             selector=selector,

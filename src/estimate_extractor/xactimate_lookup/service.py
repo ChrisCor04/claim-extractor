@@ -619,3 +619,107 @@ def run_diagnostics(
         ranking_config_loaded=ranking_config_loaded,
         warnings=warnings,
     )
+
+
+#: Hard-pinned False (Phase 5.2 Stage 12, explicit build-spec
+#: requirement): a successful TEST-project pilot must NEVER
+#: automatically enable unrestricted production-project use. Any
+#: production-project run must go through its own explicit,
+#: per-project confirmation step elsewhere -- this flag intentionally
+#: has no live-diagnostics path that can turn it True.
+PRODUCTION_PROJECT_ALLOWED = False
+
+#: Hard-pinned False (Phase 5.2 Stage 12, explicit build-spec
+#: requirement): "do not market or label the mode 'fully unattended'
+#: unless final validation actually proves it." Every live pilot run to
+#: date (Phase 5.1, Phase 5.2) has required a human to start/confirm
+#: the session, resolve REVIEW_REQUIRED/NO_MATCH rows, and re-confirm
+#: after any interruption -- that is Safe (assisted) Autofill, not
+#: unattended execution. Flip this only alongside a documented
+#: validation that proves otherwise.
+UNATTENDED_MODE_ALLOWED = False
+
+
+@dataclass(slots=True)
+class CapabilityFlags:
+    """Explicit, individually-meaningful capability flags (Phase 5.2
+    Stage 12) -- deliberately not one vague "is this ready" boolean, so
+    a caller (UI, CLI, another integration) can reason about exactly
+    what is and isn't safe to do right now, and why."""
+
+    planning_available: bool
+    live_adapter_available: bool
+    group_control_available: bool
+    safe_autofill_available: bool
+    resume_available: bool
+    production_project_allowed: bool
+    unattended_mode_allowed: bool
+    notes: list
+
+
+def compute_capability_flags(
+    adapter: XactimateAdapter | None = None,
+    diagnostics: "DiagnosticsReport | None" = None,
+) -> CapabilityFlags:
+    """Computes the current capability flags from a real (or absent)
+    adapter's live-verified state. Never mutates anything -- reuses
+    `run_diagnostics()` when a diagnostics snapshot isn't already
+    available, which itself never launches or connects to Xactimate on
+    its own (it only calls into whatever adapter the caller already
+    constructed).
+
+    `safe_autofill_available` requires ALL of: a real (non-Fake)
+    adapter that declares `supports_live_execution=True`, a positively
+    verified application/project, and group-control support (the
+    duck-typed `ensure_group`/`select_group`/`verify_group` trio
+    `execution_runner.py` requires) -- exactly the set of things Phase
+    5.1/5.2's live pilots validated before that flag could honestly be
+    True anywhere in this codebase."""
+    notes: list[str] = []
+
+    if diagnostics is None:
+        diagnostics = run_diagnostics(adapter)
+
+    is_real_adapter = adapter is not None and diagnostics.adapter_class != "FakeXactimateAdapter"
+    live_adapter_available = bool(
+        is_real_adapter and diagnostics.application_verified and diagnostics.project_verified
+    )
+    if not is_real_adapter:
+        notes.append("No real XactimateAdapter is configured -- live_adapter_available requires one.")
+    elif not live_adapter_available:
+        notes.append("Adapter could not positively verify the Xactimate application/project -- live_adapter_available is False.")
+
+    group_control_available = bool(
+        live_adapter_available
+        and hasattr(adapter, "ensure_group")
+        and hasattr(adapter, "select_group")
+        and hasattr(adapter, "verify_group")
+    )
+    if live_adapter_available and not group_control_available:
+        notes.append(f"{diagnostics.adapter_class} does not implement group control (ensure_group/select_group/verify_group).")
+
+    safe_autofill_available = bool(
+        live_adapter_available and group_control_available and diagnostics.supports_live_execution
+    )
+    if live_adapter_available and group_control_available and not diagnostics.supports_live_execution:
+        notes.append(f"{diagnostics.adapter_class}.supports_live_execution is False -- safe_autofill_available is False until a validated pilot flips it.")
+
+    notes.append(
+        "production_project_allowed is always False here -- production use requires its own explicit, "
+        "per-project confirmation step, never a global capability flag."
+    )
+    notes.append(
+        "unattended_mode_allowed is always False -- every validated live run to date has required a human "
+        "to start the session and resolve review-required/no-match rows; label this 'Safe Autofill', never 'unattended'."
+    )
+
+    return CapabilityFlags(
+        planning_available=True,
+        live_adapter_available=live_adapter_available,
+        group_control_available=group_control_available,
+        safe_autofill_available=safe_autofill_available,
+        resume_available=True,
+        production_project_allowed=PRODUCTION_PROJECT_ALLOWED,
+        unattended_mode_allowed=UNATTENDED_MODE_ALLOWED,
+        notes=notes,
+    )

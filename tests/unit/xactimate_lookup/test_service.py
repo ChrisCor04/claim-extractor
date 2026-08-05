@@ -399,3 +399,71 @@ def test_events_are_colocated_with_the_registry_used_not_a_hardcoded_path(tmp_pa
     assert not service.DEFAULT_EVENTS_PATH.exists()
     events = service.get_events(registry_db)
     assert len(events) == 1
+
+
+class _RealLikeAdapter(FakeXactimateAdapter):
+    """A stand-in with a non-Fake class name and group-control methods,
+    so compute_capability_flags() can be exercised against something
+    that looks like a real, pilot-validated adapter without needing
+    Windows/live Xactimate in a unit test."""
+
+    supports_live_execution = True
+
+    def ensure_group(self, group_name: str) -> None: ...
+
+    def select_group(self, group_name: str) -> None: ...
+
+    def verify_group(self, group_name: str) -> bool:
+        return True
+
+
+def test_capability_flags_with_no_adapter_are_conservative(tmp_path):
+    flags = service.compute_capability_flags()
+    assert flags.planning_available is True
+    assert flags.resume_available is True
+    assert flags.live_adapter_available is False
+    assert flags.group_control_available is False
+    assert flags.safe_autofill_available is False
+    assert flags.production_project_allowed is False
+    assert flags.unattended_mode_allowed is False
+    assert any("No real XactimateAdapter" in n for n in flags.notes)
+
+
+def test_capability_flags_fake_adapter_never_counts_as_real_even_if_flagged_live(tmp_path):
+    """Flipping supports_live_execution on a FakeXactimateAdapter must
+    never make it look like a validated live adapter -- the real/Fake
+    distinction is load-bearing for safe_autofill_available."""
+    adapter = FakeXactimateAdapter()
+    adapter.supports_live_execution = True
+    flags = service.compute_capability_flags(adapter)
+    assert flags.live_adapter_available is False
+    assert flags.safe_autofill_available is False
+
+
+def test_capability_flags_real_adapter_with_group_control_enables_safe_autofill(tmp_path):
+    adapter = _RealLikeAdapter()
+    flags = service.compute_capability_flags(adapter)
+    assert flags.live_adapter_available is True
+    assert flags.group_control_available is True
+    assert flags.safe_autofill_available is True
+    # Never automatically enabled by a successful pilot -- always False.
+    assert flags.production_project_allowed is False
+    assert flags.unattended_mode_allowed is False
+
+
+def test_capability_flags_real_adapter_without_group_control_blocks_safe_autofill():
+    class _NoGroupControlAdapter(FakeXactimateAdapter):
+        supports_live_execution = True
+
+    flags = service.compute_capability_flags(_NoGroupControlAdapter())
+    assert flags.live_adapter_available is True
+    assert flags.group_control_available is False
+    assert flags.safe_autofill_available is False
+
+
+def test_capability_flags_unverified_project_blocks_everything_live():
+    adapter = _RealLikeAdapter(project_verified=False)
+    flags = service.compute_capability_flags(adapter)
+    assert flags.live_adapter_available is False
+    assert flags.group_control_available is False
+    assert flags.safe_autofill_available is False

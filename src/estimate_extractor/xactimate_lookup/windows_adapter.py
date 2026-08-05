@@ -1689,22 +1689,35 @@ class WindowsXactimateAdapter(XactimateAdapter):
     #: a real 3-row tree: TEST~125, Utility Room~153, Dwelling Roof~175
     #: (relative to client origin) -- 22-23px between child rows, not
     #: 15. See docs/build-estimate.md Phase 5.1.
-    _GROUP_TREE_ROW1_DY = 27
-    _GROUP_TREE_ROW_HEIGHT = 23
+    #: Live-caught (Phase 5.2 Stage 3): the Phase 5.1 click formula
+    #: above (27, 23) and OCR-crop formula (25, 15) each worked well
+    #: enough at low row indices by margin alone, but they measure
+    #: DIFFERENT effective row pitches -- so as more groups piled up
+    #: (a 5th row), the two disagreed on which physical row a given
+    #: row_index meant. `_find_group_row()` (via the OCR/text formula)
+    #: returned an index that `_group_subtotal_pixel_count()` (via the
+    #: click formula) then read from the WRONG physical row, making
+    #: `verify_group()` measure content that was never there. Remeasured
+    #: directly via OCR word-level top positions on a real live 5-row
+    #: tree: header "Group" top=111; row text tops at 134, 154, 174,
+    #: 194, 214 -- exactly 20px apart, 23px below the header, dead
+    #: consistent across all 5 rows. One formula now, used everywhere a
+    #: row's vertical position is needed (clicking, OCR text, subtotal
+    #: pixels), so an index found one way always means the same
+    #: physical row to every other consumer.
+    _GROUP_TREE_ROW_TEXT_TOP_DY = 23
+    _GROUP_TREE_ROW_HEIGHT = 20
     _GROUP_TREE_CLICK_DX = 79
-    #: OCR text crops use a separate, shorter row-height constant from
-    #: the click positioning above -- the crop's own generous height
-    #: (_GROUP_TREE_TEXT_HEIGHT=22) tolerates the resulting cumulative
-    #: offset well enough to still read the right text (confirmed live
-    #: across every OCR read this phase), even though that same 15px
-    #: value is NOT precise enough for a click, which has no such
-    #: margin. Kept deliberately distinct rather than "fixed" to match,
-    #: since the OCR path is proven working as-is.
+    #: Click Y lands a few px below the text's top edge -- safely
+    #: mid-row rather than right at the first pixel of the glyph.
+    _GROUP_TREE_CLICK_DY_OFFSET = 8
     _GROUP_TREE_TEXT_DX = 35
-    _GROUP_TREE_TEXT_DY = 25
-    _GROUP_TREE_TEXT_ROW_HEIGHT = 15
     _GROUP_TREE_TEXT_WIDTH = 245
-    _GROUP_TREE_TEXT_HEIGHT = 22
+    #: Text/subtotal crop band: starts slightly above the real text top
+    #: for headroom, and stays under one full row pitch (20px) so it
+    #: never bleeds into the next row.
+    _GROUP_TREE_ROW_CROP_MARGIN_TOP = 3
+    _GROUP_TREE_ROW_CROP_HEIGHT = 18
 
     def _find_context_menu_popup_hwnd(self, main_hwnd: int) -> int | None:
         """Returns the HWND of the currently-open row context menu (a
@@ -2337,6 +2350,113 @@ class WindowsXactimateAdapter(XactimateAdapter):
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
 
+    #: The client size / DPI this adapter's pixel anchors (_ANCHORS,
+    #: group-tree row constants) were calibrated against -- see
+    #: _ANCHORS' own module-level docstring. Live automation run
+    #: outside this profile cannot trust any fixed-pixel coordinate.
+    _VALIDATED_CLIENT_WIDTH = 1920
+    _VALIDATED_CLIENT_HEIGHT = 1021
+    _VALIDATED_DPI = 96
+    #: Small tolerance for minor chrome/scrollbar-state variance
+    #: (measured live: 1920x1023 vs. the 1920x1021 calibration
+    #: baseline -- a 2px difference from an unrelated scrollbar state,
+    #: not a real profile mismatch).
+    _DISPLAY_PROFILE_SIZE_TOLERANCE = 6
+
+    def verify_display_profile(self) -> dict:
+        """Not part of the abstract contract (Phase 5.2 Stage 10):
+        pre-flight safety gate for live execution. Every pixel
+        coordinate and OCR crop in this file was calibrated against one
+        specific window size/DPI/layout -- running against a
+        differently-sized or differently-scaled window would silently
+        misdirect every click. This never guesses whether a different
+        profile is "close enough"; it reports specific, checkable
+        reasons and leaves the caller to decide whether that's blocking.
+        Never raises -- an exception here means the environment can't be
+        verified, which is itself a blocking result, not a crash."""
+        checks: list[str] = []
+        blocking: list[str] = []
+        try:
+            found = self._find_main_window()
+        except Exception as exc:
+            return {
+                "ok": False, "window_found": False, "client_width": None, "client_height": None, "dpi": None,
+                "dimensions_match": False, "group_tree_visible": False, "grid_anchor_visible": False,
+                "checks": [], "blocking_reasons": [f"Could not enumerate windows: {exc!r}"],
+            }
+        if found is None:
+            return {
+                "ok": False, "window_found": False, "client_width": None, "client_height": None, "dpi": None,
+                "dimensions_match": False, "group_tree_visible": False, "grid_anchor_visible": False,
+                "checks": [], "blocking_reasons": ["Xactimate main window not found -- cannot verify the display profile."],
+            }
+
+        hwnd = found[0]
+        win32gui = self._win32gui()
+        try:
+            client_rect = win32gui.GetClientRect(hwnd)
+            width, height = client_rect[2] - client_rect[0], client_rect[3] - client_rect[1]
+        except Exception as exc:
+            width = height = None
+            blocking.append(f"Could not read the window's client size: {exc!r}")
+
+        dpi = None
+        try:
+            ctypes, _ = self._win32()
+            dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
+        except Exception:
+            pass  # not fatal -- DPI check is skipped, not failed, if unavailable
+
+        dims_ok = (
+            width is not None and height is not None
+            and abs(width - self._VALIDATED_CLIENT_WIDTH) <= self._DISPLAY_PROFILE_SIZE_TOLERANCE
+            and abs(height - self._VALIDATED_CLIENT_HEIGHT) <= self._DISPLAY_PROFILE_SIZE_TOLERANCE
+        )
+        dpi_ok = dpi is None or dpi == self._VALIDATED_DPI
+        checks.append(f"client_size={width}x{height} (validated {self._VALIDATED_CLIENT_WIDTH}x{self._VALIDATED_CLIENT_HEIGHT})")
+        checks.append(f"dpi={dpi} (validated {self._VALIDATED_DPI})")
+        if not dims_ok:
+            blocking.append(
+                f"Client size {width}x{height} does not match the validated profile "
+                f"({self._VALIDATED_CLIENT_WIDTH}x{self._VALIDATED_CLIENT_HEIGHT}, +/-{self._DISPLAY_PROFILE_SIZE_TOLERANCE}px) "
+                f"-- pixel-based automation cannot be trusted at a different window size/scale."
+            )
+        if not dpi_ok:
+            blocking.append(f"DPI {dpi} does not match the validated profile ({self._VALIDATED_DPI}) -- re-run calibration before live execution.")
+
+        try:
+            image = self._capture_client_image(hwnd)
+        except Exception as exc:
+            blocking.append(f"Could not capture the window client area: {exc!r}")
+            return {
+                "ok": False, "window_found": True, "client_width": width, "client_height": height, "dpi": dpi,
+                "dimensions_match": dims_ok and dpi_ok, "group_tree_visible": False, "grid_anchor_visible": False,
+                "checks": checks, "blocking_reasons": blocking,
+            }
+
+        group_tree_visible = self._locate_group_tree_header(image) is not None
+        checks.append(f"group_tree_header_visible={group_tree_visible}")
+        if not group_tree_visible:
+            blocking.append("Could not locate the group tree ('Group' column header) -- group control cannot be trusted.")
+
+        grid_anchor_visible = self._anchor_offset(image) is not None
+        checks.append(f"grid_anchor_visible={grid_anchor_visible}")
+        if not grid_anchor_visible:
+            blocking.append("Could not locate the grid's 'Cat' column header -- item search/entry targeting cannot be trusted.")
+
+        return {
+            "ok": dims_ok and dpi_ok and group_tree_visible and grid_anchor_visible,
+            "window_found": True,
+            "client_width": width,
+            "client_height": height,
+            "dpi": dpi,
+            "dimensions_match": dims_ok and dpi_ok,
+            "group_tree_visible": group_tree_visible,
+            "grid_anchor_visible": grid_anchor_visible,
+            "checks": checks,
+            "blocking_reasons": blocking,
+        }
+
     # ------------------------------------------------------------------
     # Group control (Phase 5.1) -- not part of the abstract contract.
     # The group tree's own content is NOT UI-Automation-accessible (same
@@ -2356,7 +2476,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
         left, top = header_pos[0], header_pos[1]
         return (
             left + self._GROUP_TREE_CLICK_DX,
-            top + self._GROUP_TREE_ROW1_DY + row_index * self._GROUP_TREE_ROW_HEIGHT,
+            top + self._GROUP_TREE_ROW_TEXT_TOP_DY + row_index * self._GROUP_TREE_ROW_HEIGHT + self._GROUP_TREE_CLICK_DY_OFFSET,
+        )
+
+    def _group_tree_row_crop_top(self, header_top: int, row_index: int) -> int:
+        return (
+            header_top + self._GROUP_TREE_ROW_TEXT_TOP_DY + row_index * self._GROUP_TREE_ROW_HEIGHT
+            - self._GROUP_TREE_ROW_CROP_MARGIN_TOP
         )
 
     def snapshot_group_names(self, max_rows: int = 8) -> list[str]:
@@ -2375,23 +2501,51 @@ class WindowsXactimateAdapter(XactimateAdapter):
         left, top = header[0], header[1]
         rows = [self.expected_project_name]
         for i in range(1, max_rows):
-            row_top = top + self._GROUP_TREE_TEXT_DY + i * self._GROUP_TREE_TEXT_ROW_HEIGHT
+            row_top = self._group_tree_row_crop_top(top, i)
             crop = image.crop((
                 left + self._GROUP_TREE_TEXT_DX, row_top,
-                left + self._GROUP_TREE_TEXT_DX + self._GROUP_TREE_TEXT_WIDTH, row_top + self._GROUP_TREE_TEXT_HEIGHT,
+                left + self._GROUP_TREE_TEXT_DX + self._GROUP_TREE_TEXT_WIDTH, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT,
             ))
             rows.append(self._ocr_text(crop, psm=7).strip())
         return rows
+
+    #: Minimum difflib.SequenceMatcher ratio for a fuzzy (non-substring)
+    #: group-name match to count. Live-measured (Phase 5.2 Stage 2): a
+    #: real match with one dropped character (OCR consistently read
+    #: "Front Elevation" as "frontelevaion", not transient noise) scores
+    #: ~0.87; two genuinely different group names score ~0.3. 0.75 sits
+    #: safely between those.
+    _GROUP_NAME_FUZZY_MATCH_THRESHOLD = 0.75
 
     @staticmethod
     def _group_name_matches(ocr_text: str, group_name: str) -> bool:
         """OCR on the group tree is noisy (icons/gridlines bleed into
         the crop -- see docs/build-estimate.md Phase 5.1 Stage 3), so
-        this is a whitespace-insensitive substring match, not equality
-        -- the same tolerance level established for every other
-        OCR'd label in this file."""
+        this starts as a whitespace-insensitive substring match, not
+        equality -- the same tolerance level established for every
+        other OCR'd label in this file.
+
+        Live-caught (Phase 5.2 Stage 2): substring containment alone
+        misses a real, CONSISTENT (not transient-noise) misread -- OCR
+        read "Front Elevation" as "frontelevaion" (one dropped
+        character) on every one of 5 consecutive fresh captures. A
+        caller trusting substring-only matching here (e.g.
+        `delete_group()`) would conclude the group doesn't exist and
+        silently report success without deleting anything. Falls back
+        to a whole-string fuzzy ratio (immune to a single
+        dropped/substituted character anywhere in the name, unlike a
+        longest-contiguous-block check) when substring containment
+        fails."""
         needle = group_name.strip().lower().replace(" ", "")
-        return bool(needle) and needle in ocr_text.strip().lower().replace(" ", "")
+        haystack = ocr_text.strip().lower().replace(" ", "")
+        if not needle:
+            return False
+        if needle in haystack:
+            return True
+        import difflib
+
+        ratio = difflib.SequenceMatcher(None, needle, haystack).ratio()
+        return ratio >= WindowsXactimateAdapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD
 
     def _find_group_row(self, rows: list[str], group_name: str) -> int | None:
         for i, text in enumerate(rows):
@@ -2538,11 +2692,20 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._click_client(dialog_hwnd, *ATTACH_BUTTON)
         time.sleep(1.0)
 
-        rows_after = self.snapshot_group_names()
-        if self._find_group_row(rows_after, group_name) is None:
-            raise AdapterError(
-                f"ensure_group({group_name!r}): group still not found after the creation sequence completed."
-            )
+        # Live-caught (Phase 5.2 Stage 3): a single post-creation check
+        # right after a 1.0s sleep occasionally missed a group that WAS
+        # actually created (confirmed by a subsequent independent
+        # snapshot moments later) -- the tree can take slightly longer
+        # than 1.0s to settle for some creations. Bounded retry with an
+        # extra settle sleep, never an unbounded wait.
+        for _attempt in range(3):
+            rows_after = self.snapshot_group_names()
+            if self._find_group_row(rows_after, group_name) is not None:
+                return
+            time.sleep(0.8)
+        raise AdapterError(
+            f"ensure_group({group_name!r}): group still not found after the creation sequence completed."
+        )
 
     def select_group(self, group_name: str) -> None:
         """Not part of the abstract contract. Left-clicks the row for
@@ -2583,40 +2746,100 @@ class WindowsXactimateAdapter(XactimateAdapter):
     _VERIFY_GROUP_PROBE_CATEGORY = "SFG"
     _VERIFY_GROUP_PROBE_SELECTOR = "GUTA"
 
-    def _group_subtotal_has_content(self, image, header_pos: tuple[int, int], row_index: int, blank_row_index: int) -> bool:
+    #: Minimum dark-pixel increase in a row's own Subtotal cell, before
+    #: vs. after the probe commit, to count as "content appeared".
+    #: Live-measured (Phase 5.2 Stage 2): a populated cell's dark-pixel
+    #: count rises from ~119 (border-only) to ~182 (border + "$11.56"
+    #: text) -- a delta of ~63 -- while an unaffected row's count is
+    #: exactly stable (0 -> 0) across repeated captures. 30 sits safely
+    #: below the observed real delta and safely above measured noise.
+    _VERIFY_GROUP_SUBTOTAL_DELTA_THRESHOLD = 30
+
+    #: Grayscale luminance below which a pixel counts as "dark" (text
+    #: glyph), not "highlight fill" or "border line". Live-measured:
+    #: text glyphs render near-black; the row-selection highlight/focus
+    #: border used by Xactimate's group tree does not.
+    _GROUP_SUBTOTAL_DARK_THRESHOLD = 110
+
+    def _group_subtotal_pixel_count(self, image, header_pos: tuple[int, int], row_index: int) -> int:
         """Live-caught (Phase 5.1): OCR on the Subtotal cell was tried
         first and found unreliable at this crop size (garbled text even
         with the correct crop region located via a fresh "Subtotal"
-        header search). A pixel-presence comparison is more robust here:
-        a populated currency cell ("$11.56") has substantially more
-        non-white pixels than an empty one -- confirmed live (populated:
-        ~2450 non-white pixels; empty rows: ~1200-1800, including the
-        project root row's own icon/arrow noise). Compares against
-        `blank_row_index` (a row already independently known to be
-        empty) rather than a fixed absolute threshold, since the
-        "empty" baseline itself is not zero (gridline/icon noise)."""
+        header search). A pixel-based count is used instead.
+
+        Live-caught (Phase 5.2 Stages 2-3), two compounding bugs fixed:
+        1. The crop's vertical position originally used a click-tuned
+           (27, 23) constant pair that was never re-derived from a real
+           measurement, and separately drifted from the OCR-text crop's
+           OWN (25, 15) constants -- close enough at low row indices for
+           both to work by margin alone, but they disagreed on which
+           physical row a given row_index meant once a 5th group
+           existed (confirmed live: `_find_group_row()`, via the OCR
+           formula, returned index 5 for a row this formula, via the
+           click formula, would have read as index 4). Fixed by
+           re-measuring real row positions directly via OCR word-level
+           top coordinates on a live 5-row tree (exactly 20px apart,
+           23px below the header -- see `_GROUP_TREE_ROW_HEIGHT`) and
+           using that ONE formula (`_group_tree_row_crop_top()`)
+           everywhere a row's vertical position is needed, so every
+           consumer agrees on what row_index N means.
+        2. Counting non-white pixels conflates real text with the
+           selected/focused row's highlight or focus-border rendering,
+           which spans the full row width regardless of dollar content
+           (measured live: a genuinely-empty selected row still reads
+           ~1600-2450 non-white pixels; comparing against a DIFFERENT
+           row's baseline, or even this row's own pre-probe baseline
+           when saturated near the crop's pixel ceiling, both produced
+           false positives). Counting only DARK (near-black,
+           text-glyph-colored) pixels is immune to the highlight/border
+           fill color and isolates real digit strokes. The caller must
+           still compare this row's own count before vs. after the
+           probe (see `verify_group()`), never against another row --
+           the border contributes a stable but nonzero baseline that a
+           cross-row or fixed-threshold comparison cannot account for."""
         left, top = header_pos[0], header_pos[1]
         subtotal_header = self._locate_label(image, "Subtotal", prefer="topmost")
         subtotal_left = subtotal_header[0] if subtotal_header is not None else left + 168
-
-        def non_white_count(row_index: int) -> int:
-            row_top = top + self._GROUP_TREE_TEXT_DY + row_index * self._GROUP_TREE_ROW_HEIGHT
-            crop = image.crop((subtotal_left, row_top, subtotal_left + 130, row_top + self._GROUP_TREE_TEXT_HEIGHT))
-            return sum(1 for p in crop.getdata() if p[:3] != (255, 255, 255))
-
-        target_count = non_white_count(row_index)
-        blank_count = non_white_count(blank_row_index)
-        return target_count > blank_count + 400
+        row_top = self._group_tree_row_crop_top(top, row_index)
+        crop = image.crop((subtotal_left, row_top, subtotal_left + 130, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT))
+        count = 0
+        for pixel in crop.getdata():
+            r, g, b = pixel[:3]
+            gray = 0.299 * r + 0.587 * g + 0.114 * b
+            if gray < self._GROUP_SUBTOTAL_DARK_THRESHOLD:
+                count += 1
+        return count
 
     def verify_group(self, group_name: str) -> bool:
         """Not part of the abstract contract. Independently confirms
-        `group_name` is the group new items actually land in -- via the
-        SAME ground-truth method Phase 5.1 Stage 2 established (commit
-        one disposable, known-cheap item, read the target group's
-        Subtotal cell, clean up): a passive pixel/visual-highlight
-        check was tried first and found live-unreliable (the visible
-        selection highlight does not always track which group item
-        entry actually targets -- two reproducible live mismatches, see
+        `group_name` is the group new items actually land in.
+
+        Live-caught (Phase 5.2 Stage 3): a group verified moments after
+        `ensure_group()` creates it can transiently fail this check even
+        though it genuinely is the active group -- the tree control can
+        still be settling from the creation/selection sequence (the
+        same class of timing issue `ensure_group()`'s own post-creation
+        check hit). A false NEGATIVE here is safe (it only routes tasks
+        to REVIEW_REQUIRED, never executes against an unconfirmed
+        group), but retrying once, from a completely fresh probe, before
+        giving up avoids unnecessarily blocking a genuinely-fine group.
+        Never masks a real negative: each attempt is a full independent
+        re-measurement, not a cached/assumed result, and this still
+        returns False, never raises, if every attempt fails."""
+        for _attempt in range(2):
+            if self._verify_group_once(group_name):
+                return True
+            time.sleep(0.5)
+        return False
+
+    def _verify_group_once(self, group_name: str) -> bool:
+        """One full probe-commit-and-check cycle -- via the SAME
+        ground-truth method Phase 5.1 Stage 2 established (commit one
+        disposable, known-cheap item, read the target group's Subtotal
+        cell, clean up): a passive pixel/visual-highlight check was
+        tried first and found live-unreliable (the visible selection
+        highlight does not always track which group item entry actually
+        targets -- two reproducible live mismatches, see
         docs/build-estimate.md Phase 5.1 Stage 4). This DOES mutate the
         estimate transiently; it always cleans up before returning,
         including on failure. Returns False, never raises, on anything
@@ -2631,8 +2854,24 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if target_index is None:
                 return False
 
-            image, offset = self._capture_and_locate(hwnd)
-            row_count_before = self._count_grid_rows(image, offset) if offset is not None else None
+            # Live-caught (Phase 5.2 Stage 2): clicking a row that is
+            # ALREADY selected (as select_group() does when called
+            # right after ensure_group() creates and auto-selects a
+            # brand-new group) can leave the tree control in a
+            # transient inline-rename/focus-edit state (a dotted focus
+            # rectangle around the name, observed live) instead of a
+            # plain selected state. That transient rendering destabilizes
+            # the pixel baseline below. Escape unconditionally dismisses
+            # it (a no-op if no such state is active) before the
+            # baseline is captured.
+            self._press_key(0x1B)
+            time.sleep(0.3)
+
+            image_before = self._capture_client_image(hwnd)
+            header_before = self._locate_group_tree_header(image_before)
+            if header_before is None:
+                return False
+            subtotal_count_before = self._group_subtotal_pixel_count(image_before, header_before, target_index)
 
             self.focus_search()
             self.clear_search()
@@ -2656,7 +2895,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
             header2 = self._locate_group_tree_header(image2)
             if header2 is None:
                 return False
-            return self._group_subtotal_has_content(image2, header2, target_index, blank_row_index=0)
+            subtotal_count_after = self._group_subtotal_pixel_count(image2, header2, target_index)
+            return subtotal_count_after > subtotal_count_before + self._VERIFY_GROUP_SUBTOTAL_DELTA_THRESHOLD
         except Exception:
             return False
         finally:

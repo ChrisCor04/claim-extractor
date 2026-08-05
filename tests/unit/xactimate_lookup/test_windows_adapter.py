@@ -757,3 +757,128 @@ def test_verify_group_never_raises_on_unexpected_error(monkeypatch):
 
     monkeypatch.setattr(adapter, "verify_application", _boom)
     assert adapter.verify_group("Dwelling Roof") is False
+
+
+# ---------------------------------------------------------------------
+# verify_display_profile (Phase 5.2 Stage 10)
+# ---------------------------------------------------------------------
+
+
+class _FakeWin32Gui:
+    def __init__(self, client_rect):
+        self._client_rect = client_rect
+
+    def GetClientRect(self, hwnd):
+        return self._client_rect
+
+
+class _FakeUser32:
+    def __init__(self, dpi):
+        self._dpi = dpi
+
+    def GetDpiForWindow(self, hwnd):
+        return self._dpi
+
+
+class _FakeWindll:
+    def __init__(self, dpi):
+        self.user32 = _FakeUser32(dpi)
+
+
+class _FakeCtypes:
+    def __init__(self, dpi):
+        self.windll = _FakeWindll(dpi)
+
+
+def _patch_display_profile_happy_path(monkeypatch, adapter, *, width=1920, height=1021, dpi=96, group_tree=True, grid_anchor=True):
+    monkeypatch.setattr(adapter, "_find_main_window", lambda: (123, "TEST"))
+    monkeypatch.setattr(adapter, "_win32gui", lambda: _FakeWin32Gui((0, 0, width, height)))
+    monkeypatch.setattr(adapter, "_win32", lambda: (_FakeCtypes(dpi), None))
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0) if group_tree else None)
+    monkeypatch.setattr(adapter, "_anchor_offset", lambda image: (0, 0) if grid_anchor else None)
+
+
+def test_verify_display_profile_ok_when_everything_matches(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _patch_display_profile_happy_path(monkeypatch, adapter)
+
+    report = adapter.verify_display_profile()
+    assert report["ok"] is True
+    assert report["blocking_reasons"] == []
+    assert report["dimensions_match"] is True
+    assert report["group_tree_visible"] is True
+    assert report["grid_anchor_visible"] is True
+
+
+def test_verify_display_profile_blocks_when_window_not_found(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_find_main_window", lambda: None)
+
+    report = adapter.verify_display_profile()
+    assert report["ok"] is False
+    assert report["window_found"] is False
+    assert any("not found" in r for r in report["blocking_reasons"])
+
+
+def test_verify_display_profile_blocks_on_size_mismatch(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _patch_display_profile_happy_path(monkeypatch, adapter, width=1280, height=800)
+
+    report = adapter.verify_display_profile()
+    assert report["ok"] is False
+    assert report["dimensions_match"] is False
+    assert any("Client size" in r for r in report["blocking_reasons"])
+
+
+def test_verify_display_profile_tolerates_small_size_variance(monkeypatch):
+    """A couple of px of scrollbar/chrome variance (measured live:
+    1920x1023 vs. the 1920x1021 calibration baseline) must not block --
+    only a real profile mismatch should."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _patch_display_profile_happy_path(monkeypatch, adapter, width=1920, height=1023)
+
+    report = adapter.verify_display_profile()
+    assert report["ok"] is True
+    assert report["dimensions_match"] is True
+
+
+def test_verify_display_profile_blocks_on_dpi_mismatch(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _patch_display_profile_happy_path(monkeypatch, adapter, dpi=120)
+
+    report = adapter.verify_display_profile()
+    assert report["ok"] is False
+    assert any("DPI" in r for r in report["blocking_reasons"])
+
+
+def test_verify_display_profile_blocks_when_group_tree_not_visible(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _patch_display_profile_happy_path(monkeypatch, adapter, group_tree=False)
+
+    report = adapter.verify_display_profile()
+    assert report["ok"] is False
+    assert report["group_tree_visible"] is False
+    assert any("group tree" in r for r in report["blocking_reasons"])
+
+
+def test_verify_display_profile_blocks_when_grid_anchor_not_visible(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _patch_display_profile_happy_path(monkeypatch, adapter, grid_anchor=False)
+
+    report = adapter.verify_display_profile()
+    assert report["ok"] is False
+    assert report["grid_anchor_visible"] is False
+    assert any("Cat" in r for r in report["blocking_reasons"])
+
+
+def test_verify_display_profile_never_raises_on_unexpected_error(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    def _boom():
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(adapter, "_find_main_window", _boom)
+    report = adapter.verify_display_profile()
+    assert report["ok"] is False
+    assert report["blocking_reasons"]
