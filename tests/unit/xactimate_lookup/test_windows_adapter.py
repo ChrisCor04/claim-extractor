@@ -1018,6 +1018,27 @@ def test_reconciliation_passes_when_nothing_changed(monkeypatch):
     assert result.mismatches == []
 
 
+def test_reconciliation_tolerates_different_ocr_noise_from_the_same_blank_cell(monkeypatch):
+    """Live-caught (Phase 5.4): a genuinely-blank group Subtotal cell
+    OCR'd as two DIFFERENT short garbage strings ("dy", then "ni")
+    across two live captures of the SAME unchanged, physically blank
+    cell. Neither reading contains a digit -- reconciliation must
+    treat digit-free noise as equivalent, not flag it as a false
+    positive, while still catching a REAL value appearing later (see
+    the sibling "visually zero but financially active" test)."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(groups={"Dwelling Roof": {"rows": [], "subtotal": "dy"}}, grand_total="$0.00", saved=True)
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
+
+    state.groups["Dwelling Roof"]["subtotal"] = "ni"  # different noise, same blank cell, no digits either way
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is True
+    assert result.mismatches == []
+
+
 def test_reconciliation_detects_visually_zero_but_financially_active_row(monkeypatch):
     """The exact Phase 5.3 failure mode: a row exists with a quantity
     that reads as effectively empty/placeholder in a naive check (here

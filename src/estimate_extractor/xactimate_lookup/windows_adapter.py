@@ -2738,10 +2738,28 @@ class WindowsXactimateAdapter(XactimateAdapter):
         )
 
     @staticmethod
+    def _canonicalize_financial_text(text: str) -> str:
+        """Live-caught (Phase 5.4): a group Subtotal cell that is
+        genuinely blank (no real dollar value) OCR's as short, near-
+        random noise -- confirmed live reading two DIFFERENT 2-
+        character garbage strings ("dy", then "ni") from the SAME
+        physically-blank cell across two captures a few seconds apart,
+        with nothing on screen actually changing. An exact-match
+        comparison of that raw noise is a false positive waiting to
+        happen on every reconciliation run, not a rare edge case.
+        Since any REAL dollar value always contains at least one
+        digit, collapsing every digit-free reading to one canonical
+        empty string preserves the strict, digit-sensitive comparison
+        `_text_fields_match()` needs (a real value appearing where
+        there was none is still a change: no digits -> has digits) while
+        treating noise-vs-noise as the non-event it actually is."""
+        return text if any(ch.isdigit() for ch in text) else ""
+
+    @staticmethod
     def _text_fields_match(a: str, b: str) -> bool:
-        """EXACT (whitespace/case-normalized only) comparison for two
-        OCR reads of what should be the SAME financial/quantity field
-        at two points in time.
+        """EXACT (whitespace/case-normalized, digit-noise-canonicalized)
+        comparison for two OCR reads of what should be the SAME
+        financial/quantity field at two points in time.
 
         Live-caught (Phase 5.4): a fuzzy sliding-window comparison --
         the right tool for longer labels like group names, where a
@@ -2758,9 +2776,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
         unchanged field as different, e.g. from a one-off OCR misread)
         is far cheaper than a false NEGATIVE (missing a real financial
         change) -- so this is deliberately strict, not fuzzy. Both
-        empty is a match (nothing there, both times)."""
-        a_norm = a.strip().lower().replace(" ", "")
-        b_norm = b.strip().lower().replace(" ", "")
+        empty (after digit-noise canonicalization) is a match (nothing
+        there, both times)."""
+        a_norm = WindowsXactimateAdapter._canonicalize_financial_text(a.strip().lower().replace(" ", ""))
+        b_norm = WindowsXactimateAdapter._canonicalize_financial_text(b.strip().lower().replace(" ", ""))
         return a_norm == b_norm
 
     def verify_estimate_matches_baseline(self, baseline: EstimateBaseline) -> ReconciliationResult:

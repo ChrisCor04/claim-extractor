@@ -157,12 +157,26 @@ def _cancel_pending_selection(adapter: XactimateAdapter) -> None:
     raises."""
     if not hasattr(adapter, "cancel_current_item"):
         return
+    cancelled = False
     for _attempt in range(3):
         try:
             adapter.cancel_current_item()
-            return
+            cancelled = True
+            break
         except Exception:
             continue
+    # Live-caught (Phase 5.4): cancelling the pending row does NOT by
+    # itself return the project to a "Saved" state -- it left "Unsaved
+    # changes" behind on every trial even when the cancel itself
+    # succeeded and no financial residue remained. Explicitly saving
+    # afterward (matching `_cleanup_probe_item()`'s own established
+    # cancel-then-commit pattern) closes that gap. Best-effort: a save
+    # failure here must not mask the original stop reason either.
+    if cancelled and hasattr(adapter, "commit_item"):
+        try:
+            adapter.commit_item()
+        except Exception:
+            pass
 
 
 def execute_plan(

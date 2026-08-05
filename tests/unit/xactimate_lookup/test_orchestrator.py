@@ -331,8 +331,13 @@ def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phras
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
     assert outcome.decision == DECISION_REVIEW_REQUIRED
     assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
+    # outcome.committed is the authoritative "was anything actually
+    # committed" signal -- NOT whether commit_item() was ever called.
+    # Phase 5.4 added a save-after-cancel step (commit_item() persists
+    # the "nothing here" state so the project doesn't sit as "Unsaved
+    # changes" after a safe stop), which legitimately calls
+    # commit_item() without committing a line item.
     assert outcome.committed is False
-    assert not any(name == "commit_item" for name, _a, _k in adapter.log.calls)
     assert cancel_calls == [1]  # Phase 5.3: pending row must be cancelled, not left dangling
 
 
