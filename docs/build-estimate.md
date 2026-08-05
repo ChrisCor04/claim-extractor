@@ -432,3 +432,112 @@ run this phase. The TEST project's last confirmed state (after Stage
 or `Front Elevation` groups present (both empty, 0 committed rows,
 confirmed via live screenshot) -- clean these up as the very first step
 of the next live session before anything else.
+
+## Phase 5.3: final sign-off attempt — five more live bugs found and fixed, one unresolved
+
+Continued directly from Phase 5.2. Xactimate was confirmed running with
+TEST open at session start. Stage 1 (restore baseline) completed
+cleanly. Stages 2-3 (commit-capable pilot, cross-group proof) surfaced
+five additional real bugs beyond Phase 5.2's three -- each found via a
+live failure, root-caused with direct evidence (never guessed), and
+fixed:
+
+1. **`_locate_label()`'s exact-match-after-colon-strip check silently
+   failed on the main grid's own "Cat" header**, because PSM 11 reads
+   it with an unstable trailing artifact (`"Cat|"` on one capture,
+   `"Cat,"` on the very next capture of the same unchanged screen).
+   With no fallback, `_anchor_offset()` matched Quick Entry's "Cat:"
+   label instead and computed a wildly wrong correction (dy=-211
+   instead of the real ~-42) -- `focus_search()` and everything built
+   on it was clicking off-window. Fixed by stripping all trailing
+   non-alphanumeric characters, not a fixed set.
+2. **The Phase 5.2 fuzzy group-name match failed on a second, noisier
+   OCR corruption**: "Exterior" read as "eteior" (leading 'x' entirely
+   absent) embedded in a row string with substantial unrelated icon
+   noise, scoring only 0.52 against the whole-string comparison. Fixed
+   with a sliding-window best-match ratio (0.80 on the real case, 0.17-
+   0.38 on every unrelated-name pair -- same 0.75 threshold).
+3. **The group tree has its own independent scroll position that
+   nothing reset** -- mid-pilot, after several groups existed, it
+   scrolled the "Group"/"Subtotal" header out of the captured area
+   entirely, breaking every group-tree operation including re-
+   verifying a group that had already succeeded moments earlier for a
+   prior task. Fixed with an explicit mouse-wheel-up reset at the start
+   of every group-tree entry point.
+4. **`verify_group()`'s probe cleanup cancelled down to zero rows
+   unconditionally** -- on a group re-verified after an earlier task in
+   it already committed real content (exactly what resume does), this
+   destroyed that real content along with the probe's own disposable
+   row. Confirmed live: a $435.20 committed row vanished after the
+   next task's group re-verification. Fixed by capturing the row count
+   before the probe and cancelling down to exactly that, never to zero.
+5. **(Critical) A task that safely stops after `select_candidate()`
+   (field-mismatch or unit-mismatch) left its pending grid row
+   uncancelled.** The task itself never calls `commit_item()`, so this
+   looked safe by inspection -- but live testing proved a LATER,
+   unrelated `commit_item()` call (a different task, or `verify_group
+   ()`'s own probe cycle) saves the estimate's current on-screen state
+   wholesale, silently persisting the abandoned row with Xactimate's
+   default quantity, never having gone through the module's own commit
+   path. Confirmed live: two "REVIEW_REQUIRED, never committed" tasks
+   became real, saved, priced grid rows. Fixed by explicitly cancelling
+   the pending selection before returning from either stop path.
+
+All five are committed with tests (Fake-adapter unit tests where the
+logic allows it, live-evidence-backed commit messages throughout).
+
+### What did NOT get resolved this session
+
+After fixes 1-5, a live pilot successfully got past group creation/
+verification for both `Dwelling Roof` and `Exterior` and NO_MATCH/
+REVIEW_REQUIRED classification worked correctly, but a **$330.31
+discrepancy** was found between Grand Total ($765.51) and the sum of
+every group's visible subtotal ($435.20, all in `Dwelling Roof`) --
+`Utility Room` and `Exterior` both show empty/zero, `TEST` root shows
+zero, yet the total doesn't reconcile. $330.31 exactly matches an
+earlier `PLM/TLTRS` commit (bug 5, above) that was believed cleaned up.
+A full page reload (navigating away and back) did not change the
+figure, ruling out a stale display. Direct investigation (per-group
+OCR of the Subtotal cell, an Item-# search for the original row number,
+Xactimate's own "Summary Totals Report") did not resolve it within
+this session's time budget -- the Summary report opens as an external
+PDF in a separate browser window (not part of Xactimate's main window),
+which was opened but not yet read before the session ended.
+
+**This is the concrete, precise remaining blocker**: before any further
+live pilot work, a human needs to open the TEST project directly in
+Xactimate, find where the $330.31 actually lives (most likely: read the
+already-generated Summary Totals Report PDF, or check Xactimate's own
+"Coverage Limits" breakdown), and either identify why it's invisible to
+per-group Subtotal inspection or manually remove it. Automated cleanup
+could not verify success and must not be trusted as complete.
+
+### Live-proven this session (before the above blocker)
+
+- Stage 1 baseline restore: clean.
+- Group creation/selection/verification for `Dwelling Roof` and
+  `Exterior` both reached `GROUP_COMPLETED` after all five fixes.
+- `RFG/FELT15` reached AUTO_SELECT and committed a real row (qty 10,
+  observed) into `Dwelling Roof` -- trust_state landed REVIEW_REQUIRED
+  because the observed unit OCR'd as "sa" instead of "SQ", a known-class
+  OCR issue, not a safety failure (nothing was silently trusted).
+- NO_MATCH (`ZZZ/ZZZ`) and REVIEW_REQUIRED (ambiguous ranking, unit
+  mismatch, field mismatch) all correctly failed only their own task
+  and let the run continue -- confirmed for real live outcomes, not
+  just the Fake-adapter test suite.
+- Not yet proven live: a clean AUTO_SELECT -> VERIFIED commit landing
+  correctly in a SECOND group (the cross-group placement proof Stage 3
+  requires) -- blocked by the unresolved discrepancy above before this
+  could be attempted again.
+
+### Next session, first step
+
+1. Resolve the $330.31 discrepancy (see above) before any further live
+   mutation -- do not assume automated cleanup succeeded.
+2. Re-run a fresh multi-group pilot using the proven-exact items from
+   this session's probing (`SFG/GUTA`, `SFG/GUTC`, `SFG/GUTAB` for LF;
+   `PLM/TLTRS`, `PLM/TLTFL` for EA; `RFG/FELT15` for SQ -- all confirmed
+   AUTO_SELECT live) to get the cross-group commit proof.
+3. Stages 4 (Build Estimate UI live execution), 5 (pause/resume), 6
+   (Aranda controlled subset), and 7 (final cleanup) all still need a
+   live run.
