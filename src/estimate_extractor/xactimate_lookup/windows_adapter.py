@@ -2526,12 +2526,44 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return rows
 
     #: Minimum difflib.SequenceMatcher ratio for a fuzzy (non-substring)
-    #: group-name match to count. Live-measured (Phase 5.2 Stage 2): a
-    #: real match with one dropped character (OCR consistently read
-    #: "Front Elevation" as "frontelevaion", not transient noise) scores
-    #: ~0.87; two genuinely different group names score ~0.3. 0.75 sits
-    #: safely between those.
+    #: group-name match to count. Live-measured (Phase 5.2 Stage 2, Phase
+    #: 5.3): real matches with 1-2 dropped/garbled characters (OCR
+    #: consistently read "Front Elevation" as "frontelevaion", and
+    #: separately "Exterior" as "eteior" -- the leading 'x' entirely
+    #: absent, not just misread -- on every fresh capture, not transient
+    #: noise) score 0.80-0.96 against their best-matching window; two
+    #: genuinely different group names score 0.17-0.38. 0.75 sits safely
+    #: between those.
     _GROUP_NAME_FUZZY_MATCH_THRESHOLD = 0.75
+
+    @staticmethod
+    def _best_window_fuzzy_ratio(needle: str, haystack: str) -> float:
+        """Live-caught (Phase 5.3): comparing needle against the WHOLE
+        haystack string penalizes a real match when the row's OCR text
+        carries a lot of UNRELATED surrounding noise (icon glyphs
+        misread as stray characters) beyond the name itself -- measured
+        live, "exterior" against the full noisy row text scored only
+        0.52 (would incorrectly fail), while the same needle against
+        just the best-matching same-length-ish WINDOW of that same
+        haystack scored 0.80. Slides a window of length
+        len(needle)-1..+1 across haystack and returns the best ratio
+        found -- immune to irrelevant text elsewhere in the row, unlike
+        a whole-string comparison."""
+        import difflib
+
+        if not haystack:
+            return 0.0
+        if len(haystack) <= len(needle):
+            return difflib.SequenceMatcher(None, needle, haystack).ratio()
+        best = 0.0
+        for width in (len(needle) - 1, len(needle), len(needle) + 1):
+            if width <= 0 or width > len(haystack):
+                continue
+            for start in range(0, len(haystack) - width + 1):
+                ratio = difflib.SequenceMatcher(None, needle, haystack[start : start + width]).ratio()
+                if ratio > best:
+                    best = ratio
+        return best
 
     @staticmethod
     def _group_name_matches(ocr_text: str, group_name: str) -> bool:
@@ -2541,26 +2573,22 @@ class WindowsXactimateAdapter(XactimateAdapter):
         equality -- the same tolerance level established for every
         other OCR'd label in this file.
 
-        Live-caught (Phase 5.2 Stage 2): substring containment alone
-        misses a real, CONSISTENT (not transient-noise) misread -- OCR
-        read "Front Elevation" as "frontelevaion" (one dropped
-        character) on every one of 5 consecutive fresh captures. A
-        caller trusting substring-only matching here (e.g.
-        `delete_group()`) would conclude the group doesn't exist and
-        silently report success without deleting anything. Falls back
-        to a whole-string fuzzy ratio (immune to a single
-        dropped/substituted character anywhere in the name, unlike a
-        longest-contiguous-block check) when substring containment
-        fails."""
+        Live-caught (Phase 5.2 Stage 2, Phase 5.3): substring
+        containment alone misses real, CONSISTENT (not transient-noise)
+        misreads -- see `_GROUP_NAME_FUZZY_MATCH_THRESHOLD`'s docstring
+        for two live-reproduced examples. A caller trusting
+        substring-only matching here (e.g. `delete_group()`,
+        `ensure_group()`'s post-creation check) would conclude the
+        group doesn't exist and silently report success/failure
+        incorrectly. Falls back to `_best_window_fuzzy_ratio()` when
+        substring containment fails."""
         needle = group_name.strip().lower().replace(" ", "")
         haystack = ocr_text.strip().lower().replace(" ", "")
         if not needle:
             return False
         if needle in haystack:
             return True
-        import difflib
-
-        ratio = difflib.SequenceMatcher(None, needle, haystack).ratio()
+        ratio = WindowsXactimateAdapter._best_window_fuzzy_ratio(needle, haystack)
         return ratio >= WindowsXactimateAdapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD
 
     def _find_group_row(self, rows: list[str], group_name: str) -> int | None:
