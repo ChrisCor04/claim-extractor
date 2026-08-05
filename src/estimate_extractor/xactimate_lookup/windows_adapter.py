@@ -358,6 +358,57 @@ class CommitVerification:
     evidence_path: str | None = None
 
 
+@dataclass(slots=True)
+class GroupRowSnapshot:
+    """Phase 5.4: one grid row's identity + financial fields, captured
+    for baseline/reconciliation purposes -- deliberately a superset of
+    `snapshot_grid_identities()`'s (category, selector) tuples, since
+    Phase 5.3 live-caught a row that read as visually empty/inactive by
+    a structural (row-count) check alone while still carrying real
+    financial value. `quantity_text`/`unit_text` are raw OCR reads
+    (whitespace-stripped only), compared via fuzzy/substring tolerance
+    like every other OCR'd field in this file -- never parsed to a
+    silently-guessed number."""
+
+    category: str | None
+    selector: str | None
+    quantity_text: str | None
+    unit_text: str | None
+
+
+@dataclass(slots=True)
+class EstimateBaseline:
+    """Phase 5.4: a full structural + financial snapshot of the
+    estimate, for `verify_estimate_matches_baseline()` to compare
+    against later. Covers exactly the fields Phase 5.3's cleanup gap
+    missed: `group_subtotal_text` and `grand_total_text` are captured
+    alongside row-level identity, so cleanup verification can never
+    again pass just because a group's ACTIVE grid view was empty while
+    the group's own subtotal (and Grand Total) still carried real
+    value from a row that had gone missing from view without actually
+    being removed."""
+
+    group_names: list[str]
+    group_rows: dict[str, list[GroupRowSnapshot]]
+    group_subtotal_text: dict[str, str]
+    grand_total_text: str
+    saved: bool | None
+    captured_at: str
+
+
+@dataclass(slots=True)
+class ReconciliationResult:
+    """Phase 5.4: `verify_estimate_matches_baseline()`'s result --
+    `ok` is True only when EVERY field (row identities, row count,
+    quantities, group subtotals, Grand Total, saved state) matches the
+    baseline; `mismatches` names each specific field that didn't, so a
+    caller (and a human reading a failed cleanup report) knows exactly
+    what's still wrong rather than a single opaque "cleanup failed"."""
+
+    ok: bool
+    mismatches: list[str] = field(default_factory=list)
+
+
 def _normalize_unit_text(raw: str | None) -> str | None:
     """Strips OCR noise (gridline bleed, parens, pipes, whitespace) and
     uppercases -- shared by the OCR-confusion and synonym lookups so
@@ -2562,6 +2613,202 @@ class WindowsXactimateAdapter(XactimateAdapter):
             ))
             rows.append(self._ocr_text(crop, psm=7).strip())
         return rows
+
+    #: Grand Total's own label+value block is FIXED left-sidebar chrome
+    #: (not part of the scrollable grid content pane), live-measured at
+    #: client-relative (30, 92)-(86, 108) for the value -- see
+    #: docs/build-estimate.md Phase 5.4.
+    _GRAND_TOTAL_VALUE_BOX = (18, 86, 140, 112)
+    #: The "Saved"/"Unsaved changes" indicator, next to the page title
+    #: -- also fixed chrome. Wide enough to catch "Unsaved changes" in
+    #: full, not just "Saved".
+    _SAVED_INDICATOR_BOX = (445, 20, 620, 45)
+
+    def _read_grand_total_text(self) -> str:
+        """Not part of the abstract contract (Phase 5.4). Raw OCR text
+        of the Grand Total value -- never parsed to a float and
+        silently trusted; callers compare this text (fuzzy-tolerant,
+        like every other OCR'd field here) against a prior capture of
+        the SAME field, not against a guessed numeric value."""
+        hwnd = self._ensure_main_window()
+        image = self._capture_client_image(hwnd)
+        crop = image.crop(self._GRAND_TOTAL_VALUE_BOX)
+        return self._ocr_text(crop, psm=7).strip()
+
+    def _read_saved_state(self) -> bool | None:
+        """Not part of the abstract contract (Phase 5.4). Returns
+        True/False for a confidently-read Saved/Unsaved indicator, or
+        None if neither can be confidently distinguished -- callers
+        must treat None as "not confirmed saved", never as True by
+        default (Phase 5.1's standing principle: never silently assume
+        a positive result). "unsaved" is checked FIRST and with
+        priority: "saved" is a literal substring of "unsaved", so
+        checking "saved" first would misclassify an unsaved estimate."""
+        hwnd = self._ensure_main_window()
+        image = self._capture_client_image(hwnd)
+        crop = image.crop(self._SAVED_INDICATOR_BOX)
+        text = self._ocr_text(crop, psm=7).strip().lower().replace(" ", "")
+        if not text:
+            return None
+        unsaved_ratio = self._best_window_fuzzy_ratio("unsavedchanges", text)
+        if unsaved_ratio >= self._GROUP_NAME_FUZZY_MATCH_THRESHOLD:
+            return False
+        saved_ratio = self._best_window_fuzzy_ratio("saved", text)
+        if saved_ratio >= self._GROUP_NAME_FUZZY_MATCH_THRESHOLD:
+            return True
+        return None
+
+    def _read_group_subtotal_text(self, image, header_pos: tuple[int, int], row_index: int) -> str:
+        """Not part of the abstract contract (Phase 5.4). Raw OCR text
+        of one group row's Subtotal cell -- a text-comparison sibling
+        of `_group_subtotal_pixel_count()` (which only detects
+        "something changed", not what). Uses the SAME row-position
+        formula as every other group-tree read in this file."""
+        left, top = header_pos[0], header_pos[1]
+        subtotal_header = self._locate_label(image, "Subtotal", prefer="topmost")
+        subtotal_left = subtotal_header[0] if subtotal_header is not None else left + 168
+        row_top = self._group_tree_row_crop_top(top, row_index)
+        crop = image.crop((subtotal_left, row_top, subtotal_left + 130, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT))
+        return self._ocr_text(crop, psm=7).strip()
+
+    def _snapshot_grid_rows_detailed(self) -> list[GroupRowSnapshot]:
+        """Not part of the abstract contract (Phase 5.4). Every row
+        CURRENTLY in the grid (whatever group is presently selected),
+        with category/selector/quantity/unit -- a superset of
+        `snapshot_grid_identities()`'s (category, selector)-only
+        tuples, built for baseline/reconciliation purposes where a
+        quantity or unit change with no identity change would
+        otherwise go undetected."""
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd)
+        if offset is None:
+            return []
+        geom = self._last_row_geometry(image, offset)
+        if geom is None:
+            return []
+        row_count, _ = geom
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        rows = []
+        for i in range(row_count):
+            row_top = row_1_top + i * _GRID_ROW_HEIGHT
+            category, selector = self._read_category_selector_at(image, offset, row_top)
+            quantity = self._read_quantity_at(image, offset, row_top)
+            raw_unit, _normalized_unit = self._read_unit_at(image, offset, row_top)
+            rows.append(GroupRowSnapshot(
+                category=category, selector=selector,
+                quantity_text=(str(quantity) if quantity is not None else None),
+                unit_text=raw_unit,
+            ))
+        return rows
+
+    def capture_estimate_baseline(self, group_names: list[str]) -> EstimateBaseline:
+        """Not part of the abstract contract (Phase 5.4). Captures a
+        full structural + financial snapshot across every named group:
+        row identities/quantities/units, each group's own Subtotal
+        text, and Grand Total -- explicit group names, never
+        auto-discovered, matching this file's standing "never guess"
+        convention for group operations. Live-caught (Phase 5.3): a
+        cleanup check that only inspects the currently-active group's
+        row count can miss real financial residue sitting in a
+        DIFFERENT group (or a row that reads as visually empty while
+        still carrying value) -- this snapshot is deliberately built to
+        make that class of gap structurally impossible to miss on
+        comparison, not just less likely."""
+        hwnd = self._ensure_main_window()
+        group_rows: dict[str, list[GroupRowSnapshot]] = {}
+        group_subtotal_text: dict[str, str] = {}
+        for name in group_names:
+            self.select_group(name)
+            group_rows[name] = self._snapshot_grid_rows_detailed()
+            image = self._capture_client_image(hwnd)
+            header = self._locate_group_tree_header(image)
+            if header is not None:
+                rows = self.snapshot_group_names()
+                idx = self._find_group_row(rows, name)
+                group_subtotal_text[name] = self._read_group_subtotal_text(image, header, idx) if idx is not None else ""
+            else:
+                group_subtotal_text[name] = ""
+        return EstimateBaseline(
+            group_names=list(group_names),
+            group_rows=group_rows,
+            group_subtotal_text=group_subtotal_text,
+            grand_total_text=self._read_grand_total_text(),
+            saved=self._read_saved_state(),
+            captured_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+    @staticmethod
+    def _text_fields_match(a: str, b: str) -> bool:
+        """Fuzzy-tolerant comparison for two OCR reads of what should
+        be the SAME on-screen field at two points in time -- exact
+        equality would be too strict given this file's own documented
+        OCR instability (the same unchanged text reading differently
+        across consecutive captures), but a genuine content change
+        must still be caught. Both empty is a match (nothing there,
+        both times)."""
+        a_norm = a.strip().lower().replace(" ", "")
+        b_norm = b.strip().lower().replace(" ", "")
+        if a_norm == b_norm:
+            return True
+        if not a_norm or not b_norm:
+            return False
+        return WindowsXactimateAdapter._best_window_fuzzy_ratio(a_norm, b_norm) >= WindowsXactimateAdapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD
+
+    def verify_estimate_matches_baseline(self, baseline: EstimateBaseline) -> ReconciliationResult:
+        """Not part of the abstract contract (Phase 5.4). Re-captures
+        the same fields `capture_estimate_baseline()` did and compares
+        every one -- row identities, row count, quantities, units,
+        every named group's Subtotal text, Grand Total, and saved
+        state. `ok` is True only when ALL of them match; otherwise
+        `mismatches` names each one that didn't, so a failed cleanup
+        reports exactly what's still wrong rather than a bare False.
+        Never raises -- an inspection failure (e.g. a group that can no
+        longer be selected) is itself reported as a mismatch, not an
+        exception that aborts the check."""
+        mismatches: list[str] = []
+
+        current_grand_total = self._read_grand_total_text()
+        if not self._text_fields_match(baseline.grand_total_text, current_grand_total):
+            mismatches.append(f"Grand Total: baseline={baseline.grand_total_text!r} now={current_grand_total!r}")
+
+        current_saved = self._read_saved_state()
+        if current_saved is not True:
+            mismatches.append(f"Saved state not confirmed (read: {current_saved!r}) -- project must be Saved.")
+
+        for name in baseline.group_names:
+            try:
+                self.select_group(name)
+            except Exception as exc:
+                mismatches.append(f"Group {name!r}: could not select for verification ({exc!r}).")
+                continue
+
+            hwnd = self._ensure_main_window()
+            image = self._capture_client_image(hwnd)
+            header = self._locate_group_tree_header(image)
+            if header is None:
+                mismatches.append(f"Group {name!r}: could not locate the group tree to verify its subtotal.")
+            else:
+                rows = self.snapshot_group_names()
+                idx = self._find_group_row(rows, name)
+                current_subtotal = self._read_group_subtotal_text(image, header, idx) if idx is not None else ""
+                baseline_subtotal = baseline.group_subtotal_text.get(name, "")
+                if not self._text_fields_match(baseline_subtotal, current_subtotal):
+                    mismatches.append(f"Group {name!r} subtotal: baseline={baseline_subtotal!r} now={current_subtotal!r}")
+
+            baseline_rows = baseline.group_rows.get(name, [])
+            current_rows = self._snapshot_grid_rows_detailed()
+            if len(current_rows) != len(baseline_rows):
+                mismatches.append(f"Group {name!r} row count: baseline={len(baseline_rows)} now={len(current_rows)}")
+            else:
+                for i, (b_row, c_row) in enumerate(zip(baseline_rows, current_rows)):
+                    if (b_row.category, b_row.selector) != (c_row.category, c_row.selector):
+                        mismatches.append(f"Group {name!r} row {i}: identity baseline={(b_row.category, b_row.selector)} now={(c_row.category, c_row.selector)}")
+                    if not self._text_fields_match(b_row.quantity_text or "", c_row.quantity_text or ""):
+                        mismatches.append(f"Group {name!r} row {i}: quantity baseline={b_row.quantity_text!r} now={c_row.quantity_text!r}")
+                    if not self._text_fields_match(b_row.unit_text or "", c_row.unit_text or ""):
+                        mismatches.append(f"Group {name!r} row {i}: unit baseline={b_row.unit_text!r} now={c_row.unit_text!r}")
+
+        return ReconciliationResult(ok=(len(mismatches) == 0), mismatches=mismatches)
 
     #: Minimum difflib.SequenceMatcher ratio for a fuzzy (non-substring)
     #: group-name match to count. Live-measured (Phase 5.2 Stage 2, Phase
