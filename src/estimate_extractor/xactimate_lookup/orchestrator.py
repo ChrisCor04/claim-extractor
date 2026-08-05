@@ -126,6 +126,31 @@ def _stop(line_item_id: str, plan: LookupPlan, decision: str, reason: str, detai
     )
 
 
+def _cancel_pending_selection(adapter: XactimateAdapter) -> None:
+    """Live-caught (Phase 5.3): `select_candidate()` already puts a
+    PENDING row in the grid before this function ever decides whether
+    to commit (see the `before_snapshot` comment above) -- if a
+    post-selection safety check (field mismatch, unit mismatch) stops
+    the task here, that pending row is left behind uncancelled. It is
+    never explicitly committed by THIS task, but a real live run
+    reproduced it being silently persisted anyway: a LATER, unrelated
+    `commit_item()` call (from a different task, or `verify_group()`'s
+    own probe-and-cleanup cycle) saves the estimate's current on-screen
+    state wholesale, which includes this stale pending row -- with
+    whatever default quantity Xactimate assigned it, not the source
+    line item's real quantity. That is a real wrong-data commit that
+    never went through this module's own commit path at all. Not part
+    of the abstract adapter contract (duck-typed, like every other
+    Windows-only capability here) -- best-effort and silent on failure,
+    since a cleanup failure must never mask the original stop reason."""
+    if not hasattr(adapter, "cancel_current_item"):
+        return
+    try:
+        adapter.cancel_current_item()
+    except Exception:
+        pass
+
+
 def execute_plan(
     plan: LookupPlan,
     item: RecommendationInput,
@@ -225,6 +250,7 @@ def execute_plan(
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_ADAPTER_ERROR, str(exc), candidates=candidates, selected=top)
 
     if (populated.category, populated.selector) != (top.dropdown.category, top.dropdown.selector):
+        _cancel_pending_selection(adapter)
         return _stop(
             item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_FIELD_MISMATCH,
             f"Populated fields ({populated.category}/{populated.selector}) differ from the selected "
@@ -233,6 +259,7 @@ def execute_plan(
         )
 
     if item.source_unit and populated.unit and item.source_unit.strip().upper() != populated.unit.strip().upper():
+        _cancel_pending_selection(adapter)
         return _stop(
             item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_MISMATCH,
             f"Populated unit ({populated.unit!r}) differs from the source line item's unit ({item.source_unit!r}).",

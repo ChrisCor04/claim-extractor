@@ -302,14 +302,22 @@ def test_field_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phra
     from estimate_extractor.xactimate_lookup.models import PopulatedFields
 
     monkeypatch.setattr(adapter, "read_populated_fields", lambda: PopulatedFields(category="WRONG", selector="MISMATCH", description=None, unit=None, action=None, item_number=None))
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
     assert outcome.decision == DECISION_REVIEW_REQUIRED
     assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
     assert outcome.committed is False
+    # Phase 5.3: select_candidate() already put a pending row in the
+    # grid -- it must be cancelled here, or a LATER unrelated
+    # commit_item() call (e.g. verify_group()'s own probe cycle) can
+    # silently persist it with default/wrong data, never having gone
+    # through this module's own commit path at all (live-reproduced).
+    assert cancel_calls == [1]
 
 
-def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phrase_rules, ranking_config):
+def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phrase_rules, ranking_config, monkeypatch):
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item(source_unit="SQ")
     plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
@@ -317,12 +325,32 @@ def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phras
     d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
     adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]}, populated_unit="LF")
     adapter.supports_live_execution = True
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
     assert outcome.decision == DECISION_REVIEW_REQUIRED
     assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
     assert outcome.committed is False
     assert not any(name == "commit_item" for name, _a, _k in adapter.log.calls)
+    assert cancel_calls == [1]  # Phase 5.3: pending row must be cancelled, not left dangling
+
+
+def test_cancel_pending_selection_is_a_no_op_when_adapter_lacks_the_method(tmp_path, phrase_rules, ranking_config):
+    """Adapters that don't implement cancel_current_item (e.g. a bare
+    FakeXactimateAdapter) must not be broken by this cleanup -- it's
+    duck-typed, like every other Windows-only capability."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(source_unit="SQ")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]}, populated_unit="LF")
+    adapter.supports_live_execution = True
+    assert not hasattr(adapter, "cancel_current_item")
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+    assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
 
 
 def test_matching_populated_unit_does_not_block_commit(tmp_path, phrase_rules, ranking_config):
