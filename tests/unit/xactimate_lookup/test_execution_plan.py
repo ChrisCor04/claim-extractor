@@ -143,6 +143,7 @@ def test_build_execution_plan_carries_quantity_and_unit_provenance(tmp_path):
     assert task.source_quantity == 10.0
     assert task.source_unit == "SQ"
     assert task.expected_unit == "SQ"
+    assert task.source_page == 3
     assert task.entered_quantity is None
     assert task.observed_quantity is None
     assert task.observed_unit is None
