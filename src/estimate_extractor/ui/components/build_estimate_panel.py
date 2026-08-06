@@ -180,29 +180,90 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
 
     plan = load_execution_plan(project_dir)
 
-    # Phase 5.5: TEST-only option to also include rows with no CAT/SEL
-    # yet (searched live by description instead of excluded outright).
-    # A read-only peek at session_state set by the "Confirm project"
-    # section further below -- Streamlit widget values persist in
-    # session_state across reruns, so this mirrors that section's own
-    # project_confirmed/display_profile_ok computation without moving
-    # or altering that (existing, unchanged) section. Only ever true
-    # when the project the user actually confirmed live is exactly
-    # "TEST".
-    _confirmation = st.session_state.get("build_estimate_confirmation")
-    _typed_project_name = st.session_state.get("build_estimate_xactimate_project_name", "").strip()
-    _test_only_confirmed = bool(
-        _confirmation
-        and not _confirmation.get("error")
-        and _confirmation.get("project_name") == _typed_project_name
-        and _confirmation.get("application_verified")
-        and _confirmation.get("project_verified")
-        and _typed_project_name == TEST_ONLY_PROJECT_NAME
-        and (_confirmation.get("display_profile") is None or _confirmation["display_profile"]["ok"])
+    # Phase 5.5A: project confirmation must render BEFORE any early
+    # return caused by an empty/missing plan -- a project with zero
+    # approved rows (and nothing built yet) used to hit `plan is None`
+    # or the approved-only ExecutionPlanError below and `return` before
+    # this section ever ran, permanently hiding the "Confirm project"
+    # button (and therefore the TEST-only checkbox, which depends on a
+    # confirmation that could never happen). See docs/build-estimate.md.
+    st.markdown("---")
+    st.markdown("**Target Xactimate project**")
+    xactimate_project_name = st.text_input(
+        "Xactimate project name (must match the project currently open in Xactimate)",
+        key="build_estimate_xactimate_project_name",
     )
 
+    if st.button("Confirm project", key="build_estimate_confirm_project", disabled=not xactimate_project_name.strip()):
+        try:
+            adapter = _construct_windows_adapter(xactimate_project_name.strip())
+        except Exception as exc:  # pragma: no cover -- exercised live on Windows only
+            st.session_state["build_estimate_confirmation"] = {"project_name": xactimate_project_name.strip(), "error": str(exc)}
+        else:
+            diagnostics = service.run_diagnostics(adapter)
+            flags = service.compute_capability_flags(adapter, diagnostics)
+            display_profile = adapter.verify_display_profile() if hasattr(adapter, "verify_display_profile") else None
+            st.session_state["build_estimate_confirmation"] = {
+                "project_name": xactimate_project_name.strip(),
+                "application_verified": diagnostics.application_verified,
+                "project_verified": diagnostics.project_verified,
+                "flags": flags,
+                "display_profile": display_profile,
+                "error": None,
+            }
+        st.rerun()
+
+    confirmation = st.session_state.get("build_estimate_confirmation")
+    project_confirmed = False
+    display_profile_ok = True
+    safe_autofill_ready = False
+    if confirmation and confirmation.get("project_name") == xactimate_project_name.strip():
+        if confirmation.get("error"):
+            st.error(f"Could not construct the Xactimate adapter: {confirmation['error']}")
+        else:
+            flags = confirmation["flags"]
+            display_profile = confirmation["display_profile"]
+            project_confirmed = bool(confirmation["application_verified"] and confirmation["project_verified"])
+
+            if project_confirmed:
+                st.success(f"Confirmed: Xactimate is open on project {xactimate_project_name.strip()!r}, Estimate Items screen.")
+            else:
+                st.error(
+                    "Could not positively identify the target Xactimate project -- refusing to proceed. "
+                    + _resume_instructions(xactimate_project_name.strip())
+                )
+
+            # Shown regardless of confirmation outcome -- exactly when a
+            # user needs "why isn't this available" visibility most.
+            with st.expander("Capability flags", expanded=not project_confirmed):
+                st.dataframe(pd.DataFrame(_capability_flags_rows(flags)), use_container_width=True, hide_index=True)
+                for note in flags.notes:
+                    st.caption(note)
+
+            display_profile_ok = display_profile is None or display_profile["ok"]
+            if display_profile is not None:
+                with st.expander("Display / calibration check", expanded=not display_profile["ok"]):
+                    for c in display_profile["checks"]:
+                        st.caption(c)
+                    if display_profile["ok"]:
+                        st.success("Display profile matches the validated calibration -- safe to run live.")
+                    else:
+                        st.error("Display profile check failed -- live execution is blocked:")
+                        for r in display_profile["blocking_reasons"]:
+                            st.caption(f"- {r}")
+
+            safe_autofill_ready = project_confirmed and flags.safe_autofill_available and display_profile_ok
+
+    # Phase 5.5: TEST-only option to also include rows with no CAT/SEL
+    # yet (searched live by description instead of excluded outright).
+    # Only ever true when the project the user actually confirmed LIVE,
+    # this run, is exactly "TEST" -- never a stale/typed-but-unconfirmed
+    # value.
+    test_only_confirmed = bool(
+        project_confirmed and display_profile_ok and xactimate_project_name.strip() == TEST_ONLY_PROJECT_NAME
+    )
     include_unmapped = False
-    if _test_only_confirmed:
+    if test_only_confirmed:
         include_unmapped = st.checkbox(
             "Include rows missing CAT/SEL and search by description",
             key="build_estimate_include_unmapped_rows",
@@ -221,13 +282,14 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
             ec4.metric("Blocked: missing unit", counts["blocked_missing_unit"])
             ec5.metric("Blocked: unresolved group", counts["blocked_unresolved_group"])
 
+    st.markdown("---")
     col1, col2 = st.columns(2)
     if col1.button("Build / refresh execution plan from approved items"):
         try:
             if include_unmapped:
                 plan = build_execution_plan(
                     project_dir, project_slug,
-                    include_unmapped_rows=True, xactimate_project_name=_typed_project_name,
+                    include_unmapped_rows=True, xactimate_project_name=xactimate_project_name.strip(),
                 )
             else:
                 plan = build_execution_plan(project_dir, project_slug)
@@ -235,19 +297,28 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
             st.success(f"Built a plan with {len(plan.tasks)} task(s) across {len(plan.groups)} group(s).")
         except ExecutionPlanError as exc:
             st.error(str(exc))
-            return
 
     if plan is None:
-        st.info("No execution plan yet -- approve line items in Mapping Review, then build a plan here.")
+        st.info(
+            "No execution plan yet -- approve line items in Mapping Review, or (TEST only, once confirmed above) "
+            "check \"Include rows missing CAT/SEL\", then build a plan here."
+        )
         return
 
     st.caption(f"Plan {plan.plan_id} -- run_state: **{plan.run_state}** -- last updated {plan.updated_at}")
     summary = plan.summary()
+    pending_count = sum(1 for t in plan.tasks if t.state == TASK_PENDING)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Completed", summary.completed)
     m2.metric("Review required", len(summary.review_required_labels))
     m3.metric("Skipped", summary.skipped)
     m4.metric("Failed", len(summary.failed_labels))
+
+    if project_confirmed:
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("Groups in plan", len(plan.groups))
+        cc2.metric("Ready (pending)", pending_count)
+        cc3.metric("Uncertain (review/failed)", len(summary.review_required_labels) + len(summary.failed_labels))
 
     for group in plan.groups:
         group_tasks = plan.tasks_in_group(group.group_id)
@@ -279,79 +350,6 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
                             skip_task(plan, tid, reason, project_dir)
                         st.success(f"Skipped {len(skip_ids)} row(s).")
                         st.rerun()
-
-    pending_count = sum(1 for t in plan.tasks if t.state == TASK_PENDING)
-
-    st.markdown("---")
-    st.markdown("**Target Xactimate project**")
-    xactimate_project_name = st.text_input(
-        "Xactimate project name (must match the project currently open in Xactimate)",
-        key="build_estimate_xactimate_project_name",
-    )
-    st.caption(f"{pending_count} task(s) still pending.")
-
-    if st.button("Confirm project", key="build_estimate_confirm_project", disabled=not xactimate_project_name.strip()):
-        try:
-            adapter = _construct_windows_adapter(xactimate_project_name.strip())
-        except Exception as exc:  # pragma: no cover -- exercised live on Windows only
-            st.session_state["build_estimate_confirmation"] = {"project_name": xactimate_project_name.strip(), "error": str(exc)}
-        else:
-            diagnostics = service.run_diagnostics(adapter)
-            flags = service.compute_capability_flags(adapter, diagnostics)
-            display_profile = adapter.verify_display_profile() if hasattr(adapter, "verify_display_profile") else None
-            st.session_state["build_estimate_confirmation"] = {
-                "project_name": xactimate_project_name.strip(),
-                "application_verified": diagnostics.application_verified,
-                "project_verified": diagnostics.project_verified,
-                "flags": flags,
-                "display_profile": display_profile,
-                "error": None,
-            }
-        st.rerun()
-
-    confirmation = st.session_state.get("build_estimate_confirmation")
-    project_confirmed = False
-    safe_autofill_ready = False
-    if confirmation and confirmation.get("project_name") == xactimate_project_name.strip():
-        if confirmation.get("error"):
-            st.error(f"Could not construct the Xactimate adapter: {confirmation['error']}")
-        else:
-            flags = confirmation["flags"]
-            display_profile = confirmation["display_profile"]
-            project_confirmed = bool(confirmation["application_verified"] and confirmation["project_verified"])
-
-            if project_confirmed:
-                st.success(f"Confirmed: Xactimate is open on project {xactimate_project_name.strip()!r}, Estimate Items screen.")
-                cc1, cc2, cc3 = st.columns(3)
-                cc1.metric("Groups in plan", len(plan.groups))
-                cc2.metric("Ready (pending)", pending_count)
-                cc3.metric("Uncertain (review/failed)", len(summary.review_required_labels) + len(summary.failed_labels))
-            else:
-                st.error(
-                    "Could not positively identify the target Xactimate project -- refusing to proceed. "
-                    + _resume_instructions(xactimate_project_name.strip())
-                )
-
-            # Shown regardless of confirmation outcome -- exactly when a
-            # user needs "why isn't this available" visibility most.
-            with st.expander("Capability flags", expanded=not project_confirmed):
-                st.dataframe(pd.DataFrame(_capability_flags_rows(flags)), use_container_width=True, hide_index=True)
-                for note in flags.notes:
-                    st.caption(note)
-
-            display_profile_ok = display_profile is None or display_profile["ok"]
-            if display_profile is not None:
-                with st.expander("Display / calibration check", expanded=not display_profile["ok"]):
-                    for c in display_profile["checks"]:
-                        st.caption(c)
-                    if display_profile["ok"]:
-                        st.success("Display profile matches the validated calibration -- safe to run live.")
-                    else:
-                        st.error("Display profile check failed -- live execution is blocked:")
-                        for r in display_profile["blocking_reasons"]:
-                            st.caption(f"- {r}")
-
-            safe_autofill_ready = project_confirmed and flags.safe_autofill_available and display_profile_ok
 
     st.markdown("---")
     st.markdown("**Run against Xactimate**")
