@@ -277,6 +277,8 @@ def execute_plan(
         adapter.recover()
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_ADAPTER_ERROR, str(exc), candidates=candidates, selected=top)
 
+    outcome.populated_fields = populated
+
     if (populated.category, populated.selector) != (top.dropdown.category, top.dropdown.selector):
         _cancel_pending_selection(adapter)
         return _stop(

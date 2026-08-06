@@ -16,12 +16,14 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     ExecutionTask,
     GROUP_PENDING,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
+    LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
     TASK_SKIPPED,
     build_execution_plan,
+    classify_unmapped_rows,
     load_execution_plan,
     save_execution_plan,
 )
@@ -207,3 +209,182 @@ def test_execution_summary_matches_required_report_format():
     assert "Review Required:" in text
     assert "Skipped: 2" in text
     assert "Failed: 1" in text
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5: TEST-only inclusion of rows missing CAT/SEL, searched by
+# description instead of being excluded from the plan entirely.
+# ---------------------------------------------------------------------
+
+
+def _write_flexible_project(tmp_path, project_name, entries):
+    """`entries`: list of dicts with keys line_item_id, description,
+    area_name, section_name, quantity, unit, category, selector,
+    status ("approved"/"rejected"/omitted for unreviewed). Reuses
+    _normalized_item()/_mapped_item() above but allows each field to
+    vary per row, which the fixed-shape ITEMS/_write_project() above
+    does not."""
+    project_dir = tmp_path / project_name
+    (project_dir / "mapping").mkdir(parents=True)
+    (project_dir / "review").mkdir(parents=True)
+
+    normalized = [
+        _normalized_item(
+            e["line_item_id"], e.get("description", "A real source description"),
+            e.get("area_name"), e.get("section_name"),
+            quantity=e.get("quantity", 10.0), unit=e.get("unit", "SQ"),
+        )
+        for e in entries
+    ]
+    mapped = [_mapped_item(e["line_item_id"], category=e.get("category"), selector=e.get("selector")) for e in entries]
+    (project_dir / "mapping" / "normalized_estimate.json").write_text(json.dumps(normalized), encoding="utf-8")
+    (project_dir / "mapping" / "mapped_estimate.json").write_text(json.dumps(mapped), encoding="utf-8")
+
+    for e in entries:
+        if e.get("status") == "approved":
+            review_service.approve_item(project_dir, e["line_item_id"], reviewer="test")
+        elif e.get("status") == "rejected":
+            review_service.reject_item(project_dir, e["line_item_id"], reviewer="test")
+    return project_dir
+
+
+_UNMAPPED_TEST_ENTRIES = [
+    {"line_item_id": "line_mapped", "area_name": "Dwelling", "section_name": "Dwelling Roof",
+     "category": "RFG", "selector": "FELT15", "status": "approved"},
+    {"line_item_id": "line_unmapped_eligible", "area_name": "Dwelling", "section_name": "Dwelling Roof",
+     "description": "Roofing felt - 15 lb.", "quantity": 33.66, "unit": "SQ"},
+    {"line_item_id": "line_missing_description", "area_name": "Dwelling", "section_name": "Exterior",
+     "description": "", "quantity": 10.0, "unit": "LF"},
+    {"line_item_id": "line_missing_quantity", "area_name": "Dwelling", "section_name": "Exterior",
+     "description": "A real source description", "quantity": None, "unit": "LF"},
+    {"line_item_id": "line_missing_unit", "area_name": "Dwelling", "section_name": "Exterior",
+     "description": "A real source description", "quantity": 10.0, "unit": None},
+    {"line_item_id": "line_unresolved_group", "area_name": None, "section_name": None,
+     "description": "A real source description", "quantity": 10.0, "unit": "LF"},
+    {"line_item_id": "line_rejected_unmapped", "area_name": "Dwelling", "section_name": "Dwelling Roof",
+     "description": "A real source description", "quantity": 10.0, "unit": "LF", "status": "rejected"},
+]
+
+
+def test_normal_builder_excludes_unmapped_rows_by_default(tmp_path):
+    """Requirement 1: the normal execution-plan builder remains
+    approved-only -- include_unmapped_rows defaults to False, so an
+    unmapped-but-otherwise-eligible row is still excluded exactly as
+    before this phase."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+    plan = build_execution_plan(project_dir, "proj")
+    assert [t.line_item_id for t in plan.tasks] == ["line_mapped"]
+    assert plan.tasks[0].lookup_strategy == LOOKUP_STRATEGY_REVIEW_APPROVED
+    assert plan.tasks[0].began_unmapped is False
+
+
+def test_include_unmapped_rows_adds_eligible_unmapped_rows_for_test_project(tmp_path):
+    """Requirement 2: the TEST-only option includes otherwise eligible
+    rows missing CAT/SEL, without requiring them to be approved and
+    without changing their stored review status."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+
+    plan = build_execution_plan(project_dir, "proj", include_unmapped_rows=True, xactimate_project_name="TEST")
+
+    ids = {t.line_item_id for t in plan.tasks}
+    assert "line_mapped" in ids
+    assert "line_unmapped_eligible" in ids
+    assert "line_missing_description" not in ids
+    assert "line_missing_quantity" not in ids
+    assert "line_missing_unit" not in ids
+    assert "line_unresolved_group" not in ids
+    assert "line_rejected_unmapped" not in ids
+
+    unmapped_task = plan.task_by_id("task_line_unmapped_eligible")
+    assert unmapped_task.category is None
+    assert unmapped_task.selector is None
+    assert unmapped_task.lookup_strategy == LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST
+    assert unmapped_task.began_unmapped is True
+
+    # Never required approval, never touched the row's stored status.
+    effective = review_service.build_effective_rows(project_dir, line_item_ids=["line_unmapped_eligible"])[0]
+    assert effective["status"] == review_service.STATUS_UNREVIEWED
+
+    mapped_task = plan.task_by_id("task_line_mapped")
+    assert mapped_task.lookup_strategy == LOOKUP_STRATEGY_REVIEW_APPROVED
+    assert mapped_task.began_unmapped is False
+
+
+def test_include_unmapped_rows_refuses_when_project_is_not_test(tmp_path):
+    """Requirement 3: the option refuses any project other than TEST."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+
+    with pytest.raises(ExecutionPlanError, match="TEST"):
+        build_execution_plan(project_dir, "proj", include_unmapped_rows=True, xactimate_project_name="production-claim-42")
+
+    with pytest.raises(ExecutionPlanError, match="TEST"):
+        build_execution_plan(project_dir, "proj", include_unmapped_rows=True, xactimate_project_name=None)
+
+
+def test_classify_unmapped_rows_blocks_missing_description(tmp_path):
+    """Requirement 4: rows missing description remain blocked."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+    eligibility = classify_unmapped_rows(project_dir)
+    assert "line_missing_description" in {r["line_item_id"] for r in eligibility.blocked_missing_description}
+    assert "line_missing_description" not in {r["line_item_id"] for r in eligibility.unmapped_eligible}
+
+
+def test_classify_unmapped_rows_blocks_missing_quantity(tmp_path):
+    """Requirement 5: rows missing quantity remain blocked."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+    eligibility = classify_unmapped_rows(project_dir)
+    assert "line_missing_quantity" in {r["line_item_id"] for r in eligibility.blocked_missing_quantity}
+    assert "line_missing_quantity" not in {r["line_item_id"] for r in eligibility.unmapped_eligible}
+
+
+def test_classify_unmapped_rows_blocks_missing_unit(tmp_path):
+    """Requirement 6: rows missing unit remain blocked."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+    eligibility = classify_unmapped_rows(project_dir)
+    assert "line_missing_unit" in {r["line_item_id"] for r in eligibility.blocked_missing_unit}
+    assert "line_missing_unit" not in {r["line_item_id"] for r in eligibility.unmapped_eligible}
+
+
+def test_classify_unmapped_rows_blocks_unresolved_group(tmp_path):
+    """Requirement 7: unresolved groups remain blocked."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+    eligibility = classify_unmapped_rows(project_dir)
+    assert "line_unresolved_group" in {r["line_item_id"] for r in eligibility.blocked_unresolved_group}
+    assert "line_unresolved_group" not in {r["line_item_id"] for r in eligibility.unmapped_eligible}
+
+
+def test_classify_unmapped_rows_excludes_rejected_rows_and_counts_mapped_correctly(tmp_path):
+    """A human-rejected row is never included, mapped or not -- and the
+    counts() view matches the UI's required breakdown."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+    eligibility = classify_unmapped_rows(project_dir)
+    all_ids = {r["line_item_id"] for bucket in (
+        eligibility.mapped, eligibility.unmapped_eligible, eligibility.blocked_missing_description,
+        eligibility.blocked_missing_quantity, eligibility.blocked_missing_unit, eligibility.blocked_unresolved_group,
+    ) for r in bucket}
+    assert "line_rejected_unmapped" not in all_ids
+
+    counts = eligibility.counts()
+    assert counts["mapped"] == 1
+    assert counts["unmapped_eligible"] == 1
+    assert counts["blocked_missing_description"] == 1
+    assert counts["blocked_missing_quantity"] == 1
+    assert counts["blocked_missing_unit"] == 1
+    assert counts["blocked_unresolved_group"] == 1
+
+
+def test_unmapped_task_carries_normalized_context_for_description_first_search(tmp_path):
+    """The normalized action/trade/component/material needed by the
+    existing description-first phrase generator/ranker are carried onto
+    the task ONLY for a began_unmapped task -- never for the normal
+    approved-CAT/SEL path (unchanged behavior)."""
+    project_dir = _write_flexible_project(tmp_path, "proj", _UNMAPPED_TEST_ENTRIES)
+    plan = build_execution_plan(project_dir, "proj", include_unmapped_rows=True, xactimate_project_name="TEST")
+
+    unmapped_task = plan.task_by_id("task_line_unmapped_eligible")
+    assert unmapped_task.normalized_trade == "roofing"
+    assert unmapped_task.normalized_component == "shingles"
+
+    mapped_task = plan.task_by_id("task_line_mapped")
+    assert mapped_task.normalized_trade is None
+    assert mapped_task.normalized_component is None

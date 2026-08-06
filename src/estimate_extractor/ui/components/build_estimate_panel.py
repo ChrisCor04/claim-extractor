@@ -40,7 +40,9 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
     TASK_SKIPPED,
+    TEST_ONLY_PROJECT_NAME,
     build_execution_plan,
+    classify_unmapped_rows,
     load_execution_plan,
     save_execution_plan,
 )
@@ -178,10 +180,57 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
 
     plan = load_execution_plan(project_dir)
 
+    # Phase 5.5: TEST-only option to also include rows with no CAT/SEL
+    # yet (searched live by description instead of excluded outright).
+    # A read-only peek at session_state set by the "Confirm project"
+    # section further below -- Streamlit widget values persist in
+    # session_state across reruns, so this mirrors that section's own
+    # project_confirmed/display_profile_ok computation without moving
+    # or altering that (existing, unchanged) section. Only ever true
+    # when the project the user actually confirmed live is exactly
+    # "TEST".
+    _confirmation = st.session_state.get("build_estimate_confirmation")
+    _typed_project_name = st.session_state.get("build_estimate_xactimate_project_name", "").strip()
+    _test_only_confirmed = bool(
+        _confirmation
+        and not _confirmation.get("error")
+        and _confirmation.get("project_name") == _typed_project_name
+        and _confirmation.get("application_verified")
+        and _confirmation.get("project_verified")
+        and _typed_project_name == TEST_ONLY_PROJECT_NAME
+        and (_confirmation.get("display_profile") is None or _confirmation["display_profile"]["ok"])
+    )
+
+    include_unmapped = False
+    if _test_only_confirmed:
+        include_unmapped = st.checkbox(
+            "Include rows missing CAT/SEL and search by description",
+            key="build_estimate_include_unmapped_rows",
+        )
+        st.warning(
+            "TEST only. Unmapped rows will be searched by description. "
+            "Existing mapping approval rules are unchanged outside this run."
+        )
+        if include_unmapped:
+            eligibility = classify_unmapped_rows(project_dir)
+            counts = eligibility.counts()
+            ec1, ec2, ec3, ec4, ec5 = st.columns(5)
+            ec1.metric("Mapped rows", counts["mapped"])
+            ec2.metric("Unmapped, description-search", counts["unmapped_eligible"])
+            ec3.metric("Blocked: missing quantity", counts["blocked_missing_quantity"])
+            ec4.metric("Blocked: missing unit", counts["blocked_missing_unit"])
+            ec5.metric("Blocked: unresolved group", counts["blocked_unresolved_group"])
+
     col1, col2 = st.columns(2)
     if col1.button("Build / refresh execution plan from approved items"):
         try:
-            plan = build_execution_plan(project_dir, project_slug)
+            if include_unmapped:
+                plan = build_execution_plan(
+                    project_dir, project_slug,
+                    include_unmapped_rows=True, xactimate_project_name=_typed_project_name,
+                )
+            else:
+                plan = build_execution_plan(project_dir, project_slug)
             save_execution_plan(plan, project_dir)
             st.success(f"Built a plan with {len(plan.tasks)} task(s) across {len(plan.groups)} group(s).")
         except ExecutionPlanError as exc:

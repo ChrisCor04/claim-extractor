@@ -246,6 +246,17 @@ class LookupOutcome:
     #: concrete adapter's types. None whenever the adapter doesn't
     #: support commit verification, or nothing was committed.
     verification: object | None = None
+    #: Phase 5.5: the `PopulatedFields` read back right after
+    #: `select_candidate()` (see orchestrator.execute_plan()), set on
+    #: the outcome that is ultimately returned on a successful commit.
+    #: A field-mismatch/unit-mismatch safety stop returns a separate,
+    #: fresh outcome (via `_stop()`) and never carries this. Exists so
+    #: callers that need the Quick-Entry-populated `action` (e.g.
+    #: execution_runner.py recording an "observed activity" for an
+    #: originally-unmapped row) don't need their own separate read;
+    #: nothing about execute_plan()'s own decision logic reads this
+    #: field.
+    populated_fields: PopulatedFields | None = None
 
     def to_dict(self) -> dict:
         return {

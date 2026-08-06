@@ -31,7 +31,7 @@ from pathlib import Path
 
 from estimate_extractor.mapping.pipeline import DEFAULT_CONFIG_DIR
 from estimate_extractor.ui import group_name_service
-from estimate_extractor.ui.review_service import STATUS_APPROVED, build_effective_rows
+from estimate_extractor.ui.review_service import STATUS_APPROVED, STATUS_REJECTED, build_effective_rows
 
 DEFAULT_GROUP_NAMES_PATH = DEFAULT_CONFIG_DIR / "xactimate_group_names.yaml"
 
@@ -54,10 +54,24 @@ GROUP_COMPLETED = "completed"
 GROUP_FAILED = "failed"
 
 LOOKUP_STRATEGY_REVIEW_APPROVED = "review_approved_cat_sel"
+#: Phase 5.5: a row with no CAT/SEL yet (missing, not rejected) but a
+#: real description/quantity/unit/group, searched live via the
+#: existing description-first lookup path instead of being excluded
+#: from the plan entirely. Only ever produced by
+#: build_execution_plan(include_unmapped_rows=True, ...), which itself
+#: refuses anything but the exact Xactimate project "TEST" -- see
+#: TEST_ONLY_PROJECT_NAME.
+LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST = "test_description_first"
 RUN_STATE_NOT_STARTED = "not_started"
 RUN_STATE_IN_PROGRESS = "in_progress"
 RUN_STATE_PAUSED = "paused"
 RUN_STATE_COMPLETED = "completed"
+
+#: Phase 5.5: the ONLY Xactimate project allowed to include unmapped
+#: (CAT/SEL-missing) rows in an execution plan -- see
+#: build_execution_plan()'s include_unmapped_rows parameter. Never
+#: relaxed to a pattern/prefix match; exact string equality only.
+TEST_ONLY_PROJECT_NAME = "TEST"
 
 
 def utc_now_iso() -> str:
@@ -87,8 +101,8 @@ class ExecutionTask:
     area_name: str | None
     section_name: str | None
     description: str
-    category: str
-    selector: str
+    category: str | None
+    selector: str | None
     lookup_strategy: str
     source_quantity: float
     source_unit: str | None
@@ -97,6 +111,30 @@ class ExecutionTask:
     entered_quantity: float | None = None
     observed_quantity: float | None = None
     observed_unit: str | None = None
+    #: Phase 5.5: True only for a task built by
+    #: build_execution_plan(include_unmapped_rows=True, ...) from a row
+    #: that had no CAT/SEL at plan-build time (category/selector above
+    #: are both None). Never set for the normal approved-only path.
+    began_unmapped: bool = False
+    #: Phase 5.5: normalization context carried through ONLY for
+    #: began_unmapped tasks, so the existing description-first phrase
+    #: generator and ranker (generate_search_phrase(),
+    #: rank_dropdown_results()) have the same inputs they already use
+    #: elsewhere in this codebase. Always None for the normal
+    #: approved-CAT/SEL path -- unchanged from today's behavior.
+    normalized_action: str | None = None
+    normalized_trade: str | None = None
+    normalized_component: str | None = None
+    normalized_material: str | None = None
+    #: Phase 5.5: OCR-observed values read back after a successful live
+    #: commit of an originally-unmapped row (see execution_runner.py's
+    #: _apply_outcome_to_task()). Corroborating/informational only --
+    #: never treated as human-approved, never written back over an
+    #: existing reviewed CAT/SEL in review_service's own state.
+    observed_category: str | None = None
+    observed_selector: str | None = None
+    observed_description: str | None = None
+    observed_activity: str | None = None
     state: str = TASK_PENDING
     trust_state: str | None = None
     stop_reason: str | None = None
@@ -272,6 +310,85 @@ def _resolve_xactimate_group_name(
     return (suggestion.suggested_group_name or section_name), False
 
 
+def _is_valid_quantity(value) -> bool:
+    """Same bar `can_approve()` implicitly relies on downstream (a
+    quantity Xactimate can actually be given) -- present and a real
+    positive number. `bool` is excluded explicitly since it's a `int`
+    subclass in Python and `True`/`False` are never a real quantity."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+@dataclass(slots=True)
+class UnmappedRowEligibility:
+    """Phase 5.5: classifies every row in a project into exactly one
+    bucket for the TEST-only "include unmapped rows" option -- used by
+    both `build_execution_plan(include_unmapped_rows=True, ...)` (to
+    build the actual task list) and the Build Estimate UI (to show
+    counts before anything runs), so the two never drift apart."""
+
+    mapped: list[dict] = field(default_factory=list)
+    unmapped_eligible: list[dict] = field(default_factory=list)
+    blocked_missing_description: list[dict] = field(default_factory=list)
+    blocked_missing_quantity: list[dict] = field(default_factory=list)
+    blocked_missing_unit: list[dict] = field(default_factory=list)
+    blocked_unresolved_group: list[dict] = field(default_factory=list)
+
+    def counts(self) -> dict:
+        return {
+            "mapped": len(self.mapped),
+            "unmapped_eligible": len(self.unmapped_eligible),
+            "blocked_missing_description": len(self.blocked_missing_description),
+            "blocked_missing_quantity": len(self.blocked_missing_quantity),
+            "blocked_missing_unit": len(self.blocked_missing_unit),
+            "blocked_unresolved_group": len(self.blocked_unresolved_group),
+        }
+
+
+def classify_unmapped_rows(
+    project_dir: Path, *, group_names_path: Path = DEFAULT_GROUP_NAMES_PATH
+) -> UnmappedRowEligibility:
+    """Read-only preview of what `build_execution_plan(include_unmapped_
+    rows=True, ...)` would do -- never talks to Xactimate, never changes
+    any row's stored review status. A row already approved with CAT/SEL
+    is "mapped" (the normal path, unaffected). A rejected row is never
+    included, mapped or not -- a human already said no to it. Every
+    other row missing CAT/SEL is bucketed by the first reason (in this
+    order) it would be blocked; a row with no blocking reason is
+    `unmapped_eligible`."""
+    all_rows = build_effective_rows(project_dir)
+    group_config = group_name_service.load_group_names(group_names_path)
+    overrides = group_name_service.get_group_name_overrides(project_dir)
+
+    result = UnmappedRowEligibility()
+    for row in all_rows:
+        if row["status"] == STATUS_APPROVED and row.get("category") and row.get("selector"):
+            result.mapped.append(row)
+            continue
+        if row["status"] == STATUS_REJECTED:
+            continue
+        if row.get("category") and row.get("selector"):
+            # Mapped but not yet approved -- the normal approved-only
+            # path already excludes it; this TEST-only option only ever
+            # adds CAT/SEL-missing rows, never bypasses ordinary
+            # mapping approval for rows that already have a mapping.
+            continue
+        if not (row.get("mapped_description") or row.get("original_description")):
+            result.blocked_missing_description.append(row)
+            continue
+        if not _is_valid_quantity(row.get("quantity")):
+            result.blocked_missing_quantity.append(row)
+            continue
+        if not row.get("unit"):
+            result.blocked_missing_unit.append(row)
+            continue
+        xactimate_group_name, _reviewed = _resolve_xactimate_group_name(row.get("section_name"), overrides, group_config)
+        if not xactimate_group_name:
+            result.blocked_unresolved_group.append(row)
+            continue
+        result.unmapped_eligible.append(row)
+    return result
+
+
 def build_execution_plan(
     project_dir: Path,
     project_slug: str,
@@ -279,6 +396,8 @@ def build_execution_plan(
     source_filename: str | None = None,
     line_item_ids: list[str] | None = None,
     group_names_path: Path = DEFAULT_GROUP_NAMES_PATH,
+    include_unmapped_rows: bool = False,
+    xactimate_project_name: str | None = None,
 ) -> ExecutionPlan:
     """Builds a fresh ExecutionPlan from every APPROVED, executable line
     item in the project (or the subset named in `line_item_ids`, which
@@ -286,16 +405,44 @@ def build_execution_plan(
     execution_runner.py for the part that does. Raises
     ExecutionPlanError if there is nothing approved to build, or if an
     approved row is somehow missing category/selector (would indicate a
-    bug in review_service.can_approve()'s gate, not a normal outcome)."""
+    bug in review_service.can_approve()'s gate, not a normal outcome).
+
+    Phase 5.5: when `include_unmapped_rows=True` AND
+    `xactimate_project_name` is exactly `TEST_ONLY_PROJECT_NAME`, ALSO
+    includes rows with no CAT/SEL yet that otherwise have a real
+    description/quantity/unit/resolved group (see
+    `classify_unmapped_rows()`) -- searched live via the existing
+    description-first lookup path (`LOOKUP_STRATEGY_TEST_DESCRIPTION_
+    FIRST`) instead of the trusted CAT/SEL path. These rows are never
+    required to be approved and their stored review status is never
+    touched. Any other project name (including None) raises
+    ExecutionPlanError immediately -- this is a fast, cheap sanity
+    check only; the authoritative safety gate is the LIVE, positively-
+    verified adapter check execution_runner.py performs again before
+    actually running any such task."""
+    if include_unmapped_rows and xactimate_project_name != TEST_ONLY_PROJECT_NAME:
+        raise ExecutionPlanError(
+            f"include_unmapped_rows is only permitted for the exact Xactimate project "
+            f"{TEST_ONLY_PROJECT_NAME!r} (got {xactimate_project_name!r}) -- refusing to build a plan "
+            f"that includes unmapped rows for any other project."
+        )
+
     all_rows = build_effective_rows(project_dir)
     order_by_id = {r["line_item_id"]: i for i, r in enumerate(all_rows)}
 
     approved_rows = [r for r in all_rows if r["status"] == STATUS_APPROVED]
+    eligible_rows = list(approved_rows)
+    unmapped_ids: set[str] = set()
+    if include_unmapped_rows:
+        eligibility = classify_unmapped_rows(project_dir, group_names_path=group_names_path)
+        eligible_rows.extend(eligibility.unmapped_eligible)
+        unmapped_ids = {r["line_item_id"] for r in eligibility.unmapped_eligible}
+
     if line_item_ids is not None:
         wanted = set(line_item_ids)
-        approved_rows = [r for r in approved_rows if r["line_item_id"] in wanted]
+        eligible_rows = [r for r in eligible_rows if r["line_item_id"] in wanted]
 
-    if not approved_rows:
+    if not eligible_rows:
         raise ExecutionPlanError("No approved, executable line items found in this project -- nothing to build.")
 
     group_config = group_name_service.load_group_names(group_names_path)
@@ -304,14 +451,15 @@ def build_execution_plan(
     groups: dict[str, GroupExecutionState] = {}
     tasks: list[ExecutionTask] = []
 
-    for row in approved_rows:
+    for row in eligible_rows:
         section_name = row.get("section_name")
         area_name = row.get("area_name")
         group_id = section_name or f"__ungrouped__{area_name or 'none'}"
 
         category = row.get("category")
         selector = row.get("selector")
-        if not category or not selector:
+        is_unmapped = row["line_item_id"] in unmapped_ids
+        if not is_unmapped and (not category or not selector):
             raise ExecutionPlanError(
                 f"{row['line_item_id']} is marked approved but is missing category/selector -- "
                 f"review_service.can_approve() should have blocked this; refusing to build a task for it."
@@ -337,10 +485,15 @@ def build_execution_plan(
             description=row.get("mapped_description") or row.get("original_description") or "",
             category=category,
             selector=selector,
-            lookup_strategy=LOOKUP_STRATEGY_REVIEW_APPROVED,
+            lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST if is_unmapped else LOOKUP_STRATEGY_REVIEW_APPROVED,
             source_quantity=row.get("quantity"),
             source_unit=row.get("unit"),
             expected_unit=row.get("unit"),
+            began_unmapped=is_unmapped,
+            normalized_action=row.get("normalized_action") if is_unmapped else None,
+            normalized_trade=row.get("normalized_trade") if is_unmapped else None,
+            normalized_component=row.get("normalized_component") if is_unmapped else None,
+            normalized_material=row.get("normalized_material") if is_unmapped else None,
         )
         tasks.append(task)
         groups[group_id].task_ids.append(task.task_id)

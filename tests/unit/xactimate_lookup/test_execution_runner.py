@@ -8,6 +8,8 @@ session."""
 
 from __future__ import annotations
 
+import json
+
 from estimate_extractor.xactimate_lookup.adapter import AdapterError, FakeXactimateAdapter
 from estimate_extractor.xactimate_lookup.execution_plan import (
     ExecutionPlan,
@@ -18,6 +20,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     GROUP_VERIFIED,
     GroupExecutionState,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
+    LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
     RUN_STATE_COMPLETED,
     RUN_STATE_PAUSED,
     TASK_COMPLETED,
@@ -28,15 +31,26 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     load_execution_plan,
     save_execution_plan,
 )
-from estimate_extractor.xactimate_lookup.execution_runner import run_execution_plan, skip_task
-from estimate_extractor.xactimate_lookup.models import DropdownResult
+from estimate_extractor.xactimate_lookup.execution_runner import (
+    OBSERVED_MAPPING_STATE,
+    _observed_mappings_path,
+    run_execution_plan,
+    skip_task,
+)
+from estimate_extractor.xactimate_lookup.models import DropdownResult, PopulatedFields
 
 
 class _FakeCommitVerification:
-    def __init__(self, trust_state, quantity_observed=None, unit_observed=None):
+    def __init__(
+        self, trust_state, quantity_observed=None, unit_observed=None,
+        category_observed=None, selector_observed=None, description_observed=None,
+    ):
         self.trust_state = trust_state
         self.quantity_observed = quantity_observed
         self.unit = _FakeUnitResult(unit_observed) if unit_observed else None
+        self.category_observed = category_observed
+        self.selector_observed = selector_observed
+        self.description_observed = description_observed
 
 
 class _FakeUnitResult:
@@ -80,7 +94,14 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
 
     def verify_commit(self, before_snapshot, category, selector, expected_quantity, *, source_unit=None, expected_xactimate_unit=None):
         self.verify_commit_calls += 1
-        return _FakeCommitVerification(self.trust_state, quantity_observed=expected_quantity, unit_observed=expected_xactimate_unit)
+        # Defaults to "observed exactly what was selected" -- the normal,
+        # self-consistent case for a real successful commit. Tests that
+        # care about a specific OCR-observed value (Phase 5.5) can still
+        # override via self.trust_state's sibling knobs if needed.
+        return _FakeCommitVerification(
+            self.trust_state, quantity_observed=expected_quantity, unit_observed=expected_xactimate_unit,
+            category_observed=category, selector_observed=selector, description_observed=self._selected.description if self._selected else None,
+        )
 
 
 def _task(task_id, line_item_id, section_name, category, selector, source_order, qty=5.0, unit="LF"):
@@ -409,3 +430,194 @@ def test_project_lost_between_groups_is_a_hard_stop_for_the_whole_run(tmp_path, 
     # just that one group's tasks routed to review.
     assert result.task_by_id("task_3").state == TASK_PENDING
     assert result.group_by_id("Fence").state == GROUP_PENDING
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5: TEST-only description-first execution of rows that began
+# unmapped (no CAT/SEL at plan-build time -- see execution_plan.py's
+# include_unmapped_rows). The lookup/ranking/safety-stop machinery
+# itself is entirely orchestrator.execute_plan(), unchanged; this
+# module's own job is just: build the right kind of LookupPlan, gate on
+# the live project being exactly "TEST", and record what was observed.
+# ---------------------------------------------------------------------
+
+_FELT_PHRASE = "roofing felt"  # what generate_search_phrase() produces for the description/context below
+
+
+def _unmapped_task(task_id, line_item_id, section_name, source_order, qty=33.66, unit="SQ"):
+    return ExecutionTask(
+        task_id=task_id, line_item_id=line_item_id, source_order=source_order,
+        area_name="Dwelling", section_name=section_name, description="Roofing felt - 15 lb.",
+        category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+        source_quantity=qty, source_unit=unit, expected_unit=unit,
+        began_unmapped=True, normalized_action="install", normalized_trade="roofing",
+        normalized_component="roofing_felt", normalized_material="roofing felt",
+    )
+
+
+def _plan_mapped_and_unmapped():
+    t_mapped = _task("task_mapped", "line_mapped", "Dwelling Roof", "RFG", "3TAB", 0, qty=10.0, unit="SQ")
+    t_unmapped = _unmapped_task("task_unmapped", "line_unmapped", "Dwelling Roof", 1)
+    g1 = GroupExecutionState(
+        group_id="Dwelling Roof", area_name="Dwelling", section_name="Dwelling Roof",
+        xactimate_group_name="Dwelling Roof", group_name_reviewed=True, task_ids=["task_mapped", "task_unmapped"],
+    )
+    return ExecutionPlan(
+        plan_id="p1", project_slug="test", source_filename=None, created_at="now",
+        groups=[g1], tasks=[t_mapped, t_unmapped],
+    )
+
+
+def _felt_dropdown():
+    return DropdownResult(
+        raw_text="RFG FELT15", row_position=0, category="RFG", selector="FELT15",
+        description="Roofing felt - 15 lb.", extraction_confidence=1.0,
+    )
+
+
+def _adapter_with_test_project(**kwargs):
+    adapter = GroupAwareFakeAdapter(**kwargs)
+    adapter.supports_live_execution = True
+    adapter.expected_project_name = "TEST"
+    return adapter
+
+
+def test_unmapped_task_uses_description_first_and_mapped_task_uses_cat_sel(tmp_path, phrase_rules, ranking_config):
+    """Requirements 8 & 9: a task without CAT/SEL is searched by
+    description (the existing description-first path); a task WITH
+    CAT/SEL still goes through the unchanged trusted-lookup path in the
+    SAME run."""
+    plan = _plan_mapped_and_unmapped()
+    script = {
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        _FELT_PHRASE: [_felt_dropdown()],
+    }
+    adapter = _adapter_with_test_project(dropdown_script=script)
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.task_by_id("task_mapped").state == TASK_COMPLETED
+    assert result.task_by_id("task_unmapped").state == TASK_COMPLETED
+    search_desc_calls = [c for c in adapter.log.calls if c[0] == "search_by_description"]
+    search_cs_calls = [c for c in adapter.log.calls if c[0] == "search_by_category_selector"]
+    assert search_desc_calls == [("search_by_description", (_FELT_PHRASE,), {})]
+    assert search_cs_calls == [("search_by_category_selector", ("RFG", "3TAB"), {})]
+
+
+def test_unmapped_task_ambiguous_ranking_is_still_a_safe_stop(tmp_path, phrase_rules, ranking_config):
+    """Requirement 10: ranking and safety-stop behavior are unchanged
+    for an unmapped task -- an ambiguous dropdown still routes to
+    REVIEW_REQUIRED instead of guessing, exactly like the existing
+    CAT/SEL path already does."""
+    plan = _plan_mapped_and_unmapped()
+    script = {
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        _FELT_PHRASE: [
+            DropdownResult(raw_text="Felt A", row_position=0, category="RFG", selector="FELT15", description="Roofing felt - 15 lb.", extraction_confidence=1.0),
+            DropdownResult(raw_text="Felt B", row_position=1, category="RFG", selector="FELT30", description="Roofing felt - 30 lb.", extraction_confidence=1.0),
+        ],
+    }
+    adapter = _adapter_with_test_project(dropdown_script=script)
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.task_by_id("task_unmapped").state == TASK_REVIEW_REQUIRED
+    assert result.task_by_id("task_unmapped").stop_reason == "ambiguous_candidates"
+    # never selected/committed anything for the ambiguous task
+    select_calls = [c for c in adapter.log.calls if c[0] == "select_candidate"]
+    assert len(select_calls) == 1  # only task_mapped's unambiguous selection
+
+
+def test_observed_cat_sel_recorded_after_successful_unmapped_commit(tmp_path, phrase_rules, ranking_config):
+    """Requirement 11: observed CAT/SEL (and description/activity) are
+    recorded on the task after a successful commit of an
+    originally-unmapped row, and a proposal is written to the separate
+    observed_mappings.json file."""
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script)
+    adapter.read_populated_fields = lambda: PopulatedFields(
+        category="RFG", selector="FELT15", description="Roofing felt - 15 lb.", unit="SQ", action="install", item_number=None
+    )
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert task.state == TASK_COMPLETED
+    assert task.observed_category == "RFG"
+    assert task.observed_selector == "FELT15"
+    assert task.observed_description == "Roofing felt - 15 lb."
+    assert task.observed_activity == "install"
+    # the mapped task never gets these populated -- unchanged behavior
+    assert result.task_by_id("task_mapped").observed_category is None
+
+    proposals_path = _observed_mappings_path(tmp_path)
+    assert proposals_path.exists()
+    proposals = json.loads(proposals_path.read_text(encoding="utf-8"))
+    assert "line_unmapped" in proposals
+    proposal = proposals["line_unmapped"]
+    assert proposal["observed_category"] == "RFG"
+    assert proposal["observed_selector"] == "FELT15"
+    assert proposal["search_phrase"] == _FELT_PHRASE
+    assert "line_mapped" not in proposals  # never written for the normal CAT/SEL path
+
+
+def test_observed_mapping_proposal_uses_a_distinct_non_approved_state(tmp_path, phrase_rules, ranking_config):
+    """Requirement 12: the observed proposal is never labeled
+    human-approved -- it carries its own, clearly distinct state."""
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script)
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    proposals = json.loads(_observed_mappings_path(tmp_path).read_text(encoding="utf-8"))
+    assert proposals["line_unmapped"]["state"] == OBSERVED_MAPPING_STATE
+    assert OBSERVED_MAPPING_STATE != "approved"
+    assert "approved" not in OBSERVED_MAPPING_STATE.lower().split("_from_")[0]
+
+
+def test_observed_mapping_proposal_never_touches_review_service_state(tmp_path, phrase_rules, ranking_config):
+    """Requirement 13: existing reviewed CAT/SEL (or any review_service
+    state at all) is never overwritten -- the observed-mapping-proposal
+    writer doesn't import or touch review_service/review_state.json."""
+    project_dir = tmp_path
+    (project_dir / "review").mkdir(parents=True, exist_ok=True)
+    review_state_path = project_dir / "review" / "review_state.json"
+    review_state_path.write_text(json.dumps({
+        "line_unmapped": {"status": "unreviewed", "overrides": {}, "reviewer_note": "", "activity_required_waived": False, "updated_at": "t", "reviewer": ""}
+    }), encoding="utf-8")
+    before = review_state_path.read_text(encoding="utf-8")
+
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script)
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    after = review_state_path.read_text(encoding="utf-8")
+    assert after == before  # byte-for-byte unchanged
+
+
+def test_test_only_task_refused_when_live_project_is_not_exactly_test(tmp_path, phrase_rules, ranking_config):
+    """Hard scope boundary: a description-first (unmapped) task refuses
+    to run when the live adapter isn't positively verified on exactly
+    'TEST' -- independent of, and even if, build_execution_plan()'s own
+    plan-build-time check was somehow bypassed. Never abandons the
+    whole run -- only this one task is refused; a normal CAT/SEL task
+    in the same run is unaffected."""
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = GroupAwareFakeAdapter(dropdown_script=script)
+    adapter.supports_live_execution = True
+    adapter.expected_project_name = "some-production-claim"  # NOT "TEST"
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    unmapped = result.task_by_id("task_unmapped")
+    assert unmapped.state == TASK_REVIEW_REQUIRED
+    assert "TEST" in unmapped.stop_detail
+    assert result.task_by_id("task_mapped").state == TASK_COMPLETED  # unaffected
+    # never even attempted a search for the refused task
+    search_desc_calls = [c for c in adapter.log.calls if c[0] == "search_by_description"]
+    assert search_desc_calls == []
