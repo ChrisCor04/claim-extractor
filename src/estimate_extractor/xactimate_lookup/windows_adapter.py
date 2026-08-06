@@ -3330,6 +3330,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         short of a confident match -- callers must never silently
         proceed on an unverified group."""
         row_count_before = 0
+        skip_cleanup = False
         try:
             if not self.verify_application() or not self.verify_project():
                 return False
@@ -3370,8 +3371,27 @@ class WindowsXactimateAdapter(XactimateAdapter):
             # along with its own disposable probe row. Confirmed live:
             # without this, a resumed group's real committed item was
             # wiped out by the next task's group re-verification.
+            #
+            # Live-caught (follow-up): the line below used to silently
+            # treat "grid could not be located" (grid_offset_before is
+            # None, only returned after _capture_and_locate's own 6
+            # retries are exhausted -- a real failure, not a quick blip)
+            # as "0 rows here" and continued anyway. That let
+            # _cleanup_probe_item(0) below cancel real, already-
+            # committed rows via cancel_current_item() (which always
+            # removes whatever row is currently LAST, not specifically
+            # the probe) when the pre-probe baseline was never actually
+            # known. Fail closed instead: refuse the whole probe -- no
+            # search, no commit, no cleanup, no deletion -- whenever the
+            # starting row count can't be positively established.
             grid_image_before, grid_offset_before = self._capture_and_locate(hwnd)
-            row_count_before = self._count_grid_rows(grid_image_before, grid_offset_before) if grid_offset_before is not None else 0
+            if grid_offset_before is None:
+                skip_cleanup = True
+                return False
+            row_count_before = self._count_grid_rows(grid_image_before, grid_offset_before)
+            if row_count_before is None:
+                skip_cleanup = True
+                return False
 
             self.focus_search()
             self.clear_search()
@@ -3400,10 +3420,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         except Exception:
             return False
         finally:
-            try:
-                self._cleanup_probe_item(row_count_before)
-            except Exception:
-                pass
+            if not skip_cleanup:
+                try:
+                    self._cleanup_probe_item(row_count_before)
+                except Exception:
+                    pass
 
     def _cleanup_probe_item(self, target_row_count: int = 0) -> None:
         """Removes whatever verify_group()'s disposable probe item left

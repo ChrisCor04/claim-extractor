@@ -976,6 +976,46 @@ def test_cleanup_probe_item_defaults_to_fully_empty_grid(monkeypatch):
     assert cancel_calls == [1]
 
 
+def test_verify_group_once_fails_closed_when_grid_cannot_be_located(monkeypatch):
+    """Live-caught (follow-up): _capture_and_locate() returns
+    offset=None only after exhausting its own 6 retries -- a real
+    failure, not a quick blip. The old code silently treated that as
+    "0 rows here" and proceeded to commit a probe item, then let
+    _cleanup_probe_item(0) cancel real, already-committed rows via
+    cancel_current_item() (which always removes whatever row is
+    currently LAST, not specifically the probe). Must instead refuse
+    the whole probe: no search, no commit, no cleanup, no deletion."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Dwelling Roof"])
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    monkeypatch.setattr(adapter, "_group_subtotal_pixel_count", lambda image, header, row_index: 0)
+    # The failure under test: the grid cannot be located.
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), None))
+
+    def _fail_if_called(name):
+        def _inner(*args, **kwargs):
+            raise AssertionError(f"{name}() must not be called when the pre-probe grid state is unknown")
+        return _inner
+
+    monkeypatch.setattr(adapter, "focus_search", _fail_if_called("focus_search"))
+    monkeypatch.setattr(adapter, "clear_search", _fail_if_called("clear_search"))
+    monkeypatch.setattr(adapter, "search_by_category_selector", _fail_if_called("search_by_category_selector"))
+    monkeypatch.setattr(adapter, "capture_dropdown", _fail_if_called("capture_dropdown"))
+    monkeypatch.setattr(adapter, "select_candidate", _fail_if_called("select_candidate"))
+    monkeypatch.setattr(adapter, "enter_quantity", _fail_if_called("enter_quantity"))
+    monkeypatch.setattr(adapter, "commit_item", _fail_if_called("commit_item"))
+    monkeypatch.setattr(adapter, "_cleanup_probe_item", _fail_if_called("_cleanup_probe_item"))
+    monkeypatch.setattr(adapter, "cancel_current_item", _fail_if_called("cancel_current_item"))
+
+    assert adapter._verify_group_once("Dwelling Roof") is False
+
+
 # ---------------------------------------------------------------------
 # verify_display_profile (Phase 5.2 Stage 10)
 # ---------------------------------------------------------------------
