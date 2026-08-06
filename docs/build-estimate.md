@@ -541,3 +541,200 @@ could not verify success and must not be trusted as complete.
 3. Stages 4 (Build Estimate UI live execution), 5 (pause/resume), 6
    (Aranda controlled subset), and 7 (final cleanup) all still need a
    live run.
+
+## Phase 5.4: cross-group validation completed, cleanup verification strengthened, Safe Autofill signed off
+
+The $330.31 discrepancy from Phase 5.3 was manually resolved before
+this phase started (a real, financially active line item whose visible
+row looked zero/inactive -- a cleanup-verification defect, not a
+hidden calculation, tax, or deleted-group residue). This phase's
+mission: stop trusting visible-state checks alone, strengthen cleanup
+verification with real financial reconciliation, and complete the
+remaining live validation (cross-group commit proof, the real Build
+Estimate UI path, pause/resume, and a controlled Aranda subset) needed
+to decide Safe Autofill's readiness.
+
+### Stage 1-2: a trusted baseline and real financial reconciliation
+
+Added `capture_estimate_baseline()` / `verify_estimate_matches_baseline()`
+/ `ReconciliationResult` to `windows_adapter.py`: a baseline records
+every group's row identities (category/selector/quantity/unit), each
+group's Subtotal text, the Grand Total, and the Saved indicator;
+reconciliation re-reads all of it fresh and reports every mismatch,
+never just a boolean. Two bugs were found and fixed in this new
+mechanism itself before it could be trusted:
+
+1. Reusing the Phase 5.3 group-name fuzzy matcher for financial text
+   was too lenient -- `"$0.00"` vs `"$50.00"` scored 0.91 against the
+   same 0.75 threshold, well above it, because a short string gives a
+   sliding window too much room to find a coincidental overlap. Fixed
+   by making financial-field comparison strict/exact instead of fuzzy
+   -- deliberately biased toward false positives over false negatives,
+   since missing a real financial change is what this feature exists
+   to prevent.
+2. Strict-exact comparison then produced its own false positive: the
+   SAME physically-blank Subtotal cell OCR'd as two different noise
+   strings ("dy", then "ni") on two live captures seconds apart, with
+   nothing on screen changing. Fixed with `_canonicalize_financial_text()`,
+   which collapses any digit-free reading to `""` before comparing.
+
+### Stage 3: permanent regression coverage
+
+Eleven new tests in `test_windows_adapter.py` cover the baseline/
+reconciliation mechanism directly: hidden financial residue, a
+visually-zero-but-financially-active row, group-subtotal and
+Grand-Total mismatches, OCR-noise tolerance, quantity changes on the
+same row identity, required Saved state, a group that can't be
+selected during verification, and baseline mismatch blocking
+continuation.
+
+### Stage 4: cancellation trials found a second real residue bug
+
+Three controlled cancellation trials (PLM/TLTRS, PLM/TLT, PLM/TLTFL --
+Phase 5.3's known-problem paths) reproduced the **exact same $330.31**
+figure as fresh, real financial residue: `_cancel_pending_selection()`'s
+single `cancel_current_item()` call failed silently on its first
+attempt with no retry. Fixed with a bounded 3-attempt retry, plus a
+best-effort `commit_item()` (save) after a successful cancel -- the
+prior version left the estimate in an unsaved state even after a
+clean cancel. Re-run trials: clean.
+
+### Stage 5-7: a real cross-group commit proof
+
+`RFG/FELT15` (this phase's one consistently reliable live item)
+committed successfully into both `Dwelling Roof` (qty 10) and
+`Exterior` (qty 5) in independent runs, verified by direct per-group
+grid inspection after each -- zero wrong-group writes at this stage.
+Two real, session-specific OCR reliability problems blocked broader
+item coverage and were worked around rather than fought: `PLM` category
+consistently misread as `PLN`, and `LF`-unit items (`SFG/GUTA`,
+`SFG/GUTC`, `SFG/GUTAB`) consistently misread their unit as garbage --
+neither is a ranking-threshold problem, so thresholds were not weakened.
+Cleanup after the pilot reconciled to the Stage 1 baseline with zero
+mismatches.
+
+### Stage 8: the real Build Estimate UI path — a live wrong-group-write bug found and fixed
+
+Driven entirely through Streamlit's `AppTest` harness (never a direct
+`run_execution_plan()` call): project confirmation, the capability-flags
+table (showing `Safe Autofill available: True` through the UI for the
+first time this project), the display-profile check, Preview (dry run,
+confirmed to touch nothing), the Safe Autofill checkbox, and Execute
+all worked. Execute's first live run, however, revealed a real defect:
+a row intended for `Dwelling Roof` (via an unreviewed suggested
+Xactimate group name, `"Roof"`) committed into `Utility Room` instead.
+
+Root cause: `_find_group_row()` returned the *first* tree row whose
+text matched `group_name`, not the *best* match. `"Roof"` scored an
+exact substring match against the correct `"Dwelling Roof"` row, but
+*also* cleared the fuzzy threshold (0.857, above 0.75) against the
+earlier, unrelated `"Utility Room"` row -- sharing "Roo" with "Room" --
+and `"Utility Room"` appeared first in the tree. Fixed: exact substring
+matches are now always searched first (in row order); only when no row
+contains one does the code fall back to the single best (highest-ratio)
+fuzzy match across all rows, never the first one to merely clear the
+threshold. Two regression tests lock this in, including one that
+reproduces the exact live ratios. The wrongly-placed row was deleted,
+reconciliation confirmed clean, and a second live Execute (post-fix)
+correctly placed the row in `Dwelling Roof`. All other Stage 8
+objectives -- progress reflected in the persisted plan, the
+unresolved-rows table correctly collecting a `REVIEW_REQUIRED` task
+(a deliberately conservative post-commit trust downgrade, not a bug --
+see `verify_commit()`'s `cat_sel_contradicts` path), and all four
+report files generated -- were confirmed live.
+
+### Stage 9: live pause and resume through the real UI
+
+A two-group, two-task plan was run through a real Execute click with a
+deterministic (not polled/racy) pause: a wrapper around the live
+adapter's `verify_commit()` flips the adapter's active-project
+expectation the instant task 1's commit finalizes, synchronously, in
+the same call stack -- guaranteeing the run-level availability check
+before group 2 sees it. Result: `run_state=paused`, task 1 completed,
+task 2 genuinely untouched (`started_at=null`). A **fresh** `AppTest`
+session (simulating reopening the app) then loaded the persisted paused
+plan automatically (never via "Build / refresh," which discards
+progress), re-confirmed TEST, and resumed: task 1's `completed_at`
+timestamp was byte-for-byte unchanged (proving it was skipped, not
+re-executed) and task 2 completed into the correct group. Reconciled
+clean after cleanup.
+
+### Stage 10: a controlled Aranda subset — a second false positive found and fixed
+
+Real Aranda line items were approved through the existing, sanctioned
+review mechanism (`edit_mapping_field()` + `approve_item()`, which
+still enforces `can_approve()`'s gate) across two real groups
+(`Dwelling Roof`, `Front Elevation`), matching the same controlled-test
+pattern already established for this project's `line_0001`. A first
+attempt paired the real item's description ("laminated composition
+shingles") with `FELT15` and was correctly rejected by the ranking
+system's own grade/style conflict check -- a reassuring finding, not a
+bug. The corrected pairing (`line_0005`, literally "Roofing felt - 15
+lb.") committed live, and `verify_commit()` correctly caught a real
+quantity-read discrepancy (33.66 expected vs. an unstable OCR read) as
+`QUANTITY_MISMATCH` rather than trusting it -- proof the verification
+gate does its job on genuinely new data, not just the items rehearsed
+all phase. This surfaced one more reconciliation false positive: a
+genuinely empty/zero Subtotal cell OCR'd as digit-free noise on one
+capture and as a real-looking `"$0.0"` on another; `_canonicalize_
+financial_text()` treated the two as different (one had a digit).
+Fixed: a reading whose only digit/decimal-point characters are zeros
+now also collapses to `""`, same as noise -- any other digit still
+forces the full comparison, so this cannot mask a real change. A new
+regression test locks this in. `verify_group()`'s own live probe was
+observed to fail transiently on 2-3 occasions across repeated rapid
+Execute retries against otherwise-correct, previously-proven group
+names -- confirmed transient by an immediate direct re-test returning
+`True`, consistent with this project's established, accepted class of
+live OCR/UI timing variability (the function's own docstring already
+tolerates this: a false negative only routes a task to
+`REVIEW_REQUIRED`, never a wrong execution). Also found and corrected:
+a stale `group_name_overrides.json` entry mapping `"Dwelling Roof"` to
+the wrong live Xactimate group name (`"Roof"`, which does not exist in
+the real TEST project) -- corrected through the same sanctioned
+`group_name_service.set_group_name_review()` mechanism. All live
+residue cleaned up; final reconciliation against the Stage 1 baseline
+passed with zero mismatches.
+
+### Capability decision
+
+`WindowsXactimateAdapter.supports_live_execution` (flipped to `True` in
+this phase) and `safe_autofill_available` remain `True`, now backed by
+substantially more evidence than the initial flip: a real cross-group
+commit proof (twice over, Stages 5-9), the real Build Estimate UI path
+exercised end to end including a live-found-and-fixed wrong-group-write
+bug, live pause/resume with a proven no-duplicate-commit guarantee, and
+a controlled real-claim subset. `production_project_allowed` and
+`unattended_mode_allowed` remain separately gated `False` in
+`service.py`, untouched by this phase, as required.
+
+### Bugs found and fixed this phase (all with regression tests)
+
+1. Financial-field fuzzy matching too lenient for short strings
+   (rewritten to strict/exact).
+2. OCR-noise false positive on blank financial cells (digit-presence
+   canonicalization).
+3. **(Critical)** `_cancel_pending_selection()`'s single, unretried
+   cancel attempt could leak real financial residue -- reproduced the
+   exact same $330.31 figure live. Fixed with bounded retry + save.
+4. **(Critical)** `_find_group_row()`'s first-match (not best-match)
+   scan caused a real live wrong-group commit when a short, unreviewed
+   suggested group name fuzzy-matched an earlier, unrelated group
+   before reaching its correct exact-substring match.
+5. Zero-value financial readings ("$0.0") not recognized as equivalent
+   to blank/noise, causing a false residue mismatch on an actually-
+   clean group.
+
+### What did not fully resolve this session
+
+`verify_group()`'s live probe showed transient false negatives during
+Stage 10's rapid repeated Execute retries against the Aranda project.
+Every occurrence self-corrected on direct re-test and never caused an
+unsafe outcome (only routed tasks to `REVIEW_REQUIRED`), so this was
+not treated as a blocking defect -- but it means Stage 10's Aranda
+subset did not end with a single, unbroken, fully-`VERIFIED` live
+commit; it ended with a full live commit path proof (search, select,
+quantity entry, commit) whose own verification correctly declined to
+over-trust a genuinely uncertain OCR read. Future sessions doing rapid
+back-to-back live Execute cycles against the same project may want to
+add a short settle delay between runs if this recurs.

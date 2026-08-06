@@ -705,12 +705,42 @@ def test_group_name_matches_is_whitespace_and_case_insensitive():
     assert adapter._group_name_matches("Front Elevation", "Dwelling Roof") is False
 
 
-def test_find_group_row_returns_first_match_index():
+def test_find_group_row_returns_first_exact_substring_match_index():
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     rows = ["TEST", "Utility Room", "Dwelling Roof", ""]
     assert adapter._find_group_row(rows, "Dwelling Roof") == 2
     assert adapter._find_group_row(rows, "Utility Room") == 1
     assert adapter._find_group_row(rows, "Front Elevation") is None
+
+
+def test_find_group_row_prefers_exact_substring_match_over_an_earlier_fuzzy_false_positive():
+    """Live-caught (Phase 5.4 Stage 8): a short, unreviewed suggested
+    group name ("Roof", derived from a section named "Dwelling Roof")
+    scored an exact substring match against the correct "Dwelling
+    Roof" row, but ALSO cleared the fuzzy threshold against an
+    earlier, unrelated row -- "Utility Room" -- because "Roof" and
+    "Room" share three of four characters (ratio 0.857, above
+    `_GROUP_NAME_FUZZY_MATCH_THRESHOLD`). A first-match scan picked
+    the wrong, earlier row and a real commit landed in the wrong
+    group. The exact substring match must always win regardless of
+    row order."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    ratio_to_room = adapter._best_window_fuzzy_ratio("roof", "utilityroom")
+    assert ratio_to_room >= adapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD, (
+        "test assumption broken: 'Roof' no longer fuzzy-matches 'Utility Room' -- "
+        "update this test's premise before trusting it"
+    )
+    rows = ["TEST", "Utility Room", "Dwelling Roof", "Exterior"]
+    assert adapter._find_group_row(rows, "Roof") == 2
+
+
+def test_find_group_row_falls_back_to_best_fuzzy_match_when_no_exact_substring_exists():
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = ["TEST", "Utilty Roon", "Dweling Rooof", "Exterior"]
+    # Neither row contains "dwellingroof" as an exact substring, so this
+    # falls back to fuzzy matching -- the closer misspelling must win,
+    # not whichever row happens to appear first.
+    assert adapter._find_group_row(rows, "Dwelling Roof") == 2
 
 
 def test_select_group_raises_when_group_not_found(monkeypatch):
@@ -1047,6 +1077,28 @@ def test_reconciliation_tolerates_different_ocr_noise_from_the_same_blank_cell(m
     baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
 
     state.groups["Dwelling Roof"]["subtotal"] = "ni"  # different noise, same blank cell, no digits either way
+
+    result = adapter.verify_estimate_matches_baseline(baseline)
+
+    assert result.ok is True
+    assert result.mismatches == []
+
+
+def test_reconciliation_tolerates_a_zero_value_reading_of_the_same_blank_cell(monkeypatch):
+    """Live-caught (Phase 5.4 Stage 10): the SAME genuinely-blank group
+    Subtotal cell OCR'd as digit-free noise ("dy") on one capture and
+    as a real-looking zero value ("$0.0") on another. Both mean "no
+    value" -- a zero-value reading must canonicalize the same way
+    digit-free noise does, not be flagged as a false residue mismatch
+    on an actually-clean group. A nonzero value must still compare as
+    a real change (see the sibling "visually zero but financially
+    active" test)."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state = _MockEstimateState(groups={"Dwelling Roof": {"rows": [], "subtotal": "dy"}}, grand_total="$0.00", saved=True)
+    _wire_mock_estimate(adapter, monkeypatch, state)
+    baseline = adapter.capture_estimate_baseline(["Dwelling Roof"])
+
+    state.groups["Dwelling Roof"]["subtotal"] = "$0.0"  # zero value, same blank cell
 
     result = adapter.verify_estimate_matches_baseline(baseline)
 

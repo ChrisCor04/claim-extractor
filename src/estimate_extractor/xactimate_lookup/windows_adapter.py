@@ -2762,8 +2762,24 @@ class WindowsXactimateAdapter(XactimateAdapter):
         empty string preserves the strict, digit-sensitive comparison
         `_text_fields_match()` needs (a real value appearing where
         there was none is still a change: no digits -> has digits) while
-        treating noise-vs-noise as the non-event it actually is."""
-        return text if any(ch.isdigit() for ch in text) else ""
+        treating noise-vs-noise as the non-event it actually is.
+
+        Live-caught again (Phase 5.4 Stage 10): a genuinely empty/zero
+        cell doesn't ALWAYS OCR as digit-free noise -- one read landed
+        on "$0.0", a real-looking string that WOULD have compared
+        unequal to a digit-free noise reading ("dy") of the SAME blank
+        cell, a false residue mismatch on an actually-clean group. A
+        reading whose only digit/decimal-point characters are zeros
+        (0, 00, 0.0, 0.00, ...) is exactly as much "no value" as noise
+        is, and also collapses to "". Any OTHER digit still forces the
+        full comparison below -- this cannot mask a real nonzero
+        change."""
+        if not any(ch.isdigit() for ch in text):
+            return ""
+        digits_and_dot = "".join(ch for ch in text if ch.isdigit() or ch == ".")
+        if digits_and_dot and set(digits_and_dot) <= {"0", "."}:
+            return ""
+        return text
 
     @staticmethod
     def _text_fields_match(a: str, b: str) -> bool:
@@ -2915,10 +2931,35 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return ratio >= WindowsXactimateAdapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD
 
     def _find_group_row(self, rows: list[str], group_name: str) -> int | None:
+        """Live-caught (Phase 5.4 Stage 8): a first-match scan is unsafe
+        for short `group_name` needles (e.g. an unreviewed suggested
+        Xactimate group name like "Roof" derived from a section named
+        "Dwelling Roof"). Reproduced live: "Roof" scored an exact
+        substring match against the correct "Dwelling Roof" row, but
+        ALSO scored 0.857 (above `_GROUP_NAME_FUZZY_MATCH_THRESHOLD`)
+        against an unrelated earlier row, "Utility Room" -- sharing
+        "Roo" with "Room". A first-match scan picked the wrong,
+        earlier row and committed a real financial row into the wrong
+        group. An exact (whitespace/case-insensitive) substring match
+        is unambiguous and always preferred, searched in row order;
+        only when NO row contains an exact substring match do we fall
+        back to the single best (highest-ratio) fuzzy match across all
+        rows, never the first one to merely clear the threshold."""
+        needle = group_name.strip().lower().replace(" ", "")
+        for i, text in enumerate(rows):
+            haystack = text.strip().lower().replace(" ", "")
+            if needle and needle in haystack:
+                return i
+        best_index: int | None = None
+        best_ratio = 0.0
         for i, text in enumerate(rows):
             if self._group_name_matches(text, group_name):
-                return i
-        return None
+                haystack = text.strip().lower().replace(" ", "")
+                ratio = self._best_window_fuzzy_ratio(needle, haystack)
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_index = i
+        return best_index
 
     def _open_group_tree_context_menu(self, hwnd: int, header_pos: tuple[int, int], row_index: int) -> list:
         """Left-clicks the row (to select/focus it), forces a repaint
