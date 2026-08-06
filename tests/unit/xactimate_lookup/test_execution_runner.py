@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from estimate_extractor.xactimate_lookup.adapter import AdapterError, FakeXactimateAdapter
 from estimate_extractor.xactimate_lookup.execution_plan import (
     ExecutionPlan,
@@ -33,11 +35,18 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
 )
 from estimate_extractor.xactimate_lookup.execution_runner import (
     OBSERVED_MAPPING_STATE,
+    UnsafeLookupRouting,
     _observed_mappings_path,
+    _task_to_lookup_plan,
     run_execution_plan,
     skip_task,
 )
-from estimate_extractor.xactimate_lookup.models import DropdownResult, PopulatedFields
+from estimate_extractor.xactimate_lookup.models import (
+    LOOKUP_PATH_DESCRIPTION_SEARCH,
+    LOOKUP_PATH_TRUSTED,
+    DropdownResult,
+    PopulatedFields,
+)
 
 
 class _FakeCommitVerification:
@@ -69,15 +78,17 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
         self.trust_state = trust_state
         self.raise_on_group = raise_on_group or set()
         self.ensure_group_calls: list[str] = []
+        self.ensure_group_parent_calls: list[str | None] = []
         self.select_group_calls: list[str] = []
         self.verify_group_calls: list[str] = []
         self.snapshot_calls = 0
         self.verify_commit_calls = 0
 
-    def ensure_group(self, name: str) -> None:
+    def ensure_group(self, name: str, *, parent_group_name: str | None = None) -> None:
         if name in self.raise_on_group:
             raise AdapterError(f"Simulated failure creating group {name!r}.")
         self.ensure_group_calls.append(name)
+        self.ensure_group_parent_calls.append(parent_group_name)
 
     def select_group(self, name: str) -> None:
         self.select_group_calls.append(name)
@@ -211,7 +222,7 @@ def test_committed_without_verification_support_is_review_required_never_complet
     plan = _plan_two_groups()
 
     class GroupOnlyAdapter(FakeXactimateAdapter):
-        def ensure_group(self, name):
+        def ensure_group(self, name, *, parent_group_name=None):
             pass
 
         def select_group(self, name):
@@ -621,3 +632,116 @@ def test_test_only_task_refused_when_live_project_is_not_exactly_test(tmp_path, 
     # never even attempted a search for the refused task
     search_desc_calls = [c for c in adapter.log.calls if c[0] == "search_by_description"]
     assert search_desc_calls == []
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5B: description-first routing enforcement (Objective 1) and
+# group ancestry verification (Objective 2). See execution_runner.py's
+# _task_to_lookup_plan()/UnsafeLookupRouting and windows_adapter.py's
+# ensure_group() docstrings for the live incident these guard against.
+# ---------------------------------------------------------------------
+
+
+def test_began_unmapped_task_always_starts_description_first(phrase_rules):
+    """Requirement 1: a task whose lookup_strategy is test_description_
+    first is ALWAYS routed to the description-search path -- proven
+    directly against _task_to_lookup_plan(), not inferred from a full
+    run."""
+    task = _unmapped_task("task_unmapped", "line_unmapped", "Dwelling Roof", 0)
+    lookup_plan, actual_strategy, reason = _task_to_lookup_plan(task, phrase_rules)
+
+    assert actual_strategy == LOOKUP_PATH_DESCRIPTION_SEARCH
+    assert lookup_plan.path == LOOKUP_PATH_DESCRIPTION_SEARCH
+    assert lookup_plan.search_input == _FELT_PHRASE
+    assert "test_description_first" in reason
+
+
+def test_stale_cat_sel_values_do_not_override_test_description_first(phrase_rules):
+    """Requirement 2: even if category/selector end up populated on a
+    task whose lookup_strategy is test_description_first (e.g. a stale
+    reload, a placeholder mapping, a partially-populated field from an
+    earlier failed attempt) -- exactly the live incident this phase
+    fixes -- routing must NEVER silently use them. Refuses with a safe,
+    catchable exception instead of building a CAT/SEL search."""
+    task = _unmapped_task("task_unmapped", "line_unmapped", "Dwelling Roof", 0)
+    task.category = "RFG"  # stale/unexpected -- began_unmapped tasks never legitimately have both
+    task.selector = "FELT15"
+
+    with pytest.raises(UnsafeLookupRouting, match="test_description_first"):
+        _task_to_lookup_plan(task, phrase_rules)
+
+
+def test_review_approved_strategy_uses_trusted_cat_sel_path(phrase_rules):
+    """Requirement 3: the one currently-implemented form of a verified,
+    trusted mapping -- LOOKUP_STRATEGY_REVIEW_APPROVED, a human-approved
+    CAT/SEL carried into the plan -- correctly uses the trusted path.
+    (A "began_unmapped task reusing a previously-observed, verified
+    mapping" is intentionally NOT built by this phase -- see execution_
+    runner.py's OBSERVED_MAPPING_STATE, deliberately never auto-reused
+    -- so this is the only currently-legitimate route to CAT/SEL.)"""
+    task = _task("task_mapped", "line_mapped", "Dwelling Roof", "RFG", "3TAB", 0)
+    lookup_plan, actual_strategy, reason = _task_to_lookup_plan(task, phrase_rules)
+
+    assert actual_strategy == LOOKUP_PATH_TRUSTED
+    assert lookup_plan.path == LOOKUP_PATH_TRUSTED
+    assert lookup_plan.search_input == "RFG 3TAB"
+    assert "review_approved_cat_sel" in reason
+
+
+def test_requested_and_actual_lookup_strategies_are_reported(tmp_path, phrase_rules, ranking_config):
+    """Requirement 4: requested (task.lookup_strategy, fixed at plan-
+    build time) and actual (task.actual_lookup_strategy, set fresh at
+    execution time) strategies are both independently visible on the
+    persisted task -- the exact audit trail that would have caught the
+    live "None None" CAT/SEL incident."""
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script)
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    mapped = result.task_by_id("task_mapped")
+    assert mapped.lookup_strategy == LOOKUP_STRATEGY_REVIEW_APPROVED  # requested
+    assert mapped.actual_lookup_strategy == LOOKUP_PATH_TRUSTED  # actual
+
+    unmapped = result.task_by_id("task_unmapped")
+    assert unmapped.lookup_strategy == LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST  # requested
+    assert unmapped.actual_lookup_strategy == LOOKUP_PATH_DESCRIPTION_SEARCH  # actual
+    assert unmapped.lookup_strategy_reason  # non-empty audit reason
+
+
+def test_ancestry_mismatch_blocks_task_execution(tmp_path, phrase_rules, ranking_config):
+    """Requirement 7: when a group cannot be created/verified (e.g. its
+    ensure_group() call fails -- the same signal a real ancestry-
+    verification failure produces), its tasks are marked REVIEW_REQUIRED
+    and NEVER reach a live search -- the safety net that closes the
+    malformed-nested-tree incident at the execution-runner layer too."""
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks), raise_on_group={"Dwelling Roof"})
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    roof_tasks = [t for t in result.tasks if t.section_name == "Dwelling Roof"]
+    assert all(t.state == TASK_REVIEW_REQUIRED for t in roof_tasks)
+    assert result.group_by_id("Dwelling Roof").state == GROUP_FAILED
+    search_calls = [c for c in adapter.log.calls if c[0] in ("search_by_category_selector", "search_by_description")]
+    assert not any(a[0] == "SFG" for _n, a, _k in search_calls)  # Dwelling Roof's tasks never searched
+
+
+def test_runner_continues_to_later_sibling_groups_safely_after_ancestry_failure(tmp_path, phrase_rules, ranking_config):
+    """Requirement 8: one group's ancestry/creation failure never
+    aborts the whole run -- later sibling groups still get their own
+    fresh, independent ensure_group()/select_group()/verify_group()
+    attempt and complete normally."""
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks), raise_on_group={"Dwelling Roof"})
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.group_by_id("Dwelling Roof").state == GROUP_FAILED
+    assert result.group_by_id("Fence").state == GROUP_COMPLETED
+    fence_tasks = [t for t in result.tasks if t.section_name == "Fence"]
+    assert all(t.state == TASK_COMPLETED for t in fence_tasks)
+    assert result.run_state == RUN_STATE_COMPLETED

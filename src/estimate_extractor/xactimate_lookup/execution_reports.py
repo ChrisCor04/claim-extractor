@@ -34,6 +34,9 @@ TASK_CSV_COLUMNS = [
     "category",
     "selector",
     "lookup_strategy",
+    "requested_lookup_strategy",
+    "actual_lookup_strategy",
+    "lookup_strategy_reason",
     "mapping_state_before_execution",
     "began_unmapped",
     "source_quantity",
@@ -75,6 +78,18 @@ def _task_row(task: ExecutionTask) -> dict:
         "category": task.category,
         "selector": task.selector,
         "lookup_strategy": task.lookup_strategy,
+        # Phase 5.5B: "requested" is the strategy fixed at plan-build
+        # time (task.lookup_strategy itself -- never mutated); "actual"
+        # and "reason" are set fresh at execution time by execution_
+        # runner.py's _task_to_lookup_plan(), right before the search
+        # happens. A mismatch between requested and actual (other than
+        # the one legitimate case -- LOOKUP_STRATEGY_REVIEW_APPROVED
+        # always maps to the trusted path) is exactly the audit trail
+        # that would have caught the live "None None" CAT/SEL search
+        # incident.
+        "requested_lookup_strategy": task.lookup_strategy,
+        "actual_lookup_strategy": task.actual_lookup_strategy,
+        "lookup_strategy_reason": task.lookup_strategy_reason,
         # Phase 5.5: "unmapped" for a row that had no CAT/SEL at
         # plan-build time (see execution_plan.py's
         # include_unmapped_rows), "mapped" for the normal
@@ -171,6 +186,7 @@ def write_structured_audit(plan: ExecutionPlan, path: Path, pretty: bool = True)
                 "area_name": group.area_name,
                 "section_name": group.section_name,
                 "xactimate_group_name": group.xactimate_group_name,
+                "parent_group_name": group.parent_group_name,
                 "group_name_reviewed": group.group_name_reviewed,
                 "group_state": group.state,
                 "group_error": group.error,

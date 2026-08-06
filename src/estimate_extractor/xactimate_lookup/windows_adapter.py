@@ -3059,16 +3059,58 @@ class WindowsXactimateAdapter(XactimateAdapter):
         win32gui.EnumWindows(cb, found)
         return found[0] if found else None
 
-    def ensure_group(self, group_name: str) -> None:
+    def _ocr_group_tree_row_text(self, image, header_pos: tuple[int, int], row_index: int) -> str:
+        """Independently OCRs ANY group-tree row, including row 0 --
+        unlike `snapshot_group_names()`, which always LABELS row 0 as
+        `expected_project_name` verbatim without reading it (a
+        reasonable shortcut for read-only display of an immutable
+        label, but not safe to trust immediately before a MUTATING
+        operation like right-clicking it to create a new group under
+        it -- see `ensure_group()`)."""
+        left, top = header_pos[0], header_pos[1]
+        row_top = self._group_tree_row_crop_top(top, row_index)
+        crop = image.crop((
+            left + self._GROUP_TREE_TEXT_DX, row_top,
+            left + self._GROUP_TREE_TEXT_DX + self._GROUP_TREE_TEXT_WIDTH, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT,
+        ))
+        return self._ocr_text(crop, psm=7).strip()
+
+    def ensure_group(self, group_name: str, *, parent_group_name: str | None = None) -> None:
         """Not part of the abstract contract. Creates `group_name` as a
-        child of the project root if it doesn't already exist (a no-op,
-        verified via a fresh snapshot, if it does). Never guesses:
-        raises AdapterError if the "New Group" dialog doesn't appear, or
-        if the group still can't be found after the creation sequence
-        completes. Verifies the project before mutating anything (Phase
-        5.1 requirement: "verify project before every mutation")."""
+        child of `parent_group_name` (default: this adapter's own
+        `expected_project_name`, i.e. the project root -- there is no
+        nested Area/Section model in this codebase today, see
+        execution_plan.py's module docstring, so every execution group
+        is top-level) if it doesn't already exist (a no-op, verified
+        via a fresh snapshot, if it does). Never guesses: raises
+        AdapterError if the "New Group" dialog doesn't appear, if the
+        group still can't be found after the creation sequence
+        completes, or if the intended parent can't be independently
+        re-confirmed immediately before creating (see below). Verifies
+        the project before mutating anything (Phase 5.1 requirement:
+        "verify project before every mutation").
+
+        Live-caught (Phase 5.5B): the previous version always right-
+        clicked row index 0, trusting it was always the project root by
+        POSITION alone. `snapshot_group_names()`'s row 0 is a hardcoded
+        label, not an OCR read (see its own docstring) -- so if the
+        group tree's scroll position had drifted (the same class of
+        live UI drift `_scroll_group_tree_to_top()` exists to correct,
+        confirmed elsewhere in this file to occasionally fail silently)
+        row 0 on screen could genuinely be some OTHER group, and "New"
+        created the requested group AS A CHILD of that wrong row
+        instead of as a top-level sibling. Reproduced live as a
+        malformed nested tree (Exterior > Roof > Front Elevation >
+        Fencing instead of four top-level siblings). Fixed: the
+        intended parent is located BY NAME, then its row is
+        INDEPENDENTLY re-OCR'd (bypassing the hardcoded label) and
+        fuzzy-matched against the intended name immediately before the
+        context menu opens -- refusing to proceed if that fails, rather
+        than trusting a fixed position."""
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"ensure_group({group_name!r}): could not verify the expected project is active.")
+
+        target_parent = parent_group_name or self.expected_project_name
 
         hwnd = self._ensure_main_window()
         self._force_foreground(hwnd)
@@ -3077,12 +3119,27 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if self._find_group_row(rows, group_name) is not None:
             return  # already exists -- nothing to do
 
+        parent_index = self._find_group_row(rows, target_parent)
+        if parent_index is None:
+            raise AdapterError(f"ensure_group({group_name!r}): parent group {target_parent!r} not found in the tree.")
+
         image = self._capture_client_image(hwnd)
         header = self._locate_group_tree_header(image)
         if header is None:
             raise AdapterError(f"ensure_group({group_name!r}): could not locate the group tree.")
 
-        items = self._open_group_tree_context_menu(hwnd, header, 0)  # right-click the project root
+        # Independent re-OCR of the exact row about to be right-clicked
+        # -- never trust `rows[parent_index]` alone (row 0's text is a
+        # hardcoded label, not a live read; see docstring above).
+        actual_parent_text = self._ocr_group_tree_row_text(image, header, parent_index)
+        if not self._group_name_matches(actual_parent_text, target_parent):
+            raise AdapterError(
+                f"ensure_group({group_name!r}): row {parent_index} was expected to be the parent "
+                f"{target_parent!r} but independently re-reads as {actual_parent_text!r} -- the group tree's "
+                f"position has drifted; refusing to create a group under an unverified row."
+            )
+
+        items = self._open_group_tree_context_menu(hwnd, header, parent_index)
         self._click_group_menu_item(items, self._GROUP_MENU_NEW_INDEX)
         time.sleep(0.8)
 
@@ -3109,7 +3166,24 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # extra settle sleep, never an unbounded wait.
         for _attempt in range(3):
             rows_after = self.snapshot_group_names()
-            if self._find_group_row(rows_after, group_name) is not None:
+            new_index = self._find_group_row(rows_after, group_name)
+            if new_index is not None:
+                # Best-effort ancestry check (Phase 5.5B): the group
+                # tree is not UI-Automation-accessible (see module
+                # docstring) and every row's text is OCR'd from the
+                # SAME fixed horizontal offset regardless of true
+                # indentation depth (see snapshot_group_names()), so
+                # this cannot independently confirm parent/child
+                # nesting from pixels alone. What it CAN confirm,
+                # cheaply and honestly: the verified parent's row still
+                # reads as itself after the mutation (nothing was
+                # renamed/corrupted) -- refuses to claim more than that.
+                parent_index_after = self._find_group_row(rows_after, target_parent)
+                if parent_index_after is None:
+                    raise AdapterError(
+                        f"ensure_group({group_name!r}): group was created, but the intended parent "
+                        f"{target_parent!r} can no longer be found in the tree -- refusing to trust the result."
+                    )
                 return
             time.sleep(0.8)
         raise AdapterError(

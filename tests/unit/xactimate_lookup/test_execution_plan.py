@@ -17,6 +17,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     GROUP_PENDING,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
     LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+    RUN_STATE_COMPLETED,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
@@ -24,7 +25,9 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TASK_SKIPPED,
     build_execution_plan,
     classify_unmapped_rows,
+    diagnose_run,
     load_execution_plan,
+    reset_unfinished_tasks,
     save_execution_plan,
 )
 
@@ -388,3 +391,98 @@ def test_unmapped_task_carries_normalized_context_for_description_first_search(t
     mapped_task = plan.task_by_id("task_line_mapped")
     assert mapped_task.normalized_trade is None
     assert mapped_task.normalized_component is None
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5B, Objective 4: reset/rebuild plan maintenance.
+# ---------------------------------------------------------------------
+
+
+def _plan_with_mixed_states():
+    plan = ExecutionPlan(plan_id="p1", project_slug="s", source_filename=None, created_at="now")
+    plan.tasks = [
+        ExecutionTask(
+            task_id="t_completed", line_item_id="line_completed", source_order=0, area_name=None, section_name="Roof",
+            description="d", category="RFG", selector="FELT15", lookup_strategy=LOOKUP_STRATEGY_REVIEW_APPROVED,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ", state=TASK_COMPLETED,
+            trust_state="VERIFIED", observed_quantity=1.0, observed_unit="SQ", started_at="t1", completed_at="t2",
+        ),
+        ExecutionTask(
+            task_id="t_review", line_item_id="line_review", source_order=1, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ", state=TASK_REVIEW_REQUIRED,
+            began_unmapped=True, stop_reason="ambiguous_candidates", stop_detail="d", started_at="t1", completed_at="t2",
+        ),
+        ExecutionTask(
+            task_id="t_failed", line_item_id="line_failed", source_order=2, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ", state=TASK_FAILED,
+            began_unmapped=True, stop_reason="no_results", error="boom", started_at="t1", completed_at="t2",
+        ),
+        ExecutionTask(
+            task_id="t_pending", line_item_id="line_pending", source_order=3, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ", state=TASK_PENDING, began_unmapped=True,
+        ),
+    ]
+    from estimate_extractor.xactimate_lookup.execution_plan import GroupExecutionState
+    plan.groups = [GroupExecutionState(
+        group_id="Roof", area_name=None, section_name="Roof", xactimate_group_name="Roof",
+        group_name_reviewed=True, task_ids=["t_completed", "t_review", "t_failed", "t_pending"],
+    )]
+    return plan
+
+
+def test_resetting_unfinished_test_tasks_does_not_reset_completed_tasks(tmp_path):
+    """Requirement 10: Reset unfinished TEST execution resets REVIEW_
+    REQUIRED/FAILED tasks back to pending, leaves an already-PENDING
+    task alone, and -- critically -- never touches a TASK_COMPLETED
+    task unless full_reset=True is explicitly requested."""
+    plan = _plan_with_mixed_states()
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_count = reset_unfinished_tasks(plan, project_dir, full_reset=False)
+
+    assert reset_count == 2  # t_review and t_failed; t_pending was already pending
+    assert plan.task_by_id("t_completed").state == TASK_COMPLETED
+    assert plan.task_by_id("t_completed").observed_quantity == 1.0  # untouched
+    assert plan.task_by_id("t_review").state == TASK_PENDING
+    assert plan.task_by_id("t_review").stop_reason is None
+    assert plan.task_by_id("t_failed").state == TASK_PENDING
+    assert plan.task_by_id("t_failed").error is None
+    assert plan.task_by_id("t_pending").state == TASK_PENDING
+
+    reloaded = load_execution_plan(project_dir)
+    assert reloaded.task_by_id("t_completed").state == TASK_COMPLETED  # persisted correctly
+
+
+def test_full_reset_also_resets_completed_tasks_when_explicitly_requested(tmp_path):
+    plan = _plan_with_mixed_states()
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_count = reset_unfinished_tasks(plan, project_dir, full_reset=True)
+
+    assert reset_count == 3  # completed, review, failed -- not the already-pending one
+    assert plan.task_by_id("t_completed").state == TASK_PENDING
+    assert plan.task_by_id("t_completed").observed_quantity is None
+
+
+def test_diagnose_run_reports_exact_counts_and_stop_reason(tmp_path):
+    """Requirement 9 (backend half): diagnose_run() reports exact
+    completed/review_required/no_match/failed/skipped/not_attempted
+    counts and a non-guessed stop reason string."""
+    plan = _plan_with_mixed_states()
+    plan.groups[0].state = "completed"
+
+    diagnostics = diagnose_run(plan)
+
+    assert diagnostics.completed == 1
+    assert diagnostics.review_required == 1
+    assert diagnostics.no_match == 1  # t_failed's stop_reason is "no_results"
+    assert diagnostics.failed == 0
+    assert diagnostics.not_attempted == 1
+    assert diagnostics.remaining_unattempted == 1
+    assert diagnostics.stopped_after_row == "Row 3"  # t_failed, source_order=2 -> "Row 3"
+    assert diagnostics.stop_reason_summary  # non-empty, never fabricated beyond what's known

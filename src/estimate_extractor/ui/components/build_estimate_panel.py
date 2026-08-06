@@ -36,6 +36,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     GROUP_COMPLETED,
     RUN_STATE_COMPLETED,
     RUN_STATE_PAUSED,
+    TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
@@ -43,7 +44,9 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TEST_ONLY_PROJECT_NAME,
     build_execution_plan,
     classify_unmapped_rows,
+    diagnose_run,
     load_execution_plan,
+    reset_unfinished_tasks,
     save_execution_plan,
 )
 from estimate_extractor.xactimate_lookup.execution_reports import (
@@ -319,6 +322,66 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
         cc1.metric("Groups in plan", len(plan.groups))
         cc2.metric("Ready (pending)", pending_count)
         cc3.metric("Uncertain (review/failed)", len(summary.review_required_labels) + len(summary.failed_labels))
+
+    # Phase 5.5B, Objective 3: exact, non-guessed accounting of what the
+    # run did and why it stopped where it did -- built only from
+    # persisted state, so it's available even after a UI rerun.
+    diagnostics = diagnose_run(plan)
+    if diagnostics.stopped_after_row is not None:
+        st.caption(
+            f"Execution stopped after {diagnostics.stopped_after_row} because: {diagnostics.stop_reason_summary}"
+        )
+    st.caption(f"Remaining unattempted rows: {diagnostics.remaining_unattempted}")
+    with st.expander("Run diagnostics (exact counts)", expanded=False):
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Completed", diagnostics.completed)
+        d2.metric("Review required", diagnostics.review_required)
+        d3.metric("No match", diagnostics.no_match)
+        d4.metric("Failed (other)", diagnostics.failed)
+        d5, d6, d7, d8 = st.columns(4)
+        d5.metric("Skipped", diagnostics.skipped)
+        d6.metric("Not attempted", diagnostics.not_attempted)
+        d7.metric("Routed: CAT/SEL", diagnostics.routed_by_cat_sel)
+        d8.metric("Routed: description", diagnostics.routed_by_description)
+        st.caption(f"Skipped as already-terminal on the most recent run (resume): {diagnostics.skipped_already_terminal_last_run}")
+
+    # Phase 5.5B, Objective 4: TEST-only reset/rebuild actions. Shown
+    # only for the same confirmed-exactly-TEST condition that gates the
+    # unmapped-row checkbox above -- never for a normal/production
+    # project.
+    if test_only_confirmed:
+        st.markdown("**TEST-only plan maintenance**")
+        rc1, rc2 = st.columns(2)
+        unfinished_count = sum(1 for t in plan.tasks if t.state != TASK_COMPLETED and t.state != TASK_PENDING)
+        if rc1.button(
+            "Reset unfinished TEST execution", key="build_estimate_reset_unfinished",
+            disabled=unfinished_count == 0,
+            help="Resets REVIEW_REQUIRED/FAILED/SKIPPED tasks back to pending so they can be retried. "
+                 "Never touches already-COMPLETED (successfully committed) tasks.",
+        ):
+            reset_count = reset_unfinished_tasks(plan, project_dir, full_reset=False)
+            st.success(f"Reset {reset_count} unfinished task(s) back to pending. Completed tasks were left untouched.")
+            st.rerun()
+
+        if rc2.button(
+            "Rebuild TEST plan from current PDF", key="build_estimate_rebuild_test_plan",
+            help="Regenerates ALL tasks fresh from the current approved/eligible rows -- including tasks that "
+                 "already completed. Use 'Reset unfinished' above instead if you want to keep completed rows.",
+        ):
+            try:
+                plan = build_execution_plan(
+                    project_dir, project_slug,
+                    include_unmapped_rows=True, xactimate_project_name=xactimate_project_name.strip(),
+                )
+                save_execution_plan(plan, project_dir)
+                st.success(f"Rebuilt a fresh plan with {len(plan.tasks)} task(s) across {len(plan.groups)} group(s).")
+                st.rerun()
+            except ExecutionPlanError as exc:
+                st.error(str(exc))
+        st.caption(
+            "\"Reset unfinished\" preserves successful commits and only resets rows that didn't finish. "
+            "\"Rebuild\" discards ALL task state, including completed rows, and starts over."
+        )
 
     for group in plan.groups:
         group_tasks = plan.tasks_in_group(group.group_id)

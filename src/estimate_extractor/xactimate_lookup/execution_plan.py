@@ -32,6 +32,7 @@ from pathlib import Path
 from estimate_extractor.mapping.pipeline import DEFAULT_CONFIG_DIR
 from estimate_extractor.ui import group_name_service
 from estimate_extractor.ui.review_service import STATUS_APPROVED, STATUS_REJECTED, build_effective_rows
+from estimate_extractor.xactimate_lookup.models import LOOKUP_PATH_DESCRIPTION_SEARCH, LOOKUP_PATH_TRUSTED
 
 DEFAULT_GROUP_NAMES_PATH = DEFAULT_CONFIG_DIR / "xactimate_group_names.yaml"
 
@@ -135,6 +136,17 @@ class ExecutionTask:
     observed_selector: str | None = None
     observed_description: str | None = None
     observed_activity: str | None = None
+    #: Phase 5.5B: audit trail of the routing decision execution_
+    #: runner.py's _task_to_lookup_plan() actually made -- `lookup_
+    #: strategy` above is the REQUESTED strategy, fixed at plan-build
+    #: time and never mutated; `actual_lookup_strategy` (one of
+    #: LOOKUP_PATH_TRUSTED/LOOKUP_PATH_DESCRIPTION_SEARCH, from
+    #: models.py) and `lookup_strategy_reason` are set fresh at
+    #: execution time, right before the search happens, so a
+    #: began_unmapped task being silently routed to CAT/SEL is always
+    #: visible in the report rather than inferred after the fact.
+    actual_lookup_strategy: str | None = None
+    lookup_strategy_reason: str | None = None
     state: str = TASK_PENDING
     trust_state: str | None = None
     stop_reason: str | None = None
@@ -177,6 +189,17 @@ class GroupExecutionState:
     section_name: str | None
     xactimate_group_name: str | None
     group_name_reviewed: bool
+    #: Phase 5.5B: the Xactimate group this group must be created under.
+    #: None means "the live project root" (resolved at execution time
+    #: by the adapter's own expected_project_name -- see
+    #: WindowsXactimateAdapter.ensure_group()'s parent_group_name
+    #: parameter). The current Area/Section model has no parent/child
+    #: structure at all (see this module's own docstring: canonical
+    #: area_id/section_id foreign keys don't survive past the mapping
+    #: stage), so every execution group built by build_execution_plan()
+    #: is top-level -- this field exists so that is an explicit,
+    #: auditable fact in the plan, not an unstated assumption.
+    parent_group_name: str | None = None
     task_ids: list[str] = field(default_factory=list)
     state: str = GROUP_PENDING
     error: str | None = None
@@ -216,6 +239,78 @@ class ExecutionSummary:
 
 
 @dataclass(slots=True)
+class RunDiagnostics:
+    """Phase 5.5B, Objective 3: exact, non-guessed accounting of what a
+    run did and why it stopped where it did -- built ONLY from the
+    persisted ExecutionPlan/GroupExecutionState/ExecutionTask state
+    (never a live adapter), so it is available any time, including
+    right after a UI rerun that lost its own in-memory state. Where the
+    persisted state genuinely doesn't distinguish between two possible
+    causes, `stop_reason_summary` says so explicitly rather than
+    guessing one."""
+
+    completed: int
+    review_required: int
+    no_match: int
+    failed: int
+    skipped: int
+    not_attempted: int
+    total: int
+    routed_by_cat_sel: int
+    routed_by_description: int
+    skipped_already_terminal_last_run: int
+    stopped_after_row: str | None
+    stop_reason_summary: str
+    remaining_unattempted: int
+
+
+def diagnose_run(plan: "ExecutionPlan") -> RunDiagnostics:
+    completed = sum(1 for t in plan.tasks if t.state == TASK_COMPLETED)
+    skipped = sum(1 for t in plan.tasks if t.state == TASK_SKIPPED)
+    not_attempted = sum(1 for t in plan.tasks if t.state == TASK_PENDING)
+    review_required = sum(1 for t in plan.tasks if t.state == TASK_REVIEW_REQUIRED)
+    # "no_match" is not its own TASK_* state (see execution_runner.py's
+    # _apply_outcome_to_task()) -- a NO_MATCH ranking decision becomes
+    # TASK_FAILED with stop_reason "no_results"; split it back out here
+    # so the two are never silently conflated into one "failed" count.
+    no_match = sum(1 for t in plan.tasks if t.state == TASK_FAILED and t.stop_reason == "no_results")
+    failed = sum(1 for t in plan.tasks if t.state == TASK_FAILED and t.stop_reason != "no_results")
+    total = len(plan.tasks)
+
+    routed_by_cat_sel = sum(1 for t in plan.tasks if t.actual_lookup_strategy == LOOKUP_PATH_TRUSTED)
+    routed_by_description = sum(1 for t in plan.tasks if t.actual_lookup_strategy == LOOKUP_PATH_DESCRIPTION_SEARCH)
+
+    attempted_or_terminal = [t for t in plan.tasks if t.state != TASK_PENDING]
+    stopped_after_row = max(attempted_or_terminal, key=lambda t: t.source_order).row_label if attempted_or_terminal else None
+
+    failed_groups = [g for g in plan.groups if g.state == GROUP_FAILED]
+    if not_attempted == 0:
+        reason = "Run completed -- every task reached a terminal state; nothing remains unattempted."
+    elif plan.run_state == RUN_STATE_PAUSED and not failed_groups:
+        reason = (
+            "Project-level hard stop: Xactimate's application/project could not be re-verified before a "
+            "group started (run_state=paused). See docs/build-estimate.md 'Confirm project' / resume."
+        )
+    elif failed_groups:
+        names = "; ".join(f"{g.xactimate_group_name or g.group_id} ({g.error})" for g in failed_groups)
+        reason = f"Group verification failure for: {names}."
+    else:
+        reason = (
+            "Task-level safety stops and/or tasks not yet attempted this run -- see each task's own "
+            "stop_reason/stop_detail (no single project- or group-level cause applies)."
+        )
+
+    return RunDiagnostics(
+        completed=completed, review_required=review_required, no_match=no_match, failed=failed,
+        skipped=skipped, not_attempted=not_attempted, total=total,
+        routed_by_cat_sel=routed_by_cat_sel, routed_by_description=routed_by_description,
+        skipped_already_terminal_last_run=plan.last_run_skipped_already_terminal,
+        stopped_after_row=stopped_after_row, stop_reason_summary=reason,
+        remaining_unattempted=not_attempted,
+    )
+
+
+@dataclass(slots=True)
 class ExecutionPlan:
     plan_id: str
     project_slug: str
@@ -226,6 +321,12 @@ class ExecutionPlan:
     run_state: str = RUN_STATE_NOT_STARTED
     resume_cursor: int | None = None  # index into `tasks` (source order) of the next task to attempt
     updated_at: str = field(default_factory=utc_now_iso)
+    #: Phase 5.5B: how many tasks were ALREADY terminal (not PENDING)
+    #: when the most recent run_execution_plan() call began -- i.e.
+    #: skipped on resume, not re-attempted. Set fresh at the start of
+    #: every call (see execution_runner.py); 0 for a plan that has
+    #: never been run, or whose most recent run started from scratch.
+    last_run_skipped_already_terminal: int = 0
 
     def task_by_id(self, task_id: str) -> ExecutionTask | None:
         return next((t for t in self.tasks if t.task_id == task_id), None)
@@ -264,6 +365,7 @@ class ExecutionPlan:
             "run_state": self.run_state,
             "resume_cursor": self.resume_cursor,
             "updated_at": self.updated_at,
+            "last_run_skipped_already_terminal": self.last_run_skipped_already_terminal,
         }
 
     @staticmethod
@@ -278,6 +380,7 @@ class ExecutionPlan:
             run_state=data.get("run_state", RUN_STATE_NOT_STARTED),
             resume_cursor=data.get("resume_cursor"),
             updated_at=data.get("updated_at", utc_now_iso()),
+            last_run_skipped_already_terminal=data.get("last_run_skipped_already_terminal", 0),
         )
 
 
@@ -297,6 +400,58 @@ def load_execution_plan(project_dir: Path) -> ExecutionPlan | None:
     if not path.exists():
         return None
     return ExecutionPlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset: bool = False) -> int:
+    """Phase 5.5B, Objective 4: resets every task back to TASK_PENDING
+    EXCEPT TASK_COMPLETED ones (REVIEW_REQUIRED, FAILED, SKIPPED are all
+    reset; an already-PENDING task is a no-op) -- so a run that stopped
+    partway through can be safely retried without re-approving, re-
+    building, or losing whatever DID successfully commit. Never resets
+    a completed task unless the caller explicitly passes
+    `full_reset=True` (a deliberate, disposable full reset -- e.g. the
+    user wants to genuinely start over, including rows that already
+    committed). Also resets the group states so `_ensure_select_verify_
+    group()` re-verifies each group fresh on the next run, and clears
+    `resume_cursor`/`run_state` back to a re-runnable state. Returns the
+    number of tasks actually reset. Persists immediately."""
+    reset_count = 0
+    for task in plan.tasks:
+        if task.state == TASK_COMPLETED and not full_reset:
+            continue
+        if task.state == TASK_PENDING:
+            continue
+        task.state = TASK_PENDING
+        task.stop_reason = None
+        task.stop_detail = None
+        task.error = None
+        task.trust_state = None
+        task.actual_lookup_strategy = None
+        task.lookup_strategy_reason = None
+        task.started_at = None
+        task.completed_at = None
+        task.recovery_outcome = None
+        if full_reset:
+            task.observed_category = None
+            task.observed_selector = None
+            task.observed_description = None
+            task.observed_activity = None
+            task.observed_quantity = None
+            task.observed_unit = None
+            task.entered_quantity = None
+        reset_count += 1
+
+    for group in plan.groups:
+        group_tasks = plan.tasks_in_group(group.group_id)
+        if any(t.state == TASK_PENDING for t in group_tasks):
+            group.state = GROUP_PENDING
+            group.error = None
+
+    plan.run_state = RUN_STATE_NOT_STARTED if reset_count == len(plan.tasks) else RUN_STATE_IN_PROGRESS
+    if any(t.state == TASK_PENDING for t in plan.tasks):
+        plan.resume_cursor = None
+    save_execution_plan(plan, project_dir)
+    return reset_count
 
 
 def _resolve_xactimate_group_name(

@@ -783,6 +783,128 @@ def test_ensure_group_is_a_no_op_when_group_already_exists(monkeypatch):
     adapter.ensure_group("Dwelling Roof")  # must return without raising
 
 
+# ---------------------------------------------------------------------
+# Phase 5.5B, Objective 2: ensure_group() must locate, select, and
+# independently re-verify its intended parent BY NAME before ever
+# right-clicking to create a new group -- never trust a fixed row
+# position. Live-caught: the previous version always right-clicked row
+# index 0 assuming it was the project root; when the tree's scroll
+# position drifted, row 0 was actually some OTHER group, and "New"
+# created the requested group as a child of that wrong row (reproduced
+# live as a malformed nested tree).
+# ---------------------------------------------------------------------
+
+
+def _mock_ensure_group_scaffolding(monkeypatch, adapter, *, before_rows, after_rows, row0_actual_text):
+    """Wires up the minimum set of mocks ensure_group()'s CREATE path
+    needs, matching the establish pattern in this file (verify_
+    application/verify_project/_ensure_main_window/_force_foreground
+    already covered elsewhere). `row0_actual_text` is what the
+    INDEPENDENT re-OCR of row 0 reads -- deliberately separate from
+    `before_rows[0]`, which (like the real snapshot_group_names())
+    would otherwise just be the hardcoded expected_project_name label."""
+    calls = {"snapshot": 0}
+
+    def fake_snapshot():
+        calls["snapshot"] += 1
+        return before_rows if calls["snapshot"] == 1 else after_rows
+
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", fake_snapshot)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    monkeypatch.setattr(adapter, "_ocr_group_tree_row_text", lambda image, header, row_index: row0_actual_text if row_index == 0 else before_rows[row_index])
+    return calls
+
+
+def test_ensure_group_creates_under_the_verified_root_by_default(monkeypatch):
+    """Objective 2, requirement 5: top-level groups are created under
+    the root -- the intended parent (default: expected_project_name)
+    is independently re-OCR'd and confirmed BEFORE the context menu is
+    opened, and the context menu is opened at the CORRECT (verified)
+    row index."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _mock_ensure_group_scaffolding(
+        monkeypatch, adapter,
+        before_rows=["TEST", "Exterior"], after_rows=["TEST", "Exterior", "Front Elevation"],
+        row0_actual_text="TEST",
+    )
+
+    opened_at = {}
+
+    def fake_open_menu(hwnd, header, row_index):
+        opened_at["row_index"] = row_index
+        return [object()] * adapter._GROUP_MENU_EXPECTED_ITEM_COUNT
+
+    monkeypatch.setattr(adapter, "_open_group_tree_context_menu", fake_open_menu)
+    monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456)
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
+    monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+
+    adapter.ensure_group("Front Elevation")  # must not raise
+
+    assert opened_at["row_index"] == 0  # the verified root's actual row
+
+
+def test_current_selection_cannot_accidentally_become_the_parent(monkeypatch):
+    """Objective 2, requirement 6: if the row about to be right-clicked
+    does NOT independently re-OCR as the intended parent (the tree's
+    position has drifted, e.g. because some other group is now at row
+    0), ensure_group() refuses to create anything there -- it never
+    falls back to treating "whichever row happens to be selected" as
+    the parent."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _mock_ensure_group_scaffolding(
+        monkeypatch, adapter,
+        before_rows=["TEST", "Exterior"], after_rows=["TEST", "Exterior", "Front Elevation"],
+        row0_actual_text="Dwelling Roof",  # drifted: row 0 is NOT really "TEST" right now
+    )
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("must never open the context menu on an unverified row")
+
+    monkeypatch.setattr(adapter, "_open_group_tree_context_menu", _fail_if_called)
+
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+    with pytest.raises(AdapterError, match="drifted"):
+        adapter.ensure_group("Front Elevation")
+
+
+def test_ensure_group_accepts_an_explicit_parent_group_name(monkeypatch):
+    """The parent_group_name parameter is honored -- not just the
+    default project root -- located and verified the same way."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _mock_ensure_group_scaffolding(
+        monkeypatch, adapter,
+        before_rows=["TEST", "Exterior"], after_rows=["TEST", "Exterior", "Sub Group"],
+        row0_actual_text="TEST",
+    )
+    monkeypatch.setattr(adapter, "_ocr_group_tree_row_text", lambda image, header, row_index: ["TEST", "Exterior"][row_index])
+
+    opened_at = {}
+
+    def fake_open_menu(hwnd, header, row_index):
+        opened_at["row_index"] = row_index
+        return [object()] * adapter._GROUP_MENU_EXPECTED_ITEM_COUNT
+
+    monkeypatch.setattr(adapter, "_open_group_tree_context_menu", fake_open_menu)
+    monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456)
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
+    monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+
+    adapter.ensure_group("Sub Group", parent_group_name="Exterior")
+
+    assert opened_at["row_index"] == 1  # Exterior's row, not the root
+
+
 def test_verify_group_returns_false_when_group_not_in_tree(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(adapter, "verify_application", lambda: True)

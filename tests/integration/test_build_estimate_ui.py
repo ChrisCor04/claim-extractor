@@ -360,3 +360,86 @@ def test_existing_approved_row_workflow_still_works(monkeypatch):
             _PLAN_PATH.write_text(stale_plan_backup, encoding="utf-8")
         elif _PLAN_PATH.exists():
             _PLAN_PATH.unlink()
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5B, Objective 3 (UI half) / Objective 4: stop-reason and
+# remaining-count visibility, and TEST-only reset/rebuild actions.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _ARANDA_PROJECT.exists(), reason="aranda-insurance project fixture not present on disk")
+def test_execution_stop_reason_and_remaining_count_are_displayed():
+    """Requirement 9: a plan with some terminal and some still-pending
+    tasks shows both 'Execution stopped after row X because: ...' and
+    'Remaining unattempted rows: N' -- built only from persisted state,
+    so it survives a UI rerun."""
+    import json
+
+    stale_plan_backup = _PLAN_PATH.read_text(encoding="utf-8") if _PLAN_PATH.exists() else None
+    try:
+        at = _open_aranda_project()
+        build_buttons = [b for b in at.button if "Build / refresh execution plan" in b.label]
+        build_buttons[0].click().run()
+        assert not at.exception
+
+        data = json.loads(_PLAN_PATH.read_text(encoding="utf-8"))
+        assert data["tasks"], "expected at least one task"
+        data["tasks"][0]["state"] = "failed"
+        data["tasks"][0]["stop_reason"] = "no_results"
+        data["tasks"][0]["stop_detail"] = "Simulated for test coverage."
+        _PLAN_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        at.run()
+        assert not at.exception
+
+        captions = " | ".join(c.value for c in at.caption)
+        assert "Execution stopped after Row 1 because:" in captions
+        assert "Remaining unattempted rows:" in captions
+    finally:
+        if stale_plan_backup is not None:
+            _PLAN_PATH.write_text(stale_plan_backup, encoding="utf-8")
+        elif _PLAN_PATH.exists():
+            _PLAN_PATH.unlink()
+
+
+@pytest.mark.skipif(not _UNMAPPED_PROJECT.exists(), reason="aranda-insurance-v3 project fixture not present on disk")
+def test_reset_unfinished_button_preserves_completed_tasks_via_ui(monkeypatch):
+    """Objective 4 (UI half): clicking 'Reset unfinished TEST execution'
+    resets non-completed tasks back to pending and leaves a completed
+    task alone -- exercised through the real UI button, not just the
+    backend function directly."""
+    import json
+
+    stale_plan_backup = _UNMAPPED_PLAN_PATH.read_text(encoding="utf-8") if _UNMAPPED_PLAN_PATH.exists() else None
+    try:
+        at = _open_unmapped_project()
+        _confirm_project(at, monkeypatch, "TEST")
+        checkboxes = [c for c in at.checkbox if "Include rows missing CAT/SEL" in c.label]
+        checkboxes[0].check().run()
+        build_buttons = [b for b in at.button if "Build / refresh execution plan" in b.label]
+        build_buttons[0].click().run()
+        assert not at.exception
+
+        data = json.loads(_UNMAPPED_PLAN_PATH.read_text(encoding="utf-8"))
+        data["tasks"][0]["state"] = "completed"
+        data["tasks"][0]["trust_state"] = "VERIFIED"
+        data["tasks"][1]["state"] = "review_required"
+        data["tasks"][1]["stop_reason"] = "ambiguous_candidates"
+        _UNMAPPED_PLAN_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        at.run()
+        assert not at.exception
+        reset_buttons = [b for b in at.button if b.label == "Reset unfinished TEST execution"]
+        assert reset_buttons, "Reset button not shown for a confirmed TEST project"
+        reset_buttons[0].click().run()
+        assert not at.exception
+
+        after = json.loads(_UNMAPPED_PLAN_PATH.read_text(encoding="utf-8"))
+        assert after["tasks"][0]["state"] == "completed"  # untouched
+        assert after["tasks"][1]["state"] == "pending"  # reset
+    finally:
+        if stale_plan_backup is not None:
+            _UNMAPPED_PLAN_PATH.write_text(stale_plan_backup, encoding="utf-8")
+        elif _UNMAPPED_PLAN_PATH.exists():
+            _UNMAPPED_PLAN_PATH.unlink()

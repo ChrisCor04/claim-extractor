@@ -54,6 +54,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     GROUP_SELECTED,
     GROUP_VERIFIED,
     GroupExecutionState,
+    LOOKUP_STRATEGY_REVIEW_APPROVED,
     LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
     RUN_STATE_COMPLETED,
     RUN_STATE_IN_PROGRESS,
@@ -97,23 +98,61 @@ def _supports_commit_verification(adapter) -> bool:
     return hasattr(adapter, "snapshot_grid_identities") and hasattr(adapter, "verify_commit")
 
 
-def _task_to_lookup_plan(task: ExecutionTask, phrase_rules: PhraseRules) -> LookupPlan:
-    """Every ExecutionTask with a CAT/SEL carries a human-approved value
-    (see execution_plan.py's LOOKUP_STRATEGY_REVIEW_APPROVED) -- wrapped
-    as a transient InternalMappingRecord (never persisted to the
-    registry, exactly like orchestrator._verified_catalog_trusted_
-    mapping() does for verified-catalog matches) so it flows through the
-    SAME trusted-path code in orchestrator.execute_plan() as a
-    registry-sourced mapping.
+#: Phase 5.5B: audit reasons recorded on ExecutionTask.lookup_strategy_
+#: reason -- an explicit trail proving what _task_to_lookup_plan()
+#: actually decided and why, so a began_unmapped task can never be
+#: silently routed to CAT/SEL without that being visible in the report.
+_REASON_REVIEW_APPROVED = "review_approved_cat_sel: human-approved mapping, unchanged trusted path."
+_REASON_DESCRIPTION_FIRST = (
+    "test_description_first: no trusted CAT/SEL and no verified reusable observed mapping -- searched by description."
+)
 
-    Phase 5.5: a task with no CAT/SEL (`LOOKUP_STRATEGY_TEST_DESCRIPTION_
-    FIRST`, see execution_plan.py's include_unmapped_rows) instead gets a
-    description-search LookupPlan, built with the SAME `generate_search_
-    phrase()` call orchestrator.build_lookup_plan()'s own description-
-    first path already uses -- nothing about phrase generation, ranking,
-    or the safety-stop rules downstream in orchestrator.execute_plan()
-    is different for it."""
-    if task.category and task.selector:
+
+class UnsafeLookupRouting(Exception):
+    """Phase 5.5B: raised by _task_to_lookup_plan() when a task whose
+    lookup_strategy is LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST would
+    otherwise be routed to the trusted CAT/SEL path with no explicit,
+    verified reason -- caught by run_execution_plan() and turned into a
+    safe TASK_FAILED for that one task, never silently trusted. See
+    _task_to_lookup_plan()'s docstring for the live incident this
+    guards against."""
+
+
+def _task_to_lookup_plan(task: ExecutionTask, phrase_rules: PhraseRules) -> tuple[LookupPlan, str, str]:
+    """Returns (plan, actual_strategy, reason) -- `actual_strategy` is
+    always LOOKUP_PATH_TRUSTED or LOOKUP_PATH_DESCRIPTION_SEARCH.
+
+    Phase 5.5B: routing is driven EXCLUSIVELY by `task.lookup_strategy`
+    (set once, at plan-build time, by execution_plan.py -- see its
+    module docstring) -- never re-derived from whether task.category/
+    task.selector happen to be populated. Live-caught: an earlier
+    version routed on category/selector PRESENCE alone (`if task.
+    category and task.selector`), which a stale, pre-Phase-5.5 process
+    reproduced live as a literal "None None" CAT/SEL search for
+    originally-unmapped rows (search_input built from two None values
+    formatted into a string) -- the row was never actually searched by
+    description at all. A LOOKUP_STRATEGY_REVIEW_APPROVED task carries
+    a human-approved CAT/SEL (see execution_plan.py's
+    LOOKUP_STRATEGY_REVIEW_APPROVED) -- wrapped as a transient
+    InternalMappingRecord (never persisted to the registry, exactly
+    like orchestrator._verified_catalog_trusted_mapping() does for
+    verified-catalog matches) so it flows through the SAME trusted-path
+    code in orchestrator.execute_plan() as a registry-sourced mapping.
+    Every other task (today, only LOOKUP_STRATEGY_TEST_DESCRIPTION_
+    FIRST) is ALWAYS searched by description, built with the SAME
+    `generate_search_phrase()` call orchestrator.build_lookup_plan()'s
+    own description-first path already uses -- nothing about phrase
+    generation, ranking, or the safety-stop rules downstream in
+    orchestrator.execute_plan() is different for it. The only way such
+    a task could ever legitimately use CAT/SEL instead is a future,
+    explicit, verified-and-persisted reusable observed mapping (not
+    built by this phase -- see execution_runner.py's OBSERVED_MAPPING_
+    STATE, which is deliberately never auto-reused); absent that, a
+    task somehow reaching this function with lookup_strategy=test_
+    description_first AND both category and selector populated is an
+    unexpected, unsafe state -- raises UnsafeLookupRouting rather than
+    silently trusting it."""
+    if task.lookup_strategy == LOOKUP_STRATEGY_REVIEW_APPROVED:
         trusted = InternalMappingRecord(
             mapping_id=f"execution_plan:{task.task_id}",
             item_signature="",
@@ -128,24 +167,34 @@ def _task_to_lookup_plan(task: ExecutionTask, phrase_rules: PhraseRules) -> Look
             approval_reason="Human-approved during Mapping Review, carried into the execution plan.",
             status=MAPPING_STATUS_APPROVED,
         )
-        return LookupPlan(
+        plan = LookupPlan(
             line_item_id=task.line_item_id,
             path=LOOKUP_PATH_TRUSTED,
             item_signature="",
             search_input=f"{task.category} {task.selector}",
             trusted_mapping=trusted,
         )
+        return plan, LOOKUP_PATH_TRUSTED, _REASON_REVIEW_APPROVED
+
+    if task.category and task.selector:
+        raise UnsafeLookupRouting(
+            f"{task.task_id}: lookup_strategy={task.lookup_strategy!r} but category/selector "
+            f"({task.category!r}/{task.selector!r}) are both populated with no verified reusable observed "
+            f"mapping -- refusing to silently use the trusted CAT/SEL path for a task that must be "
+            f"searched by description."
+        )
 
     phrase_result = generate_search_phrase(
         task.description, task.normalized_component, task.normalized_material, task.normalized_action, phrase_rules
     )
-    return LookupPlan(
+    plan = LookupPlan(
         line_item_id=task.line_item_id,
         path=LOOKUP_PATH_DESCRIPTION_SEARCH,
         item_signature="",
         search_input=phrase_result.phrase,
         phrase_result=phrase_result,
     )
+    return plan, LOOKUP_PATH_DESCRIPTION_SEARCH, _REASON_DESCRIPTION_FIRST
 
 
 def _task_to_recommendation_input(task: ExecutionTask) -> RecommendationInput:
@@ -173,7 +222,7 @@ def _ensure_select_verify_group(adapter, group: GroupExecutionState) -> tuple[bo
         return False, "No resolvable Xactimate group name for this section."
 
     try:
-        adapter.ensure_group(target)
+        adapter.ensure_group(target, parent_group_name=group.parent_group_name)
         group.state = GROUP_SELECTED
         adapter.select_group(target)
         verified = adapter.verify_group(target)
@@ -314,6 +363,12 @@ def run_execution_plan(
     plan (reloaded via execution_plan.load_execution_plan()). Never
     raises on a task- or group-level failure -- see module docstring for
     exactly what stops the whole run versus one task."""
+    # Phase 5.5B, Objective 3: recorded BEFORE anything else runs, so
+    # "how many tasks did this call skip because they were already
+    # terminal (resume)" survives in the persisted plan even if the
+    # run pauses immediately after.
+    plan.last_run_skipped_already_terminal = sum(1 for t in plan.tasks if t.state != TASK_PENDING)
+
     if not adapter.verify_application():
         plan.run_state = RUN_STATE_PAUSED
         save_execution_plan(plan, project_dir)
@@ -381,7 +436,26 @@ def run_execution_plan(
                     continue
 
             item = _task_to_recommendation_input(task)
-            lookup_plan = _task_to_lookup_plan(task, phrase_rules)
+            try:
+                lookup_plan, actual_strategy, reason = _task_to_lookup_plan(task, phrase_rules)
+            except UnsafeLookupRouting as exc:
+                # Phase 5.5B: routing itself refused, before any live
+                # adapter interaction happened for this task -- a safe
+                # task-level failure, never a whole-run abort, and never
+                # a silent fall-through to CAT/SEL. See _task_to_lookup_
+                # plan()'s docstring.
+                task.state = TASK_FAILED
+                task.actual_lookup_strategy = None
+                task.lookup_strategy_reason = str(exc)
+                task.error = str(exc)
+                task.completed_at = utc_now_iso()
+                if not dry_run:
+                    plan.resume_cursor = plan.tasks.index(task) + 1
+                    save_execution_plan(plan, project_dir)
+                continue
+
+            task.actual_lookup_strategy = actual_strategy
+            task.lookup_strategy_reason = reason
             try:
                 outcome = orchestrator.execute_plan(lookup_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
                 _apply_outcome_to_task(task, outcome, dry_run)
