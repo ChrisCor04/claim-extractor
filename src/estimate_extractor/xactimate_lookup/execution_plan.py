@@ -245,6 +245,17 @@ class GroupExecutionState:
     task_ids: list[str] = field(default_factory=list)
     state: str = GROUP_PENDING
     error: str | None = None
+    #: Phase 5.7: informational-only ancestry evidence from
+    #: WindowsXactimateAdapter.ensure_group() -- set when the group was
+    #: created successfully and is uniquely locatable/selectable by
+    #: name, but landed at an unexpected nesting depth (product
+    #: requirement: ancestry is no longer a blocking safety condition
+    #: for this TEST workflow, see ensure_group()'s own docstring).
+    #: None whenever the group already existed, was placed exactly as
+    #: requested, or ancestry couldn't be confidently read either way.
+    #: Never affects `state`/`error` -- purely a note for the final
+    #: report and UI.
+    position_warning: str | None = None
 
     def to_dict(self) -> dict:
         return _dataclass_to_dict(self)

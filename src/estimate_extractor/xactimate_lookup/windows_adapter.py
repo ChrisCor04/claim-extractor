@@ -551,10 +551,31 @@ class WindowsXactimateAdapter(XactimateAdapter):
     #: FIRST TWO groups of a session as true root siblings (5/5 clean
     #: lifecycle trials -- see docs/build-estimate.md Phase 5.5C), but a
     #: 3rd+ group reproducibly nests under the 2nd regardless of which
-    #: of three different reset strategies precedes it. Flip this only
-    #: alongside the same rigor: a real mechanism for N>2, independently
-    #: verified ancestry, and repeated clean lifecycle trials.
+    #: of three different reset strategies precedes it (Phase 5.7
+    #: re-confirmed this once more, plus two new hypotheses -- double
+    #: stickiness-reset, an explicit save between creations -- neither
+    #: helped). This flag is specifically about PERFECT top-level
+    #: sibling placement; see `group_creation_available` for the
+    #: capability that actually matters for execution throughput. Flip
+    #: this only alongside the same rigor: a real mechanism for N>2,
+    #: independently verified ancestry, and repeated clean lifecycle
+    #: trials.
     multi_group_creation_available = False
+
+    #: Phase 5.7: True as of the product-requirement change in this
+    #: phase -- group ancestry/nesting depth is no longer a blocking
+    #: safety condition for TEST-project execution. `ensure_group()`
+    #: succeeds whenever the requested group can be created and then
+    #: uniquely, independently located/selected/verified BY NAME,
+    #: regardless of where in the tree Xactimate actually placed it.
+    #: This is deliberately a DIFFERENT claim than
+    #: `multi_group_creation_available` (which is about perfect
+    #: top-level sibling placement and remains False): "the named group
+    #: exists and is usable" is proven live for creation #1, #2, AND a
+    #: #3/#4 that lands nested -- see ensure_group()'s own docstring for
+    #: the exact mechanism and docs/build-estimate.md Phase 5.7 for the
+    #: live evidence.
+    group_creation_available = True
 
     def __init__(
         self,
@@ -3138,7 +3159,29 @@ class WindowsXactimateAdapter(XactimateAdapter):
         `ensure_group()`'s post-creation check) would conclude the
         group doesn't exist and silently report success/failure
         incorrectly. Falls back to `_best_window_fuzzy_ratio()` when
-        substring containment fails."""
+        substring containment fails.
+
+        Live-caught (Phase 5.7A): the whole-string fuzzy fallback alone
+        is unsafe for a FAMILY of multi-word names sharing one common
+        word -- "Rear Elevation" and "Left Elevation" each scored
+        0.77/0.81 against an EXISTING, genuinely different "Front
+        Elevation" row (both above threshold), because "elevation" (9
+        of ~14 characters) dominates the concatenated-string ratio
+        regardless of how different the distinguishing leading word is.
+        This let ensure_group()/select_group() silently target the
+        wrong group for a same-family sibling name that was never
+        actually in the tree -- a genuine wrong-group-write risk
+        (reproduced live building the real aranda-insurance-v3 group
+        set). Fixed: for a `group_name` with 2+ words, EVERY word must
+        ALSO individually clear the threshold somewhere in the haystack
+        (via the same window-search, so it stays robust to OCR text
+        that has lost its own spaces) -- not just the blended whole-
+        string ratio. Legitimate OCR noise on the correct name still
+        passes easily (each real word individually scores 0.86-1.0 in
+        the live-measured cases this threshold was calibrated against);
+        a different sibling name whose distinguishing word doesn't
+        match anywhere (e.g. "rear"/"left" score 0.57/0.67 against
+        "frontelevation", well under threshold) now correctly fails."""
         needle = group_name.strip().lower().replace(" ", "")
         haystack = ocr_text.strip().lower().replace(" ", "")
         if not needle:
@@ -3146,7 +3189,16 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if needle in haystack:
             return True
         ratio = WindowsXactimateAdapter._best_window_fuzzy_ratio(needle, haystack)
-        return ratio >= WindowsXactimateAdapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD
+        if ratio < WindowsXactimateAdapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD:
+            return False
+        words = [w for w in group_name.strip().lower().split() if w]
+        if len(words) < 2:
+            return True
+        return all(
+            WindowsXactimateAdapter._best_window_fuzzy_ratio(word, haystack)
+            >= WindowsXactimateAdapter._GROUP_NAME_FUZZY_MATCH_THRESHOLD
+            for word in words
+        )
 
     def _find_group_row(self, rows: list[str], group_name: str) -> int | None:
         """Live-caught (Phase 5.4 Stage 8): a first-match scan is unsafe
@@ -3178,6 +3230,42 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     best_ratio = ratio
                     best_index = i
         return best_index
+
+    def _matching_group_rows(self, rows: list[str], group_name: str) -> list[int]:
+        """Phase 5.7: returns EVERY row index that plausibly matches
+        `group_name`, unlike `_find_group_row()` (which silently
+        resolves to a single best guess). Exact (whitespace/case-
+        insensitive) substring matches are strongly preferred -- if any
+        exist, only those are returned; fuzzy matches are considered
+        only when no exact-substring match exists at all. Used wherever
+        more than one plausible match must be surfaced as a genuine
+        ambiguity rather than silently resolved."""
+        needle = group_name.strip().lower().replace(" ", "")
+        if not needle:
+            return []
+        exact = [i for i, text in enumerate(rows) if needle in text.strip().lower().replace(" ", "")]
+        if exact:
+            return exact
+        return [i for i, text in enumerate(rows) if self._group_name_matches(text, group_name)]
+
+    def _find_unique_group_row(self, rows: list[str], group_name: str) -> int | None:
+        """Phase 5.7: returns the row index for `group_name` ONLY when
+        it identifies exactly one row. Returns None when no row
+        matches (not found -- not itself an error, callers decide what
+        to do). Raises AdapterError when MORE than one row matches --
+        "the group exists somewhere in the tree, identifiable by name"
+        is no longer sufficient once creation is allowed to land at any
+        depth (Phase 5.7): a caller that silently picked one of several
+        same-named groups could select/verify/write into the wrong one.
+        Ambiguity must fail closed here, not be resolved by a best-
+        ratio guess."""
+        matches = self._matching_group_rows(rows, group_name)
+        if len(matches) > 1:
+            raise AdapterError(
+                f"{len(matches)} groups in the tree match {group_name!r} ({[rows[i] for i in matches]!r}) -- "
+                f"refusing to guess which one is the intended group."
+            )
+        return matches[0] if matches else None
 
     def _open_group_tree_context_menu(self, hwnd: int, header_pos: tuple[int, int], row_index: int) -> list:
         """Left-clicks the row (to select/focus it), forces a repaint
@@ -3432,20 +3520,30 @@ class WindowsXactimateAdapter(XactimateAdapter):
         except Exception:
             return False
 
-    def ensure_group(self, group_name: str, *, parent_group_name: str | None = None) -> None:
+    def ensure_group(self, group_name: str, *, parent_group_name: str | None = None) -> str | None:
         """Not part of the abstract contract. Creates `group_name` as a
         child of `parent_group_name` (default: this adapter's own
-        `expected_project_name`, i.e. the project root -- there is no
-        nested Area/Section model in this codebase today, see
-        execution_plan.py's module docstring, so every execution group
-        is top-level) if it doesn't already exist (a no-op, verified
-        via a fresh snapshot, if it does). Never guesses: raises
-        AdapterError if the "New Group" dialog doesn't appear, if the
-        group still can't be found after the creation sequence
-        completes, or if the intended parent can't be independently
-        re-confirmed immediately before creating (see below). Verifies
-        the project before mutating anything (Phase 5.1 requirement:
-        "verify project before every mutation").
+        `expected_project_name`, i.e. the project root) if it doesn't
+        already exist (a no-op, verified via a fresh snapshot, if it
+        does). Never guesses: raises AdapterError if the "New Group"
+        dialog doesn't appear, if the group still can't be found after
+        the creation sequence completes, if the intended parent can't
+        be independently re-confirmed immediately before creating (see
+        below), or if MORE THAN ONE row in the tree matches `group_name`
+        (an ambiguity that must fail closed, never resolved by
+        guessing -- Phase 5.7). Verifies the project before mutating
+        anything (Phase 5.1 requirement: "verify project before every
+        mutation").
+
+        Returns None on an unambiguous, correctly-placed result (the
+        common case), or a `GROUP_POSITION_WARNING` string (Phase 5.7)
+        when the group was created successfully and is uniquely
+        locatable/selectable by name, but landed at an unexpected
+        nesting depth. Ancestry/position is informational evidence
+        only as of Phase 5.7 -- see the docstring block below the
+        creation sequence for why, and `verify_group_path()` for a
+        read-only way to re-check position later without mutating
+        anything.
 
         Live-caught (Phase 5.5B): the previous version always right-
         clicked row index 0, trusting it was always the project root by
@@ -3456,26 +3554,37 @@ class WindowsXactimateAdapter(XactimateAdapter):
         confirmed elsewhere in this file to occasionally fail silently)
         row 0 on screen could genuinely be some OTHER group, and "New"
         created the requested group AS A CHILD of that wrong row
-        instead of as a top-level sibling. Reproduced live as a
-        malformed nested tree (Exterior > Roof > Front Elevation >
-        Fencing instead of four top-level siblings). Fixed: the
-        intended parent is located BY NAME, then its row is
-        INDEPENDENTLY re-OCR'd (bypassing the hardcoded label) and
-        fuzzy-matched against the intended name immediately before the
-        context menu opens -- refusing to proceed if that fails, rather
-        than trusting a fixed position.
+        instead of as a top-level sibling. Fixed: the intended parent
+        is located BY NAME, then its row is INDEPENDENTLY re-OCR'd
+        (bypassing the hardcoded label) and fuzzy-matched against the
+        intended name immediately before the context menu opens --
+        refusing to proceed if that fails, rather than trusting a
+        fixed position.
 
         Live-caught (Phase 5.5C): that fix alone did not solve the
         malformed tree -- the deeper cause is Xactimate always
         attaching "New Group" to the most-recently-created group in the
         session, independent of which row was right-clicked (see
-        `_reset_group_creation_stickiness()`, called below, for the
-        live-proven fix). After creation, the new row's indentation is
-        independently checked against `target_parent`'s (see
-        `_group_tree_row_indent_x()`) -- "the group exists" and "the
-        group exists beneath the intended parent" are not the same
-        claim, and only the second is safe to trust before running any
-        task against it."""
+        `_reset_group_creation_stickiness()`, called below, which fixes
+        this reliably for groups #1-#2 of a session but not #3+ -- two
+        further hypotheses tried live in Phase 5.7, double stickiness-
+        reset and an explicit save between creations, neither helped
+        either).
+
+        Product-requirement change (Phase 5.7): group ancestry/position
+        is no longer a blocking safety condition for this TEST
+        workflow. What matters is that every required group EXISTS,
+        can be located BY NAME, and can be independently selected and
+        verified -- not where in the tree Xactimate physically placed
+        it (the owner can reorganize the visual hierarchy manually
+        afterward). A mis-nested group whose name is still uniquely
+        identifiable is therefore a successful creation with a
+        GROUP_POSITION_WARNING, not a failure. What STILL fails closed:
+        more than one row matching `group_name` (genuine ambiguity --
+        cannot safely pick one) and the intended parent row vanishing
+        outright after creation (a much more fundamental problem than
+        nesting depth, since it means the tree can no longer be
+        trusted to have any stable row identities at all)."""
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"ensure_group({group_name!r}): could not verify the expected project is active.")
 
@@ -3485,8 +3594,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._force_foreground(hwnd)
         self._scroll_group_tree_to_top(hwnd)
         rows = self.snapshot_group_names()
-        if self._find_group_row(rows, group_name) is not None:
-            return  # already exists -- nothing to do
+        if self._find_unique_group_row(rows, group_name) is not None:
+            return None  # already exists, unambiguously -- nothing to do
 
         # Only reset stickiness (and re-scan) when a creation is
         # actually about to happen -- a no-op call above must never
@@ -3499,15 +3608,38 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if parent_index is None:
             raise AdapterError(f"ensure_group({group_name!r}): parent group {target_parent!r} not found in the tree.")
 
-        image = self._capture_client_image(hwnd)
-        header = self._locate_group_tree_header(image)
+        # Phase 5.7 (live-caught): the SAME class of transient-repaint
+        # flakiness `_capture_and_locate()` already retries for elsewhere
+        # in this file also affects this read -- reproduced live 3/4
+        # trials immediately after `_reset_group_creation_stickiness()`'s
+        # tab-switch, where the freshly-repainting group tree's row 0
+        # reads back completely blank for 0-3 consecutive attempts before
+        # settling to the correct text moments later (same header
+        # position each time -- this is a paint-timing gap, not a
+        # position/ancestry problem). A single unretried read here was
+        # indistinguishable from a genuine ancestry drift and caused
+        # ensure_group() to refuse a perfectly valid parent row. Bounded,
+        # matching every other OCR-retry precedent in this file -- never
+        # an unbounded wait, and still refuses (raises) if every attempt
+        # comes back blank/mismatched.
+        actual_parent_text = None
+        header = None
+        for _attempt in range(5):
+            image = self._capture_client_image(hwnd)
+            header = self._locate_group_tree_header(image)
+            if header is None:
+                time.sleep(0.4)
+                continue
+            actual_parent_text = self._ocr_group_tree_row_text(image, header, parent_index)
+            if self._group_name_matches(actual_parent_text, target_parent):
+                break
+            time.sleep(0.4)
         if header is None:
             raise AdapterError(f"ensure_group({group_name!r}): could not locate the group tree.")
 
         # Independent re-OCR of the exact row about to be right-clicked
         # -- never trust `rows[parent_index]` alone (row 0's text is a
         # hardcoded label, not a live read; see docstring above).
-        actual_parent_text = self._ocr_group_tree_row_text(image, header, parent_index)
         if not self._group_name_matches(actual_parent_text, target_parent):
             raise AdapterError(
                 f"ensure_group({group_name!r}): row {parent_index} was expected to be the parent "
@@ -3542,34 +3674,36 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # extra settle sleep, never an unbounded wait.
         for _attempt in range(3):
             rows_after = self.snapshot_group_names()
-            new_index = self._find_group_row(rows_after, group_name)
+            # Phase 5.7: uniqueness, not mere presence, is what's load-
+            # bearing now -- raises AdapterError if creation somehow
+            # produced (or exposed) more than one row matching this
+            # name, which must fail closed rather than let a later
+            # select_group() guess.
+            new_index = self._find_unique_group_row(rows_after, group_name)
             if new_index is not None:
-                # Best-effort ancestry check (Phase 5.5B): the group
-                # tree is not UI-Automation-accessible (see module
-                # docstring) and every row's text is OCR'd from the
-                # SAME fixed horizontal offset regardless of true
-                # indentation depth (see snapshot_group_names()), so
-                # this cannot independently confirm parent/child
-                # nesting from pixels alone. What it CAN confirm,
-                # cheaply and honestly: the verified parent's row still
-                # reads as itself after the mutation (nothing was
-                # renamed/corrupted) -- refuses to claim more than that.
+                # The parent row vanishing outright is a different,
+                # more fundamental problem than nesting depth (Phase
+                # 5.5B) -- it means the tree's row identities can no
+                # longer be trusted at all, not just that this one
+                # group landed somewhere unexpected. Still fails closed.
                 parent_index_after = self._find_group_row(rows_after, target_parent)
                 if parent_index_after is None:
                     raise AdapterError(
                         f"ensure_group({group_name!r}): group was created, but the intended parent "
                         f"{target_parent!r} can no longer be found in the tree -- refusing to trust the result."
                     )
-                # Real ancestry check (Phase 5.5C Stage 7): the pixel
-                # indent check CAN distinguish sibling from nested (see
-                # _group_tree_row_indent_x()). Only a CONFIRMED mismatch
-                # (both indents actually read) raises -- an unreadable
-                # indent (e.g. OCR/pixel noise) is treated the same way
-                # every other best-effort probe in this file is: it
-                # doesn't block, since a false negative here is safe
-                # (see verify_group() docstring for the same reasoning)
-                # while a false positive would incorrectly discard a
-                # correctly-placed group.
+                # Phase 5.7 product-requirement change: ancestry/nesting
+                # depth is informational evidence only, never a reason
+                # to fail an otherwise-successful, uniquely-identifiable
+                # creation (see this method's own docstring). A
+                # confirmed indentation mismatch (both indents actually
+                # read, both real) now downgrades to a returned
+                # GROUP_POSITION_WARNING string instead of raising; an
+                # unreadable indent (OCR/pixel noise) is silently not a
+                # warning, same as before -- a false negative here is
+                # safe, a false positive would wrongly flag a correctly
+                # -placed group.
+                position_warning = None
                 image_after = self._capture_client_image(hwnd)
                 header_after = self._locate_group_tree_header(image_after)
                 if header_after is not None and target_parent == self.expected_project_name:
@@ -3583,12 +3717,14 @@ class WindowsXactimateAdapter(XactimateAdapter):
                             if reference_indent is not None:
                                 break
                     if new_indent is not None and reference_indent is not None and new_indent != reference_indent:
-                        raise AdapterError(
-                            f"ensure_group({group_name!r}): created, but its indentation ({new_indent}px) "
-                            f"does not match an existing top-level group's ({reference_indent}px) -- it "
-                            f"appears to have nested under the wrong parent instead of the root."
+                        position_warning = (
+                            f"GROUP_POSITION_WARNING: ensure_group({group_name!r}) created the group, but its "
+                            f"indentation ({new_indent}px) differs from an existing top-level group's "
+                            f"({reference_indent}px) -- it likely nested under another group instead of the "
+                            f"root. The group is still uniquely identifiable by name and safe to select/verify/"
+                            f"use; reorganize the visual tree manually later if a specific layout is desired."
                         )
-                return
+                return position_warning
             time.sleep(0.8)
         raise AdapterError(
             f"ensure_group({group_name!r}): group still not found after the creation sequence completed."
@@ -3600,7 +3736,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         tree does not preserve insertion order, see docs/build-estimate.md
         Phase 5.1 Stage 3). Raises AdapterError if the group doesn't
         exist -- select_group() never creates one; call ensure_group()
-        first."""
+        first. Also raises (Phase 5.7) if MORE THAN ONE row matches
+        `group_name` -- a duplicate/ambiguous name must fail closed,
+        never resolved by picking one."""
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"select_group({group_name!r}): could not verify the expected project is active.")
 
@@ -3613,7 +3751,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             raise AdapterError(f"select_group({group_name!r}): could not locate the group tree.")
 
         rows = self.snapshot_group_names()
-        row_index = self._find_group_row(rows, group_name)
+        row_index = self._find_unique_group_row(rows, group_name)
         if row_index is None:
             raise AdapterError(f"select_group({group_name!r}): group not found in the tree (rows: {rows!r}).")
 
@@ -3741,7 +3879,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
             hwnd = self._ensure_main_window()
             self._scroll_group_tree_to_top(hwnd)
             rows = self.snapshot_group_names()
-            target_index = self._find_group_row(rows, group_name)
+            # Phase 5.7: ambiguity (more than one matching row) must
+            # fail closed like everywhere else -- _find_unique_group_row
+            # raises AdapterError in that case, caught by this method's
+            # own broad except below and turned into the promised
+            # "False, never raises" result.
+            target_index = self._find_unique_group_row(rows, group_name)
             if target_index is None:
                 return False
 

@@ -240,7 +240,12 @@ def _ensure_select_verify_group(adapter, group: GroupExecutionState) -> tuple[bo
         return False, "No resolvable Xactimate group name for this section."
 
     try:
-        adapter.ensure_group(target, parent_group_name=group.parent_group_name)
+        # Phase 5.7: ensure_group() now returns a GROUP_POSITION_WARNING
+        # string (never raises for this) when the group was created
+        # successfully but landed at an unexpected nesting depth --
+        # ancestry is informational-only, kept on the group for the
+        # final report/UI, never a reason to stop this group.
+        group.position_warning = adapter.ensure_group(target, parent_group_name=group.parent_group_name)
         group.state = GROUP_SELECTED
         adapter.select_group(target)
         verified = adapter.verify_group(target)
@@ -351,6 +356,16 @@ def _record_observed_mapping_proposal(project_dir: Path, task: ExecutionTask, ou
             "observed_quantity": task.observed_quantity,
             "source_description": task.description,
             "search_phrase": outcome.plan.search_input if outcome.plan is not None else None,
+            #: Phase 5.7A: the exact search text that WON -- the
+            #: description-search input that actually produced this
+            #: commit (identical to "search_phrase" above; kept as its
+            #: own explicitly-named field so learned-mapping consumers
+            #: don't have to know "search_phrase" doubles as this).
+            #: DESCRIPTION evidence for future searches, distinct from
+            #: observed_category/observed_selector below, which are
+            #: CAT/SEL evidence -- never conflate the two (see
+            #: _description_first_search_attempts()'s docstring).
+            "verified_search_description": outcome.plan.search_input if outcome.plan is not None else None,
             "selected_candidate_category": dropdown.category if dropdown is not None else None,
             "selected_candidate_selector": dropdown.selector if dropdown is not None else None,
             "selected_candidate_description": dropdown.description if dropdown is not None else None,
@@ -401,9 +416,35 @@ def _find_trusted_observed_mapping(project_dir: Path, line_item_id: str) -> tupl
         return None
 
 
+def _find_verified_search_description(project_dir: Path, line_item_id: str) -> str | None:
+    """Phase 5.7A: returns the DESCRIPTION text (never CAT/SEL) that
+    won a PREVIOUS run's execution of this exact line_item_id, only
+    when that commit was independently verified (trust_state ==
+    VERIFIED) -- same "verified" gate as _find_trusted_observed_
+    mapping(), same file, but returns search-input evidence instead of
+    a CAT/SEL shortcut. This is what _description_first_search_
+    attempts() tries FIRST for a repeat/resumed run of the same row --
+    CAT/SEL remains a separate, later fallback (see that function's
+    docstring). Read-only, best-effort: any error returns None rather
+    than raising."""
+    try:
+        path = _observed_mappings_path(project_dir)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entry = data.get(line_item_id)
+        if not entry or not entry.get("verified"):
+            return None
+        description = entry.get("verified_search_description")
+        return description if description and description.strip() else None
+    except Exception:
+        return None
+
+
 #: Phase 5.5D Stage 7: the fixed, ordered attempt-type labels a began_
 #: unmapped task's search sequence can produce -- recorded on each
 #: ExecutionTask.search_attempts entry's "search_type" field.
+SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION = "verified_search_description"
 SEARCH_TYPE_EXACT_DESCRIPTION = "exact_description"
 SEARCH_TYPE_NORMALIZED_DESCRIPTION = "normalized_description"
 SEARCH_TYPE_COMPACT_GENERATED_PHRASE = "compact_generated_phrase"
@@ -422,10 +463,22 @@ def _description_first_search_attempts(
     task: ExecutionTask, phrase_rules: PhraseRules, project_dir: Path,
 ) -> list[tuple[str, LookupPlan]]:
     """Builds the bounded, ordered attempt sequence for a began_unmapped
-    task (Phase 5.5D Stage 7): exact source description, normalized
+    task (Phase 5.5D Stage 7, extended Phase 5.7A): a previously
+    VERIFIED search description for this exact line item (if this row
+    was already executed and verified in an earlier run -- e.g. a
+    resume/retry), then the exact source description, normalized
     description, the existing compact/generated phrase, then -- only if
     a previous VERIFIED commit of this exact line item produced one --
-    a trusted CAT/SEL. Never starts with CAT/SEL. Reuses generate_
+    a trusted CAT/SEL as the FINAL fallback. Never starts with CAT/SEL,
+    and a learned CAT/SEL NEVER substitutes for a description attempt
+    -- see docs/build-estimate.md Phase 5.7A: a live incident where
+    SFG/GUTA (the group-verification probe's own hardcoded disposable
+    test item, unrelated to any PDF row -- see WindowsXactimateAdapter.
+    _verify_group_once()) was mistaken for an unmapped row's search
+    input prompted tracing this whole sequence end-to-end; the trace
+    confirmed description-first ordering was already correct, and this
+    phase adds the verified-description-reuse attempt plus locks the
+    ordering down with explicit regression tests. Reuses generate_
     search_phrase()/compute_normalized_description() exactly as they
     already exist elsewhere in this codebase -- no global phrase-
     generation or ranking change. Skips a candidate attempt whose text
@@ -449,6 +502,13 @@ def _description_first_search_attempts(
             ),
         ))
 
+    # Phase 5.7A: a DESCRIPTION, not a CAT/SEL shortcut -- reused only
+    # when a previous run of this EXACT row was independently verified.
+    # Still a description-search attempt like any other, ranked and
+    # safety-stopped identically; the only thing "learned" here is
+    # which wording to type first, never which candidate to pick.
+    _add(SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION, _find_verified_search_description(project_dir, task.line_item_id))
+
     _add(SEARCH_TYPE_EXACT_DESCRIPTION, task.description)
     _add(SEARCH_TYPE_NORMALIZED_DESCRIPTION, compute_normalized_description(
         task.normalized_trade, task.normalized_component, task.normalized_material, task.normalized_action,
@@ -458,6 +518,11 @@ def _description_first_search_attempts(
     )
     _add(SEARCH_TYPE_COMPACT_GENERATED_PHRASE, phrase_result.phrase, phrase_result=phrase_result)
 
+    # Phase 5.7A: CAT/SEL remains the LAST resort -- every description
+    # attempt above is tried and must fail (no_results/extraction-
+    # failed/unexpected-dialog) before this is ever reached. Learned
+    # CAT/SEL knowledge is candidate/result metadata, never a reason to
+    # skip searching by description first.
     trusted = _find_trusted_observed_mapping(project_dir, task.line_item_id)
     if trusted is not None:
         category, selector = trusted

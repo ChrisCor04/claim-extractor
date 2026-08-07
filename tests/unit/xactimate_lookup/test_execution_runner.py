@@ -39,8 +39,15 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
 )
 from estimate_extractor.xactimate_lookup.execution_runner import (
     OBSERVED_MAPPING_STATE,
+    SEARCH_TYPE_COMPACT_GENERATED_PHRASE,
+    SEARCH_TYPE_EXACT_DESCRIPTION,
+    SEARCH_TYPE_NORMALIZED_DESCRIPTION,
+    SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL,
+    SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION,
     UnsafeLookupRouting,
+    _description_first_search_attempts,
     _find_trusted_observed_mapping,
+    _find_verified_search_description,
     _observed_mappings_path,
     _task_to_lookup_plan,
     run_execution_plan,
@@ -77,11 +84,16 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
     the existing FakeXactimateAdapter, with fully controllable behavior
     per test."""
 
-    def __init__(self, *args, verified_groups=None, trust_state="VERIFIED", raise_on_group=None, **kwargs):
+    def __init__(self, *args, verified_groups=None, trust_state="VERIFIED", raise_on_group=None, position_warnings=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.verified_groups = verified_groups if verified_groups is not None else None  # None = verify everything
         self.trust_state = trust_state
         self.raise_on_group = raise_on_group or set()
+        #: Phase 5.7: name -> GROUP_POSITION_WARNING string, simulating
+        #: ensure_group() creating a group that lands at an unexpected
+        #: nesting depth (ancestry is informational-only, never a
+        #: reason to stop the group).
+        self.position_warnings = position_warnings or {}
         self.ensure_group_calls: list[str] = []
         self.ensure_group_parent_calls: list[str | None] = []
         self.select_group_calls: list[str] = []
@@ -89,11 +101,12 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
         self.snapshot_calls = 0
         self.verify_commit_calls = 0
 
-    def ensure_group(self, name: str, *, parent_group_name: str | None = None) -> None:
+    def ensure_group(self, name: str, *, parent_group_name: str | None = None) -> str | None:
         if name in self.raise_on_group:
             raise AdapterError(f"Simulated failure creating group {name!r}.")
         self.ensure_group_calls.append(name)
         self.ensure_group_parent_calls.append(parent_group_name)
+        return self.position_warnings.get(name)
 
     def select_group(self, name: str) -> None:
         self.select_group_calls.append(name)
@@ -173,6 +186,38 @@ def test_happy_path_all_groups_verified_all_tasks_completed(tmp_path, phrase_rul
     assert (reports_dir / "execution_report.csv").exists()
     assert (reports_dir / "unresolved_row_summary.json").exists()
     assert (reports_dir / "structured_audit.json").exists()
+
+
+def test_group_position_warning_is_recorded_but_never_blocks_the_group(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.7 product-requirement change: a group whose ensure_group()
+    call returns a GROUP_POSITION_WARNING (created successfully, but
+    landed at an unexpected nesting depth) must still select, verify,
+    and execute its tasks completely normally -- ancestry is
+    informational-only. The warning is recorded on the group for the
+    final report/UI, but never turns into a task-level stop reason or a
+    group-level failure."""
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(
+        dropdown_script=_dropdown_script(*plan.tasks),
+        position_warnings={"Fence": "GROUP_POSITION_WARNING: 'Fence' nested under 'Dwelling Roof' instead of the root."},
+    )
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.run_state == RUN_STATE_COMPLETED
+    assert all(t.state == TASK_COMPLETED for t in result.tasks)
+    fence_group = result.group_by_id("Fence")
+    roof_group = result.group_by_id("Dwelling Roof")
+    assert fence_group.state == GROUP_COMPLETED
+    assert fence_group.position_warning is not None
+    assert "GROUP_POSITION_WARNING" in fence_group.position_warning
+    assert roof_group.state == GROUP_COMPLETED
+    assert roof_group.position_warning is None  # no warning for the correctly-placed group
+    # tasks still landed in (and only in) their own intended named group
+    fence_tasks = [t for t in result.tasks if t.section_name == "Fence"]
+    assert len(fence_tasks) >= 1
+    assert adapter.select_group_calls.count("Fence") >= 1
 
 
 def test_group_verification_failure_marks_only_that_groups_tasks_review_required(tmp_path, phrase_rules, ranking_config):
@@ -680,6 +725,227 @@ def test_find_trusted_observed_mapping_refuses_unverified_and_missing_entries(tm
     assert _find_trusted_observed_mapping(tmp_path, "line_unverified") is None
     assert _find_trusted_observed_mapping(tmp_path, "line_verified") == ("RFG", "FELT15")
     assert _find_trusted_observed_mapping(tmp_path, "line_verified_no_cat_sel") is None
+
+
+# ---------------------------------------------------------------------
+# Phase 5.7A: DESCRIPTION = what we search for, CAT/SEL = what we
+# learn/select after Xactimate returns results. A live incident
+# (SFG/GUTA -- the group-verification probe's own hardcoded disposable
+# test item, unrelated to any PDF row -- mistaken for an unmapped row's
+# search input) prompted tracing description_first_search_attempts()
+# end-to-end and locking its ordering down with these tests.
+# ---------------------------------------------------------------------
+
+
+def test_find_verified_search_description_refuses_unverified_and_missing_entries(tmp_path):
+    """Companion to _find_trusted_observed_mapping()'s own test: the
+    DESCRIPTION-evidence reader must apply the exact same verified-only
+    gate, and must refuse an entry with no description recorded."""
+    path = _observed_mappings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "line_unverified": {
+                    "verified": False,
+                    "verified_search_description": "Gutter / downspout - aluminum - up to 5\"",
+                },
+                "line_verified": {
+                    "verified": True,
+                    "verified_search_description": "Gutter / downspout - aluminum - up to 5\"",
+                },
+                "line_verified_no_description": {
+                    "verified": True,
+                    "verified_search_description": None,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _find_verified_search_description(tmp_path, "line_unverified") is None
+    assert _find_verified_search_description(tmp_path, "line_verified") == "Gutter / downspout - aluminum - up to 5\""
+    assert _find_verified_search_description(tmp_path, "line_verified_no_description") is None
+    assert _find_verified_search_description(tmp_path, "line_never_seen") is None
+
+
+def test_unmapped_task_never_searches_cat_sel_first_even_with_a_verified_mapping(tmp_path, phrase_rules):
+    """Requirement 1: began_unmapped=True must not search CAT/SEL first
+    even when a previous run's VERIFIED CAT/SEL mapping exists for this
+    exact line item -- description attempts always come first; CAT/SEL
+    is the LAST attempt in the sequence, never the first."""
+    path = _observed_mappings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "line_0001": {
+                "verified": True,
+                "observed_category": "SFG", "observed_selector": "GUTA",
+                "verified_search_description": None,  # no learned description yet, only CAT/SEL
+            },
+        }),
+        encoding="utf-8",
+    )
+    task = _unmapped_task("task_line_0001", "line_0001", "Exterior", 0, qty=200.0, unit="LF")
+    task.description = 'R&R Gutter - aluminum - up to 5"'
+
+    attempts = _description_first_search_attempts(task, phrase_rules, tmp_path)
+
+    assert attempts[0][0] != SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL
+    assert attempts[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
+    assert attempts[0][1].search_input == 'R&R Gutter - aluminum - up to 5"'
+    assert attempts[0][1].path == "description_search"
+    # CAT/SEL is present, but strictly last, and it's the only CAT/SEL entry
+    cat_sel_attempts = [a for a in attempts if a[0] == SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL]
+    assert cat_sel_attempts == [attempts[-1]]
+    assert attempts[-1][1].path == "trusted_cat_sel"
+
+
+def test_verified_search_description_is_preferred_as_first_description_attempt(tmp_path, phrase_rules):
+    """Requirement 2: a learned verified_search_description is tried
+    FIRST (still as a description-search attempt, never CAT/SEL) --
+    ahead of the raw exact source description -- since it's already
+    proven to work for this exact row in a previous verified run."""
+    path = _observed_mappings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "line_0001": {
+                "verified": True,
+                "observed_category": "SFG", "observed_selector": "GUTA",
+                "verified_search_description": "Gutter / downspout - aluminum - up to 5\"",
+            },
+        }),
+        encoding="utf-8",
+    )
+    task = _unmapped_task("task_line_0001", "line_0001", "Exterior", 0, qty=200.0, unit="LF")
+    task.description = 'R&R Gutter - aluminum - up to 5"'
+
+    attempts = _description_first_search_attempts(task, phrase_rules, tmp_path)
+
+    assert attempts[0][0] == SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION
+    assert attempts[0][1].search_input == "Gutter / downspout - aluminum - up to 5\""
+    assert attempts[0][1].path == "description_search"
+    # the raw exact description is still tried afterward (a real, distinct attempt)
+    assert any(a[0] == SEARCH_TYPE_EXACT_DESCRIPTION for a in attempts[1:])
+
+
+def test_cat_sel_fallback_cannot_occur_before_description_attempts(tmp_path, phrase_rules, ranking_config):
+    """Requirement 4, end-to-end: even when a verified CAT/SEL mapping
+    exists, run_execution_plan() must exhaust every description attempt
+    (no_results each time) before ever calling search_by_category_
+    selector -- and the CAT/SEL search must be the LAST adapter search
+    call made for this task, never the first."""
+    path = _observed_mappings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "line_unmapped": {
+                "verified": True,
+                "observed_category": "RFG", "observed_selector": "FELT15",
+                "verified_search_description": None,
+            },
+        }),
+        encoding="utf-8",
+    )
+    plan = _plan_mapped_and_unmapped()
+    # every description-search attempt for the unmapped task returns
+    # nothing; only the trusted CAT/SEL search (added by the adapter
+    # script below) returns a real result.
+    script = {
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        "RFG FELT15": [_felt_dropdown()],
+    }
+    adapter = _adapter_with_test_project(dropdown_script=script)
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.task_by_id("task_unmapped").state == TASK_COMPLETED
+    search_desc_calls = [c for c in adapter.log.calls if c[0] == "search_by_description"]
+    search_cs_calls = [c for c in adapter.log.calls if c[0] == "search_by_category_selector"]
+    # every description attempt (exact, normalized, compact phrase --
+    # no learned description was available) was tried, all returning no
+    # results, BEFORE the one CAT/SEL search that finally succeeded for
+    # the unmapped task. ("RFG", "3TAB") is the OTHER (mapped/approved)
+    # task's own, unrelated, always-CAT/SEL search -- unaffected by
+    # this phase, expected to still happen.
+    assert len(search_desc_calls) >= 1
+    assert ("search_by_category_selector", ("RFG", "FELT15"), {}) in search_cs_calls
+    # every description search call happened strictly before the
+    # unmapped task's own CAT/SEL fallback call -- only search_by_
+    # description exists for the unmapped task, so this index comparison
+    # unambiguously proves the ordering for THIS task, not the other one.
+    all_calls = [c for c in adapter.log.calls if c[0] in ("search_by_description", "search_by_category_selector")]
+    felt15_index = all_calls.index(("search_by_category_selector", ("RFG", "FELT15"), {}))
+    desc_indices = [i for i, c in enumerate(all_calls) if c[0] == "search_by_description"]
+    assert desc_indices and all(i < felt15_index for i in desc_indices)
+
+
+def test_review_approved_task_still_uses_trusted_cat_sel_directly(phrase_rules):
+    """Requirement 5: a normal already-mapped/approved row (NOT
+    began_unmapped) is completely unchanged by Phase 5.7A -- it still
+    routes straight to the trusted CAT/SEL path via
+    _task_to_lookup_plan(), never through the description-first
+    sequence at all."""
+    task = _task("task_mapped", "line_mapped", "Dwelling Roof", "RFG", "3TAB", 0, qty=10.0, unit="SQ")
+
+    lookup_plan, actual_strategy, reason = _task_to_lookup_plan(task, phrase_rules)
+
+    assert lookup_plan.path == LOOKUP_PATH_TRUSTED
+    assert lookup_plan.search_input == "RFG 3TAB"
+    assert actual_strategy == LOOKUP_PATH_TRUSTED
+
+
+def test_gutter_and_downspout_produce_distinct_tasks_that_may_share_a_verified_description(tmp_path, phrase_rules):
+    """Requirement 6: two textually different source rows (gutter,
+    downspout) generate their own distinct search-attempt sequences
+    (never merged into one task), but -- once a verified run has
+    established a shared Xactimate-catalog description for one of
+    them -- a LATER run of the OTHER exact row can still only reuse a
+    verified_search_description recorded under ITS OWN line_item_id
+    (Phase 5.7A does not invent cross-row signature matching, which
+    would risk pulling in an unrelated item's description); each
+    family independently converges on the same real catalog wording
+    via its own exact-description attempt, as confirmed live (both
+    line_0001 and line_0032's attempt 1 -- their own raw source
+    descriptions -- separately AUTO_SELECT the same SFG/GUTA "Gutter /
+    downspout" catalog entry)."""
+    gutter = _unmapped_task("task_line_0001", "line_0001", "Exterior", 0, qty=200.0, unit="LF")
+    gutter.description = 'R&R Gutter - aluminum - up to 5"'
+    downspout = _unmapped_task("task_line_0032", "line_0032", "Rear Elevation", 1, qty=24.0, unit="LF")
+    downspout.description = 'R&R Downspout - aluminum - up to 5"'
+
+    gutter_attempts = _description_first_search_attempts(gutter, phrase_rules, tmp_path)
+    downspout_attempts = _description_first_search_attempts(downspout, phrase_rules, tmp_path)
+
+    # distinct tasks, distinct own-description search attempts
+    assert gutter_attempts[0][1].search_input == 'R&R Gutter - aluminum - up to 5"'
+    assert downspout_attempts[0][1].search_input == 'R&R Downspout - aluminum - up to 5"'
+    assert gutter_attempts[0][1].search_input != downspout_attempts[0][1].search_input
+
+    # after gutter's run is verified with a learned catalog description...
+    path = _observed_mappings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "line_0001": {
+                "verified": True,
+                "observed_category": "SFG", "observed_selector": "GUTA",
+                "verified_search_description": "Gutter / downspout - aluminum - up to 5\"",
+            },
+        }),
+        encoding="utf-8",
+    )
+    gutter_attempts_2 = _description_first_search_attempts(gutter, phrase_rules, tmp_path)
+    downspout_attempts_2 = _description_first_search_attempts(downspout, phrase_rules, tmp_path)
+
+    # line_0001's own future runs now prefer its learned description first
+    assert gutter_attempts_2[0][0] == SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION
+    assert gutter_attempts_2[0][1].search_input == "Gutter / downspout - aluminum - up to 5\""
+    # line_0032 is a DIFFERENT line_item_id -- it is never given line_0001's
+    # learned description; it still starts from its own raw description
+    assert downspout_attempts_2[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
+    assert downspout_attempts_2[0][1].search_input == 'R&R Downspout - aluminum - up to 5"'
     assert _find_trusted_observed_mapping(tmp_path, "line_never_seen") is None
 
 

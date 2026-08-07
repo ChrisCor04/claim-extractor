@@ -769,6 +769,35 @@ def test_group_name_matches_is_whitespace_and_case_insensitive():
     assert adapter._group_name_matches("Front Elevation", "Dwelling Roof") is False
 
 
+def test_group_name_matches_rejects_a_different_sibling_sharing_one_word():
+    """Live-caught (Phase 5.7A): a naive whole-string fuzzy ratio lets
+    "Rear Elevation"/"Left Elevation" match an EXISTING, genuinely
+    different "Front Elevation" row -- both score above the fuzzy
+    threshold purely because "elevation" dominates the blended ratio,
+    regardless of the leading word being completely different. This
+    let ensure_group()/select_group() silently target the wrong group.
+    Every word of a multi-word name must now individually clear the
+    threshold too, not just the blended whole-string ratio."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    assert adapter._group_name_matches("Front Elevation", "Rear Elevation") is False
+    assert adapter._group_name_matches("Front Elevation", "Left Elevation") is False
+    # the correct name itself, and real OCR noise on it, must still match
+    assert adapter._group_name_matches("Front Elevation", "Front Elevation") is True
+    assert adapter._group_name_matches("frontelevaion", "Front Elevation") is True  # dropped 't'
+    assert adapter._group_name_matches("eteior", "Exterior") is True  # dropped leading 'x', per existing calibration
+
+
+def test_matching_group_rows_does_not_cross_match_elevation_siblings():
+    """The row-level consumer of _group_name_matches() must reflect the
+    same fix: searching for a group that ISN'T in the tree yet must not
+    resolve to a different, existing sibling with a similar name."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = ["TEST", "Exterior", "Dwelling Roof", "Front Elevation", "Fence"]
+    assert adapter._matching_group_rows(rows, "Rear Elevation") == []
+    assert adapter._matching_group_rows(rows, "Left Elevation") == []
+    assert adapter._matching_group_rows(rows, "Front Elevation") == [3]
+
+
 def test_find_group_row_returns_first_exact_substring_match_index():
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     rows = ["TEST", "Utility Room", "Dwelling Roof", ""]
@@ -1009,14 +1038,15 @@ def test_ensure_group_resets_stickiness_before_creating_but_not_for_a_noop():
     assert reset_calls == [], "a no-op call must never touch the live UI, including the stickiness reset"
 
 
-def test_ensure_group_raises_when_new_group_indentation_does_not_match_a_sibling(monkeypatch):
-    """Accidental-nesting detection (Stage 7): even though the intended
-    parent (root) was independently re-verified and the group WAS
-    created and IS found by name afterward, a pixel-indentation mismatch
-    against an existing top-level group must still refuse the result --
-    "the group exists" is not the same claim as "the group exists
-    beneath the intended parent." This must fail BEFORE any task can be
-    executed against the group."""
+def test_ensure_group_returns_position_warning_when_new_group_indentation_does_not_match_a_sibling(monkeypatch):
+    """Phase 5.7 product-requirement change: group ancestry/nesting depth
+    is no longer a blocking safety condition. Even though the newly
+    created group's indentation doesn't match an existing top-level
+    group's (the same live-caught mis-nesting signal Stage 7 originally
+    hard-failed on), the group WAS created and IS uniquely findable by
+    name -- ensure_group() must succeed (return, not raise) and instead
+    return a GROUP_POSITION_WARNING string carrying the ancestry
+    evidence as informational-only."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     _mock_ensure_group_scaffolding(
         monkeypatch, adapter,
@@ -1038,9 +1068,10 @@ def test_ensure_group_raises_when_new_group_indentation_does_not_match_a_sibling
 
     monkeypatch.setattr(adapter, "_group_tree_row_indent_x", fake_indent)
 
-    from estimate_extractor.xactimate_lookup.adapter import AdapterError
-    with pytest.raises(AdapterError, match="indentation"):
-        adapter.ensure_group("Front Elevation")
+    warning = adapter.ensure_group("Front Elevation")
+    assert warning is not None
+    assert "GROUP_POSITION_WARNING" in warning
+    assert "Front Elevation" in warning
 
 
 def test_ensure_group_does_not_raise_when_new_group_indentation_matches_a_sibling(monkeypatch):
@@ -1063,7 +1094,7 @@ def test_ensure_group_does_not_raise_when_new_group_indentation_matches_a_siblin
     monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
     monkeypatch.setattr(adapter, "_group_tree_row_indent_x", lambda image, header, row_index: 39)  # same for every row
 
-    adapter.ensure_group("Dwelling Roof")  # must not raise
+    assert adapter.ensure_group("Dwelling Roof") is None  # no position warning when correctly placed
 
 
 def test_verify_group_path_true_for_a_confirmed_sibling(monkeypatch):
@@ -1182,6 +1213,130 @@ def test_verify_group_never_raises_on_unexpected_error(monkeypatch):
 
     monkeypatch.setattr(adapter, "verify_application", _boom)
     assert adapter.verify_group("Dwelling Roof") is False
+
+
+# ---------------------------------------------------------------------
+# Phase 5.7: group ancestry/nesting depth is no longer a blocking safety
+# condition -- what still must fail closed is genuine AMBIGUITY (more
+# than one row matching a name) and an unlocatable/unverifiable target.
+# ---------------------------------------------------------------------
+
+
+def test_ensure_group_raises_on_ambiguous_existing_name(monkeypatch):
+    """The no-op ("already exists") branch must still fail closed when
+    TWO rows match the requested name -- silently reusing the first one
+    found could write real line items into the wrong group."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Fence", "Fence"])
+
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+    with pytest.raises(AdapterError, match="2 groups"):
+        adapter.ensure_group("Fence")
+
+
+def test_select_group_raises_on_ambiguous_name(monkeypatch):
+    """select_group() must refuse to guess which of two same-named rows
+    is the intended target."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Fence", "Fence"])
+
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+    with pytest.raises(AdapterError, match="2 groups"):
+        adapter.select_group("Fence")
+
+
+def test_verify_group_returns_false_on_ambiguous_name(monkeypatch):
+    """verify_group() promises to never raise -- an ambiguous name must
+    still resolve to a safe False, not propagate the AdapterError."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Fence", "Fence"])
+
+    assert adapter.verify_group("Fence") is False
+
+
+def test_select_group_succeeds_on_a_uniquely_nested_group(monkeypatch):
+    """A group that exists but landed at an unexpected nesting depth
+    (Phase 5.7's whole point) must still be selectable purely by name --
+    select_group() never looks at indentation at all."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    # "Front Elevation" nested under "Dwelling Roof" -- still the only
+    # row matching its name.
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Exterior", "Dwelling Roof", "Front Elevation"])
+    clicked = []
+    monkeypatch.setattr(adapter, "_group_tree_row_xy", lambda header, row_index: (row_index, row_index))
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: clicked.append((x, y)))
+
+    adapter.select_group("Front Elevation")  # must not raise
+
+    assert clicked == [(3, 3)]  # clicked row 3, the nested group's own row
+
+
+def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
+    """_verify_group_once() must locate and probe a nested group purely
+    by name -- ancestry/indentation is never consulted in the
+    probe-commit-and-check verification path."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Dwelling Roof", "Front Elevation"])
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+
+    probed_index = {}
+    call_state = {"n": 0}
+
+    def fake_subtotal_seq(image, header, row_index):
+        probed_index["index"] = row_index
+        call_state["n"] += 1
+        return 0 if call_state["n"] == 1 else 200  # before, then after the probe commit
+
+    monkeypatch.setattr(adapter, "_group_subtotal_pixel_count", fake_subtotal_seq)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    monkeypatch.setattr(
+        adapter, "capture_dropdown",
+        lambda: [DropdownResult(raw_text="SFG GUTA", row_position=0, category="SFG", selector="GUTA")],
+    )
+    monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
+    monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
+    monkeypatch.setattr(adapter, "select_candidate", lambda target: None)
+    monkeypatch.setattr(adapter, "enter_quantity", lambda qty: None)
+    monkeypatch.setattr(adapter, "commit_item", lambda: None)
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 0)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: None)
+
+    assert adapter._verify_group_once("Front Elevation") is True
+    assert probed_index["index"] == 2  # the nested group's own row, found purely by name
 
 
 def test_cleanup_probe_item_preserves_pre_existing_rows(monkeypatch):
