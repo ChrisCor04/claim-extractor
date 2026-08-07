@@ -654,6 +654,7 @@ class CapabilityFlags:
     resume_available: bool
     production_project_allowed: bool
     unattended_mode_allowed: bool
+    multi_group_creation_available: bool
     notes: list
 
 
@@ -713,6 +714,17 @@ def compute_capability_flags(
         "to start the session and resolve review-required/no-match rows; label this 'Safe Autofill', never 'unattended'."
     )
 
+    multi_group_creation_available = bool(
+        live_adapter_available and getattr(adapter, "multi_group_creation_available", False)
+    )
+    notes.append(
+        "multi_group_creation_available is False on every adapter to date -- live investigation (Phase 5.5C) "
+        "found Xactimate's New Group command reliably creates exactly TWO groups as siblings per session, "
+        "not more; the Build Estimate UI restricts a plan to one group at a time until this changes."
+        if not multi_group_creation_available else
+        "multi_group_creation_available is True -- validated N>2 sibling group creation for this adapter."
+    )
+
     return CapabilityFlags(
         planning_available=True,
         live_adapter_available=live_adapter_available,
@@ -721,5 +733,6 @@ def compute_capability_flags(
         resume_available=True,
         production_project_allowed=PRODUCTION_PROJECT_ALLOWED,
         unattended_mode_allowed=UNATTENDED_MODE_ALLOWED,
+        multi_group_creation_available=multi_group_creation_available,
         notes=notes,
     )

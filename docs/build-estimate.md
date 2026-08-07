@@ -738,3 +738,322 @@ quantity entry, commit) whose own verification correctly declined to
 over-trust a genuinely uncertain OCR read. Future sessions doing rapid
 back-to-back live Execute cycles against the same project may want to
 add a short settle delay between runs if this recurs.
+
+## Phase 5.5: minimal TEST-only unmapped-row execution
+
+Allowed Build Estimate to include/attempt rows missing CAT/SEL (but
+with a real description/quantity/unit/resolved group) for the exact
+`TEST` project only, via the existing description-first lookup path --
+no architecture redesign, no change to extraction/normalization/
+ordinary-mapping/ranking/units/adapter/cleanup/pause-resume/reports/
+approval/Safe-Autofill behavior for any other project. Added
+`LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST`, `TEST_ONLY_PROJECT_NAME`,
+`UnmappedRowEligibility`/`classify_unmapped_rows()`, and
+`build_execution_plan(..., include_unmapped_rows=False,
+xactimate_project_name=None)` to `execution_plan.py`. `orchestrator.py`
+gained `LookupOutcome.populated_fields`. The `aranda-insurance-v3`
+project-list-visibility question raised alongside this phase turned out
+to be unrelated to this work.
+
+## Phase 5.5A: fix Build Estimate UI early-return bug
+
+Live-reported (with a screenshot): the Build Estimate tab rendered
+*only* the Build button and "No approved, executable line items found"
+-- no Confirm Project section, no TEST checkbox -- for a real project
+with zero approved rows. Root cause: project confirmation rendered
+*after* an early `return` triggered by an empty plan, so a project that
+had never been confirmed could never reach the code that would let it
+be confirmed. Fixed by reordering `build_estimate_panel.py`'s render
+path to: project name input -> Confirm button -> confirmation/
+capability/display status -> (if TEST) checkbox + counts -> Build
+button -> plan summary -> Preview/Execute, with the empty-plan early
+return moved to after all of that.
+
+## Phase 5.5B: fix description-first routing and group hierarchy
+
+The first real 42-row live run (`aranda-insurance-v3`, TEST project)
+surfaced three problems: some unmapped rows were searched via CAT/SEL
+instead of description-first, very few rows progressed, and Xactimate
+built a malformed *nested* group hierarchy (`TEST > Exterior > Roof >
+Front Elevation > Fencing`) instead of four top-level siblings.
+
+**Root cause 1 (routing):** the process running the UI was a stale
+Streamlit server that predated this phase's own code -- not a routing
+bug. Confirmed by comparing the process start time against commit
+timestamps.
+
+**Root cause 2 (hierarchy, partial fix):** `ensure_group()` always
+right-clicked tree row 0, trusting it was always the project root by
+*position* alone. `snapshot_group_names()`'s row 0 is a hardcoded label
+(never actually OCR'd), so when the group tree's scroll position
+drifted, row 0 could genuinely be some other group, and "New" created
+the requested group as a child of that wrong row. Fixed: the intended
+parent is located *by name*, then independently re-OCR'd immediately
+before the context menu opens, refusing (`AdapterError`, "drifted") if
+it doesn't match. This fix is real and stayed in place, but reproducing
+the live nesting again afterward proved it was **not the actual cause**
+-- see Phase 5.5C.
+
+**Objective 1 (enforced):** `_task_to_lookup_plan()` now routes
+strictly on `task.lookup_strategy`, never inferring from whichever of
+category/selector/description happens to be populated -- a task whose
+strategy is `test_description_first` raises `UnsafeLookupRouting`
+rather than silently using stale CAT/SEL values.
+
+**Objective 3 (diagnostics):** added `RunDiagnostics`/`diagnose_run()`
+-- exact, non-guessed accounting of what a run did and why it stopped,
+built only from persisted state (available even after a UI rerun lost
+its in-memory state).
+
+**Objective 4 (UI):** added "Reset unfinished TEST execution" (resets
+non-terminal tasks to pending, never touches completed ones) and
+"Rebuild TEST plan from current PDF" (discards all task state and
+starts over) buttons, shown only when TEST is the confirmed project.
+
+**Validation:** a controlled single-group live trial (`Exterior`, one
+real task) confirmed routing enforcement and diagnostics end to end --
+deliberately not re-triggering the still-unexplained multi-group
+nesting issue, which Phase 5.5C picked up next. 733 tests passed; zero
+wrong-group writes.
+
+## Phase 5.5C: solve deterministic top-level group creation
+
+**Scope:** solve (or explicitly fail safe on) the one blocking defect
+left by 5.5B -- Xactimate nesting multiple new groups instead of
+placing them as siblings under the project root. Everything else
+(extraction, description-first routing, CAT/SEL behavior, ranking,
+quantities, units, item commit logic, cleanup verification, execution
+reporting, approval behavior, production capability flags) was
+explicitly out of scope and not touched.
+
+### Context-menu inventory (Stage 2)
+
+UIA's `CurrentName` on this Telerik tree control's context-menu items
+is a generic, unusable `'Core.Sys.Windows.ContextMenuController'` for
+every entry. Real labels required OCR-cropping the popup's own captured
+image at each item's UIA bounding rect (converted to popup-client-
+relative coordinates). Full 26-item inventory for a group-tree row
+right-click, confirmed by OCR:
+
+```
+[0] Cut               [9]  <sep>              [18] Dimension
+[1] Copy               [10] Filter Options...  [19] <sep>
+[2] Paste               [11] Tree View (✓)     [20] Grouping, (disabled)
+[3] <sep>              [12] List View          [21] Global Changes...
+[4] Select >           [13] Grouping Selection>[22] Global Item Sort by >
+[5] Deselect >          [14] <sep>             [23] <sep>
+[6] <sep>              [15] New...             [24] Save Macro...
+[7] Expand >            [16] Edit...            [25] Retrieve Macro...
+[8] Collapse >          [17] Delete...
+```
+
+`[13] "Grouping Selection >"` opens a small Single/Multiple submenu --
+row *selection mode*, unrelated to group hierarchy; ruled out. `[16]
+"Edit..."` opens a "Group Info" dialog (tabs: Edit Grouping / Dimensions
+/ Variables) whose Edit Grouping tab exposes only Name and Coverage --
+no parent/move field; ruled out as a Stage 6 restructure mechanism.
+`[17] "Delete..."` opens a previously-undocumented **"Delete Options"**
+dialog (radio: "Grouping member(s)" [default] / "Line items only", OK/
+Cancel) -- now the documented deletion path for this codebase's future
+live testing.
+
+### New Group dialog (Stage 3)
+
+Fields: Name (text), Coverage (dropdown, default "Use Price List
+Default" in the create-time variant seen), and three buttons whose
+screen positions were pixel-identified: Append, Insert, Attach. None of
+the three changed the outcome in isolated trials -- see the mechanism
+below.
+
+### The actual mechanism (Stages 3-4)
+
+Confirmed (reconfirming Phase 5.5B's live finding under controlled,
+single-variable trials): Xactimate's "New Group" command attaches the
+new group to whichever group was **most recently created in the
+session** -- independent of which row is right-clicked/selected
+beforehand (even the *independently re-verified* root row), independent
+of which of the three dialog buttons is used, and unaffected by an
+intervening save.
+
+**State-reset hypotheses tried** (of the 15 listed in this phase's
+task spec; not all were exhaustively cycle-tested once a working lead
+was found and then found to have a hard limit):
+
+| Hypothesis | Result |
+|---|---|
+| Switch to Components tab and back to Items | **Fixes exactly the 2nd group of a session** -- two groups created back to back with this reset in between landed as true root siblings, confirmed by OCR and by an independent pixel-indentation measurement. Does **not** fix a 3rd+ group in the same session -- reproduced twice. |
+| Navigate away (Sketch) and back to Estimate Items | No effect on the 3rd-group case (tried after the tab-switch fix was shown insufficient). |
+| Applying the tab-switch reset twice in a row before the 3rd group | No effect -- same nesting result. |
+| Save between creations (Phase 5.5B) | Already disproven; not re-tried. |
+
+The 3rd (and 4th) group tested did not nest progressively deeper under
+each other (which would indicate strict "most-recently-created"); both
+nested directly under the *2nd* group specifically. The exact mechanism
+behind this specific pattern was not identified within this session's
+scope -- see "Remaining blocker" below.
+
+### Alternative mechanisms considered (Stages 5-6)
+
+`[16] "Edit..."` was the only alternative-view lead found (see above,
+ruled out -- no move/reparent field). No other grouping manager, room/
+component grouping dialog, keyboard shortcut, import/template, or
+grouping-setup screen was found via the context menu, toolbar, or
+left-nav during this investigation. Drag-and-drop was deliberately
+**not** attempted live -- the task's own guidance ("do not implement
+blind drag-and-drop based only on cached coordinates") and this
+session's time budget both argued against it; it remains an untried,
+plausible Stage 6 lead for a future session.
+
+### Ancestry verification implemented (Stage 7)
+
+Two new `WindowsXactimateAdapter` methods:
+
+- `_group_tree_row_indent_x(image, header_pos, row_index)` -- returns
+  the x-pixel of a row's folder-icon left edge, independent of OCR
+  text. Two live bugs fixed before this was trustworthy: (1) a
+  *selected* row's highlight border reads as a false `indent_x=0` --
+  filtered out by requiring a minimum vertical ink-run
+  (`_GROUP_TREE_ICON_MIN_INK_RUN = 4`, vs. the border's ~2px); (2) a row
+  *with children* shows an extra expand-arrow glyph that shifts a naive
+  scan's start point -- fixed by starting the scan past the arrow's
+  zone (`_GROUP_TREE_ICON_SCAN_START_X = 30`). After both fixes: two
+  true siblings (one with, one without an expand arrow) read identical
+  indent; a nested child reads a strictly greater indent.
+- `verify_group_path(group_name, *, parent_group_name=None) -> bool` --
+  read-only. True only if the name matches *exactly one* row (refuses
+  on duplicate-name ambiguity), the intended parent is found, and the
+  indentation check confirms the parent/child relationship (siblings:
+  identical indent to another confirmed top-level row; explicit
+  non-root parent: strictly greater indent than the parent's own row).
+  Never raises.
+
+`ensure_group()` now calls `_reset_group_creation_stickiness()`
+(components-tab-and-back) before every creation (never for a no-op),
+and after creation independently compares the new row's indent against
+an existing top-level group's -- **raising before returning** if they
+don't match, rather than silently reporting success on a group nested
+under the wrong parent.
+
+### Lifecycle trials (Stage 8) -- scoped to what's proven
+
+Per this phase's own completion gate ("do not claim sibling-group
+support unless four groups [are] created as root siblings... five
+complete lifecycle trials pass"), and since the mechanism above only
+reliably handles **two** groups per session, Stage 8 was run at the
+scope actually proven: **5/5 clean lifecycle trials** creating
+`Exterior` + `Dwelling Roof` as TEST siblings, verifying both via
+`verify_group_path()`, deleting both, and reconciling to the empty-TEST
+baseline -- all five trials clean, zero manual correction. A sixth,
+adversarial trial confirmed the *safety net* works as intended: adding
+a 3rd group (`Front Elevation`) correctly raised `AdapterError`
+("indentation... does not match") **before** any task could execute
+against it, and cleanup + reconciliation still succeeded afterward.
+
+### Two-group item placement (Stage 9)
+
+Created `Exterior` + `Dwelling Roof`, committed one disposable `SFG/
+GUTA` probe item into each via `select_group()` + the standard search/
+select/commit path. Each group's own Subtotal cell changed only when
+that group received its item -- the other group's Subtotal stayed
+exactly unchanged both times, confirming row isolation. Cleaned up both
+items and both groups; final reconciliation against the empty-TEST
+baseline: `ok=True`, zero mismatches.
+
+One **out-of-scope observation, not fixed**: the sidebar's Grand Total
+display lagged by exactly one commit in this trial (read `$0.00` right
+after the 1st item, `$11.56` right after the 2nd, never `$23.12`, even
+after an explicit save and several seconds' wait) -- `_read_grand_total_
+text()`'s own docstring already documents it as OCR text meant for
+relative comparison only, never trusted as an absolute value, so this
+is a pre-existing, already-acknowledged limitation, not a regression.
+Final reconciliation (which does not rely on that single reading) was
+unaffected and passed.
+
+### Multi-group execution stays enabled -- the existing per-group safety net already covers it (Stage 10, revised)
+
+Since N>2 sibling creation was not solved, `multi_group_creation_
+available` stays `False` on every adapter (a new `XactimateAdapter`
+base-class attribute, following the same pattern as `supports_live_
+execution`; threaded through `CapabilityFlags`/`compute_capability_
+flags()` in `service.py`). `build_execution_plan()` gained
+`restrict_to_group_id: str | None = None`.
+
+**Initial version of this Stage forced one-group-at-a-time and disabled
+Execute for any multi-group plan** -- live feedback (this same session)
+correctly pointed out that this added friction without adding safety:
+`run_execution_plan()`'s group loop (`execution_runner.py`) already
+catches an `ensure_group()` ancestry failure *per group*
+(`_ensure_select_verify_group()` catches the `AdapterError`, marks that
+group `GROUP_FAILED` and its tasks `TASK_REVIEW_REQUIRED` with a clear
+`stop_detail`, and `continue`s to the next group) rather than aborting
+the whole run or writing to the wrong group. So a multi-group plan was
+*already* safe to Execute directly: groups 1-2 complete normally
+(the state-reset mechanism handles exactly those two), and any group
+beyond that comes back Review Required instead of corrupting anything.
+Forcing a manual one-group-at-a-time rebuild before every Execute
+added a step the underlying safety net made unnecessary.
+
+**Revised, current behavior:** a plan spanning more than one group with
+`multi_group_creation_available=False` shows an *informational* note
+("This plan spans N groups... Execute will run all groups; any group
+beyond the 2nd will safely come back as Review Required...") -- Execute
+is **never disabled** by group count. An optional, collapsed "Build a
+plan for just one group" section still offers the group selector +
+"Build one-group plan for the selected group" button, for a user who
+deliberately wants to target one group (e.g. to avoid spending time on
+groups already known to fail) -- but it is a convenience, never forced.
+
+### Files changed
+
+`src/estimate_extractor/xactimate_lookup/windows_adapter.py` (the
+stickiness-reset fix, `_group_tree_row_indent_x`, `verify_group_path`,
+`ensure_group()`'s ancestry check, `multi_group_creation_available =
+False`), `adapter.py` (base-class `multi_group_creation_available`
+attribute), `execution_plan.py` (`restrict_to_group_id`, `_row_group_id`
+helper), `service.py` (`CapabilityFlags.multi_group_creation_available`,
+`compute_capability_flags()`), `ui/components/build_estimate_panel.py`
+(capability-flags row, informational multi-group note, optional
+one-group builder -- Execute is never gated on group count). Test
+files: `tests/unit/xactimate_lookup/test_windows_adapter.py`,
+`test_execution_plan.py`, `test_service.py`,
+`tests/integration/test_build_estimate_ui.py` (16 new tests; full
+suite: 749 passed, 12 skipped, 1 pre-existing unrelated failure
+confirmed via `git stash` to predate this phase).
+
+### `multi_group_creation_available`: **False**
+
+### Multi-group execution workflow (current)
+
+1. Build/rebuild a plan normally (approved rows, or TEST + unmapped).
+2. If it spans more than one group, an informational note explains the
+   known 2-group limit -- Execute stays enabled regardless.
+3. Click Execute (or enable Safe Autofill first, same as any run). The
+   run proceeds group by group in source order; each group is
+   independently created/selected/verified before its tasks run.
+4. Groups 1-2 (the ones the state-reset mechanism reliably places as
+   siblings) complete normally. Any group from the 3rd onward has its
+   `ensure_group()` call fail its ancestry check *before* any task
+   executes against it -- that group's tasks are marked Review Required
+   with a `stop_detail` explaining why, and the run continues to the
+   next group. Zero wrong-group writes either way.
+5. Check "Run diagnostics" / the per-group tables after the run to see
+   exactly which groups need a follow-up (a later session, after
+   deleting the wrongly-nested groups live and re-running -- the
+   optional one-group builder is one way to target just those).
+
+### Remaining blocker
+
+The exact reason a 3rd group attaches specifically to the *2nd*
+created group (not "most recently created," which would predict
+progressive nesting; not "session root," which would predict correct
+placement) was not identified. Two state-reset strategies (tab-switch,
+navigate-away) and one intensification (double tab-switch) were tried
+and all failed identically for the 3rd group. Plausible unexplored
+leads for a future session: drag-and-drop restructure (Stage 6, not
+attempted -- see above), a closer look at whether the *dialog's own*
+remembered target differs from the tree's visual selection, or
+Xactimate process restart between group creations (explicitly out of
+scope this session per "do not close Xactimate unless project relaunch
+is explicitly safe"). Until resolved, `multi_group_creation_available`
+must stay `False` and the one-group-at-a-time fallback is the
+supported path for any plan with more than two groups.

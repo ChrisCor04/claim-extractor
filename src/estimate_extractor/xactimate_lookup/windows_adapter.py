@@ -85,6 +85,11 @@ _ANCHORS = {
     "search_button": (843, 165, 928, 186),
     "search_dropdown_arrow": (817, 165, 836, 186),
     "items_tab": (296, 78, 342, 98),
+    #: Phase 5.5C: used only by _reset_group_creation_stickiness() to
+    #: switch away from and back to the Items tab -- never used for
+    #: reading Components content itself, so a generous rect centered
+    #: on the live-verified click point (417, 88) is fine.
+    "components_tab": (384, 78, 452, 98),
     "quick_entry_cat_label": (506, 461, 535, 475),
     #: The grid header's own "Cat" column label -- unlike the Quick Entry
     #: panel's "Cat:" label (which OCR intermittently fails to detect at
@@ -531,6 +536,16 @@ class WindowsXactimateAdapter(XactimateAdapter):
     took to earn -- never silently."""
 
     supports_live_execution = True
+
+    #: Phase 5.5C: stays False. Live investigation established that
+    #: `ensure_group()`'s state-reset fix reliably creates exactly the
+    #: FIRST TWO groups of a session as true root siblings (5/5 clean
+    #: lifecycle trials -- see docs/build-estimate.md Phase 5.5C), but a
+    #: 3rd+ group reproducibly nests under the 2nd regardless of which
+    #: of three different reset strategies precedes it. Flip this only
+    #: alongside the same rigor: a real mechanism for N>2, independently
+    #: verified ancestry, and repeated clean lifecycle trials.
+    multi_group_creation_available = False
 
     def __init__(
         self,
@@ -3075,6 +3090,145 @@ class WindowsXactimateAdapter(XactimateAdapter):
         ))
         return self._ocr_text(crop, psm=7).strip()
 
+    def _reset_group_creation_stickiness(self) -> None:
+        """Not part of the abstract contract (Phase 5.5C Stage 4).
+        Xactimate's "New Group" command attaches the new group to
+        whichever group was MOST RECENTLY CREATED in the session,
+        regardless of which row is right-clicked/selected beforehand or
+        which New-Group-dialog button (Append/Insert/Attach) is used --
+        proven live in Phase 5.5B via a chain of four groups, each
+        nesting one level deeper than the last no matter what was
+        clicked, and unaffected by an intervening save.
+
+        Live-caught (Phase 5.5C Stage 4, hypothesis 4 of 15 tried):
+        switching away from the Items tab (to Components) and back
+        clears that stickiness. Reproduced live twice: two groups
+        created back-to-back with this reset in between landed as true
+        siblings directly under the root, confirmed both by OCR and by
+        an independent pixel measurement of each row's icon indent
+        (identical for both rows -- see _group_tree_row_indent_x()).
+        Without this reset, the second group nested under the first
+        every time. Safe to call unconditionally before every group
+        creation, including the first in a session (nothing to reset,
+        so it's a no-op in effect)."""
+        hwnd = self._ensure_main_window()
+        l, t, r, b = _ANCHORS["components_tab"]
+        self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
+        time.sleep(0.5)
+        self._reset_scroll_state()  # clicks back to the Items tab
+
+    #: Live-measured (Phase 5.5C Stage 7): a SELECTED row's highlight
+    #: draws a thin (~2px-tall) border across the entire row width,
+    #: including column 0 -- a naive "first dark pixel" scan reads that
+    #: border as indent_x=0 for whichever row was just created (always
+    #: auto-selected), a reproducible false positive that would make
+    #: every freshly-created group look nested regardless of its real
+    #: position. A minimum vertical ink-run filters it out: the
+    #: highlight border is ~2px tall, the folder icon glyph is ~10px+.
+    _GROUP_TREE_ICON_MIN_INK_RUN = 4
+    #: Live-measured: a group WITH children shows an extra expand/
+    #: collapse arrow glyph to the left of its folder icon, in roughly
+    #: x=24-38 -- a row with children and a childless row at the SAME
+    #: true depth otherwise read different indent_x (24 vs 39) if the
+    #: scan starts at 0, even though neither is actually nested deeper.
+    #: Starting the scan past the arrow's zone lands on the folder icon
+    #: itself for both cases (confirmed live: siblings with and without
+    #: an expand arrow both read indent_x=39; a nested child reads 59).
+    _GROUP_TREE_ICON_SCAN_START_X = 30
+
+    def _group_tree_row_indent_x(self, image, header_pos: tuple[int, int], row_index: int) -> int | None:
+        """Not part of the abstract contract (Phase 5.5C Stage 7).
+        Returns the x-pixel (relative to the tree header's left edge)
+        of the group row's FOLDER ICON left edge -- which this Telerik
+        tree control shifts right by a fixed amount per indentation
+        level -- ignoring both the selection-highlight border and any
+        expand/collapse arrow (see the constants above). This is
+        independent of OCR text and of `_ocr_group_tree_row_text()`'s
+        fixed-offset crop (see that method's docstring: it reads text
+        from a FIXED horizontal offset regardless of true indentation,
+        so it cannot itself distinguish a sibling from a nested child).
+        Two rows at the SAME depth (true siblings) have IDENTICAL
+        indent_x; a row nested one level deeper has a strictly greater
+        indent_x. Returns None if no icon ink is found in the probed
+        region -- callers must treat None as "can't confirm", never as
+        a depth of zero."""
+        left, top = header_pos[0], header_pos[1]
+        row_top = self._group_tree_row_crop_top(top, row_index)
+        crop = image.crop((
+            left, row_top - 2, left + 200, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT + 2,
+        )).convert("L")
+        px = crop.load()
+        width, height = crop.size
+        for x in range(self._GROUP_TREE_ICON_SCAN_START_X, width):
+            ink = sum(1 for y in range(height) if px[x, y] < 200)
+            if ink >= self._GROUP_TREE_ICON_MIN_INK_RUN:
+                return x
+        return None
+
+    def verify_group_path(self, group_name: str, *, parent_group_name: str | None = None) -> bool:
+        """Not part of the abstract contract (Phase 5.5C Stage 7).
+        Read-only. Returns True only if `group_name` is confirmed to
+        exist BENEATH the intended parent (default: the project root) --
+        NOT merely that a row with a matching label exists somewhere in
+        the tree. Returns False (never raises) for any of: the group
+        isn't found, the parent isn't found, the same name matches more
+        than one row (ambiguous), or the indentation check can't
+        confirm the expected parent/child relationship. This is the
+        distinction `verify_group()` does not make: that method only
+        confirms which group currently RECEIVES new items (a mutating
+        probe-commit check); this one confirms tree POSITION without
+        mutating anything."""
+        try:
+            if not self.verify_application() or not self.verify_project():
+                return False
+            target_parent = parent_group_name or self.expected_project_name
+            hwnd = self._ensure_main_window()
+            self._scroll_group_tree_to_top(hwnd)
+            rows = self.snapshot_group_names()
+
+            matches = [
+                i for i, text in enumerate(rows)
+                if i != 0 and self._group_name_matches(text, group_name)
+            ]
+            if len(matches) != 1:
+                return False  # not found, or ambiguous same-name rows
+            group_index = matches[0]
+
+            parent_index = self._find_group_row(rows, target_parent)
+            if parent_index is None or parent_index == group_index:
+                return False
+
+            image = self._capture_client_image(hwnd)
+            header = self._locate_group_tree_header(image)
+            if header is None:
+                return False
+
+            group_indent = self._group_tree_row_indent_x(image, header, group_index)
+            if group_indent is None:
+                return False
+
+            if target_parent == self.expected_project_name:
+                # The root's own indent isn't a meaningful depth-zero
+                # reference for its children's expected indent; compare
+                # against another row already confirmed to be a direct
+                # child of the root instead, when one exists.
+                reference_index = None
+                for i, text in enumerate(rows):
+                    if i in (0, group_index):
+                        continue
+                    if text.strip():
+                        reference_index = i
+                        break
+                if reference_index is None:
+                    return True  # nothing else to compare against -- can't disprove
+                reference_indent = self._group_tree_row_indent_x(image, header, reference_index)
+                return reference_indent is not None and group_indent == reference_indent
+            else:
+                parent_indent = self._group_tree_row_indent_x(image, header, parent_index)
+                return parent_indent is not None and group_indent > parent_indent
+        except Exception:
+            return False
+
     def ensure_group(self, group_name: str, *, parent_group_name: str | None = None) -> None:
         """Not part of the abstract contract. Creates `group_name` as a
         child of `parent_group_name` (default: this adapter's own
@@ -3106,7 +3260,19 @@ class WindowsXactimateAdapter(XactimateAdapter):
         INDEPENDENTLY re-OCR'd (bypassing the hardcoded label) and
         fuzzy-matched against the intended name immediately before the
         context menu opens -- refusing to proceed if that fails, rather
-        than trusting a fixed position."""
+        than trusting a fixed position.
+
+        Live-caught (Phase 5.5C): that fix alone did not solve the
+        malformed tree -- the deeper cause is Xactimate always
+        attaching "New Group" to the most-recently-created group in the
+        session, independent of which row was right-clicked (see
+        `_reset_group_creation_stickiness()`, called below, for the
+        live-proven fix). After creation, the new row's indentation is
+        independently checked against `target_parent`'s (see
+        `_group_tree_row_indent_x()`) -- "the group exists" and "the
+        group exists beneath the intended parent" are not the same
+        claim, and only the second is safe to trust before running any
+        task against it."""
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"ensure_group({group_name!r}): could not verify the expected project is active.")
 
@@ -3118,6 +3284,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
         rows = self.snapshot_group_names()
         if self._find_group_row(rows, group_name) is not None:
             return  # already exists -- nothing to do
+
+        # Only reset stickiness (and re-scan) when a creation is
+        # actually about to happen -- a no-op call above must never
+        # touch the live UI at all (see the no-op test).
+        self._reset_group_creation_stickiness()
+        self._scroll_group_tree_to_top(hwnd)
+        rows = self.snapshot_group_names()
 
         parent_index = self._find_group_row(rows, target_parent)
         if parent_index is None:
@@ -3184,6 +3357,34 @@ class WindowsXactimateAdapter(XactimateAdapter):
                         f"ensure_group({group_name!r}): group was created, but the intended parent "
                         f"{target_parent!r} can no longer be found in the tree -- refusing to trust the result."
                     )
+                # Real ancestry check (Phase 5.5C Stage 7): the pixel
+                # indent check CAN distinguish sibling from nested (see
+                # _group_tree_row_indent_x()). Only a CONFIRMED mismatch
+                # (both indents actually read) raises -- an unreadable
+                # indent (e.g. OCR/pixel noise) is treated the same way
+                # every other best-effort probe in this file is: it
+                # doesn't block, since a false negative here is safe
+                # (see verify_group() docstring for the same reasoning)
+                # while a false positive would incorrectly discard a
+                # correctly-placed group.
+                image_after = self._capture_client_image(hwnd)
+                header_after = self._locate_group_tree_header(image_after)
+                if header_after is not None and target_parent == self.expected_project_name:
+                    new_indent = self._group_tree_row_indent_x(image_after, header_after, new_index)
+                    reference_indent = None
+                    for i, text in enumerate(rows_after):
+                        if i in (0, new_index):
+                            continue
+                        if text.strip():
+                            reference_indent = self._group_tree_row_indent_x(image_after, header_after, i)
+                            if reference_indent is not None:
+                                break
+                    if new_indent is not None and reference_indent is not None and new_indent != reference_indent:
+                        raise AdapterError(
+                            f"ensure_group({group_name!r}): created, but its indentation ({new_indent}px) "
+                            f"does not match an existing top-level group's ({reference_indent}px) -- it "
+                            f"appears to have nested under the wrong parent instead of the root."
+                        )
                 return
             time.sleep(0.8)
         raise AdapterError(

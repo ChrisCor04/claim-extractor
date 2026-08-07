@@ -802,22 +802,33 @@ def _mock_ensure_group_scaffolding(monkeypatch, adapter, *, before_rows, after_r
     already covered elsewhere). `row0_actual_text` is what the
     INDEPENDENT re-OCR of row 0 reads -- deliberately separate from
     `before_rows[0]`, which (like the real snapshot_group_names())
-    would otherwise just be the hardcoded expected_project_name label."""
+    would otherwise just be the hardcoded expected_project_name label.
+
+    Phase 5.5C: ensure_group() now snapshots TWICE before creating (once
+    for the no-op check, once again after _reset_group_creation_
+    stickiness()) and once after -- `before_rows` covers the first two,
+    `after_rows` the rest. `_reset_group_creation_stickiness()` and the
+    pixel-indent ancestry check are stubbed to no-ops/pass here; tests
+    that specifically target those behaviors override them."""
     calls = {"snapshot": 0}
 
     def fake_snapshot():
         calls["snapshot"] += 1
-        return before_rows if calls["snapshot"] == 1 else after_rows
+        return before_rows if calls["snapshot"] <= 2 else after_rows
 
     monkeypatch.setattr(adapter, "verify_application", lambda: True)
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
     monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "_reset_group_creation_stickiness", lambda: None)
     monkeypatch.setattr(adapter, "snapshot_group_names", fake_snapshot)
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
     monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
     monkeypatch.setattr(adapter, "_ocr_group_tree_row_text", lambda image, header, row_index: row0_actual_text if row_index == 0 else before_rows[row_index])
+    # Neutral by default: no confirmed mismatch, so the new Stage 7
+    # ancestry check never blocks tests that aren't exercising it.
+    monkeypatch.setattr(adapter, "_group_tree_row_indent_x", lambda image, header, row_index: 35)
     return calls
 
 
@@ -903,6 +914,186 @@ def test_ensure_group_accepts_an_explicit_parent_group_name(monkeypatch):
     adapter.ensure_group("Sub Group", parent_group_name="Exterior")
 
     assert opened_at["row_index"] == 1  # Exterior's row, not the root
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5C: Xactimate's "New Group" command attaches the new group to
+# whichever group was MOST RECENTLY CREATED in the session, independent
+# of which row is right-clicked (live-proven in Phase 5.5B). Live
+# investigation found switching Estimate Items tabs and back resets
+# that stickiness -- reliably for exactly the 2nd group of a session,
+# not a 3rd+ (see docs/build-estimate.md Phase 5.5C). These tests cover
+# _reset_group_creation_stickiness()'s call site and the pixel-
+# indentation ancestry check that catches an accidental nest before any
+# task can execute against it.
+# ---------------------------------------------------------------------
+
+
+def test_ensure_group_resets_stickiness_before_creating_but_not_for_a_noop():
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    reset_calls = []
+    adapter._reset_group_creation_stickiness = lambda: reset_calls.append(1)
+    adapter.verify_application = lambda: True
+    adapter.verify_project = lambda: True
+    adapter._ensure_main_window = lambda: 123
+    adapter._force_foreground = lambda hwnd: True
+    adapter._scroll_group_tree_to_top = lambda hwnd: None
+    adapter.snapshot_group_names = lambda: ["TEST", "Dwelling Roof"]
+
+    adapter.ensure_group("Dwelling Roof")  # already exists -- a no-op
+
+    assert reset_calls == [], "a no-op call must never touch the live UI, including the stickiness reset"
+
+
+def test_ensure_group_raises_when_new_group_indentation_does_not_match_a_sibling(monkeypatch):
+    """Accidental-nesting detection (Stage 7): even though the intended
+    parent (root) was independently re-verified and the group WAS
+    created and IS found by name afterward, a pixel-indentation mismatch
+    against an existing top-level group must still refuse the result --
+    "the group exists" is not the same claim as "the group exists
+    beneath the intended parent." This must fail BEFORE any task can be
+    executed against the group."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _mock_ensure_group_scaffolding(
+        monkeypatch, adapter,
+        before_rows=["TEST", "Exterior"], after_rows=["TEST", "Exterior", "Front Elevation"],
+        row0_actual_text="TEST",
+    )
+    monkeypatch.setattr(adapter, "_open_group_tree_context_menu", lambda hwnd, header, row_index: [object()] * adapter._GROUP_MENU_EXPECTED_ITEM_COUNT)
+    monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456)
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
+    monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+
+    # Exterior (row 1, an existing sibling) reads indent 39; the newly
+    # created Front Elevation (row 2) reads indent 59 -- nested one
+    # level deeper, exactly the live-caught failure mode.
+    def fake_indent(image, header, row_index):
+        return {1: 39, 2: 59}[row_index]
+
+    monkeypatch.setattr(adapter, "_group_tree_row_indent_x", fake_indent)
+
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+    with pytest.raises(AdapterError, match="indentation"):
+        adapter.ensure_group("Front Elevation")
+
+
+def test_ensure_group_does_not_raise_when_new_group_indentation_matches_a_sibling(monkeypatch):
+    """The counterpart to the test above: a correctly-placed sibling
+    (identical indentation to an existing top-level group) must NOT be
+    rejected -- this is the exact false positive a naive "first dark
+    pixel" measurement produced against a SELECTED row's highlight
+    border before _GROUP_TREE_ICON_MIN_INK_RUN/_SCAN_START_X fixed it."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _mock_ensure_group_scaffolding(
+        monkeypatch, adapter,
+        before_rows=["TEST", "Exterior"], after_rows=["TEST", "Exterior", "Dwelling Roof"],
+        row0_actual_text="TEST",
+    )
+    monkeypatch.setattr(adapter, "_open_group_tree_context_menu", lambda hwnd, header, row_index: [object()] * adapter._GROUP_MENU_EXPECTED_ITEM_COUNT)
+    monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456)
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
+    monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+    monkeypatch.setattr(adapter, "_group_tree_row_indent_x", lambda image, header, row_index: 39)  # same for every row
+
+    adapter.ensure_group("Dwelling Roof")  # must not raise
+
+
+def test_verify_group_path_true_for_a_confirmed_sibling(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Exterior", "Dwelling Roof"])
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    monkeypatch.setattr(adapter, "_group_tree_row_indent_x", lambda image, header, row_index: 39)
+
+    assert adapter.verify_group_path("Dwelling Roof") is True
+
+
+def test_verify_group_path_false_when_group_not_found(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Exterior"])
+
+    assert adapter.verify_group_path("Dwelling Roof") is False
+
+
+def test_verify_group_path_false_for_ambiguous_duplicate_group_names(monkeypatch):
+    """Two rows matching the same name is exactly the "duplicate same-
+    name ambiguity" case Stage 7 requires verify_group_path() to refuse
+    rather than guess at."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Dwelling Roof", "Dwelling Roof"])
+
+    assert adapter.verify_group_path("Dwelling Roof") is False
+
+
+def test_verify_group_path_false_when_indentation_indicates_nesting(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Dwelling Roof", "Front Elevation"])
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+
+    def fake_indent(image, header, row_index):
+        return {1: 39, 2: 59}[row_index]  # Front Elevation nested one level deeper
+
+    monkeypatch.setattr(adapter, "_group_tree_row_indent_x", fake_indent)
+
+    assert adapter.verify_group_path("Front Elevation") is False
+
+
+def test_verify_group_path_explicit_parent_requires_deeper_indent_than_parent(monkeypatch):
+    """The non-root parent_group_name branch: a genuine child must have
+    a STRICTLY GREATER indent than its named parent, not merely a
+    different one -- verified against the exact scenario ensure_group()
+    already supports (an explicit parent_group_name)."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Exterior", "Sub Group"])
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+
+    def fake_indent_nested_correctly(image, header, row_index):
+        return {1: 39, 2: 59}[row_index]
+
+    monkeypatch.setattr(adapter, "_group_tree_row_indent_x", fake_indent_nested_correctly)
+    assert adapter.verify_group_path("Sub Group", parent_group_name="Exterior") is True
+
+    def fake_indent_same_level(image, header, row_index):
+        return {1: 39, 2: 39}[row_index]  # "child" is actually a sibling, not nested
+
+    monkeypatch.setattr(adapter, "_group_tree_row_indent_x", fake_indent_same_level)
+    assert adapter.verify_group_path("Sub Group", parent_group_name="Exterior") is False
+
+
+def test_verify_group_path_never_raises_on_unexpected_error():
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    def _boom():
+        raise RuntimeError("simulated failure")
+
+    adapter.verify_application = _boom
+    assert adapter.verify_group_path("Dwelling Roof") is False
 
 
 def test_verify_group_returns_false_when_group_not_in_tree(monkeypatch):
