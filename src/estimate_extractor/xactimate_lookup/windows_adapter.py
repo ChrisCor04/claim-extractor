@@ -1307,6 +1307,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     description=row.description_text,
                     item_number=None,
                     extraction_confidence=1.0,  # exact UI Automation text, not OCR
+                    price_text=row.price_text,  # Phase 5.6: previously discarded
                 )
             )
         return results
@@ -2072,6 +2073,19 @@ class WindowsXactimateAdapter(XactimateAdapter):
         "incompatible": "hard_stop",
     }
 
+    def check_unit_compatibility(
+        self, source_unit: str | None, expected_xactimate_unit: str | None, observed_xactimate_unit: str | None,
+    ) -> UnitVerificationResult:
+        """Not part of the abstract contract (Phase 5.6). Thin instance
+        wrapper around the pure, module-level `check_unit_compatibility()`
+        so orchestrator.py can call it duck-typed (`hasattr(adapter,
+        "check_unit_compatibility")`, exactly like `verify_commit`/
+        `snapshot_grid_identities`) without importing this Windows-only
+        module directly -- keeping orchestrator.py adapter-agnostic.
+        See the module-level function's own docstring for the actual
+        compatibility logic (unchanged, reused as-is)."""
+        return check_unit_compatibility(source_unit, expected_xactimate_unit, observed_xactimate_unit)
+
     def verify_commit(
         self,
         before_snapshot: list[tuple[str | None, str | None]],
@@ -2081,6 +2095,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         source_unit: str | None = None,
         expected_xactimate_unit: str | None = None,
         timeout_s: float = 3.0,
+        populated_unit: str | None = None,
     ) -> CommitVerification:
         """Not part of the abstract contract -- Phase 4.8's row
         identification and verification strategy, replacing Phase
@@ -2130,6 +2145,22 @@ class WindowsXactimateAdapter(XactimateAdapter):
            `trust_state="QUANTITY_MISMATCH"`; an incompatible unit ->
            `trust_state="UNIT_MISMATCH"` (checked after quantity, but
            neither ever downgrades to merely "supporting").
+
+           Phase 5.6 Stage 4 (live-caught): a real committed row
+           (line_0001, R&R Gutter, 200 LF, correct SFG/GUTA selection,
+           quantity read back exactly) was downgraded to
+           REVIEW_REQUIRED because this method's own post-commit OCR
+           misread the unit cell as "a". `populated_unit` -- the
+           majority-voted OCR read of the SAME cell taken by
+           `read_populated_fields()` right after `select_candidate()`,
+           BEFORE commit -- is preferred as the observed unit whenever
+           it resolves to a known Xactimate unit; the post-commit
+           single-shot OCR read here is used only when `populated_unit`
+           is missing or unreadable. This does not weaken the check --
+           an incompatible unit is still incompatible regardless of
+           which read supplied it -- it only avoids letting an
+           unrelated OCR miss on ONE of two independent reads of the
+           same cell override a genuinely correct commit.
         7. Category and selector OCR at the known position (Phase
            4.8's explicit directive: category OCR becomes supporting
            evidence whenever stronger evidence exists, and this phase
@@ -2241,8 +2272,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 sample["unit_raw"] = unit_raw
 
                 quantity_matched = quantity_observed is not None and quantity_observed == expected_quantity
-                unit_result = check_unit_compatibility(source_unit, expected_xactimate_unit, unit_raw)
+
+                # Phase 5.6 Stage 4: prefer the pre-commit, majority-
+                # voted populated-field unit read over this method's own
+                # single-shot post-commit OCR read whenever it resolves
+                # to a known unit -- see class docstring above.
+                populated_unit_vocab = _resolve_observed_unit_vocab(populated_unit)
+                unit_source = "populated_field" if populated_unit_vocab is not None else "post_commit_ocr"
+                observed_unit_for_check = populated_unit if populated_unit_vocab is not None else unit_raw
+
+                unit_result = check_unit_compatibility(source_unit, expected_xactimate_unit, observed_unit_for_check)
                 compatibility = self._UNIT_STATE_TO_COMPATIBILITY.get(unit_result.unit_match_state, "review_required")
+                sample["unit_source"] = unit_source
 
                 cat_sel_present = cat_observed is not None or sel_observed is not None
                 cat_sel_agrees = (cat_observed == category and sel_observed == selector) if cat_sel_present else None

@@ -122,12 +122,17 @@ def test_execute_plan_stops_on_unexpected_dialog(tmp_path, phrase_rules, ranking
 
 
 def test_execute_plan_stops_on_ambiguous_candidates(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.6: neither candidate is an exact match to the source
+    (both add a different unmentioned qualifier) -- genuinely
+    ambiguous, unlike the plain-vs-superset case ranking.py now
+    resolves cleanly (see test_ranking.py's exact-match-beats-superset
+    coverage)."""
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item(original_description="Drip edge", component=None, material=None, action=None)
     plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
     conn.close()
-    a = _dropdown("Drip edge", sel="DRIP", pos=0)
-    b = _dropdown("Drip edge - copper", sel="DRIPC", pos=1)
+    a = _dropdown("Drip edge - copper", sel="DRIPC", pos=0)
+    b = _dropdown("Drip edge - PVC/TPO clad metal", sel="DRIPP", pos=1)
     adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [a, b]})
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
     assert outcome.decision == DECISION_REVIEW_REQUIRED
@@ -223,8 +228,8 @@ class _VerifyingFakeAdapter(FakeXactimateAdapter):
         self.snapshot_calls += 1
         return [("EXISTING", "ROW")]
 
-    def verify_commit(self, before_snapshot, category, selector, expected_quantity, *, source_unit=None, expected_xactimate_unit=None):
-        self.verify_commit_calls.append((before_snapshot, category, selector, expected_quantity, source_unit, expected_xactimate_unit))
+    def verify_commit(self, before_snapshot, category, selector, expected_quantity, *, source_unit=None, expected_xactimate_unit=None, populated_unit=None):
+        self.verify_commit_calls.append((before_snapshot, category, selector, expected_quantity, source_unit, expected_xactimate_unit, populated_unit))
         return self.verification_result
 
 
@@ -248,7 +253,7 @@ def test_verify_commit_called_on_live_commit_when_adapter_supports_it(tmp_path, 
     assert outcome.committed is True
     assert adapter.snapshot_calls == 1
     assert len(adapter.verify_commit_calls) == 1
-    before_snapshot, category, selector, quantity, source_unit, expected_unit = adapter.verify_commit_calls[0]
+    before_snapshot, category, selector, quantity, source_unit, expected_unit, populated_unit = adapter.verify_commit_calls[0]
     assert before_snapshot == [("EXISTING", "ROW")]
     assert (category, selector) == (d.category, d.selector)
     assert quantity == item.quantity

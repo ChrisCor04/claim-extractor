@@ -72,6 +72,14 @@ class DropdownResult:
     description: str | None = None
     item_number: str | None = None
     extraction_confidence: float = 1.0
+    #: Phase 5.6 Stage 3: the dropdown's own price text, exact UI
+    #: Automation text (never OCR) -- previously captured in the raw
+    #: read (_RawDropdownRow.price_text) and then silently discarded by
+    #: parse_dropdown(). Informational/audit-table use only; no unit is
+    #: embedded in it (confirmed live against real Xactimate dropdown
+    #: rows -- price_text is a bare dollar amount like "$11.56", never
+    #: "$11.56/LF"), so this does not feed unit verification.
+    price_text: str | None = None
 
 
 @dataclass(slots=True)

@@ -576,6 +576,70 @@ def test_verify_commit_identifies_row_after_delayed_rendering(monkeypatch):
     assert result.compatibility == "compatible"
 
 
+def test_verify_commit_prefers_populated_unit_over_garbage_post_commit_ocr(monkeypatch):
+    """Regression test (Phase 5.6 Stage 4, live-caught): a real commit
+    (line_0001, R&R Gutter, 200 LF, correct SFG/GUTA selection,
+    quantity read back exactly) was downgraded to REVIEW_REQUIRED
+    because verify_commit()'s own post-commit OCR misread the unit
+    cell as "a". The majority-voted populated-field unit read taken
+    right after select_candidate() (before commit) correctly read
+    "LF" -- verify_commit() must prefer that over its own unreadable
+    post-commit OCR rather than downgrading a genuinely correct
+    commit."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTA")]],
+        unit_reads=[("a", None)],
+        quantity_reads=[200.0],
+    )
+    result = adapter.verify_commit(
+        [], "SFG", "GUTA", 200.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+        populated_unit="LF",
+    )
+    assert result.trust_state == "VERIFIED"
+    assert result.compatibility == "compatible"
+
+
+def test_verify_commit_falls_back_to_post_commit_ocr_when_populated_unit_unreadable(monkeypatch):
+    """Companion to the fix above: when the populated-field unit is
+    ALSO unreadable (or wasn't supplied), verify_commit() must still
+    fall back to its own post-commit OCR read rather than silently
+    treating the row as verified -- the preference for populated_unit
+    must not weaken the check when populated_unit provides no real
+    evidence."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTA")]],
+        unit_reads=[("a", None)],
+        quantity_reads=[200.0],
+    )
+    result = adapter.verify_commit(
+        [], "SFG", "GUTA", 200.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+        populated_unit=None,
+    )
+    assert result.trust_state == "REVIEW_REQUIRED"
+    assert result.compatibility == "review_required"
+
+
+def test_verify_commit_still_catches_genuine_unit_mismatch_with_populated_unit(monkeypatch):
+    """The populated_unit preference must not create a bypass: a
+    populated_unit that itself resolves to a genuinely incompatible
+    unit still hard-stops, exactly as a bad post-commit OCR read
+    would."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTA")]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[200.0],
+    )
+    result = adapter.verify_commit(
+        [], "SFG", "GUTA", 200.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+        populated_unit="EA",
+    )
+    assert result.trust_state == "UNIT_MISMATCH"
+    assert result.compatibility == "hard_stop"
+
+
 def test_verify_commit_unreadable_category_does_not_block_verified(monkeypatch):
     """Regression test (Phase 4.8's central claim): category/selector
     OCR is corroborating evidence only -- when it's unreadable but

@@ -40,6 +40,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
 from estimate_extractor.xactimate_lookup.execution_runner import (
     OBSERVED_MAPPING_STATE,
     UnsafeLookupRouting,
+    _find_trusted_observed_mapping,
     _observed_mappings_path,
     _task_to_lookup_plan,
     run_execution_plan,
@@ -107,7 +108,7 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
         self.snapshot_calls += 1
         return [("EXISTING", "ROW")]
 
-    def verify_commit(self, before_snapshot, category, selector, expected_quantity, *, source_unit=None, expected_xactimate_unit=None):
+    def verify_commit(self, before_snapshot, category, selector, expected_quantity, *, source_unit=None, expected_xactimate_unit=None, populated_unit=None):
         self.verify_commit_calls += 1
         # Defaults to "observed exactly what was selected" -- the normal,
         # self-consistent case for a real successful commit. Tests that
@@ -456,7 +457,7 @@ def test_project_lost_between_groups_is_a_hard_stop_for_the_whole_run(tmp_path, 
 # the live project being exactly "TEST", and record what was observed.
 # ---------------------------------------------------------------------
 
-_FELT_PHRASE = "roofing felt"  # what generate_search_phrase() produces for the description/context below
+_FELT_PHRASE = "roofing felt 15"  # what generate_search_phrase() produces for the description/context below (Phase 5.6: "15" now recognized as a size term, see phrase_generator.py's weight-unit pattern)
 
 
 def _unmapped_task(task_id, line_item_id, section_name, source_order, qty=33.66, unit="SQ"):
@@ -533,9 +534,13 @@ def test_unmapped_task_ambiguous_ranking_is_still_a_safe_stop(tmp_path, phrase_r
     plan = _plan_mapped_and_unmapped()
     script = {
         "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        # Phase 5.6: two candidates that are EQUALLY distant from the
+        # source (neither is the "15 lb" exact/near match Stage 5's
+        # weight-unit size fix now correctly disambiguates) -- genuinely
+        # ambiguous, tied fuzzy scores by construction.
         _FELT_PHRASE: [
-            DropdownResult(raw_text="Felt A", row_position=0, category="RFG", selector="FELT15", description="Roofing felt - 15 lb.", extraction_confidence=1.0),
-            DropdownResult(raw_text="Felt B", row_position=1, category="RFG", selector="FELT30", description="Roofing felt - 30 lb.", extraction_confidence=1.0),
+            DropdownResult(raw_text="Felt A", row_position=0, category="RFG", selector="FELTX", description="Roofing felt product Alpha", extraction_confidence=1.0),
+            DropdownResult(raw_text="Felt B", row_position=1, category="RFG", selector="FELTY", description="Roofing felt product Omega", extraction_confidence=1.0),
         ],
     }
     adapter = _adapter_with_test_project(dropdown_script=script)
@@ -543,7 +548,13 @@ def test_unmapped_task_ambiguous_ranking_is_still_a_safe_stop(tmp_path, phrase_r
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
 
     assert result.task_by_id("task_unmapped").state == TASK_REVIEW_REQUIRED
-    assert result.task_by_id("task_unmapped").stop_reason == "ambiguous_candidates"
+    # Either safe-stop reason is fine here -- the property under test is
+    # "never guesses among equally-weak candidates", not which specific
+    # ranking rule caught it (this pair also mismatches the source's
+    # "15" size term, which Stage 5's own size check now correctly
+    # flags as a hard conflict rather than leaving it to the margin
+    # check alone).
+    assert result.task_by_id("task_unmapped").stop_reason in ("ambiguous_candidates", "hard_conflict")
     # never selected/committed anything for the ambiguous task
     select_calls = [c for c in adapter.log.calls if c[0] == "select_candidate"]
     assert len(select_calls) == 1  # only task_mapped's unambiguous selection
@@ -596,6 +607,80 @@ def test_observed_mapping_proposal_uses_a_distinct_non_approved_state(tmp_path, 
     assert proposals["line_unmapped"]["state"] == OBSERVED_MAPPING_STATE
     assert OBSERVED_MAPPING_STATE != "approved"
     assert "approved" not in OBSERVED_MAPPING_STATE.lower().split("_from_")[0]
+
+
+@pytest.mark.parametrize(
+    "trust_state", ["REVIEW_REQUIRED", "UNIT_MISMATCH", "QUANTITY_MISMATCH", "CONFLICTING_ROW", "VERIFICATION_FAILED"],
+)
+def test_observed_mapping_proposal_verified_flag_false_for_any_non_verified_trust_state(
+    tmp_path, phrase_rules, ranking_config, trust_state,
+):
+    """Phase 5.6 Stage 6: persisted learned mappings must be reusable
+    ONLY from a genuinely VERIFIED commit -- a merely-committed row
+    whose independent post-commit verification landed on ANY other
+    trust_state (review-required, a unit mismatch, a quantity
+    mismatch, a conflicting row, or an outright verification failure)
+    must be recorded with verified=False, never eligible for reuse."""
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script, trust_state=trust_state)
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    proposals = json.loads(_observed_mappings_path(tmp_path).read_text(encoding="utf-8"))
+    assert proposals["line_unmapped"]["verified"] is False
+
+
+def test_observed_mapping_proposal_verified_flag_true_only_for_verified_trust_state(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """Companion to the test above: the positive case -- a commit whose
+    independent post-commit verification reaches VERIFIED is recorded
+    with verified=True, the one and only signal
+    _find_trusted_observed_mapping() will ever trust."""
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script, trust_state="VERIFIED")
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    proposals = json.loads(_observed_mappings_path(tmp_path).read_text(encoding="utf-8"))
+    assert proposals["line_unmapped"]["verified"] is True
+
+
+def test_find_trusted_observed_mapping_refuses_unverified_and_missing_entries(tmp_path):
+    """Phase 5.6 Stage 6: _find_trusted_observed_mapping() -- the only
+    path by which a PRIOR run's observed CAT/SEL can be reused as a
+    later task's search fallback -- must refuse an entry whose
+    verified flag is false or absent, and must refuse a line_item_id
+    it has no entry for at all. Only an entry with verified=True and a
+    resolvable category/selector is ever returned."""
+    path = _observed_mappings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "line_unverified": {
+                    "verified": False,
+                    "observed_category": "RFG", "observed_selector": "FELT15",
+                },
+                "line_verified": {
+                    "verified": True,
+                    "observed_category": "RFG", "observed_selector": "FELT15",
+                },
+                "line_verified_no_cat_sel": {
+                    "verified": True,
+                    "observed_category": None, "observed_selector": None,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _find_trusted_observed_mapping(tmp_path, "line_unverified") is None
+    assert _find_trusted_observed_mapping(tmp_path, "line_verified") == ("RFG", "FELT15")
+    assert _find_trusted_observed_mapping(tmp_path, "line_verified_no_cat_sel") is None
+    assert _find_trusted_observed_mapping(tmp_path, "line_never_seen") is None
 
 
 def test_observed_mapping_proposal_never_touches_review_service_state(tmp_path, phrase_rules, ranking_config):

@@ -47,9 +47,35 @@ def test_unknown_component_sentinel_is_not_a_conflict(phrase_rules, ranking_conf
     assert not candidates[0].has_hard_conflict
 
 
-def test_ambiguous_candidates_without_margin_require_review(phrase_rules, ranking_config):
+def test_exact_match_beats_a_superset_variant_the_source_never_mentioned(phrase_rules, ranking_config):
+    """Phase 5.6 (live-caught against real Xactimate dropdown data): an
+    exact-text match must score STRICTLY higher than a candidate whose
+    description is a superset of the source text (adds a material/size/
+    attachment qualifier the source description never mentioned) --
+    both used to score an identical flat 1.0 (any substring-containment
+    match was treated as "perfect"), which live-reproduced a 0.0 margin
+    for "Drip edge" vs "Drip edge - copper"/"- PVC/TPO clad metal"/etc.
+    and forced REVIEW_REQUIRED on an item a human would select without
+    hesitation. The plain, exact match must now clearly AUTO_SELECT."""
     a = _dropdown("Drip edge", sel="DRIP", pos=0)
     b = _dropdown("Drip edge - copper", sel="DRIPC", pos=1)
+    candidates = ranking.rank_dropdown_results(
+        original_description="Drip edge", trade="roofing", component=None, material=None,
+        action=None, unit="LF", size_key=None, grade_key=None, dropdowns=[a, b], rules=phrase_rules, config=ranking_config,
+    )
+    assert candidates[0].dropdown.selector == "DRIP"
+    assert candidates[0].score == 1.0
+    assert candidates[0].score - candidates[1].score >= ranking_config.auto_select_margin
+    assert ranking.classify_decision(candidates, ranking_config) == DECISION_AUTO_SELECT
+
+
+def test_two_different_superset_variants_still_require_review(phrase_rules, ranking_config):
+    """The complement of the above: when NEITHER candidate is an exact
+    match (both add a different unmentioned qualifier), the exact-match
+    fix must not manufacture a false margin between them -- genuinely
+    ambiguous cases still require review."""
+    a = _dropdown("Drip edge - copper", sel="DRIPC", pos=0)
+    b = _dropdown("Drip edge - PVC/TPO clad metal", sel="DRIPP", pos=1)
     candidates = ranking.rank_dropdown_results(
         original_description="Drip edge", trade="roofing", component=None, material=None,
         action=None, unit="LF", size_key=None, grade_key=None, dropdowns=[a, b], rules=phrase_rules, config=ranking_config,

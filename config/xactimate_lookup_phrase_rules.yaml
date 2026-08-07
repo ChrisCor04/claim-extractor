@@ -87,6 +87,7 @@ material_keywords:
   - ["composite", "composite"]
   - ["fiber cement", "fiber cement"]
   - ["metal", "metal"]
+  - ["plastic", "plastic"]
   - ["steel", "steel"]
   - ["copper", "copper"]
   - ["fiberglass", "fiberglass"]
@@ -129,6 +130,18 @@ style_keywords:
   - ["standard grade", "standard grade"]
   - ["economy grade", "economy grade"]
   - ["builder grade", "builder grade"]
+  # Phase 5.6 (live-caught against real aranda-insurance-v3 dropdown
+  # data): these two are real, recurring Xactimate catalog VARIANT
+  # qualifiers that trail the component -- e.g. "Gutter / downspout -
+  # half round - aluminum - up to 5\"" vs the plain "Gutter / downspout
+  # - aluminum - up to 5\"", and "Wood fence rail - ... - treated" vs
+  # the plain rail. Neither was captured by ANY existing dimension/
+  # material/action check, so a source description that never mentions
+  # "half round"/"treated" could not distinguish the plain item from
+  # the variant -- both scored within ~0.04 of each other, collapsing
+  # the AUTO_SELECT margin on an otherwise-unambiguous exact match.
+  - ["half round", "half round"]
+  - ["treated", "treated"]
 
 # Modifiers that must be preserved even though they're neither
 # component/material/size/style -- confirmed real and recurring in the

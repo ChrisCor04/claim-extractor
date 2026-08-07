@@ -90,7 +90,36 @@ def score_dropdown_candidate(
 
     description_score = 0.0
     if item_text and candidate_text:
-        description_score = 1.0 if (item_text in candidate_text or candidate_text in item_text) else _fuzzy_ratio(item_text, candidate_text)
+        if item_text == candidate_text:
+            description_score = 1.0
+        elif item_text in candidate_text:
+            # Phase 5.6 (live-caught): a source description that is a
+            # PREFIX/substring of a longer CANDIDATE description used to
+            # score the SAME flat 1.0 as an exact match -- e.g. "Drip
+            # edge" (source) tied with "Drip edge - copper", "Drip edge
+            # - PVC/TPO clad metal", etc., all at 1.0, collapsing the
+            # top-vs-second AUTO_SELECT margin to 0.0 even though the
+            # plain item is the obviously-correct one and the others add
+            # real, distinguishing qualifiers (a material, a size, an
+            # attachment type) the source never mentioned. Scoring this
+            # case by length ratio instead rewards the closer (shorter
+            # extra-text) match without ever scoring it as low as a
+            # genuinely different description -- still much higher than
+            # the fuzzy-ratio floor for two truly different strings.
+            #
+            # Deliberately ONE-DIRECTIONAL: only a longer CANDIDATE is
+            # suspicious (it's claiming to be a more specific variant the
+            # source never asked for). The reverse -- source is a longer,
+            # more narrative sentence that happens to CONTAIN a terse
+            # catalog description as a substring (a real PDF description
+            # is routinely more verbose than a short catalog code) -- is
+            # normal, not evidence of a wrong candidate, and stays at the
+            # full 1.0 it always scored.
+            description_score = len(item_text) / len(candidate_text)
+        elif candidate_text in item_text:
+            description_score = 1.0
+        else:
+            description_score = _fuzzy_ratio(item_text, candidate_text)
 
     # "unknown" is Phase 2's sentinel for "no component was extracted" --
     # it must never be treated as a literal component to search for
@@ -102,6 +131,24 @@ def score_dropdown_candidate(
     candidate_words = set(re.findall(r"[a-z0-9]+", candidate_text))
     component_ok = not component_words or bool(component_words & candidate_words)
     component_score = 1.0 if component_ok else 0.0
+
+    # Phase 5.6 (live-caught): when normalization didn't extract a
+    # material at all (material=None/empty -- e.g. "Roof vent - turtle
+    # type - Plastic", where "roof_vent" is the component and nothing
+    # upstream tags "Plastic" as a material), the material dimension
+    # was skipped entirely, so a "Metal" candidate and the correct
+    # "Plastic" candidate scored almost identically (pure text fuzz on
+    # two otherwise-identical strings differing by one word) --
+    # reproduced live as a 0.078 margin, just under the 0.08 threshold.
+    # Falls back to extracting a material word directly from the
+    # SOURCE description using the same curated material_keywords
+    # vocabulary phrase_generator.py already uses -- never invents a
+    # new word list, never overrides an already-normalized material.
+    if not material:
+        for keyword, canonical in rules.material_keywords:
+            if keyword in item_text:
+                material = canonical
+                break
 
     material_ok = True
     material_score = 0.0
@@ -138,6 +185,26 @@ def score_dropdown_candidate(
     if grade_key:
         grade_ok = grade_key.lower() in candidate_text
         grade_score = 1.0 if grade_ok else 0.0
+
+    # Phase 5.6 (live-caught): the check above is one-directional -- it
+    # only asks "does the candidate have the style/grade word the
+    # SOURCE mentioned". It says nothing about a candidate that adds an
+    # UNREQUESTED distinguishing variant qualifier ("half round",
+    # "treated") the source never mentions at all -- reproduced live as
+    # "Gutter / downspout - aluminum - up to 5\"" (exact match) scoring
+    # only ~0.04 above "...- half round - aluminum..." (a real, different
+    # catalog item), never enough margin for AUTO_SELECT. Checked
+    # against the SAME curated, evidence-backed style_keywords/leading_
+    # style_keywords vocabulary already used for grade_key -- not a new
+    # word list, just applied in the other direction. Folded into the
+    # SAME grade/style conflict dimension (not a new one) since it is
+    # the same concept: an incompatible style/grade qualifier.
+    if grade_ok:
+        for keyword, _canonical in (*rules.style_keywords, *rules.leading_style_keywords):
+            if keyword in candidate_text and keyword not in item_text:
+                grade_ok = False
+                grade_key = grade_key or keyword  # only for the conflict message below
+                break
 
     action_term = rules.action_search_terms.get(action or "") if action else None
     action_ok = True

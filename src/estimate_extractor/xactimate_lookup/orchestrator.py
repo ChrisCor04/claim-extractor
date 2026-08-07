@@ -299,13 +299,40 @@ def execute_plan(
             candidates=candidates, selected=top,
         )
 
-    if item.source_unit and populated.unit and item.source_unit.strip().upper() != populated.unit.strip().upper():
-        _cancel_pending_selection(adapter)
-        return _stop(
-            item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_MISMATCH,
-            f"Populated unit ({populated.unit!r}) differs from the source line item's unit ({item.source_unit!r}).",
-            candidates=candidates, selected=top,
-        )
+    # Phase 5.6 Stage 4 (live-caught): the naive strict-equality check
+    # this replaced treated OCR garbage ("sa", "')_|'", etc.) from the
+    # freshly-populated Quick Entry unit field as equal-quality evidence
+    # to a real unit mismatch -- reproduced live, blocking an otherwise
+    # correct selection on unreadable OCR alone. `check_unit_
+    # compatibility()` (duck-typed, like verify_commit/snapshot_grid_
+    # identities -- only WindowsXactimateAdapter implements it today)
+    # applies the SAME evidence-aware synonym/OCR-confusion logic
+    # verify_commit()'s post-commit check already uses. Only a
+    # CONFIRMED incompatible unit (both readable AND genuinely
+    # different, e.g. EA vs LF) stops here pre-commit; an unreadable or
+    # missing observed unit is not treated as evidence of a mismatch --
+    # the commit proceeds and the more thorough post-commit verify_
+    # commit() (which polls/retries) makes the final call. Adapters
+    # without this method (e.g. FakeXactimateAdapter in tests) keep the
+    # original strict-equality behavior unchanged.
+    if item.source_unit and populated.unit:
+        if hasattr(adapter, "check_unit_compatibility"):
+            unit_result = adapter.check_unit_compatibility(item.source_unit, item.source_unit, populated.unit)
+            if unit_result.unit_match_state == "incompatible":
+                _cancel_pending_selection(adapter)
+                return _stop(
+                    item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_MISMATCH,
+                    f"Populated unit ({populated.unit!r}) is incompatible with the source line item's unit "
+                    f"({item.source_unit!r}): {unit_result.unit_match_reason}",
+                    candidates=candidates, selected=top,
+                )
+        elif item.source_unit.strip().upper() != populated.unit.strip().upper():
+            _cancel_pending_selection(adapter)
+            return _stop(
+                item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_MISMATCH,
+                f"Populated unit ({populated.unit!r}) differs from the source line item's unit ({item.source_unit!r}).",
+                candidates=candidates, selected=top,
+            )
 
     try:
         adapter.enter_quantity(item.quantity)
@@ -334,5 +361,6 @@ def execute_plan(
         outcome.verification = adapter.verify_commit(
             before_snapshot, top.dropdown.category, top.dropdown.selector, item.quantity,
             source_unit=item.source_unit, expected_xactimate_unit=item.source_unit,
+            populated_unit=populated.unit,
         )
     return outcome

@@ -35,9 +35,16 @@ _SIZE_PATTERNS = [
     # fails at end-of-string or before another symbol (e.g. '1/2"' at the
     # end of a description), silently dropping exactly the fraction-inch
     # sizes this pattern exists to catch.
-    re.compile(rf"\b{_NUM}\s*(?:in(?:ch(?:es)?)?\b|ft\b|feet\b|foot\b|sf\b|sq\.?\s*ft\b|lf\b|sq\b|sy\b|\"|')"),
+    # Phase 5.6 (live-caught): "lb"/"lbs"/"pound(s)" added alongside the
+    # existing linear/area units -- real catalog data has multiple
+    # otherwise-identical entries distinguished ONLY by a weight spec
+    # ("Roofing felt - 15 lb." vs "- 30 lb."), which previously had no
+    # size_key at all and fell through to raw text-fuzzy scoring, where
+    # a 2-character difference ("15" vs "30") in an otherwise-identical
+    # string scored high enough to nearly tie the correct candidate.
+    re.compile(rf"\b{_NUM}\s*(?:in(?:ch(?:es)?)?\b|ft\b|feet\b|foot\b|sf\b|sq\.?\s*ft\b|lf\b|sq\b|sy\b|lbs?\b|pounds?\b|\"|')"),
 ]
-_TRAILING_UNIT_WORD = re.compile(r"\s*(?:in(?:ch(?:es)?)?|ft|feet|foot|sf|sq\.?\s*ft|lf|sq|sy|\"|')\s*$")
+_TRAILING_UNIT_WORD = re.compile(r"\s*(?:in(?:ch(?:es)?)?|ft|feet|foot|sf|sq\.?\s*ft|lf|sq|sy|lbs?|pounds?|\"|')\s*$")
 _RANGE_SPACING = re.compile(r"\s*(-|to)\s*")
 
 
