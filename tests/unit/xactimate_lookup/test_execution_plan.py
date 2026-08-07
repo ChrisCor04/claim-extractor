@@ -161,6 +161,51 @@ def test_build_execution_plan_missing_line_item_ids_filter_narrows_scope(tmp_pat
     assert [t.line_item_id for t in plan.tasks] == ["line_0002"]
 
 
+# ---------------------------------------------------------------------
+# Phase 5.5C Stage 10: restrict_to_group_id -- the one-group-at-a-time
+# UI fallback rebuilds the plan restricted to a single group's own
+# rows, since live investigation found Xactimate cannot reliably create
+# more than two sibling groups per session (see docs/build-estimate.md
+# Phase 5.5C). A run must never silently include a second group's rows.
+# ---------------------------------------------------------------------
+
+
+def test_build_execution_plan_restrict_to_group_id_filters_to_one_group(tmp_path):
+    project_dir = _write_project(tmp_path, ITEMS)
+    _approve_all(project_dir, [lid for lid, *_ in ITEMS])
+
+    plan = build_execution_plan(project_dir, "test-project", restrict_to_group_id="Dwelling Roof")
+
+    assert len(plan.groups) == 1
+    assert plan.groups[0].group_id == "Dwelling Roof"
+    assert {t.line_item_id for t in plan.tasks} == {"line_0001", "line_0002"}
+
+
+def test_build_execution_plan_restrict_to_group_id_never_pulls_in_another_group(tmp_path):
+    """The restricted plan's tasks must be an exact subset of the
+    unrestricted plan's tasks for that group -- never more, never a
+    different group's rows leaking in via a group_id formula mismatch."""
+    project_dir = _write_project(tmp_path, ITEMS)
+    _approve_all(project_dir, [lid for lid, *_ in ITEMS])
+
+    full_plan = build_execution_plan(project_dir, "test-project")
+    full_group_task_ids = {t.line_item_id for t in full_plan.tasks_in_group("Front Elevation")}
+
+    restricted_plan = build_execution_plan(project_dir, "test-project", restrict_to_group_id="Front Elevation")
+    restricted_task_ids = {t.line_item_id for t in restricted_plan.tasks}
+
+    assert restricted_task_ids == full_group_task_ids == {"line_0003"}
+    assert len(restricted_plan.groups) == 1
+
+
+def test_build_execution_plan_restrict_to_group_id_raises_when_no_rows_match(tmp_path):
+    project_dir = _write_project(tmp_path, ITEMS)
+    _approve_all(project_dir, [lid for lid, *_ in ITEMS])
+
+    with pytest.raises(ExecutionPlanError, match="No approved"):
+        build_execution_plan(project_dir, "test-project", restrict_to_group_id="Nonexistent Group")
+
+
 def test_save_and_load_execution_plan_round_trips(tmp_path):
     project_dir = _write_project(tmp_path, ITEMS)
     _approve_all(project_dir, ["line_0001", "line_0004"])

@@ -74,6 +74,40 @@ RUN_STATE_COMPLETED = "completed"
 #: relaxed to a pattern/prefix match; exact string equality only.
 TEST_ONLY_PROJECT_NAME = "TEST"
 
+#: Phase 5.5D: bumped whenever a persisted ExecutionPlan's on-disk
+#: shape can no longer be trusted to carry every field the CURRENT
+#: execution code depends on. Every plan built before this constant
+#: existed has no `schema_version` key at all and loads as 1 (see
+#: ExecutionPlan.from_dict) -- always < CURRENT_SCHEMA_VERSION, never
+#: silently treated as current. See is_plan_stale().
+CURRENT_SCHEMA_VERSION = 2
+
+
+#: Phase 5.5D Stage 8: the fixed vocabulary run_execution_plan() sets
+#: on ExecutionPlan.stop_reason_category at every distinct exit point
+#: -- so a caller (the UI, this module's own diagnose_run(), a test)
+#: can tell exactly why the most recent run ended where it did without
+#: re-deriving it from run_state/task states, and never has to guess
+#: between "normal completion" and every category of hard stop.
+STOP_REASON_NORMAL_COMPLETION = "normal_completion"
+STOP_REASON_PROJECT_VERIFICATION_FAILURE = "project_verification_failure"
+STOP_REASON_PROJECT_LEVEL_HARD_STOP = "project_level_hard_stop"
+STOP_REASON_GROUP_VERIFICATION_FAILURE = "group_verification_failure"
+STOP_REASON_ADAPTER_EXCEPTION = "adapter_exception"
+STOP_REASON_PROTECTED_ROW_REFUSAL = "protected_row_cleanup_refusal"
+STOP_REASON_TASK_LEVEL_STOPS = "task_level_safety_stops"
+
+
+def is_plan_stale(plan: "ExecutionPlan") -> bool:
+    """True if `plan` was built by older code than CURRENT_SCHEMA_
+    VERSION expects -- see build_estimate_panel.py, which refuses to
+    Execute (Preview/inspection stay available) against a stale plan
+    rather than silently running current routing logic against task
+    records an older build_execution_plan() produced. Rebuilding the
+    plan (the existing "Build / refresh execution plan" / "Rebuild
+    TEST plan" actions) always produces a current-schema plan."""
+    return plan.schema_version < CURRENT_SCHEMA_VERSION
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -162,6 +196,14 @@ class ExecutionTask:
     #: failed" if it also raised. None means no adapter-error recovery
     #: was ever attempted for this task.
     recovery_outcome: str | None = None
+    #: Phase 5.5D Stage 7: the ordered, bounded search-attempt trail for
+    #: a began_unmapped/test_description_first task -- one dict per
+    #: attempt (attempt_number, search_type, search_text, result_count,
+    #: top_candidate_score, decision, stop_reason, advanced_reason). See
+    #: execution_runner._run_test_description_first_attempts(). Empty
+    #: for any task that was never routed through that bounded sequence
+    #: (e.g. a normal review_approved CAT/SEL task).
+    search_attempts: list = field(default_factory=list)
 
     @property
     def row_label(self) -> str:
@@ -327,6 +369,19 @@ class ExecutionPlan:
     #: every call (see execution_runner.py); 0 for a plan that has
     #: never been run, or whose most recent run started from scratch.
     last_run_skipped_already_terminal: int = 0
+    #: Phase 5.5D: defaults to CURRENT_SCHEMA_VERSION -- any ExecutionPlan
+    #: constructed directly in Python code (by build_execution_plan(),
+    #: by a test, by any future caller) IS current by construction. The
+    #: only place this ever reads as stale is ExecutionPlan.from_dict()
+    #: loading OLD PERSISTED JSON that predates this field entirely
+    #: (every plan saved before this phase) -- see is_plan_stale(),
+    #: from_dict()'s own `data.get("schema_version", 1)`.
+    schema_version: int = CURRENT_SCHEMA_VERSION
+    #: Phase 5.5D: set by run_execution_plan() to exactly ONE fixed
+    #: label explaining why the most recent run ended where it did --
+    #: see execution_runner.STOP_REASON_CATEGORIES. None for a plan
+    #: that has never been run.
+    stop_reason_category: str | None = None
 
     def task_by_id(self, task_id: str) -> ExecutionTask | None:
         return next((t for t in self.tasks if t.task_id == task_id), None)
@@ -366,6 +421,8 @@ class ExecutionPlan:
             "resume_cursor": self.resume_cursor,
             "updated_at": self.updated_at,
             "last_run_skipped_already_terminal": self.last_run_skipped_already_terminal,
+            "schema_version": self.schema_version,
+            "stop_reason_category": self.stop_reason_category,
         }
 
     @staticmethod
@@ -381,6 +438,8 @@ class ExecutionPlan:
             resume_cursor=data.get("resume_cursor"),
             updated_at=data.get("updated_at", utc_now_iso()),
             last_run_skipped_already_terminal=data.get("last_run_skipped_already_terminal", 0),
+            schema_version=data.get("schema_version", 1),
+            stop_reason_category=data.get("stop_reason_category"),
         )
 
 
@@ -452,6 +511,15 @@ def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset
         plan.resume_cursor = None
     save_execution_plan(plan, project_dir)
     return reset_count
+
+
+def _row_group_id(row: dict) -> str:
+    """The same group_id formula build_execution_plan()'s main loop
+    uses, factored out so restrict_to_group_id filtering (Phase 5.5C
+    Stage 10) and the loop can never silently drift apart."""
+    section_name = row.get("section_name")
+    area_name = row.get("area_name")
+    return section_name or f"__ungrouped__{area_name or 'none'}"
 
 
 def _resolve_xactimate_group_name(
@@ -553,6 +621,7 @@ def build_execution_plan(
     group_names_path: Path = DEFAULT_GROUP_NAMES_PATH,
     include_unmapped_rows: bool = False,
     xactimate_project_name: str | None = None,
+    restrict_to_group_id: str | None = None,
 ) -> ExecutionPlan:
     """Builds a fresh ExecutionPlan from every APPROVED, executable line
     item in the project (or the subset named in `line_item_ids`, which
@@ -597,6 +666,16 @@ def build_execution_plan(
         wanted = set(line_item_ids)
         eligible_rows = [r for r in eligible_rows if r["line_item_id"] in wanted]
 
+    if restrict_to_group_id is not None:
+        # Phase 5.5C Stage 10: the multi-group Xactimate sibling-creation
+        # mechanism is not reliably solved for more than two groups per
+        # session (see docs/build-estimate.md Phase 5.5C) -- the UI
+        # offers a one-group-at-a-time fallback that rebuilds the plan
+        # restricted to a single group's own rows, so a run never
+        # attempts a second group's "New Group" creation in the same
+        # session. Never silently expands beyond the requested group.
+        eligible_rows = [r for r in eligible_rows if _row_group_id(r) == restrict_to_group_id]
+
     if not eligible_rows:
         raise ExecutionPlanError("No approved, executable line items found in this project -- nothing to build.")
 
@@ -609,7 +688,7 @@ def build_execution_plan(
     for row in eligible_rows:
         section_name = row.get("section_name")
         area_name = row.get("area_name")
-        group_id = section_name or f"__ungrouped__{area_name or 'none'}"
+        group_id = _row_group_id(row)
 
         category = row.get("category")
         selector = row.get("selector")
@@ -637,7 +716,24 @@ def build_execution_plan(
             area_name=area_name,
             section_name=section_name,
             source_page=row.get("source_page"),
-            description=row.get("mapped_description") or row.get("original_description") or "",
+            # Phase 5.5D Stage 6/7 (live-caught): for a row that BEGAN
+            # UNMAPPED, `description` is what the bounded search
+            # sequence's "exact_description" attempt actually searches
+            # with -- it must be the true raw extracted text, not
+            # `mapped_description` (a machine-bucketed summary from the
+            # mapping stage). Live-reproduced: two textually different
+            # rows ("R&R Wood fence rail - 2\" x 4\" x 8'" and "Stain -
+            # wood fence/gate") both had mapped_description == "Wood
+            # fence", so both searched identically -- not "the exact
+            # source description" by any reasonable reading. A normal
+            # (already-mapped/approved) row is UNCHANGED: mapped_
+            # description is a real, reviewed value there and stays
+            # preferred.
+            description=(
+                (row.get("original_description") or row.get("mapped_description") or "")
+                if is_unmapped
+                else (row.get("mapped_description") or row.get("original_description") or "")
+            ),
             category=category,
             selector=selector,
             lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST if is_unmapped else LOOKUP_STRATEGY_REVIEW_APPROVED,
@@ -670,4 +766,5 @@ def build_execution_plan(
         created_at=now,
         groups=ordered_groups,
         tasks=tasks,
+        schema_version=CURRENT_SCHEMA_VERSION,
     )

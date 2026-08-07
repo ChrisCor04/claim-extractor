@@ -43,7 +43,7 @@ import json
 from pathlib import Path
 
 from estimate_extractor.xactimate_lookup import orchestrator
-from estimate_extractor.xactimate_lookup.adapter import AdapterError, XactimateAdapter
+from estimate_extractor.xactimate_lookup.adapter import AdapterError, ProtectedCommittedRowError, XactimateAdapter
 from estimate_extractor.xactimate_lookup.execution_plan import (
     ExecutionPlan,
     ExecutionTask,
@@ -59,12 +59,19 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     RUN_STATE_COMPLETED,
     RUN_STATE_IN_PROGRESS,
     RUN_STATE_PAUSED,
+    STOP_REASON_GROUP_VERIFICATION_FAILURE,
+    STOP_REASON_NORMAL_COMPLETION,
+    STOP_REASON_PROJECT_LEVEL_HARD_STOP,
+    STOP_REASON_PROJECT_VERIFICATION_FAILURE,
+    STOP_REASON_PROTECTED_ROW_REFUSAL,
+    STOP_REASON_TASK_LEVEL_STOPS,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
     TASK_SKIPPED,
     TEST_ONLY_PROJECT_NAME,
+    is_plan_stale,
     save_execution_plan,
     utc_now_iso,
 )
@@ -78,9 +85,13 @@ from estimate_extractor.xactimate_lookup.models import (
     LookupPlan,
     MAPPING_STATUS_APPROVED,
     RecommendationInput,
+    STOP_REASON_EXTRACTION_FAILED,
+    STOP_REASON_NO_RESULTS,
+    STOP_REASON_UNEXPECTED_DIALOG,
 )
 from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, generate_search_phrase
 from estimate_extractor.xactimate_lookup.ranking import RankingConfig
+from estimate_extractor.xactimate_lookup.signature import compute_normalized_description
 
 # Trust states verify_commit() (Phase 4.8) can return that still count as a
 # safely-completed commit -- ONLY "VERIFIED" does. Everything else means
@@ -211,9 +222,16 @@ def _task_to_recommendation_input(task: ExecutionTask) -> RecommendationInput:
 
 
 def _ensure_select_verify_group(adapter, group: GroupExecutionState) -> tuple[bool, str | None]:
-    """Returns (verified, error_detail). Never raises -- a group that
-    can't be verified means every task inside it is marked
-    REVIEW_REQUIRED, not that the whole run stops (Priority 8)."""
+    """Returns (verified, error_detail). Never raises for an ordinary
+    AdapterError -- a group that can't be verified means every task
+    inside it is marked REVIEW_REQUIRED, not that the whole run stops
+    (Priority 8). ProtectedCommittedRowError (Phase 5.5D) is the one
+    deliberate exception to that: it means group verification's own
+    probe-cleanup would have deleted a row Execute already successfully
+    committed, in some OTHER group this run. That is never a "this one
+    group failed" condition -- it is let through so run_execution_plan()
+    can hard-stop the whole run instead of silently continuing to the
+    next group as if nothing happened."""
     if not _supports_group_operations(adapter):
         return False, "Adapter does not support group operations (ensure_group/select_group/verify_group)."
 
@@ -226,6 +244,8 @@ def _ensure_select_verify_group(adapter, group: GroupExecutionState) -> tuple[bo
         group.state = GROUP_SELECTED
         adapter.select_group(target)
         verified = adapter.verify_group(target)
+    except ProtectedCommittedRowError:
+        raise
     except AdapterError as exc:
         return False, str(exc)
 
@@ -341,11 +361,181 @@ def _record_observed_mapping_proposal(project_dir: Path, task: ExecutionTask, ou
             "quantity": task.source_quantity,
             "evidence_path": task.evidence_path,
             "observed_at": utc_now_iso(),
+            #: Phase 5.5D Stage 7: True only when THIS commit's own
+            #: independent post-commit verification reached VERIFIED --
+            #: the one and only signal _find_trusted_observed_mapping()
+            #: will ever treat as safe to reuse as a later task's
+            #: attempt-4 CAT/SEL fallback. A merely-committed-but-
+            #: unverified row (trust_state != VERIFIED) is never
+            #: eligible, no matter how recent.
+            "verified": task.trust_state == _VERIFIED_TRUST_STATE,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     except Exception:
         pass
+
+
+def _find_trusted_observed_mapping(project_dir: Path, line_item_id: str) -> tuple[str, str] | None:
+    """Phase 5.5D Stage 7: returns (category, selector) ONLY if a
+    PREVIOUS run's execution of this exact line_item_id both committed
+    AND was independently verified (trust_state == VERIFIED) -- read
+    from observed_mappings.json (see _record_observed_mapping_
+    proposal()'s "verified" field). Read-only, best-effort: any error
+    (missing file, malformed JSON, missing fields) returns None rather
+    than raising, matching every other observed-mapping helper here."""
+    try:
+        path = _observed_mappings_path(project_dir)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entry = data.get(line_item_id)
+        if not entry or not entry.get("verified"):
+            return None
+        category = entry.get("observed_category") or entry.get("selected_candidate_category")
+        selector = entry.get("observed_selector") or entry.get("selected_candidate_selector")
+        if not category or not selector:
+            return None
+        return category, selector
+    except Exception:
+        return None
+
+
+#: Phase 5.5D Stage 7: the fixed, ordered attempt-type labels a began_
+#: unmapped task's search sequence can produce -- recorded on each
+#: ExecutionTask.search_attempts entry's "search_type" field.
+SEARCH_TYPE_EXACT_DESCRIPTION = "exact_description"
+SEARCH_TYPE_NORMALIZED_DESCRIPTION = "normalized_description"
+SEARCH_TYPE_COMPACT_GENERATED_PHRASE = "compact_generated_phrase"
+SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL = "trusted_observed_cat_sel"
+
+#: Decision/stop_reason combinations that mean "try the next attempt" --
+#: everything else means "stop here, this attempt produced a defensible
+#: result" (an AUTO_SELECT, or a REVIEW_REQUIRED for any reason OTHER
+#: than these two -- e.g. an ambiguous ranking IS defensible: a human
+#: should look at THAT candidate, not have the row silently re-searched
+#: with different text).
+_ADVANCE_STOP_REASONS = frozenset({STOP_REASON_NO_RESULTS, STOP_REASON_EXTRACTION_FAILED, STOP_REASON_UNEXPECTED_DIALOG})
+
+
+def _description_first_search_attempts(
+    task: ExecutionTask, phrase_rules: PhraseRules, project_dir: Path,
+) -> list[tuple[str, LookupPlan]]:
+    """Builds the bounded, ordered attempt sequence for a began_unmapped
+    task (Phase 5.5D Stage 7): exact source description, normalized
+    description, the existing compact/generated phrase, then -- only if
+    a previous VERIFIED commit of this exact line item produced one --
+    a trusted CAT/SEL. Never starts with CAT/SEL. Reuses generate_
+    search_phrase()/compute_normalized_description() exactly as they
+    already exist elsewhere in this codebase -- no global phrase-
+    generation or ranking change. Skips a candidate attempt whose text
+    is empty or exactly duplicates an earlier attempt's text (nothing
+    new to learn from re-running an identical search)."""
+    attempts: list[tuple[str, LookupPlan]] = []
+    seen_texts: set[str] = set()
+
+    def _add(search_type: str, text: str | None, *, phrase_result=None) -> None:
+        if not text or not text.strip():
+            return
+        normalized_text = text.strip()
+        if normalized_text.lower() in seen_texts:
+            return
+        seen_texts.add(normalized_text.lower())
+        attempts.append((
+            search_type,
+            LookupPlan(
+                line_item_id=task.line_item_id, path=LOOKUP_PATH_DESCRIPTION_SEARCH,
+                item_signature="", search_input=normalized_text, phrase_result=phrase_result,
+            ),
+        ))
+
+    _add(SEARCH_TYPE_EXACT_DESCRIPTION, task.description)
+    _add(SEARCH_TYPE_NORMALIZED_DESCRIPTION, compute_normalized_description(
+        task.normalized_trade, task.normalized_component, task.normalized_material, task.normalized_action,
+    ))
+    phrase_result = generate_search_phrase(
+        task.description, task.normalized_component, task.normalized_material, task.normalized_action, phrase_rules,
+    )
+    _add(SEARCH_TYPE_COMPACT_GENERATED_PHRASE, phrase_result.phrase, phrase_result=phrase_result)
+
+    trusted = _find_trusted_observed_mapping(project_dir, task.line_item_id)
+    if trusted is not None:
+        category, selector = trusted
+        trusted_mapping = InternalMappingRecord(
+            mapping_id=f"observed_mapping:{task.line_item_id}",
+            item_signature="", source_description=task.description, search_phrase="",
+            category=category, selector=selector, xactimate_description=task.description,
+            unit=task.expected_unit, action=None, reviewer="",
+            approval_reason="Reused from a previous VERIFIED commit of this exact line item (Phase 5.5D Stage 7).",
+            status=MAPPING_STATUS_APPROVED,
+        )
+        attempts.append((
+            SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL,
+            LookupPlan(
+                line_item_id=task.line_item_id, path=LOOKUP_PATH_TRUSTED, item_signature="",
+                search_input=f"{category} {selector}", trusted_mapping=trusted_mapping,
+            ),
+        ))
+    return attempts
+
+
+def _run_description_first_task(
+    task: ExecutionTask, item: RecommendationInput, adapter, ranking_config: RankingConfig,
+    phrase_rules: PhraseRules, project_dir: Path, dry_run: bool,
+):
+    """Phase 5.5D Stage 7: runs a began_unmapped task through the
+    bounded attempt sequence from _description_first_search_attempts(),
+    stopping at the FIRST attempt that produces a defensible result
+    (anything other than no-results/extraction-failure/unexpected-
+    dialog) -- reusing orchestrator.execute_plan() UNCHANGED for every
+    individual attempt, so ranking/safety-stop/commit/verify behavior
+    is identical to any other lookup. Records the full attempt trail on
+    `task.search_attempts` regardless of outcome. Returns the winning
+    (or final) LookupOutcome, and (actual_strategy, reason) exactly
+    like _task_to_lookup_plan() -- kept in that same 3-tuple shape so
+    the caller's existing task.actual_lookup_strategy/lookup_strategy_
+    reason assignment doesn't need special-casing."""
+    attempts = _description_first_search_attempts(task, phrase_rules, project_dir)
+    if not attempts:
+        raise UnsafeLookupRouting(
+            f"{task.task_id}: no search attempt could be built (empty description and no fallback) -- "
+            f"refusing to guess."
+        )
+
+    outcome = None
+    for attempt_number, (search_type, attempt_plan) in enumerate(attempts, start=1):
+        outcome = orchestrator.execute_plan(attempt_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
+        is_last_attempt = attempt_number == len(attempts)
+        should_advance = (
+            not is_last_attempt
+            and (outcome.decision == DECISION_NO_MATCH or outcome.stop_reason in _ADVANCE_STOP_REASONS)
+        )
+        top = outcome.candidates[0] if outcome.candidates else None
+        task.search_attempts.append({
+            "attempt_number": attempt_number,
+            "search_type": search_type,
+            "search_text": attempt_plan.search_input,
+            "result_count": len(outcome.candidates),
+            "top_candidate_category": top.dropdown.category if top is not None else None,
+            "top_candidate_selector": top.dropdown.selector if top is not None else None,
+            "top_candidate_score": top.score if top is not None else None,
+            "decision": outcome.decision,
+            "stop_reason": outcome.stop_reason,
+            "advanced_to_next_attempt": should_advance,
+            "advance_reason": (
+                "no defensible candidate -- trying the next attempt" if should_advance
+                else ("final attempt in the sequence" if is_last_attempt else "defensible result found -- stopping here")
+            ),
+        })
+        if not should_advance:
+            break
+
+    reason = (
+        f"test_description_first: attempt {len(task.search_attempts)}/{len(attempts)} "
+        f"({task.search_attempts[-1]['search_type']}) -- {task.search_attempts[-1]['advance_reason']}."
+    )
+    actual_strategy = LOOKUP_PATH_TRUSTED if outcome.plan.path == LOOKUP_PATH_TRUSTED else LOOKUP_PATH_DESCRIPTION_SEARCH
+    return outcome, actual_strategy, reason
 
 
 def run_execution_plan(
@@ -362,19 +552,41 @@ def run_execution_plan(
     be resumed later (Priority 6) by calling this again with the SAME
     plan (reloaded via execution_plan.load_execution_plan()). Never
     raises on a task- or group-level failure -- see module docstring for
-    exactly what stops the whole run versus one task."""
+    exactly what stops the whole run versus one task.
+
+    Phase 5.5D: refuses outright (no group/task is touched) if `plan`
+    is stale (see execution_plan.is_plan_stale()) -- the UI's own
+    "Build / refresh" / "Rebuild TEST plan" actions always produce a
+    current-schema plan; this is the defense-in-depth check for any
+    other caller. Also never silently continues past a
+    ProtectedCommittedRowError (Phase 5.5D) -- that means some
+    destructive cleanup call would have deleted a row THIS run already
+    successfully committed, in some other group; the whole run hard-
+    stops rather than treating it as an ordinary per-group failure."""
+    if not dry_run and is_plan_stale(plan):
+        plan.run_state = RUN_STATE_PAUSED
+        plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
+        save_execution_plan(plan, project_dir)
+        return plan
+
     # Phase 5.5B, Objective 3: recorded BEFORE anything else runs, so
     # "how many tasks did this call skip because they were already
     # terminal (resume)" survives in the persisted plan even if the
     # run pauses immediately after.
     plan.last_run_skipped_already_terminal = sum(1 for t in plan.tasks if t.state != TASK_PENDING)
 
+    run_id = f"run_{utc_now_iso().replace(':', '').replace('-', '').replace('.', '').replace('+', '')}"
+    if hasattr(adapter, "set_execution_context"):
+        adapter.set_execution_context(run_id=run_id)
+
     if not adapter.verify_application():
         plan.run_state = RUN_STATE_PAUSED
+        plan.stop_reason_category = STOP_REASON_PROJECT_VERIFICATION_FAILURE
         save_execution_plan(plan, project_dir)
         return plan
     if not adapter.verify_project():
         plan.run_state = RUN_STATE_PAUSED
+        plan.stop_reason_category = STOP_REASON_PROJECT_VERIFICATION_FAILURE
         save_execution_plan(plan, project_dir)
         return plan
 
@@ -387,6 +599,9 @@ def run_execution_plan(
         if not pending_tasks:
             continue
 
+        if hasattr(adapter, "set_execution_context"):
+            adapter.set_execution_context(group=group.xactimate_group_name or group.section_name or group.group_id)
+
         if not dry_run:
             # Re-verify the application/project are still in a sane state
             # before EACH group -- if Xactimate crashed or the wrong
@@ -394,12 +609,24 @@ def run_execution_plan(
             # than risk executing against the wrong estimate.
             if not (adapter.verify_application() and adapter.verify_project()):
                 plan.run_state = RUN_STATE_PAUSED
+                plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
                 save_execution_plan(plan, project_dir)
                 write_all_execution_reports(plan, project_dir)
                 return plan
 
             group.state = GROUP_IN_PROGRESS
-            verified, detail = _ensure_select_verify_group(adapter, group)
+            try:
+                verified, detail = _ensure_select_verify_group(adapter, group)
+            except ProtectedCommittedRowError as exc:
+                # Never treated as "this group failed" -- a committed
+                # row from this run was about to be deleted. Hard stop.
+                plan.run_state = RUN_STATE_PAUSED
+                plan.stop_reason_category = STOP_REASON_PROTECTED_ROW_REFUSAL
+                group.state = GROUP_FAILED
+                group.error = str(exc)
+                save_execution_plan(plan, project_dir)
+                write_all_execution_reports(plan, project_dir)
+                return plan
             if not verified:
                 group.state = GROUP_FAILED
                 group.error = detail
@@ -412,6 +639,8 @@ def run_execution_plan(
 
         for task in pending_tasks:
             task.started_at = task.started_at or utc_now_iso()
+            if hasattr(adapter, "set_execution_context"):
+                adapter.set_execution_context(task_id=task.task_id, source_row=task.row_label)
 
             # Phase 5.5: a second, authoritative gate for unmapped-row
             # description-first tasks, independent of the cheap string
@@ -437,7 +666,27 @@ def run_execution_plan(
 
             item = _task_to_recommendation_input(task)
             try:
-                lookup_plan, actual_strategy, reason = _task_to_lookup_plan(task, phrase_rules)
+                # Phase 5.5D Stage 7: a began_unmapped task runs through
+                # the bounded exact-description-first attempt sequence
+                # instead of a single generated-phrase search -- see
+                # _run_description_first_task()'s docstring. Every other
+                # (today, only review_approved) task is completely
+                # unchanged: one _task_to_lookup_plan() call, one
+                # orchestrator.execute_plan() call, exactly as before
+                # this phase.
+                if task.lookup_strategy == LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST:
+                    outcome, actual_strategy, reason = _run_description_first_task(
+                        task, item, adapter, ranking_config, phrase_rules, project_dir, dry_run,
+                    )
+                else:
+                    lookup_plan, actual_strategy, reason = _task_to_lookup_plan(task, phrase_rules)
+                    outcome = orchestrator.execute_plan(lookup_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
+
+                task.actual_lookup_strategy = actual_strategy
+                task.lookup_strategy_reason = reason
+                _apply_outcome_to_task(task, outcome, dry_run)
+                if not dry_run:
+                    _record_observed_mapping_proposal(project_dir, task, outcome)
             except UnsafeLookupRouting as exc:
                 # Phase 5.5B: routing itself refused, before any live
                 # adapter interaction happened for this task -- a safe
@@ -453,14 +702,19 @@ def run_execution_plan(
                     plan.resume_cursor = plan.tasks.index(task) + 1
                     save_execution_plan(plan, project_dir)
                 continue
-
-            task.actual_lookup_strategy = actual_strategy
-            task.lookup_strategy_reason = reason
-            try:
-                outcome = orchestrator.execute_plan(lookup_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
-                _apply_outcome_to_task(task, outcome, dry_run)
+            except ProtectedCommittedRowError as exc:
+                # Never treated as "this task failed" -- a committed row
+                # from this run was about to be deleted. Hard stop.
+                plan.run_state = RUN_STATE_PAUSED
+                plan.stop_reason_category = STOP_REASON_PROTECTED_ROW_REFUSAL
+                task.state = TASK_FAILED
+                task.error = str(exc)
+                task.completed_at = utc_now_iso()
                 if not dry_run:
-                    _record_observed_mapping_proposal(project_dir, task, outcome)
+                    plan.resume_cursor = plan.tasks.index(task) + 1
+                    save_execution_plan(plan, project_dir)
+                    write_all_execution_reports(plan, project_dir)
+                return plan
             except Exception as exc:  # noqa: BLE001 -- one task's unexpected failure must never abort the run
                 task.state = TASK_FAILED
                 task.error = repr(exc)
@@ -479,7 +733,14 @@ def run_execution_plan(
             group.state = GROUP_COMPLETED if all(t.state != TASK_PENDING for t in group_tasks) else group.state
 
     if not dry_run:
-        plan.run_state = RUN_STATE_COMPLETED if all(t.state != TASK_PENDING for t in plan.tasks) else RUN_STATE_PAUSED
+        all_terminal = all(t.state != TASK_PENDING for t in plan.tasks)
+        plan.run_state = RUN_STATE_COMPLETED if all_terminal else RUN_STATE_PAUSED
+        if all_terminal:
+            plan.stop_reason_category = STOP_REASON_NORMAL_COMPLETION
+        elif any(g.state == GROUP_FAILED for g in plan.groups):
+            plan.stop_reason_category = STOP_REASON_GROUP_VERIFICATION_FAILURE
+        else:
+            plan.stop_reason_category = STOP_REASON_TASK_LEVEL_STOPS
         save_execution_plan(plan, project_dir)
         write_all_execution_reports(plan, project_dir)
 

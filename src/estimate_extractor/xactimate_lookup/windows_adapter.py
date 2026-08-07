@@ -62,8 +62,17 @@ from pathlib import Path
 
 from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
+    ProtectedCommittedRowError,
     UnexpectedDialogError,
     XactimateAdapter,
+)
+from estimate_extractor.xactimate_lookup.destructive_audit import (
+    DESTRUCTIVE_REASONS,
+    DestructiveActionAuditor,
+    ExecutionContext,
+    InvalidDestructiveReason,
+    ProtectedRowLedger,
+    ProtectedRowRecord,
 )
 from estimate_extractor.xactimate_lookup.models import DropdownResult, PopulatedFields
 
@@ -569,6 +578,75 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_selected: DropdownResult | None = None
         self._last_selected_row_count_before: int | None = None
         self._current_query: str | None = None
+
+        # Phase 5.5D: committed-row protection + destructive-call audit
+        # trail -- see destructive_audit.py. One ledger/auditor per
+        # adapter instance, matching one live session; a fresh adapter
+        # starts with an empty ledger.
+        self._execution_context = ExecutionContext()
+        self._protected_row_ledger = ProtectedRowLedger()
+        self._destructive_auditor = DestructiveActionAuditor(self.evidence_dir / "destructive_action_audit.jsonl")
+
+    # ------------------------------------------------------------------
+    # Phase 5.5D: committed-row protection + destructive-call audit
+    # ------------------------------------------------------------------
+
+    def set_execution_context(
+        self, *, run_id: str | None = None, task_id: str | None = None,
+        source_row: str | None = None, group: str | None = None,
+    ) -> None:
+        """Not part of the abstract contract. Purely descriptive --
+        execution_runner.py calls this before each group/task so
+        destructive-call audit entries and the protected-row ledger
+        know "what's happening right now" without threading that
+        context through every method's own parameters. Never affects
+        ranking, routing, or commit behavior. Any argument left as
+        None keeps that field's PREVIOUS value (a caller updating only
+        `task_id` between tasks in the same group need not re-pass
+        `run_id`/`group` every time)."""
+        if run_id is not None:
+            self._execution_context.run_id = run_id
+        if task_id is not None:
+            self._execution_context.task_id = task_id
+        if source_row is not None:
+            self._execution_context.source_row = source_row
+        if group is not None:
+            self._execution_context.group = group
+
+    def record_protected_commit(
+        self, *, category: str | None, selector: str | None, description: str | None = None,
+        quantity: float | None = None, unit: str | None = None,
+        xactimate_item_number: str | None = None, verification_state: str | None = None,
+    ) -> None:
+        """Not part of the abstract contract (Phase 5.5D). Called by
+        orchestrator.execute_plan() as soon as commit_item() completes
+        successfully (never waiting on verify_commit(), which can
+        itself legitimately fail/mismatch AFTER a real row already
+        landed) -- the row is protected under the CURRENT execution
+        context's group (see set_execution_context()). Best-effort:
+        never raises, since a failure to protect a row must not mask
+        the commit's own already-decided success."""
+        try:
+            hwnd = self._ensure_main_window()
+            image, offset = self._capture_and_locate(hwnd)
+            row_count_after = None
+            if offset is not None:
+                geom = self._last_row_geometry(image, offset)
+                if geom is not None:
+                    row_count_after, _ = geom
+            ctx = self._execution_context
+            record = ProtectedRowRecord(
+                task_id=ctx.task_id, source_row=ctx.source_row, group=ctx.group,
+                category=category, selector=selector, description=description,
+                quantity=quantity, unit=unit, xactimate_item_number=xactimate_item_number,
+                committed_row_identity=(category, selector),
+                row_count_after_commit=row_count_after,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                verification_state=verification_state,
+            )
+            self._protected_row_ledger.record(ctx.group, record)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Lazy Windows-only imports
@@ -2297,7 +2375,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 f"delete_existing_item(): unexpected change to other rows -- expected {expected}, got {after}."
             )
 
-    def cancel_current_item(self) -> None:
+    def cancel_current_item(self, *, reason: str, caller: str) -> None:
         """Not part of the abstract contract -- used by the
         non-destructive and assisted-selection trials to remove the
         LAST row WITHOUT ever calling commit_item(). For removing a
@@ -2313,55 +2391,139 @@ class WindowsXactimateAdapter(XactimateAdapter):
         (Phase 4.4/4.5) was retired rather than patched further: three
         rounds of conservative fixes each closed one OCR failure mode
         and exposed a new one, which is a structural fragility of that
-        approach, not a bug count converging on zero."""
+        approach, not a bug count converging on zero.
+
+        Phase 5.5D: `reason`/`caller` are now REQUIRED, not optional --
+        a live incident showed this method (via `_cleanup_probe_item()`)
+        deleting rows Execute had just successfully committed, with no
+        record of why. `reason` must be one of destructive_audit.
+        DESTRUCTIVE_REASONS (raises InvalidDestructiveReason otherwise).
+        Every call is logged via self._destructive_auditor regardless of
+        outcome. Before deleting anything, this refuses (raises
+        ProtectedCommittedRowError, still logged) if doing so would
+        drop the CURRENT execution context's group below the number of
+        rows record_protected_commit() has protected there this
+        session -- "the row is last" or "row count exceeds some
+        target" is never sufficient justification on its own."""
+        if reason not in DESTRUCTIVE_REASONS:
+            # Validated BEFORE touching the window/grid at all -- an
+            # invalid reason is a pure programming error, independent
+            # of live Xactimate state, and must fail the same way
+            # whether or not a window happens to be found right now.
+            raise InvalidDestructiveReason(
+                f"cancel_current_item(): reason {reason!r} is not one of {sorted(DESTRUCTIVE_REASONS)}."
+            )
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
+        group = self._execution_context.group
+        protected_floor = self._protected_row_ledger.count_for_group(group)
+
         if offset is None:
+            self._destructive_auditor.record(
+                context=self._execution_context, method="cancel_current_item", reason=reason, caller=caller,
+                target_type="last_grid_row", target_identity=None,
+                row_count_before=None, row_identities_before=None,
+                row_count_after=None, row_identities_after=None,
+                result="refused", exception="grid could not be located",
+            )
             raise AdapterError("Could not locate the grid to cancel the current item.")
+
+        row_identities_before = [
+            self._read_category_selector_at(image, offset, self._shifted_anchor("grid_row_1", offset)[1] + i * _GRID_ROW_HEIGHT)
+            for i in range(self._count_grid_rows(image, offset))
+        ]
         geom = self._last_row_geometry(image, offset)
         if geom is None:
+            self._destructive_auditor.record(
+                context=self._execution_context, method="cancel_current_item", reason=reason, caller=caller,
+                target_type="last_grid_row", target_identity=None,
+                row_count_before=0, row_identities_before=row_identities_before,
+                row_count_after=0, row_identities_after=row_identities_before,
+                result="no_op_empty_grid", exception=None,
+            )
             return
         row_count_before, last_row_top = geom
+        target_identity = row_identities_before[-1] if row_identities_before else None
+
+        if row_count_before - 1 < protected_floor:
+            self._destructive_auditor.record(
+                context=self._execution_context, method="cancel_current_item", reason=reason, caller=caller,
+                target_type="last_grid_row", target_identity=str(target_identity),
+                row_count_before=row_count_before, row_identities_before=row_identities_before,
+                row_count_after=row_count_before, row_identities_after=row_identities_before,
+                result="refused",
+                exception=(
+                    f"would drop group {group!r} to {row_count_before - 1} row(s), below its "
+                    f"{protected_floor} protected committed row(s)"
+                ),
+            )
+            raise ProtectedCommittedRowError(
+                f"cancel_current_item(): refusing -- deleting the last row in group {group!r} would drop its "
+                f"row count to {row_count_before - 1}, below the {protected_floor} row(s) already protected "
+                f"there this session (reason={reason!r}, caller={caller!r}, target={target_identity!r})."
+            )
 
         col_l, col_r = _GRID_COLUMNS["description"]
         dx = offset[0]
         row_x = (col_l + col_r) // 2 + dx
         row_y = last_row_top + _GRID_ROW_HEIGHT // 2
 
-        self._open_row_context_menu(hwnd, row_x, row_y)
+        try:
+            self._open_row_context_menu(hwnd, row_x, row_y)
 
-        popup_hwnd = self._find_context_menu_popup_hwnd(hwnd)
-        if popup_hwnd is None or not self._click_delete_via_uia(popup_hwnd):
-            # Best-effort: dismiss whatever menu is open rather than
-            # leaving it hanging over the next call.
-            self._press_key(0x1B)  # VK_ESCAPE
-            raise AdapterError("cancel_current_item(): could not invoke the 'Delete' context-menu item.")
-        time.sleep(1.2)  # empirically: 0.5s was too short and produced a false-negative verification once
+            popup_hwnd = self._find_context_menu_popup_hwnd(hwnd)
+            if popup_hwnd is None or not self._click_delete_via_uia(popup_hwnd):
+                # Best-effort: dismiss whatever menu is open rather than
+                # leaving it hanging over the next call.
+                self._press_key(0x1B)  # VK_ESCAPE
+                raise AdapterError("cancel_current_item(): could not invoke the 'Delete' context-menu item.")
+            time.sleep(1.2)  # empirically: 0.5s was too short and produced a false-negative verification once
 
-        # Live-caught false-positive bug (see docs/xactimate-lookup.md
-        # Phase 4.4): if the click misses "Delete" and instead lands on
-        # something that opens a different window, that window can
-        # visually obscure the grid row at the moment of the post-click
-        # capture, making row_count_after read as lower than it really
-        # is -- a false "success" that doesn't actually delete
-        # anything. Checking for an unexpected window FIRST, and
-        # treating its mere presence as a hard failure (not just
-        # closing it and re-checking), catches this rather than
-        # trusting a row-count read that could have been taken while
-        # occluded.
-        if self._unexpected_dialog_present():
-            self.close_transient_dialogs()
-            raise AdapterError(
-                "cancel_current_item(): an unexpected window appeared after the context-menu click "
-                "(the click likely missed 'Delete') -- refusing to trust the row count until this is resolved."
+            # Live-caught false-positive bug (see docs/xactimate-lookup.md
+            # Phase 4.4): if the click misses "Delete" and instead lands on
+            # something that opens a different window, that window can
+            # visually obscure the grid row at the moment of the post-click
+            # capture, making row_count_after read as lower than it really
+            # is -- a false "success" that doesn't actually delete
+            # anything. Checking for an unexpected window FIRST, and
+            # treating its mere presence as a hard failure (not just
+            # closing it and re-checking), catches this rather than
+            # trusting a row-count read that could have been taken while
+            # occluded.
+            if self._unexpected_dialog_present():
+                self.close_transient_dialogs()
+                raise AdapterError(
+                    "cancel_current_item(): an unexpected window appeared after the context-menu click "
+                    "(the click likely missed 'Delete') -- refusing to trust the row count until this is resolved."
+                )
+
+            image_after, offset_after = self._capture_and_locate(hwnd)
+            row_count_after = self._count_grid_rows(image_after, offset_after) if offset_after is not None else None
+            if row_count_after is None or row_count_after >= row_count_before:
+                raise AdapterError(
+                    f"cancel_current_item(): row count did not decrease (before={row_count_before}, after={row_count_after})."
+                )
+        except Exception as exc:
+            self._destructive_auditor.record(
+                context=self._execution_context, method="cancel_current_item", reason=reason, caller=caller,
+                target_type="last_grid_row", target_identity=str(target_identity),
+                row_count_before=row_count_before, row_identities_before=row_identities_before,
+                row_count_after=None, row_identities_after=None,
+                result="failed", exception=repr(exc),
             )
+            raise
 
-        image_after, offset_after = self._capture_and_locate(hwnd)
-        row_count_after = self._count_grid_rows(image_after, offset_after) if offset_after is not None else None
-        if row_count_after is None or row_count_after >= row_count_before:
-            raise AdapterError(
-                f"cancel_current_item(): row count did not decrease (before={row_count_before}, after={row_count_after})."
-            )
+        row_identities_after = [
+            self._read_category_selector_at(image_after, offset_after, self._shifted_anchor("grid_row_1", offset_after)[1] + i * _GRID_ROW_HEIGHT)
+            for i in range(row_count_after)
+        ] if offset_after is not None else None
+        self._destructive_auditor.record(
+            context=self._execution_context, method="cancel_current_item", reason=reason, caller=caller,
+            target_type="last_grid_row", target_identity=str(target_identity),
+            row_count_before=row_count_before, row_identities_before=row_identities_before,
+            row_count_after=row_count_after, row_identities_after=row_identities_after,
+            result="deleted", exception=None,
+        )
 
     def capture_evidence(self) -> str:
         hwnd = self._ensure_main_window()
@@ -3624,13 +3786,25 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if not skip_cleanup:
                 try:
                     self._cleanup_probe_item(row_count_before)
+                except ProtectedCommittedRowError:
+                    # Phase 5.5D: never swallowed -- this means cleaning
+                    # up the disposable probe would have deleted a row
+                    # Execute already successfully committed. That is a
+                    # hard stop for the whole run, not a best-effort
+                    # cleanup failure to shrug off.
+                    raise
                 except Exception:
                     pass
 
     def _cleanup_probe_item(self, target_row_count: int = 0) -> None:
         """Removes whatever verify_group()'s disposable probe item left
-        behind -- bounded, best-effort, never raises (matches every
-        other cleanup helper in this file).
+        behind -- bounded, best-effort, never raises on ordinary
+        flakiness (matches every other cleanup helper in this file) --
+        EXCEPT ProtectedCommittedRowError (Phase 5.5D), which is
+        deliberately let through: it means this specific cancel would
+        have deleted a row Execute already successfully committed, the
+        exact live incident this phase exists to make structurally
+        impossible.
 
         `target_row_count` is the grid's row count BEFORE the probe was
         entered -- this cancels down to exactly that count, never
@@ -3645,7 +3819,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if row_count is not None and row_count <= target_row_count:
                 break
             try:
-                self.cancel_current_item()
+                self.cancel_current_item(reason="disposable_group_probe", caller="_cleanup_probe_item")
+            except ProtectedCommittedRowError:
+                raise
             except Exception:
                 pass
             time.sleep(0.3)

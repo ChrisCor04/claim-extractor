@@ -467,3 +467,46 @@ def test_capability_flags_unverified_project_blocks_everything_live():
     assert flags.live_adapter_available is False
     assert flags.group_control_available is False
     assert flags.safe_autofill_available is False
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5C Stage 10: multi_group_creation_available -- live
+# investigation found Xactimate's "New Group" command reliably creates
+# only the first two sibling groups of a session (a 3rd+ nests under
+# the 2nd regardless of reset strategy, see docs/build-estimate.md
+# Phase 5.5C), so this defaults False everywhere and must only read
+# True from an adapter that explicitly, positively declares it -- the
+# same "never fabricate capability" pattern safe_autofill_available
+# already follows.
+# ---------------------------------------------------------------------
+
+
+def test_capability_flags_multi_group_creation_available_false_by_default():
+    """A real, live-verified adapter that simply doesn't override the
+    base class attribute (the class default, matching every adapter in
+    this codebase today) must report the flag as False."""
+    adapter = _RealLikeAdapter()
+    flags = service.compute_capability_flags(adapter)
+    assert adapter.multi_group_creation_available is False  # base class default
+    assert flags.multi_group_creation_available is False
+
+
+def test_capability_flags_multi_group_creation_available_true_only_when_adapter_declares_it():
+    """Flips True only for an adapter that explicitly sets the
+    attribute AND is otherwise live-verified -- an adapter declaring
+    the capability while unverified (application/project not
+    confirmed) must still report False, matching safe_autofill_
+    available's same live_adapter_available gate."""
+    class _MultiGroupCapableAdapter(_RealLikeAdapter):
+        multi_group_creation_available = True
+
+    verified_flags = service.compute_capability_flags(_MultiGroupCapableAdapter())
+    assert verified_flags.multi_group_creation_available is True
+
+    unverified_flags = service.compute_capability_flags(_MultiGroupCapableAdapter(project_verified=False))
+    assert unverified_flags.multi_group_creation_available is False
+
+
+def test_capability_flags_no_adapter_reports_multi_group_creation_unavailable():
+    flags = service.compute_capability_flags()
+    assert flags.multi_group_creation_available is False

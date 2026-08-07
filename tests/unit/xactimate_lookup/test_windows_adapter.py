@@ -1138,7 +1138,7 @@ def test_cleanup_probe_item_preserves_pre_existing_rows(monkeypatch):
     row_counts = iter([2, 1])
     monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: next(row_counts))
     cancel_calls = []
-    monkeypatch.setattr(adapter, "cancel_current_item", lambda: cancel_calls.append(1))
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1))
     commit_calls = []
     monkeypatch.setattr(adapter, "commit_item", lambda: commit_calls.append(1))
 
@@ -1159,7 +1159,7 @@ def test_cleanup_probe_item_defaults_to_fully_empty_grid(monkeypatch):
     row_counts = iter([1, 0])
     monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: next(row_counts))
     cancel_calls = []
-    monkeypatch.setattr(adapter, "cancel_current_item", lambda: cancel_calls.append(1))
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1))
     monkeypatch.setattr(adapter, "commit_item", lambda: None)
 
     adapter._cleanup_probe_item()
@@ -1617,3 +1617,176 @@ def test_reconciliation_baseline_mismatch_blocks_continuation_in_execution_runne
     # never treat cleanup as complete when this is False.
     cleanup_complete = result.ok
     assert cleanup_complete is False
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5D: destructive-action audit + committed-row protection.
+# Live incident: rows Build Estimate -> Execute successfully committed
+# were later deleted by an UNRELATED group's verify_group() cleanup
+# cycle. cancel_current_item() is the one primitive every destructive
+# path in this codebase funnels through -- these tests exercise the
+# protection/audit logic directly on it, plus the two callers
+# (_cleanup_probe_item, recover) that must never bypass it.
+# ---------------------------------------------------------------------
+
+
+def _adapter_with_stubbed_grid(monkeypatch, *, row_identities, group="Dwelling Roof"):
+    """Wires up enough of cancel_current_item()'s own dependencies to
+    reach its protection check without touching any real win32/OCR
+    API. `row_identities` is the CURRENT grid's [(cat, sel), ...] --
+    the last entry is what a real cancel would target."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: len(row_identities))
+    monkeypatch.setattr(adapter, "_shifted_anchor", lambda name, offset: (0, 0, 0, 0))
+    row_iter_state = {"i": 0}
+
+    def _fake_read_cat_sel(image, offset, row_top):
+        # Called once per row, top-to-bottom, by cancel_current_item()'s
+        # own before/after identity reads.
+        idx = row_top // _GRID_ROW_HEIGHT if row_top else 0
+        idx = min(idx, len(row_identities) - 1)
+        return row_identities[idx]
+
+    monkeypatch.setattr(adapter, "_read_category_selector_at", _fake_read_cat_sel)
+    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (len(row_identities), (len(row_identities) - 1) * _GRID_ROW_HEIGHT))
+    adapter.set_execution_context(run_id="run_1", group=group)
+    return adapter
+
+
+def test_cancel_current_item_requires_reason_and_caller():
+    """Phase 5.5D: reason/caller are no longer optional -- a call site
+    that doesn't declare them is a programming error, not something
+    this method can silently default."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    with pytest.raises(TypeError):
+        adapter.cancel_current_item()  # missing required keyword args
+
+
+def test_cancel_current_item_refuses_when_it_would_drop_below_protected_floor(monkeypatch):
+    """The exact live incident this phase closes: a group already has 1
+    protected (successfully committed) row; cancel_current_item() must
+    refuse to remove it, even though it's the LAST row in the grid --
+    "it's last" is never sufficient justification on its own."""
+    from estimate_extractor.xactimate_lookup.adapter import ProtectedCommittedRowError
+
+    adapter = _adapter_with_stubbed_grid(monkeypatch, row_identities=[("SFG", "GUTA")], group="Dwelling Roof")
+    adapter.record_protected_commit(category="SFG", selector="GUTA")
+    assert adapter._protected_row_ledger.count_for_group("Dwelling Roof") == 1
+
+    with pytest.raises(ProtectedCommittedRowError):
+        adapter.cancel_current_item(reason="disposable_group_probe", caller="test")
+
+
+def test_cancel_current_item_allows_deletion_above_the_protected_floor(monkeypatch):
+    """The counterpart: a probe row ON TOP OF a protected row is safe to
+    cancel -- the floor is "protected count", not "zero mutation ever
+    allowed". Confirms the protection is precise, not a blanket freeze."""
+    adapter = _adapter_with_stubbed_grid(
+        monkeypatch, row_identities=[("SFG", "GUTA"), ("SFG", "GUTA")], group="Dwelling Roof",
+    )
+    adapter.record_protected_commit(category="SFG", selector="GUTA")  # 1 protected row
+    monkeypatch.setattr(adapter, "_open_row_context_menu", lambda hwnd, x, y: None)
+    monkeypatch.setattr(adapter, "_find_context_menu_popup_hwnd", lambda hwnd: 456)
+    monkeypatch.setattr(adapter, "_click_delete_via_uia", lambda popup_hwnd: True)
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+
+    # After the "delete", only the 1 protected row remains.
+    call_count = {"n": 0}
+
+    def _count_after(image, offset):
+        call_count["n"] += 1
+        return 1  # dropped from 2 to 1 -- exactly the protected floor
+
+    def _capture_and_locate_after_first_call(hwnd, attempts=6, delay_s=0.6):
+        return object(), (0, 0)
+
+    monkeypatch.setattr(adapter, "_capture_and_locate", _capture_and_locate_after_first_call)
+    monkeypatch.setattr(adapter, "_count_grid_rows", _count_after)
+
+    adapter.cancel_current_item(reason="disposable_group_probe", caller="test")  # must not raise
+
+
+def test_invalid_destructive_reason_is_refused():
+    from estimate_extractor.xactimate_lookup.destructive_audit import InvalidDestructiveReason
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    with pytest.raises(InvalidDestructiveReason):
+        adapter.cancel_current_item(reason="cleanup", caller="test")  # not in the fixed reason set
+
+
+def test_cleanup_probe_item_propagates_protected_row_error_instead_of_swallowing_it(monkeypatch):
+    """The exact fix for the live incident: _cleanup_probe_item()'s
+    own bare `except Exception: pass` used to silently absorb this,
+    letting the run continue as if cleanup had simply failed. It must
+    now propagate so the whole run hard-stops."""
+    from estimate_extractor.xactimate_lookup.adapter import ProtectedCommittedRowError
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 5)  # never reaches target -- keeps trying
+
+    def _raise_protected(**kwargs):
+        raise ProtectedCommittedRowError("simulated refusal")
+
+    monkeypatch.setattr(adapter, "cancel_current_item", _raise_protected)
+    monkeypatch.setattr(adapter, "commit_item", lambda: None)
+
+    with pytest.raises(ProtectedCommittedRowError):
+        adapter._cleanup_probe_item(target_row_count=0)
+
+
+def test_recover_never_calls_cancel_current_item():
+    """recover() is Escape + internal state reset only -- it must never
+    reach the one primitive that can delete a row, protected or not."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    def _fail_if_called(**kwargs):
+        raise AssertionError("recover() must never call cancel_current_item()")
+
+    adapter.cancel_current_item = _fail_if_called
+    adapter.close_transient_dialogs = lambda: False
+    adapter._press_key = lambda code: None
+
+    adapter.recover()  # must not raise (and must not call cancel_current_item)
+
+
+def test_record_protected_commit_populates_the_ledger(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (1, 0))
+    adapter.set_execution_context(run_id="run_1", task_id="task_1", source_row="Row 1", group="Dwelling Roof")
+
+    adapter.record_protected_commit(category="SFG", selector="GUTA", description="Gutter", quantity=5.0, unit="LF")
+
+    records = adapter._protected_row_ledger.records_for_group("Dwelling Roof")
+    assert len(records) == 1
+    assert records[0].task_id == "task_1"
+    assert records[0].committed_row_identity == ("SFG", "GUTA")
+
+
+def test_destructive_action_auditor_writes_one_json_line_per_call(tmp_path):
+    from estimate_extractor.xactimate_lookup.destructive_audit import DestructiveActionAuditor, ExecutionContext
+
+    log_path = tmp_path / "destructive_action_audit.jsonl"
+    auditor = DestructiveActionAuditor(log_path)
+    ctx = ExecutionContext(run_id="run_1", task_id="task_1", source_row="Row 1", group="Dwelling Roof")
+
+    auditor.record(
+        context=ctx, method="cancel_current_item", reason="disposable_group_probe", caller="test",
+        target_type="last_grid_row", target_identity="('SFG', 'GUTA')",
+        row_count_before=2, row_identities_before=[("SFG", "GUTA"), ("SFG", "GUTA")],
+        row_count_after=1, row_identities_after=[("SFG", "GUTA")],
+        result="deleted",
+    )
+
+    import json
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["reason"] == "disposable_group_probe"
+    assert entry["run_id"] == "run_1"
+    assert entry["result"] == "deleted"

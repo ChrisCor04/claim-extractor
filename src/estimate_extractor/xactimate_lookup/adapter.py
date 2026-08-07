@@ -51,11 +51,39 @@ class UnsupportedAdapterError(AdapterError):
     implemented one."""
 
 
+class ProtectedCommittedRowError(AdapterError):
+    """Phase 5.5D: raised instead of performing a destructive action
+    (cancel/delete) that would reduce a group's row count below the
+    number of rows Execute has already successfully committed and
+    protected there this session -- see destructive_audit.py's
+    ProtectedRowLedger. A live incident showed rows Execute had just
+    committed disappearing during an UNRELATED group's verification
+    cleanup; this is the hard stop that makes that structurally
+    impossible instead of merely less likely. Never caught and
+    silently swallowed anywhere in this codebase -- a caller seeing
+    this must stop, not retry the same destructive call."""
+
+
 class XactimateAdapter(ABC):
     #: Must be True for a concrete adapter before orchestrator.py will
     #: ever call select_candidate/enter_quantity/commit_item for a live
     #: (non-dry-run) execution. FakeXactimateAdapter leaves this False.
     supports_live_execution: bool = False
+
+    #: Phase 5.5C: True only if this adapter's ensure_group() can
+    #: reliably create MORE THAN TWO Xactimate groups as true siblings
+    #: within a single session. Live investigation (see docs/build-
+    #: estimate.md Phase 5.5C) found Xactimate's "New Group" command
+    #: attaches to the most-recently-created group regardless of click
+    #: target or dialog button; a state-reset workaround (switching
+    #: Estimate Items tabs) reliably fixes exactly the 2nd group but NOT
+    #: a 3rd+ in the same session, reproduced across three different
+    #: reset strategies. Default False -- build_estimate_panel.py uses
+    #: this to gate whether the UI allows a multi-group plan or forces
+    #: the one-group-at-a-time fallback ("Run one group at a time.").
+    #: FakeXactimateAdapter leaves this False; a real adapter sets it
+    #: True only once N>2 sibling creation is independently verified.
+    multi_group_creation_available: bool = False
 
     @abstractmethod
     def verify_application(self) -> bool:

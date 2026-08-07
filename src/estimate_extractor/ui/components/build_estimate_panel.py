@@ -25,6 +25,8 @@ from __future__ import annotations
 import csv
 import io
 import json
+import subprocess
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -32,10 +34,17 @@ import streamlit as st
 from estimate_extractor.mapping.pipeline import DEFAULT_CONFIG_DIR
 from estimate_extractor.xactimate_lookup import phrase_generator, ranking, service
 from estimate_extractor.xactimate_lookup.execution_plan import (
+    CURRENT_SCHEMA_VERSION,
     ExecutionPlanError,
     GROUP_COMPLETED,
     RUN_STATE_COMPLETED,
     RUN_STATE_PAUSED,
+    STOP_REASON_GROUP_VERIFICATION_FAILURE,
+    STOP_REASON_NORMAL_COMPLETION,
+    STOP_REASON_PROJECT_LEVEL_HARD_STOP,
+    STOP_REASON_PROJECT_VERIFICATION_FAILURE,
+    STOP_REASON_PROTECTED_ROW_REFUSAL,
+    STOP_REASON_TASK_LEVEL_STOPS,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
@@ -45,6 +54,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     build_execution_plan,
     classify_unmapped_rows,
     diagnose_run,
+    is_plan_stale,
     load_execution_plan,
     reset_unfinished_tasks,
     save_execution_plan,
@@ -55,8 +65,48 @@ from estimate_extractor.xactimate_lookup.execution_reports import (
     write_all_execution_reports,
 )
 from estimate_extractor.xactimate_lookup.execution_runner import run_execution_plan, skip_task
+from estimate_extractor.xactimate_lookup.models import LOOKUP_PATH_DESCRIPTION_SEARCH, LOOKUP_PATH_TRUSTED
 
 EVIDENCE_DIR = DEFAULT_CONFIG_DIR.parent / "automation_evidence"
+
+#: Phase 5.5D Stage 1: captured once, at module import time -- proves
+#: (or disproves) whether the process currently serving this page has
+#: actually loaded the CURRENT source. Streamlit's file-watcher re-
+#: imports a changed module on its own, so this timestamp jumping
+#: forward on a rerun after an edit is the expected, useful signal;
+#: it staying frozen across many edits is the "stale process" symptom
+#: this exists to catch (see the live incident this phase responds to).
+_MODULE_IMPORTED_AT = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _get_git_revision() -> str | None:
+    """Best-effort, never raises -- None if git isn't available or this
+    isn't a git checkout. `git -C <dir>` lets git discover the repo
+    root itself from this file's own directory rather than guessing a
+    fixed number of parents."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _get_git_status_short() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "status", "--short"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 #: Task states a human still needs to look at -- never conflated with
 #: TASK_COMPLETED (Phase 5.2 Stage 9: "never present 'completed' when a
@@ -136,6 +186,7 @@ def _capability_flags_rows(flags) -> list[dict]:
         {"Capability": "Resume available", "Value": flags.resume_available},
         {"Capability": "Production project allowed", "Value": flags.production_project_allowed},
         {"Capability": "Unattended mode allowed", "Value": flags.unattended_mode_allowed},
+        {"Capability": "Multi-group creation available", "Value": flags.multi_group_creation_available},
     ]
 
 
@@ -183,6 +234,94 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
 
     plan = load_execution_plan(project_dir)
 
+    # Phase 5.5D Stage 1: proves (or disproves) which code is actually
+    # running BEFORE anything else on this page -- a live incident this
+    # phase responds to was caused in part by testing against a stale
+    # Streamlit process that had never re-imported current source.
+    # Always visible, never behind a button click.
+    with st.expander("App / plan diagnostics (Phase 5.5D)", expanded=False):
+        git_revision = _get_git_revision()
+        git_status = _get_git_status_short()
+        d1, d2 = st.columns(2)
+        d1.caption(f"App source revision: `{git_revision or 'unknown (not a git checkout?)'}`")
+        d2.caption(f"App process/module import time: `{_MODULE_IMPORTED_AT}`")
+        if git_status:
+            st.caption("Uncommitted working-tree changes present (this process is running EDITED, not just committed, source):")
+            st.code(git_status, language="diff")
+        else:
+            st.caption("Working tree clean relative to the last commit (or git unavailable).")
+        if plan is not None:
+            st.caption(f"Execution-plan created: `{plan.created_at}` -- updated: `{plan.updated_at}`")
+            st.caption(f"Execution-plan schema version: `{plan.schema_version}` (current: `{CURRENT_SCHEMA_VERSION}`)")
+            if is_plan_stale(plan):
+                st.warning(
+                    "This persisted plan predates the current execution code's schema -- rebuild it "
+                    "(\"Build / refresh execution plan\" / \"Rebuild TEST plan\" below) before Execute. "
+                    "Execute will refuse to run against it as-is."
+                )
+        else:
+            st.caption("No persisted execution plan yet.")
+
+    # Phase 5.5D Stage 2: full task-table audit of the CURRENTLY
+    # persisted plan, plus exact counts -- available before any
+    # confirmation/Execute, so a stale or malformed plan is visible up
+    # front rather than only discovered mid-run.
+    if plan is not None:
+        with st.expander("Plan audit -- full task table (Phase 5.5D)", expanded=False):
+            audit_rows = []
+            for t in plan.tasks:
+                r = _task_row(t)
+                last_attempt = t.search_attempts[-1] if t.search_attempts else None
+                audit_rows.append({
+                    "Source row": r["row_label"],
+                    "Line item": r["line_item_id"],
+                    "Group": r["section_name"],
+                    "Source description": r["description"],
+                    "CAT": r["category"],
+                    "SEL": r["selector"],
+                    "Began unmapped": r["began_unmapped"],
+                    "Lookup strategy": r["lookup_strategy"],
+                    "Requested strategy": r["requested_lookup_strategy"],
+                    "Actual strategy": r["actual_lookup_strategy"],
+                    "Strategy reason": r["lookup_strategy_reason"],
+                    "Search phrase (last attempt)": last_attempt["search_text"] if last_attempt else None,
+                    "Status": r["state"],
+                    "Stop reason": r["stop_reason"],
+                    "Recovery outcome": r["recovery_outcome"],
+                    "Completed at": r["completed_at"],
+                })
+            st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True)
+
+            none_none_tasks = [
+                t for t in plan.tasks
+                if (t.category is None and t.selector is None and t.actual_lookup_strategy is None and t.error and "None" in str(t.error))
+            ]
+            missing_began_unmapped = [t for t in plan.tasks if not hasattr(t, "began_unmapped")]
+            mismatched_cat_sel_routing = [
+                t for t in plan.tasks
+                if t.lookup_strategy == "test_description_first" and t.actual_lookup_strategy == LOOKUP_PATH_TRUSTED
+            ]
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Completed", sum(1 for t in plan.tasks if t.state == TASK_COMPLETED))
+            a2.metric("Review required", sum(1 for t in plan.tasks if t.state == TASK_REVIEW_REQUIRED))
+            a3.metric("Failed", sum(1 for t in plan.tasks if t.state == TASK_FAILED))
+            a4.metric("Skipped", sum(1 for t in plan.tasks if t.state == TASK_SKIPPED))
+            a5, a6, a7, a8 = st.columns(4)
+            a5.metric("Not attempted", sum(1 for t in plan.tasks if t.state == TASK_PENDING))
+            a6.metric("Terminal skipped on rerun", plan.last_run_skipped_already_terminal)
+            a7.metric("Routed: CAT/SEL", sum(1 for t in plan.tasks if t.actual_lookup_strategy == LOOKUP_PATH_TRUSTED))
+            a8.metric("Routed: description", sum(1 for t in plan.tasks if t.actual_lookup_strategy == LOOKUP_PATH_DESCRIPTION_SEARCH))
+            a9, a10, a11 = st.columns(3)
+            a9.metric('Contains "None None"', len(none_none_tasks))
+            a10.metric("Missing began_unmapped", len(missing_began_unmapped))
+            a11.metric("test_description_first routed by CAT/SEL", len(mismatched_cat_sel_routing))
+            if mismatched_cat_sel_routing:
+                st.error(
+                    f"{len(mismatched_cat_sel_routing)} task(s) requested test_description_first routing but "
+                    f"were actually routed by CAT/SEL -- this is exactly the unsafe-routing incident Phase "
+                    f"5.5B/5.5D exist to prevent. Rebuild the plan and re-run."
+                )
+
     # Phase 5.5A: project confirmation must render BEFORE any early
     # return caused by an empty/missing plan -- a project with zero
     # approved rows (and nothing built yet) used to hit `plan is None`
@@ -220,6 +359,10 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
     project_confirmed = False
     display_profile_ok = True
     safe_autofill_ready = False
+    #: Phase 5.5C Stage 10: defaults False (never assume live sibling-
+    #: group creation is available before a real adapter has positively
+    #: confirmed it) -- only set from confirmation["flags"] below.
+    multi_group_creation_available = False
     if confirmation and confirmation.get("project_name") == xactimate_project_name.strip():
         if confirmation.get("error"):
             st.error(f"Could not construct the Xactimate adapter: {confirmation['error']}")
@@ -227,6 +370,7 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
             flags = confirmation["flags"]
             display_profile = confirmation["display_profile"]
             project_confirmed = bool(confirmation["application_verified"] and confirmation["project_verified"])
+            multi_group_creation_available = flags.multi_group_creation_available
 
             if project_confirmed:
                 st.success(f"Confirmed: Xactimate is open on project {xactimate_project_name.strip()!r}, Estimate Items screen.")
@@ -332,6 +476,25 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
             f"Execution stopped after {diagnostics.stopped_after_row} because: {diagnostics.stop_reason_summary}"
         )
     st.caption(f"Remaining unattempted rows: {diagnostics.remaining_unattempted}")
+    # Phase 5.5D Stage 8: the exact fixed-vocabulary category run_
+    # execution_plan() set at its actual exit point -- never displays
+    # "execution complete" when tasks remain unattempted, and always
+    # distinguishes a protected-row refusal from an ordinary group/task
+    # stop rather than folding it into the same generic message.
+    _STOP_REASON_CATEGORY_LABELS = {
+        STOP_REASON_NORMAL_COMPLETION: "Normal completion -- every task reached a terminal state.",
+        STOP_REASON_PROJECT_VERIFICATION_FAILURE: "Project-level: Xactimate application/project could not be verified before the run started.",
+        STOP_REASON_PROJECT_LEVEL_HARD_STOP: "Project-level hard stop: Xactimate/project verification failed mid-run, or the persisted plan was rejected as stale.",
+        STOP_REASON_GROUP_VERIFICATION_FAILURE: "One or more groups failed verification (see the group tables above) -- their tasks were marked Review Required.",
+        STOP_REASON_PROTECTED_ROW_REFUSAL: "STOPPED: a cleanup/verification step would have deleted a row this run already successfully committed -- refused. See the destructive-action audit log.",
+        STOP_REASON_TASK_LEVEL_STOPS: "Task-level safety stops and/or tasks not yet attempted this run.",
+    }
+    if plan.stop_reason_category:
+        label = _STOP_REASON_CATEGORY_LABELS.get(plan.stop_reason_category, plan.stop_reason_category)
+        if plan.stop_reason_category == STOP_REASON_PROTECTED_ROW_REFUSAL:
+            st.error(f"Exact stop reason: {label}")
+        else:
+            st.caption(f"Exact stop reason: {label}")
     with st.expander("Run diagnostics (exact counts)", expanded=False):
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Completed", diagnostics.completed)
@@ -344,6 +507,7 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
         d7.metric("Routed: CAT/SEL", diagnostics.routed_by_cat_sel)
         d8.metric("Routed: description", diagnostics.routed_by_description)
         st.caption(f"Skipped as already-terminal on the most recent run (resume): {diagnostics.skipped_already_terminal_last_run}")
+        st.caption(f"Attempted this run: {diagnostics.completed + diagnostics.review_required + diagnostics.no_match + diagnostics.failed + diagnostics.skipped}")
 
     # Phase 5.5B, Objective 4: TEST-only reset/rebuild actions. Shown
     # only for the same confirmed-exactly-TEST condition that gates the
@@ -430,6 +594,67 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
                 "Preview (dry run) is still available."
             )
 
+    # Phase 5.5C Stage 10 (revised): live investigation found Xactimate's
+    # "New Group" command reliably creates only the FIRST TWO sibling
+    # groups of a session -- a 3rd+ group reproducibly nests under the
+    # 2nd regardless of which state-reset strategy precedes it (see
+    # docs/build-estimate.md Phase 5.5C). ensure_group() itself refuses
+    # (raises before any task executes) if a created group's ancestry
+    # doesn't check out, and run_execution_plan()'s group loop already
+    # catches that per-group -- marking that group's tasks REVIEW_
+    # REQUIRED with a clear reason and `continue`-ing to the next group
+    # -- rather than aborting the whole run or writing to the wrong
+    # group. That existing safety net means a multi-group plan is
+    # already safe to Execute directly: groups 1-2 complete normally,
+    # any group beyond that comes back Review Required instead of
+    # corrupting anything. This is informational, not a gate -- Execute
+    # is never disabled here. The one-group selector below is an
+    # OPTIONAL convenience for deliberately targeting a single group
+    # (e.g. to avoid burning time on groups already known to fail),
+    # never a forced step.
+    if len(plan.groups) > 1 and not multi_group_creation_available:
+        st.info(
+            f"This plan spans {len(plan.groups)} groups. Xactimate reliably creates only the first two groups "
+            "of a session as top-level siblings -- Execute will run all groups; any group beyond the 2nd will "
+            "safely come back as Review Required (never written to the wrong group) instead of failing the "
+            "whole run. See Run diagnostics after Execute for exactly which groups need a follow-up run. "
+            "Optionally, use the selector below to build a plan for just one group first."
+        )
+        with st.expander("Build a plan for just one group (optional)", expanded=False):
+            group_options = {
+                g.group_id: (
+                    f"{g.section_name or '(no section)'} -> Xactimate group {g.xactimate_group_name!r} "
+                    f"({len(plan.tasks_in_group(g.group_id))} task(s))"
+                )
+                for g in plan.groups
+            }
+            selected_group_id = st.selectbox(
+                "Group to run this session",
+                options=list(group_options.keys()),
+                format_func=lambda gid: group_options[gid],
+                key="build_estimate_single_group_selection",
+            )
+            if st.button("Build one-group plan for the selected group", key="build_estimate_build_single_group_plan"):
+                try:
+                    if include_unmapped:
+                        restricted_plan = build_execution_plan(
+                            project_dir, project_slug,
+                            include_unmapped_rows=True, xactimate_project_name=xactimate_project_name.strip(),
+                            restrict_to_group_id=selected_group_id,
+                        )
+                    else:
+                        restricted_plan = build_execution_plan(
+                            project_dir, project_slug, restrict_to_group_id=selected_group_id,
+                        )
+                    save_execution_plan(restricted_plan, project_dir)
+                    st.success(
+                        f"Built a one-group plan with {len(restricted_plan.tasks)} task(s) for "
+                        f"{group_options[selected_group_id]}."
+                    )
+                    st.rerun()
+                except ExecutionPlanError as exc:
+                    st.error(str(exc))
+
     c1, c2 = st.columns(2)
     if c1.button("Preview (dry run -- never touches Xactimate's data)", disabled=not project_confirmed or pending_count == 0):
         try:
@@ -447,8 +672,20 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
                 st.info("Dry run complete -- no task states were changed, nothing was entered into Xactimate.")
                 st.dataframe(pd.DataFrame(_task_table_rows(preview_plan.tasks)), use_container_width=True, hide_index=True)
 
+    # Phase 5.5D Stage 2: never silently execute a legacy plan --
+    # run_execution_plan() itself also refuses (defense in depth), but
+    # gating the button here gives an immediate, specific reason
+    # instead of a post-click error.
+    plan_stale = is_plan_stale(plan)
+    if plan_stale:
+        st.error(
+            f"This plan's schema (version {plan.schema_version}) predates the current execution code "
+            f"(version {CURRENT_SCHEMA_VERSION}) -- Execute is disabled until it's rebuilt. Use "
+            f"\"Build / refresh execution plan\" or \"Rebuild TEST plan\" above."
+        )
+
     execute_label = "Execute (Safe Autofill)" if safe_autofill_enabled else "Execute"
-    if c2.button(execute_label, disabled=not project_confirmed or pending_count == 0, type="primary"):
+    if c2.button(execute_label, disabled=not project_confirmed or pending_count == 0 or plan_stale, type="primary"):
         try:
             adapter = _construct_windows_adapter(xactimate_project_name.strip())
         except Exception as exc:  # pragma: no cover -- exercised live on Windows only

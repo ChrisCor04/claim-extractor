@@ -287,6 +287,71 @@ def test_checking_the_checkbox_and_rebuilding_produces_the_42_task_plan(monkeypa
 
 
 @pytest.mark.skipif(not _UNMAPPED_PROJECT.exists(), reason="aranda-insurance-v3 project fixture not present on disk")
+def test_multi_group_plan_shows_informational_note_but_never_disables_execute(monkeypatch):
+    """Phase 5.5C Stage 10 (revised per live feedback): a plan spanning
+    more than one group, built against a FakeXactimateAdapter (multi_
+    group_creation_available defaults False, matching every adapter in
+    this codebase today), must show an INFORMATIONAL note about the
+    known Xactimate group-nesting limit -- but Execute must stay
+    enabled. run_execution_plan()'s group loop already catches an
+    ensure_group() ancestry failure per-group (marks that group's tasks
+    Review Required, continues to the next group) rather than aborting
+    or writing to the wrong group, so forcing one-group-at-a-time here
+    would add friction without adding safety. See docs/build-estimate.md
+    Phase 5.5C."""
+    stale_plan_backup = _UNMAPPED_PLAN_PATH.read_text(encoding="utf-8") if _UNMAPPED_PLAN_PATH.exists() else None
+    try:
+        at = _open_unmapped_project()
+        _confirm_project(at, monkeypatch, "TEST")
+
+        checkboxes = [c for c in at.checkbox if "Include rows missing CAT/SEL" in c.label]
+        checkboxes[0].check().run()
+        assert not at.exception
+
+        build_buttons = [b for b in at.button if "Build / refresh execution plan" in b.label]
+        build_buttons[0].click().run()
+        assert not at.exception
+
+        groups_metric = next(m.value for m in at.metric if m.label == "Groups in plan")
+        assert int(groups_metric) > 1, "this test requires a real multi-group plan to exercise the note"
+
+        infos = " ".join(i.value for i in at.info)
+        assert "This plan spans" in infos
+        assert "Execute will run all groups" in infos
+
+        # Never a blocking error, and Execute must stay enabled.
+        errors = " ".join(e.value for e in at.error)
+        assert "Multi-group execution is not currently available" not in errors
+
+        execute_buttons = [b for b in at.button if b.label in ("Execute", "Execute (Safe Autofill)")]
+        assert execute_buttons, "Execute button not found"
+        assert execute_buttons[0].disabled is False
+
+        # The optional one-group selector is still offered as a
+        # convenience, just never forced.
+        selectors = [s for s in at.selectbox if s.label == "Group to run this session"]
+        assert selectors, "optional one-group selector not offered for a multi-group plan"
+
+        selectors[0].set_value(selectors[0].options[0]).run()
+        assert not at.exception
+        rebuild_buttons = [b for b in at.button if "Build one-group plan for the selected group" in b.label]
+        assert rebuild_buttons
+        rebuild_buttons[0].click().run()
+        assert not at.exception
+
+        import json
+        data = json.loads(_UNMAPPED_PLAN_PATH.read_text(encoding="utf-8"))
+        assert len(data["groups"]) == 1
+        successes_after = " ".join(s.value for s in at.success)
+        assert "Built a one-group plan" in successes_after
+    finally:
+        if stale_plan_backup is not None:
+            _UNMAPPED_PLAN_PATH.write_text(stale_plan_backup, encoding="utf-8")
+        elif _UNMAPPED_PLAN_PATH.exists():
+            _UNMAPPED_PLAN_PATH.unlink()
+
+
+@pytest.mark.skipif(not _UNMAPPED_PROJECT.exists(), reason="aranda-insurance-v3 project fixture not present on disk")
 def test_non_test_confirmation_does_not_show_the_checkbox(monkeypatch):
     """Requirement 4 / hard scope boundary: confirming any project other
     than exactly TEST must never offer the unmapped-row checkbox."""

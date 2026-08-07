@@ -303,7 +303,7 @@ def test_field_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phra
 
     monkeypatch.setattr(adapter, "read_populated_fields", lambda: PopulatedFields(category="WRONG", selector="MISMATCH", description=None, unit=None, action=None, item_number=None))
     cancel_calls = []
-    monkeypatch.setattr(adapter, "cancel_current_item", lambda: cancel_calls.append(1), raising=False)
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
     assert outcome.decision == DECISION_REVIEW_REQUIRED
@@ -326,7 +326,7 @@ def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phras
     adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]}, populated_unit="LF")
     adapter.supports_live_execution = True
     cancel_calls = []
-    monkeypatch.setattr(adapter, "cancel_current_item", lambda: cancel_calls.append(1), raising=False)
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
     assert outcome.decision == DECISION_REVIEW_REQUIRED
@@ -359,7 +359,7 @@ def test_cancel_pending_selection_retries_when_the_first_attempt_fails(tmp_path,
 
     attempts = []
 
-    def _flaky_cancel():
+    def _flaky_cancel(**kwargs):
         attempts.append(1)
         if len(attempts) == 1:
             raise AdapterError("cancel_current_item(): row count did not decrease (before=1, after=1).")
@@ -383,7 +383,7 @@ def test_cancel_pending_selection_gives_up_after_bounded_retries_without_raising
 
     attempts = []
 
-    def _always_fails():
+    def _always_fails(**kwargs):
         attempts.append(1)
         raise AdapterError("simulated persistent failure")
 

@@ -12,8 +12,9 @@ import json
 
 import pytest
 
-from estimate_extractor.xactimate_lookup.adapter import AdapterError, FakeXactimateAdapter
+from estimate_extractor.xactimate_lookup.adapter import AdapterError, FakeXactimateAdapter, ProtectedCommittedRowError
 from estimate_extractor.xactimate_lookup.execution_plan import (
+    CURRENT_SCHEMA_VERSION,
     ExecutionPlan,
     ExecutionTask,
     GROUP_COMPLETED,
@@ -25,11 +26,14 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
     RUN_STATE_COMPLETED,
     RUN_STATE_PAUSED,
+    STOP_REASON_NORMAL_COMPLETION,
+    STOP_REASON_PROTECTED_ROW_REFUSAL,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
     TASK_SKIPPED,
+    is_plan_stale,
     load_execution_plan,
     save_execution_plan,
 )
@@ -495,13 +499,15 @@ def _adapter_with_test_project(**kwargs):
 
 def test_unmapped_task_uses_description_first_and_mapped_task_uses_cat_sel(tmp_path, phrase_rules, ranking_config):
     """Requirements 8 & 9: a task without CAT/SEL is searched by
-    description (the existing description-first path); a task WITH
-    CAT/SEL still goes through the unchanged trusted-lookup path in the
-    SAME run."""
+    description -- Phase 5.5D Stage 7's bounded attempt sequence means
+    the FIRST attempt is the exact source description (not the compact
+    generated phrase); a task WITH CAT/SEL still goes through the
+    unchanged trusted-lookup path in the SAME run, and CAT/SEL is never
+    tried for the unmapped task at all."""
     plan = _plan_mapped_and_unmapped()
     script = {
         "RFG 3TAB": [_dropdown("RFG", "3TAB")],
-        _FELT_PHRASE: [_felt_dropdown()],
+        "Roofing felt - 15 lb.": [_felt_dropdown()],  # exact source description -- attempt 1 succeeds immediately
     }
     adapter = _adapter_with_test_project(dropdown_script=script)
 
@@ -511,8 +517,12 @@ def test_unmapped_task_uses_description_first_and_mapped_task_uses_cat_sel(tmp_p
     assert result.task_by_id("task_unmapped").state == TASK_COMPLETED
     search_desc_calls = [c for c in adapter.log.calls if c[0] == "search_by_description"]
     search_cs_calls = [c for c in adapter.log.calls if c[0] == "search_by_category_selector"]
-    assert search_desc_calls == [("search_by_description", (_FELT_PHRASE,), {})]
+    # Exactly ONE description search -- the exact source description --
+    # never the compact phrase, since attempt 1 already found a match.
+    assert search_desc_calls == [("search_by_description", ("Roofing felt - 15 lb.",), {})]
     assert search_cs_calls == [("search_by_category_selector", ("RFG", "3TAB"), {})]
+    unmapped_task = result.task_by_id("task_unmapped")
+    assert [a["search_type"] for a in unmapped_task.search_attempts] == ["exact_description"]
 
 
 def test_unmapped_task_ambiguous_ranking_is_still_a_safe_stop(tmp_path, phrase_rules, ranking_config):
@@ -745,3 +755,109 @@ def test_runner_continues_to_later_sibling_groups_safely_after_ancestry_failure(
     fence_tasks = [t for t in result.tasks if t.section_name == "Fence"]
     assert all(t.state == TASK_COMPLETED for t in fence_tasks)
     assert result.run_state == RUN_STATE_COMPLETED
+
+
+# ---------------------------------------------------------------------
+# Phase 5.5D: no automatic baseline restoration, committed rows survive
+# the run, an unresolved later group can't delete an earlier group's
+# committed row, stale plans are rejected, and stop_reason_category is
+# reported accurately. See destructive_audit.py / windows_adapter.py's
+# cancel_current_item() for the actual protection mechanism -- these
+# tests exercise it through run_execution_plan()'s own call path.
+# ---------------------------------------------------------------------
+
+
+class ProtectionAwareFakeAdapter(GroupAwareFakeAdapter):
+    """Adds just enough of the Phase 5.5D protection surface
+    (set_execution_context/record_protected_commit/cancel_current_item)
+    to prove run_execution_plan() reacts correctly to a
+    ProtectedCommittedRowError raised from inside group verification --
+    without needing any real win32/OCR API."""
+
+    def __init__(self, *args, raise_protected_error_on_group=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.raise_protected_error_on_group = raise_protected_error_on_group or set()
+        self.protected_commits: list[tuple[str | None, str, str]] = []  # (group, category, selector)
+        self.context_group = None
+
+    def set_execution_context(self, *, run_id=None, task_id=None, source_row=None, group=None):
+        if group is not None:
+            self.context_group = group
+
+    def record_protected_commit(self, *, category, selector, description=None, quantity=None, unit=None, xactimate_item_number=None, verification_state=None):
+        self.protected_commits.append((self.context_group, category, selector))
+
+    def verify_group(self, name: str) -> bool:
+        if name in self.raise_protected_error_on_group:
+            raise ProtectedCommittedRowError(
+                f"simulated: cleaning up {name!r} would have deleted a protected row from an earlier group."
+            )
+        return super().verify_group(name)
+
+
+def test_execute_never_automatically_restores_the_baseline_or_reverts_committed_tasks(tmp_path, phrase_rules, ranking_config):
+    """Requirements 1 & 2: nothing in run_execution_plan()'s own call
+    path restores a baseline or reverts an already-COMPLETED task --
+    confirmed by running a full plan and checking every committed task
+    is still COMPLETED in the value run_execution_plan() itself
+    returns (not just what was persisted mid-run)."""
+    plan = _plan_two_groups()
+    adapter = ProtectionAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert all(t.state == TASK_COMPLETED for t in result.tasks)
+    assert result.run_state == RUN_STATE_COMPLETED
+    assert result.stop_reason_category == STOP_REASON_NORMAL_COMPLETION
+    # Protected-commit hook fired once per successful commit.
+    assert len(adapter.protected_commits) == 3
+
+
+def test_protected_row_error_in_one_group_hard_stops_without_touching_earlier_completed_tasks(tmp_path, phrase_rules, ranking_config):
+    """Requirement 3: a ProtectedCommittedRowError raised while
+    verifying a LATER group (simulating group-probe cleanup about to
+    delete an earlier group's committed row) hard-stops the whole run
+    -- the EARLIER group's already-completed tasks are left exactly as
+    they were, never marked failed or reset, and the run is clearly
+    flagged as a protected-row refusal, not an ordinary group failure."""
+    plan = _plan_two_groups()  # "Dwelling Roof" (2 tasks) then "Fence" (1 task)
+    adapter = ProtectionAwareFakeAdapter(
+        dropdown_script=_dropdown_script(*plan.tasks), raise_protected_error_on_group={"Fence"},
+    )
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    roof_tasks = [t for t in result.tasks if t.section_name == "Dwelling Roof"]
+    fence_tasks = [t for t in result.tasks if t.section_name == "Fence"]
+    assert all(t.state == TASK_COMPLETED for t in roof_tasks)  # untouched
+    assert result.run_state == RUN_STATE_PAUSED
+    assert result.stop_reason_category == STOP_REASON_PROTECTED_ROW_REFUSAL
+    assert result.group_by_id("Fence").state == GROUP_FAILED
+    assert all(t.state != TASK_COMPLETED for t in fence_tasks)  # never silently completed either
+
+
+def test_stale_plan_schema_is_rejected_before_any_task_runs(tmp_path, phrase_rules, ranking_config):
+    """Requirement 7: a plan whose schema_version predates
+    CURRENT_SCHEMA_VERSION (the on-disk-legacy-JSON case -- see
+    ExecutionPlan.from_dict()'s own data.get("schema_version", 1))
+    must be refused outright, before touching the adapter or any
+    group/task at all."""
+    plan = _plan_two_groups()
+    plan.schema_version = CURRENT_SCHEMA_VERSION - 1
+    assert is_plan_stale(plan)
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert all(t.state == TASK_PENDING for t in result.tasks)  # nothing was attempted
+    assert adapter.ensure_group_calls == []  # never even reached group setup
+    assert result.run_state == RUN_STATE_PAUSED
+
+
+def test_current_schema_plan_is_never_treated_as_stale(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_two_groups()
+    assert plan.schema_version == CURRENT_SCHEMA_VERSION
+    assert not is_plan_stale(plan)

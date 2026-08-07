@@ -19,7 +19,12 @@ from __future__ import annotations
 import sqlite3
 
 from estimate_extractor.xactimate_lookup import registry, signature as signature_mod
-from estimate_extractor.xactimate_lookup.adapter import AdapterError, UnexpectedDialogError, XactimateAdapter
+from estimate_extractor.xactimate_lookup.adapter import (
+    AdapterError,
+    ProtectedCommittedRowError,
+    UnexpectedDialogError,
+    XactimateAdapter,
+)
 from estimate_extractor.xactimate_lookup.models import (
     DECISION_NO_MATCH,
     DECISION_REVIEW_REQUIRED,
@@ -154,15 +159,21 @@ def _cancel_pending_selection(adapter: XactimateAdapter) -> None:
     a $330.31 row survived a field-mismatch stop). Bounded retry --
     never unbounded -- closes this without weakening the "never let
     cleanup mask the original stop reason" contract: it still never
-    raises."""
+    raises -- EXCEPT for ProtectedCommittedRowError (Phase 5.5D), which
+    is never a transient flakiness signal to retry past: it means this
+    specific cancel would have deleted a row Execute already
+    successfully committed. That is a hard stop for the whole run, not
+    a per-task condition to swallow -- propagated deliberately."""
     if not hasattr(adapter, "cancel_current_item"):
         return
     cancelled = False
     for _attempt in range(3):
         try:
-            adapter.cancel_current_item()
+            adapter.cancel_current_item(reason="pending_uncommitted_selection", caller="_cancel_pending_selection")
             cancelled = True
             break
+        except ProtectedCommittedRowError:
+            raise
         except Exception:
             continue
     # Live-caught (Phase 5.4): cancelling the pending row does NOT by
@@ -304,6 +315,20 @@ def execute_plan(
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_EXTRACTION_FAILED, str(exc), candidates=candidates, selected=top)
 
     outcome.committed = True
+
+    # Phase 5.5D: protect this row as soon as commit_item() has
+    # completed successfully -- deliberately BEFORE verify_commit()
+    # below, which can itself legitimately fail/mismatch after a real
+    # row already landed; the row must stay protected regardless of
+    # that outcome. Best-effort/duck-typed (only WindowsXactimateAdapter
+    # implements it) and never raises -- see record_protected_commit()'s
+    # own docstring.
+    if hasattr(adapter, "record_protected_commit"):
+        adapter.record_protected_commit(
+            category=top.dropdown.category, selector=top.dropdown.selector,
+            description=item.original_description, quantity=item.quantity, unit=item.source_unit,
+        )
+
     outcome.evidence_reference = adapter.capture_evidence()
     if before_snapshot is not None and hasattr(adapter, "verify_commit"):
         outcome.verification = adapter.verify_commit(
