@@ -761,6 +761,36 @@ def test_verify_commit_identity_available_for_cleanup_after_unit_mismatch(monkey
 # ---------------------------------------------------------------------------
 
 
+def test_snapshot_group_names_reads_well_past_the_old_8_row_default(monkeypatch):
+    """Live-caught (Phase 5.7B): the old default (max_rows=8, i.e. only
+    7 child groups) silently truncated the tree for a real PDF needing
+    more groups -- the 8th/9th groups were never read at all, so every
+    caller reported "not found" even though they genuinely existed.
+    This locks in real headroom: a 10-row tree (TEST + 9 real groups)
+    must be read in full."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    real_rows = [
+        "Exterior", "Dwelling Roof", "Front Elevation", "Rear Elevation", "Left Elevation",
+        "Right Elevation", "Fencing", "Debris Removal", "Labor Minimums Applied",
+    ]
+    monkeypatch.setattr(adapter, "_ocr_text", lambda crop, psm=7: crop)
+    monkeypatch.setattr(adapter, "_group_tree_row_crop_top", lambda header_top, row_index: row_index)
+
+    class _FakeImage:
+        def crop(self, box):
+            row_top = box[1]
+            return real_rows[row_top - 1] if 1 <= row_top <= len(real_rows) else ""
+
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: _FakeImage())
+
+    rows = adapter.snapshot_group_names()
+
+    assert rows[0] == "TEST"
+    assert rows[1:10] == real_rows  # all 9 real groups read, none silently dropped
+
+
 def test_group_name_matches_is_whitespace_and_case_insensitive():
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     assert adapter._group_name_matches("fy DwellingRoofl Ss", "Dwelling Roof") is True
@@ -946,7 +976,7 @@ def test_ensure_group_creates_under_the_verified_root_by_default(monkeypatch):
 
     monkeypatch.setattr(adapter, "_open_group_tree_context_menu", fake_open_menu)
     monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
-    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456 if title == "New Group" else None)
     monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
     monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
     monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
@@ -999,7 +1029,7 @@ def test_ensure_group_accepts_an_explicit_parent_group_name(monkeypatch):
 
     monkeypatch.setattr(adapter, "_open_group_tree_context_menu", fake_open_menu)
     monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
-    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456 if title == "New Group" else None)
     monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
     monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
     monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
@@ -1055,7 +1085,7 @@ def test_ensure_group_returns_position_warning_when_new_group_indentation_does_n
     )
     monkeypatch.setattr(adapter, "_open_group_tree_context_menu", lambda hwnd, header, row_index: [object()] * adapter._GROUP_MENU_EXPECTED_ITEM_COUNT)
     monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
-    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456 if title == "New Group" else None)
     monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
     monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
     monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
@@ -1088,7 +1118,7 @@ def test_ensure_group_does_not_raise_when_new_group_indentation_matches_a_siblin
     )
     monkeypatch.setattr(adapter, "_open_group_tree_context_menu", lambda hwnd, header, row_index: [object()] * adapter._GROUP_MENU_EXPECTED_ITEM_COUNT)
     monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
-    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456 if title == "New Group" else None)
     monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
     monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
     monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
@@ -1213,6 +1243,99 @@ def test_verify_group_never_raises_on_unexpected_error(monkeypatch):
 
     monkeypatch.setattr(adapter, "verify_application", _boom)
     assert adapter.verify_group("Dwelling Roof") is False
+
+
+def test_verify_group_caches_a_positive_result_for_this_session(monkeypatch):
+    """Phase 5.7B: once a group has been positively verified via a real
+    probe, a later call for the SAME name must return the cached True
+    WITHOUT running another probe -- the visually confusing, mutating
+    disposable SFG/GUTA commit only needs to happen once per group per
+    live adapter instance."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    probe_calls = []
+    monkeypatch.setattr(adapter, "_verify_group_once", lambda name: probe_calls.append(name) or True)
+
+    assert adapter.verify_group("Dwelling Roof") is True
+    assert adapter.verify_group("Dwelling Roof") is True
+    assert adapter.verify_group("dwelling roof") is True  # case-insensitive cache key
+    assert probe_calls == ["Dwelling Roof"]  # probed exactly once, not three times
+
+    # a DIFFERENT group is never served from another group's cache entry
+    assert adapter.verify_group("Fence") is True
+    assert probe_calls == ["Dwelling Roof", "Fence"]
+
+
+def test_verify_group_use_cache_false_forces_a_fresh_probe(monkeypatch):
+    """use_cache=False (diagnostics/tests needing real-time ground
+    truth) must bypass the cache even for an already-verified group."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    probe_calls = []
+    monkeypatch.setattr(adapter, "_verify_group_once", lambda name: probe_calls.append(name) or True)
+
+    assert adapter.verify_group("Dwelling Roof") is True
+    assert adapter.verify_group("Dwelling Roof", use_cache=False) is True
+    assert probe_calls == ["Dwelling Roof", "Dwelling Roof"]  # probed both times
+
+
+def test_verify_group_never_caches_a_negative_result(monkeypatch):
+    """A False result must never be cached -- a group that failed
+    verification once (e.g. a transient settling issue) must get a
+    completely fresh probe next time, not a stuck cached failure."""
+    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    results = iter([False, False, True, True])  # verify_group() retries internally (2 attempts)
+    monkeypatch.setattr(adapter, "_verify_group_once", lambda name: next(results))
+    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
+
+    assert adapter.verify_group("Dwelling Roof") is False  # both internal attempts failed
+    assert adapter.verify_group("Dwelling Roof") is True  # fresh attempt, not blocked by a cached False
+
+
+# ---------------------------------------------------------------------
+# Phase 5.7B: Xactimate's own "Duplicate Item(s)" cross-group reminder,
+# live-caught blocking every group after the first for the rest of a
+# real 42-row run -- must be answered "Yes" (never silently discard a
+# correct commit) and self-healed at every group-tree entry point.
+# ---------------------------------------------------------------------
+
+
+def test_handle_duplicate_item_dialog_clicks_yes_when_present(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 789 if title == "Duplicate Item(s)" else None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_label", lambda image, text, prefer=None: (240, 45, 256, 53) if text == "Yes" else None)
+    clicked = []
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: clicked.append((hwnd, x, y)))
+
+    assert adapter._handle_duplicate_item_dialog() is True
+    assert clicked == [(789, 248, 49)]
+
+
+def test_handle_duplicate_item_dialog_is_a_noop_when_absent(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: None)
+    clicked = []
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: clicked.append((hwnd, x, y)))
+
+    assert adapter._handle_duplicate_item_dialog() is False
+    assert clicked == []
+
+
+def test_commit_item_dismisses_a_duplicate_item_dialog(monkeypatch):
+    """A live commit (real PDF item OR the disposable probe) that
+    triggers the duplicate-item reminder must not leave it hanging --
+    commit_item() checks for and dismisses it automatically."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_press_ctrl", lambda vk: None)
+    calls = []
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: calls.append(1) or True)
+    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
+    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
+
+    adapter.commit_item()
+
+    assert calls == [1]
 
 
 # ---------------------------------------------------------------------

@@ -608,6 +608,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._protected_row_ledger = ProtectedRowLedger()
         self._destructive_auditor = DestructiveActionAuditor(self.evidence_dir / "destructive_action_audit.jsonl")
 
+        #: Phase 5.7B: names (normalized lowercase) of groups this
+        #: adapter INSTANCE has already positively verified via a real
+        #: disposable-probe commit -- see verify_group()'s use_cache
+        #: parameter. Only ever accumulates confirmed True results,
+        #: never a prior False (a stale negative would incorrectly keep
+        #: blocking a group that's actually fine now; a stale positive
+        #: would be unsafe, which is why only True is ever cached).
+        #: Scoped to this adapter instance ("the current live run"), not
+        #: persisted -- a fresh adapter (a genuinely new live session)
+        #: always starts with an empty cache and re-earns every group.
+        self._verified_groups_this_session: set[str] = set()
+
     # ------------------------------------------------------------------
     # Phase 5.5D: committed-row protection + destructive-call audit
     # ------------------------------------------------------------------
@@ -1734,10 +1746,60 @@ class WindowsXactimateAdapter(XactimateAdapter):
         best_unit, best_count = max(votes.items(), key=lambda kv: kv[1])
         return raw, (best_unit if best_count >= 2 else None)
 
+    #: Live-caught (Phase 5.7B): Xactimate's own cross-group duplicate-
+    #: item reminder ("<CAT> <SEL> already exists in <GROUP>, Continue?")
+    #: -- fires on Ctrl+S whenever the item being committed shares a
+    #: CAT/SEL with one already present in ANY OTHER group of the same
+    #: estimate. Reproduced live running the full aranda-insurance-v3
+    #: plan: it fired after the first group's disposable SFG/GUTA
+    #: verification probe, and every SUBSEQUENT group's commit (probe
+    #: AND real PDF items) silently failed for the rest of the run --
+    #: `_unexpected_dialog_present()` correctly detected the blocked
+    #: state, but nothing ever recognized or dismissed THIS specific
+    #: dialog, so every later verify_group()/ensure_group() call safely
+    #: refused against a window that could no longer be interacted with
+    #: at all.
+    _DUPLICATE_ITEM_DIALOG_TITLE = "Duplicate Item(s)"
+
+    def _handle_duplicate_item_dialog(self) -> bool:
+        """Not part of the abstract contract (Phase 5.7B). If
+        Xactimate's "Duplicate Item(s)" confirmation is currently open,
+        clicks "Yes" and returns True; returns False (no-op) if the
+        dialog isn't present. "Yes" -- not "No"/Escape -- is the
+        correct answer here: the SAME catalog item genuinely and
+        correctly appearing in more than one group is normal in a real
+        estimate (confirmed live: e.g. SFG/GUTA legitimately selected
+        for both a gutter row in one group and a downspout row in
+        another), and the disposable group-verification probe
+        intentionally reuses one fixed item across every group by
+        design. This dialog is Xactimate's own generic cross-group
+        hygiene reminder, not a signal that the current selection is
+        wrong -- answering "No" would silently discard an otherwise
+        correct, already-decided commit. The dialog exposes no UI
+        Automation button elements (confirmed live, same as the rest of
+        this app's custom-drawn chrome), so "Yes" is located the same
+        way every other custom-drawn control in this file is: a fresh
+        OCR read of its own client area, never a hardcoded screen
+        position."""
+        hwnd = self._find_window_by_title(self._DUPLICATE_ITEM_DIALOG_TITLE)
+        if hwnd is None:
+            return False
+        image = self._capture_client_image(hwnd)
+        yes_pos = self._locate_label(image, "Yes", prefer="topmost")
+        if yes_pos is None:
+            return False
+        cx = (yes_pos[0] + yes_pos[2]) // 2
+        cy = (yes_pos[1] + yes_pos[3]) // 2
+        self._click_client(hwnd, cx, cy)
+        time.sleep(0.5)
+        return True
+
     def commit_item(self) -> None:
         VK_S = 0x53
         self._press_ctrl(VK_S)
-        time.sleep(1.5)
+        time.sleep(1.0)
+        self._handle_duplicate_item_dialog()
+        time.sleep(0.5)
 
     def verify_quantity_committed(
         self, expected_quantity: float, timeout_s: float = 3.0
@@ -2839,14 +2901,27 @@ class WindowsXactimateAdapter(XactimateAdapter):
             time.sleep(0.05)
         time.sleep(0.2)
 
-    def snapshot_group_names(self, max_rows: int = 8) -> list[str]:
+    def snapshot_group_names(self, max_rows: int = 24) -> list[str]:
         """Not part of the abstract contract. Returns the group tree's
         rows top-to-bottom, OCR'd -- row 0 is always the project root
         (returned as `expected_project_name` verbatim, never OCR'd: it's
         immutable and OCR noise on it is not informative), rows 1+ are
         child groups, read fresh every call (never cached -- matches
         `snapshot_grid_identities()`'s own contract). Returns `[]` if the
-        tree header can't be located."""
+        tree header can't be located.
+
+        Live-caught (Phase 5.7B): the previous default (8, i.e. 7 child
+        groups) silently truncated the row list for a real PDF needing
+        MORE groups -- running the full aranda-insurance-v3 plan (9
+        groups), the 8th and 9th groups (Debris Removal, Labor Minimums
+        Applied) were never even present in the returned list, so every
+        caller (select_group(), ensure_group(), _verify_group_once())
+        reported "not found" even though the groups genuinely existed
+        moments after being created. Not a matching bug -- the rows
+        were simply never read. Bumped with real headroom; OCR-ing a
+        handful of extra empty rows past the real content is cheap and
+        already handled gracefully everywhere a "row" turns out to be
+        garbage/blank (never matches a real group name)."""
         hwnd = self._ensure_main_window()
         image = self._capture_client_image(hwnd)
         header = self._locate_group_tree_header(image)
@@ -3584,7 +3659,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
         cannot safely pick one) and the intended parent row vanishing
         outright after creation (a much more fundamental problem than
         nesting depth, since it means the tree can no longer be
-        trusted to have any stable row identities at all)."""
+        trusted to have any stable row identities at all).
+
+        Phase 5.7B: self-heals from a "Duplicate Item(s)" dialog left
+        open by an EARLIER commit (see commit_item()'s own docstring) --
+        every group-tree entry point checks for and dismisses it first,
+        so one earlier miss doesn't cascade into every later group
+        looking unreachable ("context menu did not appear") for the
+        rest of the run, exactly as reproduced live."""
+        self._handle_duplicate_item_dialog()
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"ensure_group({group_name!r}): could not verify the expected project is active.")
 
@@ -3738,7 +3821,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
         exist -- select_group() never creates one; call ensure_group()
         first. Also raises (Phase 5.7) if MORE THAN ONE row matches
         `group_name` -- a duplicate/ambiguous name must fail closed,
-        never resolved by picking one."""
+        never resolved by picking one. Phase 5.7B: self-heals from a
+        "Duplicate Item(s)" dialog left open by an earlier commit --
+        see ensure_group()'s docstring."""
+        self._handle_duplicate_item_dialog()
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"select_group({group_name!r}): could not verify the expected project is active.")
 
@@ -3836,7 +3922,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 count += 1
         return count
 
-    def verify_group(self, group_name: str) -> bool:
+    def verify_group(self, group_name: str, *, use_cache: bool = True) -> bool:
         """Not part of the abstract contract. Independently confirms
         `group_name` is the group new items actually land in.
 
@@ -3851,9 +3937,36 @@ class WindowsXactimateAdapter(XactimateAdapter):
         giving up avoids unnecessarily blocking a genuinely-fine group.
         Never masks a real negative: each attempt is a full independent
         re-measurement, not a cached/assumed result, and this still
-        returns False, never raises, if every attempt fails."""
+        returns False, never raises, if every attempt fails.
+
+        Phase 5.7B: Stage 1/2 tested whether a non-mutating (pixel/
+        visual selection-highlight) check could replace the disposable
+        SFG/GUTA probe entirely. Live-measured across 15 alternating
+        switches over 5 real groups, cross-checked against this same
+        probe as ground truth: the highlight reliably identified 3 of 5
+        groups (Dwelling Roof, Front Elevation, Rear Elevation -- a
+        clear, confident darkening every time) but never confidently
+        detected the highlight at all for the other 2 (Exterior,
+        Fence), even though the probe confirmed them genuinely active
+        both times tested -- reconfirming, with fresh live evidence,
+        the original Phase 5.1 finding that the visual highlight does
+        not reliably track the active group for every row position.
+        The probe therefore remains necessary for a confident answer,
+        but IS now cached per adapter instance (`use_cache=True`,
+        the default): once a group has been positively verified THIS
+        session, a later call for the SAME name returns the cached
+        True immediately rather than re-probing -- exactly the
+        "already-verified, no context-loss" case
+        _ensure_select_verify_group() hits on a partial-resume within
+        the same live run. Pass use_cache=False to force a fresh probe
+        regardless (used by diagnostics that need real-time ground
+        truth, and by tests of the probe itself)."""
+        normalized = group_name.strip().lower()
+        if use_cache and normalized in self._verified_groups_this_session:
+            return True
         for _attempt in range(2):
             if self._verify_group_once(group_name):
+                self._verified_groups_this_session.add(normalized)
                 return True
             time.sleep(0.5)
         return False
@@ -3874,6 +3987,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         row_count_before = 0
         skip_cleanup = False
         try:
+            self._handle_duplicate_item_dialog()  # Phase 5.7B: self-heal, see ensure_group()'s docstring
             if not self.verify_application() or not self.verify_project():
                 return False
             hwnd = self._ensure_main_window()
