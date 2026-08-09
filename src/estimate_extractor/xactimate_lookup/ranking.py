@@ -70,6 +70,41 @@ def _fuzzy_ratio(a: str, b: str) -> float:
         return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def _words_match_with_catalog_tolerance(word_a: str, word_b: str) -> bool:
+    """Phase 5.8 (live-caught): a strict exact-word intersection missed
+    the objectively correct candidate family for a real PDF row --
+    normalized_component "composition_shingles" (words "composition",
+    "shingles") never matched Xactimate's own catalog text "Laminated -
+    comp. shingle rfg. - w/out felt" (words "comp", "shingle"), wrongly
+    triggering a hard wrong_component conflict that clamped every
+    genuinely-correct grade variant's score to 0.45 -- well below even
+    review_required_min, producing NO_MATCH despite 10 visibly relevant
+    candidates. Tolerant of two GENERAL, evidence-backed patterns, not
+    a hardcoded "comp"="composition" special case:
+    1. singular/plural ("shingles" / "shingle");
+    2. Xactimate's consistent truncated-abbreviation catalog style
+       (a >=4-character prefix match in either direction, e.g. "comp"
+       is a prefix of "composition") -- confirmed against the same
+       live dropdown, which also abbreviates "roofing" as "rfg" and
+       drops articles/prepositions entirely.
+    Deliberately narrow (word-level, both directions, minimum length
+    guard against short-word false positives) -- this fixes evidence
+    quality, not a ranking threshold."""
+    if word_a == word_b:
+        return True
+    singular_a = word_a[:-1] if word_a.endswith("s") and len(word_a) > 3 else word_a
+    singular_b = word_b[:-1] if word_b.endswith("s") and len(word_b) > 3 else word_b
+    if singular_a == singular_b:
+        return True
+    if len(word_a) >= 4 and len(word_b) >= 4 and (word_a.startswith(word_b) or word_b.startswith(word_a)):
+        return True
+    return False
+
+
+def _any_word_matches(words_a: set[str], words_b: set[str]) -> bool:
+    return any(_words_match_with_catalog_tolerance(a, b) for a in words_a for b in words_b)
+
+
 def score_dropdown_candidate(
     *,
     original_description: str,
@@ -129,7 +164,7 @@ def score_dropdown_candidate(
     component_clean = component if component and component != "unknown" else ""
     component_words = {w for w in re.findall(r"[a-z0-9]+", component_clean.replace("_", " "))}
     candidate_words = set(re.findall(r"[a-z0-9]+", candidate_text))
-    component_ok = not component_words or bool(component_words & candidate_words)
+    component_ok = not component_words or _any_word_matches(component_words, candidate_words)
     component_score = 1.0 if component_ok else 0.0
 
     # Phase 5.6 (live-caught): when normalization didn't extract a

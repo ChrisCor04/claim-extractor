@@ -205,6 +205,41 @@ class PopupNotFoundError(AdapterError):
     selection."""
 
 
+class PopupCaptureFailedError(AdapterError):
+    """Phase 5.8: raised when the results popup window WAS found at
+    least once, but no candidate rows could ever be confidently read
+    from it -- even after the bounded stabilization/retry sequence in
+    capture_dropdown(). Distinct from PopupNotFoundError (the popup
+    window handle never appeared at all) and from a genuine zero-
+    result search (see capture_dropdown()'s own "NO_RESULTS requires
+    positive evidence" contract) -- live-caught screenshots showed a
+    dropdown that visibly displayed real candidates, which must never
+    be silently reported as if Xactimate found nothing."""
+
+
+@dataclass(slots=True)
+class DropdownCaptureDiagnostics:
+    """Phase 5.8: one search's popup-lifecycle timeline, in monotonic
+    seconds (never wall-clock, so relative ordering can be asserted in
+    tests without depending on real time). Purely observational --
+    never consulted by ranking or commit logic, only surfaced for live
+    diagnostics/tests. See capture_dropdown()'s docstring for what each
+    field marks."""
+
+    search_submitted_at: float | None = None
+    popup_first_seen_at: float | None = None
+    popup_stable_at: float | None = None
+    popup_row_count: int | None = None
+    popup_bounds: tuple[int, int, int, int] | None = None
+    popup_closed_at: float | None = None
+    candidate_parse_completed_at: float | None = None
+    selection_clicked_at: float | None = None
+    search_retries: int = 0
+    #: One of "CANDIDATES_PARSED", "NO_RESULTS", "POPUP_CAPTURE_FAILED",
+    #: "POPUP_DISAPPEARED" -- see capture_dropdown()'s docstring.
+    outcome: str | None = None
+
+
 @dataclass(slots=True)
 class _RawDropdownRow:
     """Adapter-internal raw row -- carries the live popup handle and
@@ -599,6 +634,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_selected: DropdownResult | None = None
         self._last_selected_row_count_before: int | None = None
         self._current_query: str | None = None
+        #: Phase 5.8: monotonic timestamp of the most recent
+        #: search_by_description()/search_by_category_selector() call
+        #: -- read by capture_dropdown() to fill in
+        #: DropdownCaptureDiagnostics.search_submitted_at.
+        self._current_query_submitted_at: float | None = None
+        #: Phase 5.8: the most recent capture_dropdown() call's popup-
+        #: lifecycle timeline -- read-only diagnostics, see
+        #: DropdownCaptureDiagnostics. None until the first search.
+        self.last_dropdown_diagnostics: DropdownCaptureDiagnostics | None = None
 
         # Phase 5.5D: committed-row protection + destructive-call audit
         # trail -- see destructive_audit.py. One ledger/auditor per
@@ -619,6 +663,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         #: persisted -- a fresh adapter (a genuinely new live session)
         #: always starts with an empty cache and re-earns every group.
         self._verified_groups_this_session: set[str] = set()
+        #: Phase 5.8 Stage 8: total real disposable-probe runs (never
+        #: incremented on a cache hit) and a per-group breakdown -- read-
+        #: only diagnostics proving the cache is actually eliminating
+        #: redundant probes, not just assumed to.
+        self.probes_run_total: int = 0
+        self.probes_by_group: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Phase 5.5D: committed-row protection + destructive-call audit
@@ -1254,32 +1304,172 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def search_by_description(self, phrase: str) -> None:
         self._current_query = phrase
+        self._current_query_submitted_at = time.monotonic()
         self._type_keybdevent(phrase)
 
     def search_by_category_selector(self, category: str, selector: str) -> None:
         query = f"{category}{selector}"
         self._current_query = query
+        self._current_query_submitted_at = time.monotonic()
         self._type_keybdevent(query)
+
+    #: Phase 5.8: bounded stabilization -- after the popup window handle
+    #: first appears, poll its row content at this interval, requiring
+    #: two consecutive reads with the SAME non-zero row count before
+    #: trusting it, rather than clicking/reading on the very first
+    #: sighting (live-caught: a popup that visibly displayed real
+    #: candidates could still be mid-render or about to close at the
+    #: instant its window handle first becomes enumerable). Bounded by
+    #: _DROPDOWN_STABILIZE_TIMEOUT_S, never an unbounded wait -- live-
+    #: measured popup content settles within ~0.3-0.7s of search
+    #: submission and then stays stable (no flicker observed across 8
+    #: rapid back-to-back live searches), so this adds one extra ~0.08s
+    #: poll in the common case.
+    _DROPDOWN_STABILIZE_POLL_S = 0.08
+    _DROPDOWN_STABILIZE_TIMEOUT_S = 1.5
+    #: How many times to re-submit the SAME search text (never advance
+    #: to a different description-first attempt -- that decision stays
+    #: entirely in execution_runner.py, untouched) if the popup never
+    #: yields any candidate rows at all, or disappears before any were
+    #: read.
+    _DROPDOWN_SEARCH_RETRY_ATTEMPTS = 2
 
     def capture_dropdown(self):
         """Waits for the separate top-level popup window to appear,
-        then does ONE raw UI Automation walk of it. Never trusts a
-        cached popup handle from a previous search."""
+        then stabilizes and reads its rows. Never trusts a cached popup
+        handle from a previous search.
+
+        Phase 5.8 (live-caught): a single immediate read on first
+        sighting the popup's window handle risked reading it mid-
+        render or right as it closed, and a resulting empty read was
+        indistinguishable downstream from a genuine zero-result search
+        -- "VISIBLE CANDIDATES != NO_MATCH" was being violated. Fixed
+        with a bounded stabilization poll (_capture_dropdown_once()):
+        requires two consecutive non-zero reads with the same row
+        count before trusting the result, but retains the FIRST non-
+        empty read even if the popup closes before a second confirming
+        read -- once candidate text is successfully read, it is never
+        discarded merely because the popup later disappeared. If a
+        whole stabilization cycle produces zero rows without the popup
+        ever closing, that IS positive evidence of a genuine zero-
+        result search (STOP_REASON_NO_RESULTS downstream). If the
+        popup never appears at all, or disappears before any rows were
+        ever read, the SAME search text (not a different phrase -- see
+        _description_first_search_attempts()'s own, unchanged, attempt
+        sequence) is re-submitted up to _DROPDOWN_SEARCH_RETRY_ATTEMPTS
+        times before giving up with PopupCaptureFailedError. Populates
+        self.last_dropdown_diagnostics with the full timing trace
+        regardless of outcome."""
+        diag = DropdownCaptureDiagnostics(search_submitted_at=self._current_query_submitted_at)
+        last_outcome = None
+        for attempt in range(1 + self._DROPDOWN_SEARCH_RETRY_ATTEMPTS):
+            rows, outcome, first_seen_at, closed_at, stable_at = self._capture_dropdown_once()
+            last_outcome = outcome
+            if diag.popup_first_seen_at is None and first_seen_at is not None:
+                diag.popup_first_seen_at = first_seen_at
+
+            if outcome == "CANDIDATES_PARSED":
+                diag.popup_stable_at = stable_at
+                diag.popup_row_count = len(rows)
+                diag.popup_closed_at = closed_at  # set only when a good read was retained despite the popup closing right after
+                diag.candidate_parse_completed_at = time.monotonic()
+                diag.search_retries = attempt
+                diag.outcome = outcome
+                self.last_dropdown_diagnostics = diag
+                # Phase 5.8 (self-caught in review): use the hwnd the
+                # successful read actually came from (carried on each
+                # row already), never a fresh _find_dropdown_window()
+                # call here -- re-querying at this point could itself
+                # return None if the popup closed in the instant after
+                # a good read, which would silently defeat the whole
+                # "retain the snapshot even if the popup later closes"
+                # guarantee by making select_candidate() refuse anyway.
+                self._last_dropdown_hwnd = rows[0].popup_hwnd
+                self._last_dropdown_rows = rows
+                return rows
+
+            if outcome == "NO_RESULTS":
+                diag.popup_row_count = 0
+                diag.candidate_parse_completed_at = time.monotonic()
+                diag.search_retries = attempt
+                diag.outcome = outcome
+                self.last_dropdown_diagnostics = diag
+                self._last_dropdown_hwnd = None
+                self._last_dropdown_rows = []
+                return []
+
+            # POPUP_CAPTURE_FAILED (never found) or POPUP_DISAPPEARED
+            # (found, but closed before ANY row was ever read) -- retry
+            # the SAME search text, bounded, before giving up.
+            diag.popup_closed_at = closed_at
+            if attempt < self._DROPDOWN_SEARCH_RETRY_ATTEMPTS and self._current_query:
+                query = self._current_query
+                self.focus_search()
+                self.clear_search()
+                self._type_keybdevent(query)
+                self._current_query = query
+                self._current_query_submitted_at = time.monotonic()
+
+        diag.outcome = last_outcome
+        diag.search_retries = self._DROPDOWN_SEARCH_RETRY_ATTEMPTS
+        self.last_dropdown_diagnostics = diag
+        self._last_dropdown_hwnd = None
+        self._last_dropdown_rows = []
+        raise PopupCaptureFailedError(
+            f"Results popup {(last_outcome or 'capture_failed').lower()} for query {self._current_query!r} "
+            f"after {1 + self._DROPDOWN_SEARCH_RETRY_ATTEMPTS} attempt(s) -- no candidate rows were ever read."
+        )
+
+    def _capture_dropdown_once(self):
+        """One wait-for-popup + bounded-stabilize-and-read cycle.
+        Returns (rows, outcome, popup_first_seen_at, popup_closed_at,
+        popup_stable_at). outcome is one of "CANDIDATES_PARSED",
+        "NO_RESULTS", "POPUP_CAPTURE_FAILED", "POPUP_DISAPPEARED" --
+        see capture_dropdown()'s own docstring for what each means and
+        how the caller uses it. Never raises."""
         deadline = time.monotonic() + self.dropdown_timeout_s
         dropdown_hwnd = None
+        popup_first_seen_at = None
         while time.monotonic() < deadline:
             dropdown_hwnd = self._find_dropdown_window()
             if dropdown_hwnd is not None:
+                popup_first_seen_at = time.monotonic()
                 break
-            time.sleep(0.3)
+            time.sleep(0.1)
 
         if dropdown_hwnd is None:
-            raise PopupNotFoundError(f"No results popup appeared within {self.dropdown_timeout_s}s for query {self._current_query!r}.")
+            return [], "POPUP_CAPTURE_FAILED", None, None, None
 
-        self._last_dropdown_hwnd = dropdown_hwnd
-        raw_rows = self._read_dropdown_rows(dropdown_hwnd)
-        self._last_dropdown_rows = raw_rows
-        return raw_rows
+        stabilize_deadline = time.monotonic() + self._DROPDOWN_STABILIZE_TIMEOUT_S
+        last_rows: list[_RawDropdownRow] = []
+        popup_closed_at = None
+        while time.monotonic() < stabilize_deadline:
+            hwnd_now = self._find_dropdown_window()
+            if hwnd_now is None:
+                popup_closed_at = time.monotonic()
+                break
+            rows = self._read_dropdown_rows(hwnd_now)
+            if rows and last_rows and len(rows) == len(last_rows):
+                return rows, "CANDIDATES_PARSED", popup_first_seen_at, None, time.monotonic()
+            last_rows = rows
+            time.sleep(self._DROPDOWN_STABILIZE_POLL_S)
+
+        if last_rows:
+            # Real candidate text WAS read at least once -- retained
+            # even though a second confirming read never happened
+            # (stabilization window ran out, or the popup closed right
+            # after this read). See capture_dropdown()'s docstring:
+            # "once candidate text is successfully read, retain that
+            # candidate snapshot even if the popup later closes."
+            return last_rows, "CANDIDATES_PARSED", popup_first_seen_at, popup_closed_at, time.monotonic()
+
+        if popup_closed_at is not None:
+            return [], "POPUP_DISAPPEARED", popup_first_seen_at, popup_closed_at, None
+
+        # Popup stayed open and enumerable for the ENTIRE stabilization
+        # window, every single read confirmed zero rows -- positive
+        # evidence of a genuine zero-result search.
+        return [], "NO_RESULTS", popup_first_seen_at, None, None
 
     def _read_dropdown_rows(self, dropdown_hwnd: int) -> list[_RawDropdownRow]:
         uia, UIA = self._uia()
@@ -1407,6 +1597,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         cx = (rect.left + rect.right) // 2
         cy = (rect.top + rect.bottom) // 2
         self._click_screen(cx, cy)
+        if self.last_dropdown_diagnostics is not None:
+            self.last_dropdown_diagnostics.selection_clicked_at = time.monotonic()
         time.sleep(1.0)
 
         # Live-discovered: re-selecting a CAT/SEL that already exists in the
@@ -3983,7 +4175,16 @@ class WindowsXactimateAdapter(XactimateAdapter):
         estimate transiently; it always cleans up before returning,
         including on failure. Returns False, never raises, on anything
         short of a confident match -- callers must never silently
-        proceed on an unverified group."""
+        proceed on an unverified group.
+
+        Phase 5.8 Stage 8: every REAL call here (never a cache hit --
+        verify_group()'s cache short-circuits before this is ever
+        reached) increments self.probes_run_total and self.
+        probes_by_group[group_name], live-measured at ~20-25s each --
+        real cost that makes verify_group()'s per-session cache (Phase
+        5.7B) worth confirming stays effective, not just assumed."""
+        self.probes_run_total += 1
+        self.probes_by_group[group_name] = self.probes_by_group.get(group_name, 0) + 1
         row_count_before = 0
         skip_cleanup = False
         try:

@@ -102,6 +102,11 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
         self.verify_commit_calls = 0
 
     def ensure_group(self, name: str, *, parent_group_name: str | None = None) -> str | None:
+        # Phase 5.8: recorded into the SAME shared, ordered self.log.calls
+        # every task-level call already uses, so a test can assert the
+        # exact interleaved order of group setup vs. task execution
+        # (see test_group_boundary_ordering_last_task_before_next_group).
+        self.log.record("ensure_group", name)
         if name in self.raise_on_group:
             raise AdapterError(f"Simulated failure creating group {name!r}.")
         self.ensure_group_calls.append(name)
@@ -109,9 +114,11 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
         return self.position_warnings.get(name)
 
     def select_group(self, name: str) -> None:
+        self.log.record("select_group", name)
         self.select_group_calls.append(name)
 
     def verify_group(self, name: str) -> bool:
+        self.log.record("verify_group", name)
         self.verify_group_calls.append(name)
         if self.verified_groups is None:
             return True
@@ -186,6 +193,57 @@ def test_happy_path_all_groups_verified_all_tasks_completed(tmp_path, phrase_rul
     assert (reports_dir / "execution_report.csv").exists()
     assert (reports_dir / "unresolved_row_summary.json").exists()
     assert (reports_dir / "structured_audit.json").exists()
+
+
+def test_group_boundary_ordering_last_task_before_next_group(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.8 Stage 6/7 regression: live-reported symptom was that a
+    group's LAST task sometimes appeared skipped, as if the runner
+    began setting up the next group before the current group's final
+    task had actually completed. Group A: 3 tasks, Group B: 2 tasks --
+    every one of group A's tasks (including A3, the last) must be
+    searched, and A3 must reach a terminal state, strictly BEFORE any
+    of group B's setup calls (ensure_group/select_group/verify_group)
+    happen. GroupAwareFakeAdapter records group setup into the SAME
+    shared, ordered call log task-level search calls already use, so
+    the full interleaved order can be asserted exactly, not just
+    inferred from final state."""
+    tA1 = _task("A1", "line_a1", "Group A", "AAA", "SEL1", 0)
+    tA2 = _task("A2", "line_a2", "Group A", "AAA", "SEL2", 1)
+    tA3 = _task("A3", "line_a3", "Group A", "AAA", "SEL3", 2)
+    tB1 = _task("B1", "line_b1", "Group B", "BBB", "SEL1", 3)
+    tB2 = _task("B2", "line_b2", "Group B", "BBB", "SEL2", 4)
+    gA = GroupExecutionState(
+        group_id="Group A", area_name=None, section_name="Group A",
+        xactimate_group_name="Group A", group_name_reviewed=True, task_ids=["A1", "A2", "A3"],
+    )
+    gB = GroupExecutionState(
+        group_id="Group B", area_name=None, section_name="Group B",
+        xactimate_group_name="Group B", group_name_reviewed=True, task_ids=["B1", "B2"],
+    )
+    plan = ExecutionPlan(
+        plan_id="p1", project_slug="test", source_filename=None, created_at="now",
+        groups=[gA, gB], tasks=[tA1, tA2, tA3, tB1, tB2],
+    )
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(tA1, tA2, tA3, tB1, tB2))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert all(t.state == TASK_COMPLETED for t in result.tasks)  # every task, including A3, actually ran
+
+    trace = []
+    for name, args, _kwargs in adapter.log.calls:
+        if name in ("ensure_group", "select_group", "verify_group"):
+            trace.append(f"{name}:{args[0]}")
+        elif name == "search_by_category_selector":
+            trace.append(f"search:{args[0]}{args[1]}")
+
+    assert trace == [
+        "ensure_group:Group A", "select_group:Group A", "verify_group:Group A",
+        "search:AAASEL1", "search:AAASEL2", "search:AAASEL3",
+        "ensure_group:Group B", "select_group:Group B", "verify_group:Group B",
+        "search:BBBSEL1", "search:BBBSEL2",
+    ]
 
 
 def test_group_position_warning_is_recorded_but_never_blocks_the_group(tmp_path, phrase_rules, ranking_config):

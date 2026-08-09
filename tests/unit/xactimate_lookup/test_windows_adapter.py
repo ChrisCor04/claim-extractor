@@ -21,6 +21,7 @@ from estimate_extractor.xactimate_lookup.windows_adapter import (
     CommitVerification,
     EstimateBaseline,
     GroupRowSnapshot,
+    PopupCaptureFailedError,
     PopupNotFoundError,
     QuantityVerificationResult,
     ReconciliationResult,
@@ -145,17 +146,150 @@ def test_verify_project_is_case_insensitive():
     assert adapter.verify_project() is True
 
 
-def test_capture_dropdown_raises_popup_not_found_after_timeout():
+def test_capture_dropdown_raises_popup_capture_failed_after_timeout(monkeypatch):
     """Confirms the timeout path raises rather than hanging or
     returning an empty-but-successful result -- orchestrator.py must
-    see this as an AdapterError-family exception to stop safely."""
+    see this as an AdapterError-family exception to stop safely. Phase
+    5.8: the popup never appearing at all (across every bounded retry)
+    now raises the more specific PopupCaptureFailedError."""
     adapter = WindowsXactimateAdapter(
         expected_project_name="TEST",
-        window_finder=lambda: ([], []),  # no popup ever appears
+        window_finder=lambda: ([(123, "TEST", (0, 0, 100, 100))], []),  # main window exists, no popup ever
         dropdown_timeout_s=0.2,
     )
-    with pytest.raises(PopupNotFoundError):
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+    adapter.search_by_description("anything")
+    with pytest.raises(PopupCaptureFailedError):
         adapter.capture_dropdown()
+
+
+# ---------------------------------------------------------------------
+# Phase 5.8: popup stabilization -- live-caught screenshots proved the
+# results dropdown can visibly display real candidates that the old
+# single-immediate-read capture_dropdown() risked missing entirely,
+# collapsing into a false NO_MATCH. "VISIBLE CANDIDATES != NO_MATCH".
+# ---------------------------------------------------------------------
+
+
+def _stabilize_test_adapter(monkeypatch, *, timeout_s=1.5, poll_s=0.0):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+    adapter._DROPDOWN_STABILIZE_TIMEOUT_S = timeout_s
+    adapter._DROPDOWN_STABILIZE_POLL_S = poll_s
+    adapter.dropdown_timeout_s = 1.0
+    adapter.search_by_description("R&R gutter splash guard")
+    return adapter
+
+
+def test_capture_dropdown_waits_for_two_matching_reads_before_trusting_result(monkeypatch):
+    """Requirement (Stage 2): do not click/trust on the first sighting
+    -- a row count that's still settling (mid-render) must not be
+    reported as the final candidate set. Two consecutive reads with
+    the SAME non-zero row count are required."""
+    adapter = _stabilize_test_adapter(monkeypatch)
+    final_rows = [_raw_row("SFGGSG", "Gutter splash guard", "$35.20"), _raw_row("SFGGRD", "Gutter guard/screen", "$5.95")]
+    reads = iter([
+        [_raw_row("SFGGSG", "Gutter splash guard", "$35.20")],  # 1 row -- still rendering
+        final_rows,  # 2 rows -- settling
+        final_rows,  # 2 rows again -- stable, trusted here
+    ])
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: 555)
+    monkeypatch.setattr(adapter, "_read_dropdown_rows", lambda hwnd: next(reads))
+
+    result = adapter.capture_dropdown()
+
+    assert result == final_rows
+    assert adapter.last_dropdown_diagnostics.outcome == "CANDIDATES_PARSED"
+    assert adapter.last_dropdown_diagnostics.popup_row_count == 2
+
+
+def test_capture_dropdown_retains_candidates_when_popup_closes_after_one_good_read(monkeypatch):
+    """Requirement (Stage 2): "once candidate text is successfully
+    read, retain that candidate snapshot even if the popup later
+    closes" -- a popup that visibly appeared, was read once with real
+    rows, and then disappeared before a second confirming read must
+    still return those real rows, not NO_MATCH."""
+    adapter = _stabilize_test_adapter(monkeypatch)
+    good_rows = [_raw_row("SFGGSG", "Gutter splash guard", "$35.20")]
+    hwnd_calls = iter([555, 555, None])  # outer wait finds it; stabilize check+read; then it's gone
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: next(hwnd_calls))
+    monkeypatch.setattr(adapter, "_read_dropdown_rows", lambda hwnd: good_rows)
+
+    result = adapter.capture_dropdown()
+
+    assert result == good_rows
+    assert adapter.last_dropdown_diagnostics.outcome == "CANDIDATES_PARSED"
+    assert adapter.last_dropdown_diagnostics.popup_closed_at is not None
+    # select_candidate() must still be able to act on this -- the hwnd
+    # used is the one the successful read actually came from, never a
+    # fresh (possibly-None) re-query after the popup already closed.
+    assert adapter._last_dropdown_hwnd == 999  # _raw_row()'s default popup_hwnd
+
+
+def test_capture_dropdown_treats_persistent_zero_rows_as_positive_no_results(monkeypatch):
+    """Requirement (Stage 3): NO_RESULTS requires POSITIVE evidence --
+    the popup stayed open and enumerable for the entire stabilization
+    window, and every single read confirmed zero rows. This is the
+    only path that may legitimately return an empty list without
+    retrying the search."""
+    adapter = _stabilize_test_adapter(monkeypatch, timeout_s=0.05, poll_s=0.0)
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: 555)
+    monkeypatch.setattr(adapter, "_read_dropdown_rows", lambda hwnd: [])
+
+    result = adapter.capture_dropdown()
+
+    assert result == []
+    assert adapter.last_dropdown_diagnostics.outcome == "NO_RESULTS"
+    assert adapter.last_dropdown_diagnostics.search_retries == 0
+
+
+def test_capture_dropdown_retries_same_search_when_popup_disappears_before_any_read(monkeypatch):
+    """Requirement (Stage 3): a popup that appears and then disappears
+    before ANY row was ever read is POPUP_DISAPPEARED, not NO_RESULTS
+    -- retry the SAME search text (never a different phrase) rather
+    than concluding no match."""
+    adapter = _stabilize_test_adapter(monkeypatch, timeout_s=0.05, poll_s=0.0)
+    good_rows = [_raw_row("SFGGSG", "Gutter splash guard", "$35.20")]
+    # Attempt 1: popup appears then immediately gone, no row ever read.
+    # Attempt 2 (after re-submitting the SAME search): popup appears
+    # and yields a stable read.
+    hwnd_calls = iter([555, None, 555, 555, 555])
+    read_calls = iter([good_rows, good_rows])
+    resubmitted_queries = []
+
+    def fake_type(text):
+        resubmitted_queries.append(text)
+
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: next(hwnd_calls))
+    monkeypatch.setattr(adapter, "_read_dropdown_rows", lambda hwnd: next(read_calls))
+    monkeypatch.setattr(adapter, "_type_keybdevent", fake_type)
+
+    result = adapter.capture_dropdown()
+
+    assert result == good_rows
+    assert adapter.last_dropdown_diagnostics.outcome == "CANDIDATES_PARSED"
+    assert adapter.last_dropdown_diagnostics.search_retries == 1
+    assert resubmitted_queries == ["R&R gutter splash guard"]  # same text, not a different phrase
+
+
+def test_capture_dropdown_raises_after_exhausting_retries_with_no_rows_ever_read(monkeypatch):
+    """If the popup never once yields a readable row across every
+    bounded retry, capture_dropdown() must raise PopupCaptureFailedError
+    -- never silently return [] and let that be mistaken for a
+    positively-confirmed zero-result search."""
+    adapter = _stabilize_test_adapter(monkeypatch, timeout_s=0.02, poll_s=0.0)
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: None)  # popup never appears, ever
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+
+    with pytest.raises(PopupCaptureFailedError):
+        adapter.capture_dropdown()
+
+    assert adapter.last_dropdown_diagnostics.outcome == "POPUP_CAPTURE_FAILED"
+    assert adapter.last_dropdown_diagnostics.search_retries == adapter._DROPDOWN_SEARCH_RETRY_ATTEMPTS
 
 
 def test_select_candidate_without_prior_capture_raises():
@@ -1460,6 +1594,44 @@ def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
 
     assert adapter._verify_group_once("Front Elevation") is True
     assert probed_index["index"] == 2  # the nested group's own row, found purely by name
+    # Phase 5.8 Stage 8: a real probe run must be counted, per-group.
+    assert adapter.probes_run_total == 1
+    assert adapter.probes_by_group == {"Front Elevation": 1}
+
+
+def test_probe_counts_start_at_zero_and_only_increment_on_a_real_probe(monkeypatch):
+    """Phase 5.8 Stage 8: probes_run_total/probes_by_group must reflect
+    ONLY real disposable-probe runs -- a cached verify_group() hit
+    (Phase 5.7B) must never increment them, so a normal N-group run
+    shows at most N probes, never one per task or per repeated group
+    operation."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    assert adapter.probes_run_total == 0
+    assert adapter.probes_by_group == {}
+
+    real_probe_calls = []
+
+    def fake_verify_group_once(name):
+        real_probe_calls.append(name)
+        adapter.probes_run_total += 1
+        adapter.probes_by_group[name] = adapter.probes_by_group.get(name, 0) + 1
+        return True
+
+    monkeypatch.setattr(adapter, "_verify_group_once", fake_verify_group_once)
+
+    # 3 groups, each verified multiple times (as a resumed/rechecked
+    # run might) -- only the FIRST verify_group() call per group must
+    # reach the real probe; every later call for the same name is
+    # served from cache.
+    for _ in range(3):
+        assert adapter.verify_group("Exterior") is True
+    for _ in range(2):
+        assert adapter.verify_group("Dwelling Roof") is True
+    assert adapter.verify_group("Fence") is True
+
+    assert real_probe_calls == ["Exterior", "Dwelling Roof", "Fence"]  # exactly one real probe per group
+    assert adapter.probes_run_total == 3
+    assert adapter.probes_by_group == {"Exterior": 1, "Dwelling Roof": 1, "Fence": 1}
 
 
 def test_cleanup_probe_item_preserves_pre_existing_rows(monkeypatch):
