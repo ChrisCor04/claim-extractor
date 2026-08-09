@@ -206,6 +206,25 @@ class PopupNotFoundError(AdapterError):
     selection."""
 
 
+class ProbeCleanupFailedError(AdapterError):
+    """Phase 5.9 Priority 1/2 (live-caught): raised by
+    _cleanup_probe_item() when it cannot POSITIVELY confirm the
+    disposable group-verification probe row is gone -- either because
+    the probe was never observed becoming visible at all within the
+    bounded settle window (a stale/slow grid read), or because the
+    last row's identity never matched the probe's own CAT/SEL so
+    nothing was safely deletable, or because the grid never returned
+    to the expected baseline row count after cleanup attempts. Never
+    silently swallowed by _verify_group_once()'s finally block --
+    surfaces as a specific, diagnosable group-verification failure
+    reason instead of a bare False. See docs/build-estimate.md
+    Phase 5.9 Priority 1/2: a live incident found the ORIGINAL cleanup
+    trusted a single immediate post-commit grid read, which could be
+    stale and make cleanup silently declare victory without ever
+    having removed the probe it just added -- leaving real garbage
+    SFG/GUTA rows in the live estimate."""
+
+
 class GroupTransitionUnsafeError(AdapterError):
     """Phase 5.9: raised by `_assert_group_transition_settled()` when
     ensure_group()/select_group()/verify_group()/the Components-tab
@@ -4399,7 +4418,34 @@ class WindowsXactimateAdapter(XactimateAdapter):
             )
             if target is None:
                 return False
-            self.select_candidate(target)
+            try:
+                self.select_candidate(target)
+            except UnexpectedDialogError:
+                # Phase 5.9 Priority 3 (live-caught): the probe
+                # deliberately reuses ONE fixed CAT/SEL across every
+                # group (see _handle_duplicate_item_dialog()'s
+                # docstring) -- a group that already legitimately
+                # contains that same SFG/GUTA content (Exterior's real
+                # gutter row, or any Elevation group's real downspout
+                # row) pops Xactimate's "Duplicate Item(s)" dialog
+                # IMMEDIATELY after the candidate is clicked, before
+                # enter_quantity()/commit_item() ever run.
+                # select_candidate() deliberately hard-stops there for
+                # a REAL task (never auto-dismissed -- see its own
+                # docstring), but the probe is EXPECTED to hit this and
+                # must tolerate it, unlike a real task. Live-confirmed:
+                # clicking "Yes" already completes the selection --
+                # read_populated_fields() shows the candidate pending
+                # in Quick Entry immediately afterward -- so this is
+                # never retried (the results popup handle
+                # select_candidate() would need is already gone by
+                # this point regardless). Without this, EVERY group
+                # whose real content already includes SFG/GUTA would
+                # fail verify_group() on every fresh (uncached) probe,
+                # independent of tree depth/position -- confirmed live
+                # for Rear Elevation and Left Elevation.
+                if not self._handle_duplicate_item_dialog():
+                    raise
             self.enter_quantity(1)
             self.commit_item()
             time.sleep(1.0)
@@ -4420,6 +4466,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
             skip_cleanup = True
             raise
         except Exception:
+            # Phase 5.9 (live-caught): a failed probe attempt --
+            # commonly an UnexpectedDialogError this method couldn't
+            # self-heal -- previously left the "Duplicate Item(s)"
+            # dialog (or a stray results popup) genuinely open in
+            # Xactimate, silently blocking whatever ran next (confirmed
+            # live: a leftover dialog from one failed probe made an
+            # UNRELATED later script's search fail outright). Best-
+            # effort recovery before returning False.
+            try:
+                self.recover()
+            except Exception:
+                pass
             return False
         finally:
             if not skip_cleanup:
@@ -4432,31 +4490,112 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     # hard stop for the whole run, not a best-effort
                     # cleanup failure to shrug off.
                     raise
+                except ProbeCleanupFailedError:
+                    # Phase 5.9 Priority 2: never swallowed either --
+                    # cleanup could not positively confirm the probe
+                    # was removed. Surfacing this as a specific,
+                    # diagnosable group-verification failure reason is
+                    # the whole point; silently continuing is exactly
+                    # what let garbage SFG/GUTA rows accumulate.
+                    raise
                 except Exception:
                     pass
 
+    #: Phase 5.9 Priority 1: bounded settle-poll for the probe's own
+    #: commit to actually become observable in the grid before cleanup
+    #: trusts any read -- live-measured (see priority1_settle_timing
+    #: evidence in the Phase 5.9 report) that a single immediate
+    #: post-commit read can be stale.
+    _PROBE_SETTLE_POLL_S = 0.15
+    _PROBE_SETTLE_TIMEOUT_S = 3.0
+
     def _cleanup_probe_item(self, target_row_count: int = 0) -> None:
         """Removes whatever verify_group()'s disposable probe item left
-        behind -- bounded, best-effort, never raises on ordinary
-        flakiness (matches every other cleanup helper in this file) --
-        EXCEPT ProtectedCommittedRowError (Phase 5.5D), which is
-        deliberately let through: it means this specific cancel would
-        have deleted a row Execute already successfully committed, the
-        exact live incident this phase exists to make structurally
-        impossible.
+        behind -- EXCEPT ProtectedCommittedRowError (Phase 5.5D), which
+        is deliberately let through: it means this specific cancel
+        would have deleted a row Execute already successfully
+        committed. `target_row_count` is the grid's row count BEFORE
+        the probe was entered -- this cancels down to exactly that
+        count, never unconditionally to zero, so a group that already
+        held real committed rows (a resumed group re-verified after an
+        earlier task in it already completed) keeps them.
 
-        `target_row_count` is the grid's row count BEFORE the probe was
-        entered -- this cancels down to exactly that count, never
-        unconditionally to zero, so a group that already held real
-        committed rows (a resumed group re-verified after an earlier
-        task in it already completed) keeps them. Defaults to 0 for any
-        caller that genuinely started from an empty grid."""
+        Phase 5.9 Priority 1/2 (live-caught): the ORIGINAL version
+        trusted a SINGLE immediate post-commit grid read -- if that read
+        happened to be stale (not yet repainted) and showed row_count
+        already <= target_row_count, cleanup silently declared victory
+        and returned having removed nothing, even though the probe row
+        genuinely landed a moment later. Confirmed live: this left real
+        garbage SFG/GUTA rows sitting in Rear Elevation and Left
+        Elevation, undetected, with no audit trail (nothing was ever
+        attempted, so DestructiveActionAuditor never even saw a call).
+        Now requires POSITIVE, bounded-poll confirmation the probe row
+        is actually visible -- identified by CAT/SEL, never by "last
+        row" position alone -- before attempting to remove it, and
+        POSITIVE confirmation the grid is back at target_row_count
+        afterward. Raises ProbeCleanupFailedError (never silently
+        continues) if either cannot be confirmed within the bounded
+        settle window, or if the last row's identity ever fails to
+        match the probe's own CAT/SEL (refusing to delete some other,
+        unrelated last row 'just because it's last')."""
         hwnd = self._ensure_main_window()
+        probe_identity = (self._VERIFY_GROUP_PROBE_CATEGORY, self._VERIFY_GROUP_PROBE_SELECTOR)
+
+        def _last_row_identity(image, offset, row_count):
+            row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+            last_row_top = row_1_top + (row_count - 1) * _GRID_ROW_HEIGHT
+            return self._read_category_selector_at(image, offset, last_row_top)
+
+        # Phase 1: positively confirm the probe row is visible. A single
+        # read showing row_count <= target is NOT trusted on its own
+        # (that was the original bug -- a stale read right after commit
+        # can still show the pre-probe count); two CONSECUTIVE such
+        # reads are required before concluding "nothing was ever added"
+        # -- the same stabilization idiom capture_dropdown() already
+        # uses (Phase 5.8) for the equivalent "trust a negative result"
+        # problem. A single positive read (row_count > target WITH
+        # matching identity) is trusted immediately -- positive evidence
+        # doesn't need the same skepticism a negative result does.
+        deadline = time.time() + self._PROBE_SETTLE_TIMEOUT_S
+        probe_seen = False
+        stable_at_baseline_reads = 0
+        while time.time() < deadline:
+            image, offset = self._capture_and_locate(hwnd)
+            row_count = self._count_grid_rows(image, offset) if offset is not None else None
+            if row_count is not None and row_count > target_row_count:
+                stable_at_baseline_reads = 0
+                if _last_row_identity(image, offset, row_count) == probe_identity:
+                    probe_seen = True
+                    break
+            elif row_count is not None:  # row_count <= target_row_count
+                stable_at_baseline_reads += 1
+                if stable_at_baseline_reads >= 2:
+                    return  # positively confirmed, twice: nothing was ever added
+            else:
+                stable_at_baseline_reads = 0
+            time.sleep(self._PROBE_SETTLE_POLL_S)
+        if not probe_seen:
+            raise ProbeCleanupFailedError(
+                f"_cleanup_probe_item(): could not positively observe the probe row {probe_identity!r} become "
+                f"visible within {self._PROBE_SETTLE_TIMEOUT_S}s -- refusing to guess whether cleanup is needed."
+            )
+
+        # Phase 2: remove exactly the identified probe row(s), re-
+        # confirming identity before each deletion.
         for _attempt in range(6):
             image, offset = self._capture_and_locate(hwnd)
             row_count = self._count_grid_rows(image, offset) if offset is not None else None
             if row_count is not None and row_count <= target_row_count:
                 break
+            if row_count is None:
+                time.sleep(0.3)
+                continue
+            identity = _last_row_identity(image, offset, row_count)
+            if identity != probe_identity:
+                raise ProbeCleanupFailedError(
+                    f"_cleanup_probe_item(): refusing to delete the last row -- its identity {identity!r} does "
+                    f"not match the probe's own {probe_identity!r}."
+                )
             try:
                 self.cancel_current_item(reason="disposable_group_probe", caller="_cleanup_probe_item")
             except ProtectedCommittedRowError:
@@ -4464,6 +4603,14 @@ class WindowsXactimateAdapter(XactimateAdapter):
             except Exception:
                 pass
             time.sleep(0.3)
+
+        image, offset = self._capture_and_locate(hwnd)
+        row_count = self._count_grid_rows(image, offset) if offset is not None else None
+        if row_count is None or row_count > target_row_count:
+            raise ProbeCleanupFailedError(
+                f"_cleanup_probe_item(): row count is {row_count!r} after cleanup attempts, expected <= "
+                f"{target_row_count} -- could not positively confirm the probe was removed."
+            )
         self.commit_item()
         time.sleep(0.3)
 

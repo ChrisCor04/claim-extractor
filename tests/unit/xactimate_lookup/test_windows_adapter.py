@@ -18,6 +18,7 @@ import time
 
 import pytest
 
+from estimate_extractor.xactimate_lookup.adapter import UnexpectedDialogError
 from estimate_extractor.xactimate_lookup.models import DropdownResult
 from estimate_extractor.xactimate_lookup.windows_adapter import (
     CommitVerification,
@@ -1737,6 +1738,198 @@ def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
     assert adapter.probes_by_group == {"Front Elevation": 1}
 
 
+# ---------------------------------------------------------------------
+# Phase 5.9 Priority 1/2/3: probe cleanup positive-confirmation +
+# identity-based deletion, and the probe's own duplicate-item self-heal.
+# ---------------------------------------------------------------------
+
+
+def test_cleanup_probe_item_waits_for_a_stale_read_to_settle(monkeypatch):
+    """Priority 1: the ORIGINAL bug -- a single immediate post-commit
+    read can be stale and show row_count already <= target, causing
+    cleanup to silently declare victory without the probe ever having
+    been removed. Simulates exactly that: the first two reads still
+    show the OLD (pre-probe) count, the probe only becomes observable
+    on the third read. Cleanup must wait for it, not trust the early
+    stale reads."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+    # target_row_count=1 (1 pre-existing real row). Reads: stale(1),
+    # then probe visible(2) -- THEN cleanup removes it back to 1. (Two
+    # CONSECUTIVE stale reads would instead confirm "nothing added" --
+    # see the production code's stabilization comment -- so this test
+    # deliberately stops at one stale read before the probe appears.)
+    read_sequence = iter([1, 2])
+    state = {"row_count": None}
+
+    def _count(image, offset):
+        try:
+            state["row_count"] = next(read_sequence)
+        except StopIteration:
+            pass  # subsequent reads (post-cancel, final confirmation) use state["row_count"]
+        return state["row_count"]
+
+    monkeypatch.setattr(adapter, "_count_grid_rows", _count)
+    monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: ("SFG", "GUTA"))
+    cancel_calls = []
+
+    def _cancel(**kwargs):
+        cancel_calls.append(1)
+        state["row_count"] = 1
+
+    monkeypatch.setattr(adapter, "cancel_current_item", _cancel)
+    monkeypatch.setattr(adapter, "commit_item", lambda: None)
+
+    adapter._cleanup_probe_item(target_row_count=1)
+
+    assert cancel_calls == [1]  # the probe WAS removed, not silently skipped
+
+
+def test_cleanup_probe_item_raises_when_probe_never_becomes_observable(monkeypatch):
+    """Priority 1: if the probe row can never be positively confirmed
+    within the bounded settle window, cleanup must raise
+    ProbeCleanupFailedError -- never silently return as if there was
+    nothing to clean up."""
+    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (None, None))
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: None)  # grid never locates
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    adapter._PROBE_SETTLE_TIMEOUT_S = 0.05  # keep the test fast -- real wall-clock deadline
+
+    with pytest.raises(ProbeCleanupFailedError):
+        adapter._cleanup_probe_item(target_row_count=0)
+
+
+def test_cleanup_probe_item_refuses_to_delete_a_non_probe_last_row(monkeypatch):
+    """Priority 2: never delete "whatever's last" -- if the last row's
+    identity does not match the probe's own CAT/SEL, refuse (raise
+    ProbeCleanupFailedError) rather than cancel some other, unrelated
+    real row."""
+    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 2)  # never changes -- no real cancel happens
+    monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: ("RFG", "ARMV>"))
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1))
+
+    with pytest.raises(ProbeCleanupFailedError):
+        adapter._cleanup_probe_item(target_row_count=1)
+
+    assert cancel_calls == []  # never touched the non-probe row
+
+
+def test_verify_group_once_self_heals_duplicate_dialog_from_its_own_probe(monkeypatch):
+    """Priority 3: a group whose real content already contains SFG/GUTA
+    (e.g. Exterior's or an Elevation group's real gutter/downspout row)
+    pops Xactimate's 'Duplicate Item(s)' dialog immediately after
+    select_candidate()'s click, raising UnexpectedDialogError -- before
+    this fix, _verify_group_once()'s broad except swallowed that as a
+    bare False without ever reaching commit/cleanup. Must now self-heal
+    via _handle_duplicate_item_dialog() and continue to
+    enter_quantity()/commit_item()."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Rear Elevation"])
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    subtotal_state = {"n": 0}
+
+    def _fake_subtotal(image, header, row_index):
+        subtotal_state["n"] += 1
+        return 0 if subtotal_state["n"] == 1 else 200  # before, then after the probe commit
+
+    monkeypatch.setattr(adapter, "_group_subtotal_pixel_count", _fake_subtotal)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    monkeypatch.setattr(
+        adapter, "capture_dropdown",
+        lambda: [DropdownResult(raw_text="SFG GUTA", row_position=0, category="SFG", selector="GUTA")],
+    )
+    monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
+    monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 1)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: None)
+
+    select_calls = []
+
+    def _select_candidate(target):
+        select_calls.append(1)
+        raise UnexpectedDialogError("simulated Duplicate Item(s) dialog")
+
+    monkeypatch.setattr(adapter, "select_candidate", _select_candidate)
+    heal_calls = []
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: heal_calls.append(1) or True)
+    quantity_calls = []
+    monkeypatch.setattr(adapter, "enter_quantity", lambda qty: quantity_calls.append(qty))
+    commit_calls = []
+    monkeypatch.setattr(adapter, "commit_item", lambda: commit_calls.append(1))
+
+    assert adapter._verify_group_once("Rear Elevation") is True
+    assert select_calls == [1]  # select_candidate() itself is never retried
+    # Called twice: once by this method's own opening Phase 5.7B self-
+    # heal check (a no-op here, nothing open yet), once more to heal
+    # the dialog select_candidate() actually raised on.
+    assert heal_calls == [1, 1]
+    assert quantity_calls == [1]  # execution continued straight through to quantity/commit
+    assert commit_calls == [1]
+
+
+def test_verify_group_once_reraises_when_duplicate_dialog_cannot_be_self_healed(monkeypatch):
+    """Counterpart: if _handle_duplicate_item_dialog() can't find/click
+    'Yes' (some other, genuinely unexpected dialog), the original
+    UnexpectedDialogError must still propagate up to the outer except,
+    not be silently swallowed here."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Rear Elevation"])
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    monkeypatch.setattr(adapter, "_group_subtotal_pixel_count", lambda image, header, row_index: 0)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    monkeypatch.setattr(
+        adapter, "capture_dropdown",
+        lambda: [DropdownResult(raw_text="SFG GUTA", row_position=0, category="SFG", selector="GUTA")],
+    )
+    monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
+    monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 0)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: None)
+    monkeypatch.setattr(adapter, "select_candidate", lambda target: (_ for _ in ()).throw(UnexpectedDialogError("boom")))
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)  # nothing to heal
+    recover_calls = []
+    monkeypatch.setattr(adapter, "recover", lambda: recover_calls.append(1))
+
+    assert adapter._verify_group_once("Rear Elevation") is False  # caught by the outer except, never raises
+    assert recover_calls == [1]  # Phase 5.9: best-effort recovery before returning False
+
+
 def test_probe_counts_start_at_zero_and_only_increment_on_a_real_probe(monkeypatch):
     """Phase 5.8 Stage 8: probes_run_total/probes_by_group must reflect
     ONLY real disposable-probe runs -- a cached verify_group() hit
@@ -1784,13 +1977,22 @@ def test_cleanup_probe_item_preserves_pre_existing_rows(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
 
     # Grid starts at 2 rows (1 pre-existing real commit + 1 probe row
     # just added) -- must cancel exactly once, down to 1, and stop.
-    row_counts = iter([2, 1])
-    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: next(row_counts))
+    # Phase 5.9: identity-based -- the "last row" is the probe's own
+    # CAT/SEL until the cancel actually happens.
+    state = {"row_count": 2}
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: state["row_count"])
+    monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: ("SFG", "GUTA"))
     cancel_calls = []
-    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1))
+
+    def _cancel(**kwargs):
+        cancel_calls.append(1)
+        state["row_count"] -= 1
+
+    monkeypatch.setattr(adapter, "cancel_current_item", _cancel)
     commit_calls = []
     monkeypatch.setattr(adapter, "commit_item", lambda: commit_calls.append(1))
 
@@ -1807,11 +2009,18 @@ def test_cleanup_probe_item_defaults_to_fully_empty_grid(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
 
-    row_counts = iter([1, 0])
-    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: next(row_counts))
+    state = {"row_count": 1}
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: state["row_count"])
+    monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: ("SFG", "GUTA"))
     cancel_calls = []
-    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1))
+
+    def _cancel(**kwargs):
+        cancel_calls.append(1)
+        state["row_count"] -= 1
+
+    monkeypatch.setattr(adapter, "cancel_current_item", _cancel)
     monkeypatch.setattr(adapter, "commit_item", lambda: None)
 
     adapter._cleanup_probe_item()
@@ -2424,6 +2633,8 @@ def test_cleanup_probe_item_propagates_protected_row_error_instead_of_swallowing
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
     monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 5)  # never reaches target -- keeps trying
+    monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: ("SFG", "GUTA"))
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
 
     def _raise_protected(**kwargs):
         raise ProtectedCommittedRowError("simulated refusal")
