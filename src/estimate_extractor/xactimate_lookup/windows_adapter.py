@@ -718,6 +718,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         #: evidence. Never consulted by verify_group()/_verify_group_
         #: once() to decide pass/fail -- see that method's docstring.
         self.last_verify_group_subtotal_evidence: str | None = None
+        #: Phase 5.10C: per-poll trace from the MOST RECENT
+        #: _wait_for_probe_visible() call -- see that method's own
+        #: docstring. Live diagnostics only, never consulted for
+        #: pass/fail decisions.
+        self.last_probe_visibility_polls: list[dict] = []
 
     # ------------------------------------------------------------------
     # Phase 5.5D: committed-row protection + destructive-call audit
@@ -4308,16 +4313,68 @@ class WindowsXactimateAdapter(XactimateAdapter):
         _ensure_select_verify_group() hits on a partial-resume within
         the same live run. Pass use_cache=False to force a fresh probe
         regardless (used by diagnostics that need real-time ground
-        truth, and by tests of the probe itself)."""
+        truth, and by tests of the probe itself).
+
+        Phase 5.10C Stage 4 (live-caught): a probe-observation/cleanup
+        timeout inside _verify_group_once() raises ProbeCleanupFailedError
+        (Phase 5.9 Priority 2 -- never silently swallowed, by design),
+        but that exception used to propagate straight OUT of this
+        method entirely, bypassing the `for _attempt in range(2)` retry
+        loop below -- so a single transient observation timeout hard-
+        failed the group on its FIRST attempt, never getting the 2nd
+        attempt this loop was always meant to provide (confirmed live:
+        exactly the P510B-Bravo incident). A timeout is inconclusive,
+        not evidence of a real problem (ProtectedCommittedRowError and
+        GroupTransitionUnsafeError are NOT caught here -- both still
+        propagate immediately, since those DO mean something is
+        actually, concretely wrong). Before the retry, positively
+        resolves whatever the failed attempt might have left behind
+        (_resolve_stray_probe_before_retry()) so the next attempt's own
+        probe can never be confused with a leftover one -- if THAT
+        resolution itself cannot succeed, it propagates too, and this
+        method fails closed exactly as before (still at most 2 real
+        attempts, never more)."""
         normalized = group_name.strip().lower()
         if use_cache and normalized in self._verified_groups_this_session:
             return True
-        for _attempt in range(2):
-            if self._verify_group_once(group_name):
-                self._verified_groups_this_session.add(normalized)
-                return True
+        for attempt in range(2):
+            try:
+                if self._verify_group_once(group_name):
+                    self._verified_groups_this_session.add(normalized)
+                    return True
+            except ProbeCleanupFailedError:
+                if attempt == 0:
+                    self._resolve_stray_probe_before_retry(group_name)
+                else:
+                    raise
             time.sleep(0.5)
         return False
+
+    def _resolve_stray_probe_before_retry(self, group_name: str) -> None:
+        """Phase 5.10C Stage 4: called by verify_group() between its
+        two attempts, ONLY after the first attempt's own cleanup raised
+        ProbeCleanupFailedError. Positively resolves whatever that
+        attempt might have left behind BEFORE the next attempt starts
+        its own fresh probe cycle -- if left unresolved, the next
+        attempt's own baseline capture would silently treat a leftover
+        probe row as "pre-existing content" instead of recognizing it,
+        permanently hiding it as an unidentified garbage row (the exact
+        "do not create multiple unidentified probes" failure mode this
+        stage exists to prevent). Cleans down to the group's own
+        PROTECTED row count (never that failed attempt's own possibly-
+        stale row_count_before) -- reuses the same identity-based
+        _cleanup_probe_item() mechanism, never a distinct probe of its
+        own. Propagates ProbeCleanupFailedError/ProtectedCommittedRowError
+        if it cannot positively resolve the state either -- the caller
+        then fails closed rather than risking a second attempt on top
+        of an unresolved first one."""
+        try:
+            self._handle_duplicate_item_dialog()
+            self.recover()
+        except Exception:
+            pass
+        protected_floor = self._protected_row_ledger.count_for_group(group_name)
+        self._cleanup_probe_item(protected_floor)
 
     def _verify_group_once(self, group_name: str) -> bool:
         """One full probe-commit-and-check cycle. This DOES mutate the
@@ -4594,7 +4651,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return self._read_category_selector_at(image, offset, last_row_top)
 
     def _wait_for_probe_visible(self, target_row_count: int) -> str:
-        """Phase 5.9A: bounded-poll for the disposable group-
+        """Phase 5.9A/5.10C: bounded-poll for the disposable group-
         verification probe (CAT/SEL = _VERIFY_GROUP_PROBE_CATEGORY/
         _VERIFY_GROUP_PROBE_SELECTOR) to become positively observable
         as the grid's LAST row -- Xactimate always appends new rows at
@@ -4611,31 +4668,81 @@ class WindowsXactimateAdapter(XactimateAdapter):
           can still show the pre-probe count, which used to make
           cleanup silently declare victory without the probe having
           been removed -- see docs/build-estimate.md Phase 5.9).
-        - "timeout": neither could be confirmed within the bounded
-          settle window.
+        - "contradiction": TWO CONSECUTIVE reads at row_count >
+          target_row_count agree on the SAME identity, and it is
+          neither empty/unreadable NOR the probe's own CAT/SEL -- a
+          real, repeated (not just noisy-once) signal that something
+          other than the probe landed there. Phase 5.10C: a single
+          unreadable OCR read (cat/sel both None, or a one-off garbled
+          value that never repeats) is NEVER treated as contradictory
+          on its own -- only a STABLE, repeated non-matching reading
+          is, mirroring the same "two consecutive reads" skepticism
+          "absent" already applies to negative evidence.
+        - "timeout": none of the above could be confirmed within the
+          bounded settle window (Phase 5.10C: live-measured -- see
+          docs/build-estimate.md Phase 5.10C for the percentile data
+          _PROBE_SETTLE_TIMEOUT_S is calibrated from).
+
+        Every poll is recorded to self.last_probe_visibility_polls
+        (elapsed_s, grid_located, row_count, last_row identity) for
+        live diagnostics, regardless of outcome -- Phase 5.10C Stage 1.
 
         Never raises. Shared by _cleanup_probe_item() (where "absent"
-        means nothing to clean up and "timeout" is a hard failure) and
-        _verify_group_once() (Phase 5.9A: where "observed" IS the
-        group-activation verification signal, replacing the Grouping
-        panel's optional/frequently-unavailable Subtotal pixel check)."""
+        means nothing to clean up, "contradiction"/"timeout" are hard
+        failures) and _verify_group_once() (Phase 5.9A: where
+        "observed" IS the group-activation verification signal,
+        replacing the Grouping panel's optional/frequently-unavailable
+        Subtotal pixel check)."""
         hwnd = self._ensure_main_window()
         probe_identity = (self._VERIFY_GROUP_PROBE_CATEGORY, self._VERIFY_GROUP_PROBE_SELECTOR)
+        start = time.monotonic()
         deadline = time.time() + self._PROBE_SETTLE_TIMEOUT_S
         stable_at_baseline_reads = 0
+        last_other_identity = None
+        stable_other_identity_reads = 0
+        self.last_probe_visibility_polls = []
         while time.time() < deadline:
             image, offset = self._capture_and_locate(hwnd)
-            row_count = self._count_grid_rows(image, offset) if offset is not None else None
+            grid_located = offset is not None
+            row_count = self._count_grid_rows(image, offset) if grid_located else None
+            last_identity = None
+            outcome = None
             if row_count is not None and row_count > target_row_count:
-                stable_at_baseline_reads = 0
-                if self._last_row_identity(image, offset, row_count) == probe_identity:
-                    return "observed"
+                last_identity = self._last_row_identity(image, offset, row_count)
+                if last_identity == probe_identity:
+                    outcome = "observed"
+                elif last_identity in ((None, None), (None, ""), ("", None), ("", "")) or not any(last_identity):
+                    # Unreadable this poll -- inconclusive, never counts
+                    # against either "absent" or "contradiction".
+                    stable_at_baseline_reads = 0
+                    last_other_identity = None
+                    stable_other_identity_reads = 0
+                else:
+                    stable_at_baseline_reads = 0
+                    if last_identity == last_other_identity:
+                        stable_other_identity_reads += 1
+                        if stable_other_identity_reads >= 2:
+                            outcome = "contradiction"
+                    else:
+                        last_other_identity = last_identity
+                        stable_other_identity_reads = 1
             elif row_count is not None:  # row_count <= target_row_count
                 stable_at_baseline_reads += 1
+                last_other_identity = None
+                stable_other_identity_reads = 0
                 if stable_at_baseline_reads >= 2:
-                    return "absent"
+                    outcome = "absent"
             else:
                 stable_at_baseline_reads = 0
+                last_other_identity = None
+                stable_other_identity_reads = 0
+
+            self.last_probe_visibility_polls.append({
+                "elapsed_s": round(time.monotonic() - start, 3), "grid_located": grid_located,
+                "row_count": row_count, "last_row_identity": last_identity, "outcome_this_poll": outcome,
+            })
+            if outcome is not None:
+                return outcome
             time.sleep(self._PROBE_SETTLE_POLL_S)
         return "timeout"
 
@@ -4679,6 +4786,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
             raise ProbeCleanupFailedError(
                 f"_cleanup_probe_item(): could not positively observe the probe row {probe_identity!r} become "
                 f"visible within {self._PROBE_SETTLE_TIMEOUT_S}s -- refusing to guess whether cleanup is needed."
+            )
+        if status == "contradiction":
+            raise ProbeCleanupFailedError(
+                f"_cleanup_probe_item(): the last row repeatedly read as a DIFFERENT, non-probe identity "
+                f"instead of {probe_identity!r} -- refusing to guess whether cleanup is needed."
             )
 
         # status == "observed" -- remove exactly the identified probe

@@ -1430,6 +1430,177 @@ def test_verify_group_never_caches_a_negative_result(monkeypatch):
 
 
 # ---------------------------------------------------------------------
+# Phase 5.10C Stage 4 (live-caught): a probe-observation/cleanup
+# timeout (ProbeCleanupFailedError) used to propagate straight out of
+# verify_group(), bypassing its own 2-attempt retry loop entirely --
+# reproduced live as the P510B-Bravo incident (one transient timeout
+# hard-failed the group on its first and only attempt).
+# ---------------------------------------------------------------------
+
+
+def test_verify_group_retries_after_a_probe_cleanup_timeout(monkeypatch):
+    """A ProbeCleanupFailedError on attempt 1 must not escape -- the
+    2nd attempt this loop was always meant to provide must still run,
+    and succeed if the 2nd attempt's own probe is clean."""
+    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
+    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    attempts = iter([ProbeCleanupFailedError("timeout"), True])
+
+    def _fake_once(name):
+        outcome = next(attempts)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(adapter, "_verify_group_once", _fake_once)
+    resolve_calls = []
+    monkeypatch.setattr(adapter, "_resolve_stray_probe_before_retry", lambda name: resolve_calls.append(name))
+    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
+
+    assert adapter.verify_group("Dwelling Roof") is True
+    assert resolve_calls == ["Dwelling Roof"]  # stray-probe resolution ran between attempts
+
+
+def test_verify_group_resolves_stray_probe_before_the_retry_attempt(monkeypatch):
+    """_resolve_stray_probe_before_retry() must run BEFORE the 2nd
+    _verify_group_once() call, never after -- otherwise the 2nd
+    attempt's own baseline capture could see a still-present leftover
+    row and silently treat it as pre-existing content."""
+    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
+    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    call_order = []
+
+    def _fake_once(name):
+        call_order.append("verify_group_once")
+        if call_order.count("verify_group_once") == 1:
+            raise ProbeCleanupFailedError("timeout")
+        return True
+
+    monkeypatch.setattr(adapter, "_verify_group_once", _fake_once)
+    monkeypatch.setattr(adapter, "_resolve_stray_probe_before_retry", lambda name: call_order.append("resolve"))
+    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
+
+    assert adapter.verify_group("Dwelling Roof") is True
+    assert call_order == ["verify_group_once", "resolve", "verify_group_once"]
+
+
+def test_verify_group_fails_closed_after_second_probe_cleanup_failure(monkeypatch):
+    """If the retry ALSO raises ProbeCleanupFailedError, it must
+    propagate (fail closed) -- never a silent 3rd attempt."""
+    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
+    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    call_count = {"n": 0}
+
+    def _fake_once(name):
+        call_count["n"] += 1
+        raise ProbeCleanupFailedError(f"timeout attempt {call_count['n']}")
+
+    monkeypatch.setattr(adapter, "_verify_group_once", _fake_once)
+    monkeypatch.setattr(adapter, "_resolve_stray_probe_before_retry", lambda name: None)
+    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
+
+    with pytest.raises(ProbeCleanupFailedError):
+        adapter.verify_group("Dwelling Roof")
+    assert call_count["n"] == 2  # exactly 2 attempts, never a 3rd
+
+
+def test_verify_group_never_retries_on_protected_committed_row_error(monkeypatch):
+    """ProtectedCommittedRowError means something is ACTUALLY, concretely
+    wrong (cleanup would have deleted a real committed row) -- unlike a
+    bare timeout, this must propagate immediately, never be retried."""
+    from estimate_extractor.xactimate_lookup.adapter import ProtectedCommittedRowError
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    call_count = {"n": 0}
+
+    def _fake_once(name):
+        call_count["n"] += 1
+        raise ProtectedCommittedRowError("would delete a committed row")
+
+    monkeypatch.setattr(adapter, "_verify_group_once", _fake_once)
+    resolve_calls = []
+    monkeypatch.setattr(adapter, "_resolve_stray_probe_before_retry", lambda name: resolve_calls.append(name))
+
+    with pytest.raises(ProtectedCommittedRowError):
+        adapter.verify_group("Dwelling Roof")
+    assert call_count["n"] == 1  # never retried
+    assert resolve_calls == []  # resolution never even attempted
+
+
+def test_resolve_stray_probe_before_retry_cleans_to_the_protected_floor(monkeypatch):
+    """The resolution step must clean down to the group's own PROTECTED
+    row count -- never the failed attempt's own possibly-stale
+    row_count_before -- and never open a new probe of its own."""
+    from estimate_extractor.xactimate_lookup.destructive_audit import ProtectedRowRecord
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._protected_row_ledger.record(
+        group="Dwelling Roof",
+        record=ProtectedRowRecord(
+            task_id="t1", source_row="line_1", group="Dwelling Roof", category="RFG", selector="FELT15",
+            description="Roofing felt", quantity=33.66, unit="SQ", xactimate_item_number=None,
+            committed_row_identity=("RFG", "FELT15"), row_count_after_commit=1, timestamp="now",
+            verification_state="VERIFIED",
+        ),
+    )
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "recover", lambda: None)
+    cleanup_calls = []
+    monkeypatch.setattr(adapter, "_cleanup_probe_item", lambda target_row_count: cleanup_calls.append(target_row_count))
+
+    adapter._resolve_stray_probe_before_retry("Dwelling Roof")
+
+    assert cleanup_calls == [1]  # the group's protected floor, not some other guess
+
+
+# ---------------------------------------------------------------------
+# Phase 5.10C Stage 2: probe observation must not mistake a single
+# unreadable OCR read for a real contradiction, but a STABLE, repeated
+# non-matching identity is real, opposing evidence.
+# ---------------------------------------------------------------------
+
+
+def test_wait_for_probe_visible_ignores_a_single_unreadable_read(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 1)  # > target(0)
+    identities = iter([(None, None), ("SFG", "GUTA")])  # unreadable once, then the real probe
+    monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: next(identities))
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+    assert adapter._wait_for_probe_visible(0) == "observed"
+
+
+def test_wait_for_probe_visible_returns_contradiction_on_stable_different_identity(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 1)  # > target(0)
+    monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: ("RFG", "ARMV>"))
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+    assert adapter._wait_for_probe_visible(0) == "contradiction"
+
+
+def test_cleanup_probe_item_raises_on_contradiction(monkeypatch):
+    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_wait_for_probe_visible", lambda target: "contradiction")
+
+    with pytest.raises(ProbeCleanupFailedError):
+        adapter._cleanup_probe_item(target_row_count=0)
+
+
+# ---------------------------------------------------------------------
 # Phase 5.7B: Xactimate's own "Duplicate Item(s)" cross-group reminder,
 # live-caught blocking every group after the first for the rest of a
 # real 42-row run -- must be answered "Yes" (never silently discard a
