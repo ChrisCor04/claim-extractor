@@ -13,11 +13,14 @@ from estimate_extractor.ui import review_service
 from estimate_extractor.xactimate_lookup.execution_plan import (
     ExecutionPlan,
     ExecutionPlanError,
+    ExecutionPlanOverwriteRefused,
     ExecutionTask,
     GROUP_PENDING,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
     LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
     RUN_STATE_COMPLETED,
+    TASK_COMMIT_STATE_COMMITTED,
+    TASK_COMMIT_STATE_NOT_COMMITTED,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
@@ -25,10 +28,12 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TASK_SKIPPED,
     build_execution_plan,
     classify_unmapped_rows,
+    commit_state_from_trust_state,
     diagnose_run,
     load_execution_plan,
     reset_unfinished_tasks,
     save_execution_plan,
+    task_has_committed_row,
 )
 
 
@@ -512,6 +517,166 @@ def test_full_reset_also_resets_completed_tasks_when_explicitly_requested(tmp_pa
     assert reset_count == 3  # completed, review, failed -- not the already-pending one
     assert plan.task_by_id("t_completed").state == TASK_PENDING
     assert plan.task_by_id("t_completed").observed_quantity is None
+
+
+# ---------------------------------------------------------------------
+# Phase 5.9 (live-caught): a task can carry state == TASK_REVIEW_REQUIRED
+# while a real row genuinely committed to Xactimate -- reset_unfinished_
+# tasks() must not treat that as "unfinished, safe to retry", or the
+# next Execute duplicates a real row. See task_has_committed_row().
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "trust_state,commit_state,state,expected",
+    [
+        (None, None, TASK_COMPLETED, True),  # state alone is sufficient
+        ("QUANTITY_MISMATCH", None, TASK_REVIEW_REQUIRED, True),  # legacy: inferred from trust_state
+        ("VERIFIED", None, TASK_REVIEW_REQUIRED, True),
+        ("VERIFICATION_FAILED", None, TASK_REVIEW_REQUIRED, False),  # delta stayed 0 -- nothing landed
+        (None, None, TASK_REVIEW_REQUIRED, False),  # never even reached commit
+        (None, TASK_COMMIT_STATE_COMMITTED, TASK_REVIEW_REQUIRED, True),  # explicit field wins
+        ("VERIFIED", TASK_COMMIT_STATE_NOT_COMMITTED, TASK_REVIEW_REQUIRED, False),  # explicit field wins over trust_state
+    ],
+)
+def test_task_has_committed_row(trust_state, commit_state, state, expected):
+    task = ExecutionTask(
+        task_id="t", line_item_id="line_1", source_order=0, area_name=None, section_name="Roof",
+        description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+        source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
+        state=state, trust_state=trust_state, commit_state=commit_state,
+    )
+    assert task_has_committed_row(task) is expected
+
+
+def test_commit_state_from_trust_state():
+    assert commit_state_from_trust_state("VERIFIED") == TASK_COMMIT_STATE_COMMITTED
+    assert commit_state_from_trust_state("QUANTITY_MISMATCH") == TASK_COMMIT_STATE_COMMITTED
+    assert commit_state_from_trust_state("VERIFICATION_FAILED") == TASK_COMMIT_STATE_NOT_COMMITTED
+    assert commit_state_from_trust_state(None) == TASK_COMMIT_STATE_COMMITTED
+
+
+def test_reset_unfinished_tasks_preserves_a_committed_but_unverified_row(tmp_path):
+    """The exact live incident: a task genuinely committed (trust_state
+    QUANTITY_MISMATCH -- a real row landed, just with a quantity OCR
+    couldn't confirm) but state == TASK_REVIEW_REQUIRED. Reset unfinished
+    must leave it alone, same as a TASK_COMPLETED task."""
+    plan = _plan_with_mixed_states()
+    committed_review = ExecutionTask(
+        task_id="t_committed_review", line_item_id="line_committed_review", source_order=4,
+        area_name=None, section_name="Roof", description="d", category=None, selector=None,
+        lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST, source_quantity=1.0, source_unit="SQ",
+        expected_unit="SQ", state=TASK_REVIEW_REQUIRED, began_unmapped=True,
+        trust_state="QUANTITY_MISMATCH", started_at="t1", completed_at="t2",
+    )
+    plan.tasks.append(committed_review)
+    plan.groups[0].task_ids.append(committed_review.task_id)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_count = reset_unfinished_tasks(plan, project_dir, full_reset=False)
+
+    assert reset_count == 2  # t_review and t_failed only -- NOT t_committed_review
+    assert plan.task_by_id("t_committed_review").state == TASK_REVIEW_REQUIRED
+    assert plan.task_by_id("t_committed_review").trust_state == "QUANTITY_MISMATCH"
+
+
+def test_reset_unfinished_tasks_full_reset_still_resets_committed_but_unverified_rows(tmp_path):
+    """full_reset=True is the explicit, deliberate "start completely
+    over" escape hatch -- it must still be able to reset a committed-
+    but-unverified row, exactly like a TASK_COMPLETED one."""
+    plan = _plan_with_mixed_states()
+    committed_review = ExecutionTask(
+        task_id="t_committed_review", line_item_id="line_committed_review", source_order=4,
+        area_name=None, section_name="Roof", description="d", category=None, selector=None,
+        lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST, source_quantity=1.0, source_unit="SQ",
+        expected_unit="SQ", state=TASK_REVIEW_REQUIRED, began_unmapped=True,
+        trust_state="QUANTITY_MISMATCH", started_at="t1", completed_at="t2",
+    )
+    plan.tasks.append(committed_review)
+    plan.groups[0].task_ids.append(committed_review.task_id)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_unfinished_tasks(plan, project_dir, full_reset=True)
+
+    assert plan.task_by_id("t_committed_review").state == TASK_PENDING
+    assert plan.task_by_id("t_committed_review").trust_state is None
+
+
+# ---------------------------------------------------------------------
+# Phase 5.9: save_execution_plan() refuses to silently shrink a plan.
+# ---------------------------------------------------------------------
+
+
+def test_save_execution_plan_refuses_to_shrink_an_existing_plan(tmp_path):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    big_plan = ExecutionPlan(plan_id="real", project_slug="s", source_filename=None, created_at="now")
+    big_plan.tasks = [
+        ExecutionTask(
+            task_id=f"t{i}", line_item_id=f"line_{i}", source_order=i, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
+        )
+        for i in range(5)
+    ]
+    save_execution_plan(big_plan, project_dir)
+
+    small_plan = ExecutionPlan(plan_id="throwaway_diagnostic", project_slug="s", source_filename=None, created_at="now")
+    small_plan.tasks = [big_plan.tasks[0]]
+
+    with pytest.raises(ExecutionPlanOverwriteRefused):
+        save_execution_plan(small_plan, project_dir)
+
+    # Refused -- the real 5-task plan must still be on disk, untouched.
+    reloaded = load_execution_plan(project_dir)
+    assert len(reloaded.tasks) == 5
+
+
+def test_save_execution_plan_allows_shrink_when_explicitly_requested(tmp_path):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    big_plan = ExecutionPlan(plan_id="real", project_slug="s", source_filename=None, created_at="now")
+    big_plan.tasks = [
+        ExecutionTask(
+            task_id=f"t{i}", line_item_id=f"line_{i}", source_order=i, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
+        )
+        for i in range(5)
+    ]
+    save_execution_plan(big_plan, project_dir)
+
+    small_plan = ExecutionPlan(plan_id="deliberate_rebuild", project_slug="s", source_filename=None, created_at="now")
+    small_plan.tasks = [big_plan.tasks[0]]
+
+    save_execution_plan(small_plan, project_dir, allow_shrink=True)  # must not raise
+
+    reloaded = load_execution_plan(project_dir)
+    assert len(reloaded.tasks) == 1
+
+
+def test_save_execution_plan_never_refuses_when_growing_or_same_size(tmp_path):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    plan = ExecutionPlan(plan_id="p", project_slug="s", source_filename=None, created_at="now")
+    plan.tasks = [
+        ExecutionTask(
+            task_id="t0", line_item_id="line_0", source_order=0, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
+        )
+    ]
+    save_execution_plan(plan, project_dir)
+    save_execution_plan(plan, project_dir)  # same size -- must not raise
+
+    plan.tasks.append(ExecutionTask(
+        task_id="t1", line_item_id="line_1", source_order=1, area_name=None, section_name="Roof",
+        description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+        source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
+    ))
+    save_execution_plan(plan, project_dir)  # growing -- must not raise
 
 
 def test_diagnose_run_reports_exact_counts_and_stop_reason(tmp_path):

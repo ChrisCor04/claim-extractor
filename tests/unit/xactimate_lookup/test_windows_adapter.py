@@ -14,6 +14,8 @@ for why every OS-specific dependency is a lazy import.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from estimate_extractor.xactimate_lookup.models import DropdownResult
@@ -1513,26 +1515,99 @@ def test_dismiss_stray_results_popup_never_raises(monkeypatch):
 
 
 @pytest.mark.parametrize("method_name", ["ensure_group", "select_group"])
-def test_group_entry_points_self_heal_a_stray_results_popup(monkeypatch, method_name):
-    """ensure_group()/select_group() must check for and dismiss a stray
-    results popup left open by a previous task, independent of
-    orchestrator.py's own fix -- defense in depth at the exact point
-    the live defect was reproduced (group-tree interaction beginning
-    while a popup from the prior task was still open)."""
+def test_group_entry_points_assert_transition_settled(monkeypatch, method_name):
+    """Phase 5.9: ensure_group()/select_group() must check the group-
+    transition settle assertion (never the old silent dismiss-and-
+    proceed) at the exact point the live defect was reproduced (group-
+    tree interaction beginning while a popup from the prior task was
+    still open)."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    dismiss_calls = []
-    monkeypatch.setattr(adapter, "_dismiss_stray_results_popup", lambda: dismiss_calls.append(1))
+    assert_calls = []
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda *, next_group: assert_calls.append(next_group))
     monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
-    # Fail fast right after the self-heal calls -- we only care that
-    # they happened, not the rest of the (extensively tested elsewhere)
-    # method body.
+    # Fail fast right after the self-heal/assertion calls -- we only
+    # care that they happened, not the rest of the (extensively tested
+    # elsewhere) method body.
     monkeypatch.setattr(adapter, "verify_application", lambda: False)
 
     from estimate_extractor.xactimate_lookup.adapter import AdapterError
     with pytest.raises(AdapterError):
         getattr(adapter, method_name)("Dwelling Roof")
 
-    assert dismiss_calls == [1]
+    assert assert_calls == ["Dwelling Roof"]
+
+
+@pytest.mark.parametrize("method_name", ["ensure_group", "select_group"])
+def test_group_entry_points_never_silently_dismiss_a_stray_popup(monkeypatch, method_name):
+    """Phase 5.9 (live-caught defect this phase fixes): a stray results
+    popup still open when a group-tree entry point is about to run must
+    cause a hard refusal, never a silent Escape-and-continue -- see
+    docs/build-estimate.md Phase 5.9, "Do not dismiss an open results
+    dropdown just to proceed to the next group."."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: 555)  # popup never clears
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    recover_calls = []
+    monkeypatch.setattr(adapter, "recover", lambda: recover_calls.append(1))
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import GroupTransitionUnsafeError
+    with pytest.raises(GroupTransitionUnsafeError):
+        getattr(adapter, method_name)("Dwelling Roof")
+
+    # The old self-heal (Phase 5.8A) would have called recover() to
+    # dismiss it and proceeded anyway -- Phase 5.9 must never do that.
+    assert recover_calls == []
+
+
+def test_assert_group_transition_settled_passes_once_ui_clears(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    states = [555, 555, None]  # popup present twice, then clears
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: states.pop(0))
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+    adapter._assert_group_transition_settled(next_group="Dwelling Roof")  # must not raise
+    assert states == []
+
+
+def test_record_lifecycle_event_tags_current_execution_context(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter.set_execution_context(run_id="run_1", task_id="t1", source_row="line_0001", group="Dwelling Roof")
+
+    adapter.record_lifecycle_event("DECISION_MADE", decision="AUTO_SELECT")
+
+    events = adapter._row_lifecycle_ledger.events_for_task("t1")
+    assert len(events) == 1
+    assert events[0]["run_id"] == "run_1"
+    assert events[0]["group"] == "Dwelling Roof"
+    assert events[0]["event"] == "DECISION_MADE"
+    assert events[0]["decision"] == "AUTO_SELECT"
+
+
+def test_record_lifecycle_event_never_raises(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    def boom(**kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(adapter._row_lifecycle_ledger, "record", boom)
+    adapter.record_lifecycle_event("PLANNED")  # must not raise
+
+
+def test_assert_group_transition_settled_raises_after_bounded_wait(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: 555)
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    sleep_calls = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleep_calls.append(s))
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import GroupTransitionUnsafeError
+    with pytest.raises(GroupTransitionUnsafeError):
+        adapter._assert_group_transition_settled(next_group="Dwelling Roof")
+    # Bounded, not unbounded -- exactly the configured attempt count.
+    assert len(sleep_calls) == adapter._GROUP_TRANSITION_SETTLE_ATTEMPTS
 
 
 # ---------------------------------------------------------------------
@@ -2283,6 +2358,51 @@ def test_cancel_current_item_allows_deletion_above_the_protected_floor(monkeypat
     monkeypatch.setattr(adapter, "_count_grid_rows", _count_after)
 
     adapter.cancel_current_item(reason="disposable_group_probe", caller="test")  # must not raise
+
+
+def test_delete_group_refuses_when_group_has_protected_rows(monkeypatch):
+    """Phase 5.9 Stage 5: delete_group() removes an ENTIRE group -- it
+    had no protected-row check at all before this phase, unlike
+    cancel_current_item(). A group holding even one row this run
+    already committed must refuse outright, before touching the live
+    UI at all."""
+    from estimate_extractor.xactimate_lookup.adapter import ProtectedCommittedRowError
+    from estimate_extractor.xactimate_lookup.destructive_audit import ProtectedRowRecord
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._protected_row_ledger.record(
+        group="Dwelling Roof",
+        record=ProtectedRowRecord(
+            task_id="t1", source_row="line_0001", group="Dwelling Roof", category="RFG", selector="ARMV>",
+            description="Tear off shingles", quantity=33.66, unit="SQ", xactimate_item_number=None,
+            committed_row_identity=("RFG", "ARMV>"), row_count_after_commit=1, timestamp="2026-01-01T00:00:00",
+            verification_state="VERIFIED",
+        ),
+    )
+    # verify_application would be the next live call if the refusal
+    # didn't happen first -- forcing it to raise proves this test would
+    # fail loudly if the protection check were ever bypassed/reordered.
+    def _boom():
+        raise AssertionError("delete_group() touched the live UI before checking protected rows")
+    monkeypatch.setattr(adapter, "verify_application", _boom)
+
+    with pytest.raises(ProtectedCommittedRowError):
+        adapter.delete_group("Dwelling Roof")
+
+
+def test_delete_group_proceeds_when_group_has_no_protected_rows(monkeypatch):
+    """Counterpart: a group nobody has committed anything to this
+    session is safe to delete -- the protection check must not block
+    the ordinary disposable-test-cleanup use case."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 1)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST"])  # already gone
+
+    assert adapter.delete_group("Dwelling Roof") is True
 
 
 def test_invalid_destructive_reason_is_refused():

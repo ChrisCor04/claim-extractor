@@ -190,6 +190,18 @@ def _cancel_pending_selection(adapter: XactimateAdapter) -> None:
             pass
 
 
+def _record_lifecycle(adapter: XactimateAdapter, event: str, **detail) -> None:
+    """Phase 5.9: duck-typed, best-effort row-lifecycle logging -- see
+    execution_diagnostics.py. A FakeXactimateAdapter/non-Windows
+    adapter without record_lifecycle_event() is completely unaffected;
+    never raises, never affects control flow."""
+    if hasattr(adapter, "record_lifecycle_event"):
+        try:
+            adapter.record_lifecycle_event(event, **detail)
+        except Exception:
+            pass
+
+
 def execute_plan(
     plan: LookupPlan,
     item: RecommendationInput,
@@ -211,6 +223,7 @@ def execute_plan(
     if not adapter.verify_project():
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_CONTEXT_UNVERIFIED, "Adapter could not verify the active Xactimate project/estimate context.")
 
+    _record_lifecycle(adapter, "SEARCH_STARTED", search_input=plan.search_input, path=plan.path)
     adapter.focus_search()
     adapter.clear_search()
     if plan.path == LOOKUP_PATH_TRUSTED:
@@ -221,6 +234,8 @@ def execute_plan(
     try:
         raw = adapter.capture_dropdown()
         dropdowns = adapter.parse_dropdown(raw)
+        _record_lifecycle(adapter, "POPUP_OBSERVED")
+        _record_lifecycle(adapter, "CANDIDATES_CAPTURED", count=len(dropdowns))
     except UnexpectedDialogError as exc:
         adapter.recover()
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNEXPECTED_DIALOG, str(exc))
@@ -254,6 +269,7 @@ def execute_plan(
         rules=phrase_rules, config=ranking_config, prior_verified_mapping=(plan.path == LOOKUP_PATH_TRUSTED),
     )
     decision = classify_decision(candidates, ranking_config)
+    _record_lifecycle(adapter, "DECISION_MADE", decision=decision)
 
     if decision == DECISION_NO_MATCH:
         adapter.recover()  # Phase 5.8A: same popup-left-open fix as above
@@ -296,7 +312,9 @@ def execute_plan(
 
     try:
         adapter.select_candidate(top.dropdown)
+        _record_lifecycle(adapter, "CANDIDATE_SELECTED", category=top.dropdown.category, selector=top.dropdown.selector)
         populated = adapter.read_populated_fields()
+        _record_lifecycle(adapter, "QUICK_ENTRY_POPULATED")
     except UnexpectedDialogError as exc:
         adapter.recover()
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNEXPECTED_DIALOG, str(exc), candidates=candidates, selected=top)
@@ -352,7 +370,10 @@ def execute_plan(
 
     try:
         adapter.enter_quantity(item.quantity)
+        _record_lifecycle(adapter, "QUANTITY_ENTERED", quantity=item.quantity)
+        _record_lifecycle(adapter, "COMMIT_STARTED")
         adapter.commit_item()
+        _record_lifecycle(adapter, "COMMIT_RETURNED")
     except AdapterError as exc:
         adapter.recover()
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_EXTRACTION_FAILED, str(exc), candidates=candidates, selected=top)
@@ -371,6 +392,7 @@ def execute_plan(
             category=top.dropdown.category, selector=top.dropdown.selector,
             description=item.original_description, quantity=item.quantity, unit=item.source_unit,
         )
+    _record_lifecycle(adapter, "ROW_OBSERVED_IN_GRID", category=top.dropdown.category, selector=top.dropdown.selector)
 
     outcome.evidence_reference = adapter.capture_evidence()
     if before_snapshot is not None and hasattr(adapter, "verify_commit"):
@@ -379,4 +401,5 @@ def execute_plan(
             source_unit=item.source_unit, expected_xactimate_unit=item.source_unit,
             populated_unit=populated.unit,
         )
+        _record_lifecycle(adapter, "VERIFIED", trust_state=getattr(outcome.verification, "trust_state", None))
     return outcome

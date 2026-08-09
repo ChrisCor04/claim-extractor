@@ -65,14 +65,18 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     STOP_REASON_PROJECT_VERIFICATION_FAILURE,
     STOP_REASON_PROTECTED_ROW_REFUSAL,
     STOP_REASON_TASK_LEVEL_STOPS,
+    TASK_COMMIT_STATE_COMMITTED,
+    TASK_COMMIT_STATE_NOT_COMMITTED,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
     TASK_SKIPPED,
     TEST_ONLY_PROJECT_NAME,
+    commit_state_from_trust_state,
     is_plan_stale,
     save_execution_plan,
+    task_has_committed_row,
     utc_now_iso,
 )
 from estimate_extractor.xactimate_lookup.execution_reports import write_all_execution_reports
@@ -260,6 +264,20 @@ def _ensure_select_verify_group(adapter, group: GroupExecutionState) -> tuple[bo
     return True, None
 
 
+def _record_terminal(adapter, task: ExecutionTask) -> None:
+    """Phase 5.9: marks this task's row-lifecycle ledger entry TERMINAL
+    -- called at every exit point of the per-task loop in
+    run_execution_plan(), regardless of which outcome/exception path
+    was taken, so the ledger always has a closing event to compare
+    against an independent post-run grid re-inventory (Stage 11: task
+    status is never, by itself, proof the row is still there)."""
+    if hasattr(adapter, "record_lifecycle_event"):
+        try:
+            adapter.record_lifecycle_event("TERMINAL", task_state=task.state, stop_reason=task.stop_reason)
+        except Exception:
+            pass
+
+
 def _apply_outcome_to_task(task: ExecutionTask, outcome, dry_run: bool) -> None:
     task.attempts += 1
     task.completed_at = utc_now_iso()
@@ -274,18 +292,24 @@ def _apply_outcome_to_task(task: ExecutionTask, outcome, dry_run: bool) -> None:
         return
 
     if not outcome.committed:
+        task.commit_state = TASK_COMMIT_STATE_NOT_COMMITTED
         task.state = TASK_FAILED if outcome.decision == DECISION_NO_MATCH else TASK_REVIEW_REQUIRED
         return
 
     verification = outcome.verification
     if verification is None:
         # Committed, but the adapter cannot independently confirm it.
-        # Never claim success without evidence -- route to review.
+        # Never claim success without evidence -- route to review. Still
+        # a real commit_item() call succeeded, though -- conservatively
+        # treated as committed (see commit_state_from_trust_state()'s
+        # docstring) so it is never silently retried/duplicated.
+        task.commit_state = TASK_COMMIT_STATE_COMMITTED
         task.state = TASK_REVIEW_REQUIRED
         task.stop_detail = (task.stop_detail or "") + " Committed, but the adapter does not support commit verification."
         return
 
     task.trust_state = getattr(verification, "trust_state", None)
+    task.commit_state = commit_state_from_trust_state(task.trust_state)
     task.observed_quantity = getattr(verification, "quantity_observed", None)
     observed_unit = getattr(verification, "unit", None)
     task.observed_unit = getattr(observed_unit, "observed_xactimate_unit", None) if observed_unit is not None else None
@@ -703,9 +727,38 @@ def run_execution_plan(
                 continue
 
         for task in pending_tasks:
+            # Phase 5.9: defense-in-depth, independent of reset_
+            # unfinished_tasks()'s own protection -- a task should never
+            # legitimately reach TASK_PENDING with commit evidence still
+            # attached (that function now clears commit_state/trust_
+            # state on genuine reset), so this should be unreachable in
+            # normal operation. It exists for the same reason
+            # ProtectedCommittedRowError does: a second, structurally
+            # independent gate against duplicating a real committed row,
+            # in case some OTHER path (a manual JSON edit, a future bug)
+            # ever puts a committed task back in TASK_PENDING.
+            if not dry_run and task_has_committed_row(task):
+                task.state = TASK_REVIEW_REQUIRED
+                task.stop_detail = (
+                    "ALREADY_COMMITTED — RETRY BLOCKED: this task has evidence of a prior real commit "
+                    "(commit_state/trust_state indicates a row landed) -- automatic retry refused. Reconcile "
+                    "against the live Xactimate grid before ever re-executing this row."
+                )
+                task.completed_at = utc_now_iso()
+                _record_terminal(adapter, task)
+                if not dry_run:
+                    plan.resume_cursor = plan.tasks.index(task) + 1
+                    save_execution_plan(plan, project_dir)
+                continue
+
             task.started_at = task.started_at or utc_now_iso()
             if hasattr(adapter, "set_execution_context"):
                 adapter.set_execution_context(task_id=task.task_id, source_row=task.row_label)
+            if hasattr(adapter, "record_lifecycle_event"):
+                try:
+                    adapter.record_lifecycle_event("PLANNED", description=task.description)
+                except Exception:
+                    pass
 
             # Phase 5.5: a second, authoritative gate for unmapped-row
             # description-first tasks, independent of the cheap string
@@ -727,6 +780,7 @@ def run_execution_plan(
                     if not dry_run:
                         plan.resume_cursor = plan.tasks.index(task) + 1
                         save_execution_plan(plan, project_dir)
+                    _record_terminal(adapter, task)
                     continue
 
             item = _task_to_recommendation_input(task)
@@ -766,6 +820,7 @@ def run_execution_plan(
                 if not dry_run:
                     plan.resume_cursor = plan.tasks.index(task) + 1
                     save_execution_plan(plan, project_dir)
+                _record_terminal(adapter, task)
                 continue
             except ProtectedCommittedRowError as exc:
                 # Never treated as "this task failed" -- a committed row
@@ -779,6 +834,7 @@ def run_execution_plan(
                     plan.resume_cursor = plan.tasks.index(task) + 1
                     save_execution_plan(plan, project_dir)
                     write_all_execution_reports(plan, project_dir)
+                _record_terminal(adapter, task)
                 return plan
             except Exception as exc:  # noqa: BLE001 -- one task's unexpected failure must never abort the run
                 task.state = TASK_FAILED
@@ -790,6 +846,7 @@ def run_execution_plan(
                 except Exception:
                     task.recovery_outcome = "recovery_failed"
 
+            _record_terminal(adapter, task)
             if not dry_run:
                 plan.resume_cursor = plan.tasks.index(task) + 1
                 save_execution_plan(plan, project_dir)

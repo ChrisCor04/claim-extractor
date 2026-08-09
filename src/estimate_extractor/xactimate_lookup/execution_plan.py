@@ -45,6 +45,24 @@ TASK_REVIEW_REQUIRED = "review_required"
 TASK_FAILED = "failed"
 VALID_TASK_STATES = frozenset({TASK_PENDING, TASK_COMPLETED, TASK_SKIPPED, TASK_REVIEW_REQUIRED, TASK_FAILED})
 
+# Phase 5.9: commit evidence, tracked SEPARATELY from `state` (execution
+# outcome) and `trust_state` (post-commit verification confidence) --
+# see ExecutionTask.commit_state's own docstring and task_has_committed_
+# row() below. A live incident showed `state == TASK_REVIEW_REQUIRED`
+# alone cannot answer "did a real row land in Xactimate" -- 13 of 14
+# rows physically committed during a Phase 5.8A run carried
+# TASK_REVIEW_REQUIRED because their post-commit OCR verification came
+# back below VERIFIED confidence, not because nothing committed.
+TASK_COMMIT_STATE_NOT_COMMITTED = "not_committed"
+TASK_COMMIT_STATE_COMMITTED = "committed"
+
+#: verify_commit()'s trust_state values that mean the row-count delta
+#: stayed at 0 through the whole polling window -- i.e. commit_item()
+#: was called but nothing structurally landed in the grid. The ONE
+#: trust_state that is NOT evidence of a real committed row, despite
+#: outcome.committed having been True at the Python level.
+_TRUST_STATES_WITHOUT_A_LANDED_ROW = frozenset({"VERIFICATION_FAILED"})
+
 # Group execution states (Priority 5) -- a group must reach VERIFIED before
 # any task inside it is executed; never inferred, never skipped.
 GROUP_PENDING = "pending"
@@ -117,6 +135,60 @@ class ExecutionPlanError(Exception):
     pass
 
 
+class ExecutionPlanOverwriteRefused(ExecutionPlanError):
+    """Phase 5.9: raised by save_execution_plan() when it would replace
+    an EXISTING persisted plan with a plan carrying materially FEWER
+    tasks -- the exact live incident this guards against: a small
+    throwaway diagnostic/synthetic plan (built by a scratch script)
+    silently clobbering a real, larger, already-tracked project plan.
+    Pass allow_shrink=True for a deliberate, intentional replace (the
+    UI's "Rebuild TEST plan" / "Build one-group plan" actions do this
+    explicitly -- a human chose to replace the plan, which is a
+    fundamentally different situation from a script accidentally
+    reusing a real project's directory)."""
+
+
+def task_has_committed_row(task: "ExecutionTask") -> bool:
+    """Phase 5.9: the single source of truth for "is there real
+    evidence this task's row landed in Xactimate" -- callers (reset_
+    unfinished_tasks(), run_execution_plan()'s pre-execution guard, the
+    UI's single-row retry action) MUST use this instead of reading
+    `task.state`/`task.trust_state` directly, since neither alone is
+    safe: `state == TASK_REVIEW_REQUIRED` does NOT mean nothing
+    committed (see ExecutionTask.commit_state's docstring), and a bare
+    `trust_state is not None` check would incorrectly count
+    VERIFICATION_FAILED (commit_item() was called but the row-count
+    delta never moved off 0 -- nothing actually landed) as committed.
+
+    Prefers the explicit `commit_state` field (set by every task
+    executed under Phase 5.9 or later); falls back to inferring from
+    `trust_state` for a plan built before that field existed, so old
+    persisted plans are never silently treated as "nothing committed"
+    just because they predate this phase."""
+    if task.state == TASK_COMPLETED:
+        return True
+    if task.commit_state == TASK_COMMIT_STATE_COMMITTED:
+        return True
+    if task.commit_state == TASK_COMMIT_STATE_NOT_COMMITTED:
+        return False
+    return task.trust_state is not None and task.trust_state not in _TRUST_STATES_WITHOUT_A_LANDED_ROW
+
+
+def commit_state_from_trust_state(trust_state: str | None) -> str:
+    """Phase 5.9: the ONE place that maps a verify_commit() trust_state
+    to TASK_COMMIT_STATE_COMMITTED/NOT_COMMITTED -- used by execution_
+    runner._apply_outcome_to_task() right after outcome.committed is
+    True and a real verification result came back. `trust_state=None`
+    (verification unsupported/unavailable) is treated as COMMITTED,
+    not NOT_COMMITTED -- commit_item() itself succeeded and this
+    function is never called for the `not outcome.committed` case, so
+    the conservative assumption is a row landed, protecting it from
+    automatic retry rather than risking a duplicate."""
+    if trust_state in _TRUST_STATES_WITHOUT_A_LANDED_ROW:
+        return TASK_COMMIT_STATE_NOT_COMMITTED
+    return TASK_COMMIT_STATE_COMMITTED
+
+
 def _dataclass_to_dict(obj) -> dict:
     return {f.name: getattr(obj, f.name) for f in fields(obj)}
 
@@ -183,6 +255,18 @@ class ExecutionTask:
     lookup_strategy_reason: str | None = None
     state: str = TASK_PENDING
     trust_state: str | None = None
+    #: Phase 5.9: whether a real row is known to have landed in
+    #: Xactimate for this task -- set explicitly by execution_runner.
+    #: _apply_outcome_to_task() based on orchestrator.execute_plan()'s
+    #: own commit/verification outcome, INDEPENDENT of `state`/`trust_
+    #: state`. `state == TASK_REVIEW_REQUIRED` does NOT mean nothing
+    #: committed -- a row can genuinely land and still carry a low-
+    #: confidence trust_state (QUANTITY_MISMATCH, UNIT_MISMATCH, etc.).
+    #: None on any plan built before this field existed -- see
+    #: task_has_committed_row(), which every caller MUST use instead of
+    #: reading this field directly, since it also handles that legacy
+    #: fallback.
+    commit_state: str | None = None
     stop_reason: str | None = None
     stop_detail: str | None = None
     evidence_path: str | None = None
@@ -458,9 +542,27 @@ def _plan_path(project_dir: Path) -> Path:
     return project_dir / "execution" / "execution_plan.json"
 
 
-def save_execution_plan(plan: ExecutionPlan, project_dir: Path) -> None:
-    plan.updated_at = utc_now_iso()
+def save_execution_plan(plan: ExecutionPlan, project_dir: Path, *, allow_shrink: bool = False) -> None:
+    """Phase 5.9: refuses (raises ExecutionPlanOverwriteRefused, writes
+    nothing) if a plan ALREADY exists at `project_dir`'s path and `plan`
+    has FEWER tasks than it -- unless `allow_shrink=True`. Every normal
+    resumable save (execution_runner.py re-saving the SAME plan object
+    after each task) never shrinks the task count, so this is invisible
+    to that path; only a genuinely different, smaller plan being saved
+    over a larger existing one trips it. See ExecutionPlanOverwriteRefused."""
     path = _plan_path(project_dir)
+    if not allow_shrink and path.exists():
+        try:
+            existing_task_count = len(json.loads(path.read_text(encoding="utf-8")).get("tasks", []))
+        except (json.JSONDecodeError, OSError):
+            existing_task_count = 0
+        if len(plan.tasks) < existing_task_count:
+            raise ExecutionPlanOverwriteRefused(
+                f"Refusing to save a {len(plan.tasks)}-task plan (plan_id={plan.plan_id!r}) over the "
+                f"existing {existing_task_count}-task plan at {path} -- pass allow_shrink=True if this is a "
+                f"deliberate rebuild/replace, not an accidental overwrite."
+            )
+    plan.updated_at = utc_now_iso()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(plan.to_dict(), indent=2, default=str), encoding="utf-8")
 
@@ -484,10 +586,22 @@ def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset
     committed). Also resets the group states so `_ensure_select_verify_
     group()` re-verifies each group fresh on the next run, and clears
     `resume_cursor`/`run_state` back to a re-runnable state. Returns the
-    number of tasks actually reset. Persists immediately."""
+    number of tasks actually reset. Persists immediately.
+
+    Phase 5.9 (live-caught): "TASK_COMPLETED" alone was never a
+    sufficient "leave it alone" test -- a task whose row genuinely
+    committed but whose post-commit OCR verification came back below
+    VERIFIED confidence carries `state == TASK_REVIEW_REQUIRED`, which
+    the ORIGINAL version of this function reset straight back to
+    PENDING. The next Execute would then re-search and re-commit it,
+    producing a real DUPLICATE row in Xactimate (confirmed live: 13 of
+    14 committed rows in a real run were in exactly this state). Now
+    uses task_has_committed_row() -- not `state` alone -- to decide what
+    "already finished, leave it alone" means, same `full_reset` escape
+    hatch as before for a genuine, deliberate start-over."""
     reset_count = 0
     for task in plan.tasks:
-        if task.state == TASK_COMPLETED and not full_reset:
+        if not full_reset and (task.state == TASK_COMPLETED or task_has_committed_row(task)):
             continue
         if task.state == TASK_PENDING:
             continue
@@ -496,6 +610,7 @@ def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset
         task.stop_detail = None
         task.error = None
         task.trust_state = None
+        task.commit_state = None
         task.actual_lookup_strategy = None
         task.lookup_strategy_reason = None
         task.started_at = None

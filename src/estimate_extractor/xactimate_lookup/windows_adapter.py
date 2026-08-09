@@ -74,6 +74,7 @@ from estimate_extractor.xactimate_lookup.destructive_audit import (
     ProtectedRowLedger,
     ProtectedRowRecord,
 )
+from estimate_extractor.xactimate_lookup.execution_diagnostics import RowLifecycleLedger
 from estimate_extractor.xactimate_lookup.models import DropdownResult, PopulatedFields
 
 #: Xactimate's HwndWrapper class names embed this literal substring for
@@ -203,6 +204,25 @@ class PopupNotFoundError(AdapterError):
     """Raised when the search-results popup window does not appear
     within the timeout, or disappears/changes between capture and
     selection."""
+
+
+class GroupTransitionUnsafeError(AdapterError):
+    """Phase 5.9: raised by `_assert_group_transition_settled()` when
+    ensure_group()/select_group()/verify_group()/the Components-tab
+    click inside `_reset_group_creation_stickiness()` is about to run
+    while the live UI still shows a results popup or an unexpected
+    dialog after a bounded settle-wait -- i.e. the previous group's
+    final task has not actually finished at the UI level, no matter
+    what its Python-level return value claimed. Unlike
+    `_dismiss_stray_results_popup()` (a self-heal for a DIFFERENT,
+    already-understood benign condition -- a stray popup from some
+    future code path that forgot to call `recover()`), this check
+    NEVER dismisses anything itself: see docs/build-estimate.md
+    Phase 5.9, "Do not dismiss an open results dropdown just to
+    proceed." Caught the same way any other AdapterError is -- the
+    ONE group this happens to is marked unverified/failed (its tasks
+    routed to REVIEW_REQUIRED), never a reason to abort the whole
+    run, matching every other per-group failure in this codebase."""
 
 
 class PopupCaptureFailedError(AdapterError):
@@ -651,6 +671,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._execution_context = ExecutionContext()
         self._protected_row_ledger = ProtectedRowLedger()
         self._destructive_auditor = DestructiveActionAuditor(self.evidence_dir / "destructive_action_audit.jsonl")
+        #: Phase 5.9: append-only per-task row lifecycle ledger -- see
+        #: execution_diagnostics.py's module docstring.
+        self._row_lifecycle_ledger = RowLifecycleLedger(self.evidence_dir / "row_lifecycle_ledger.jsonl")
 
         #: Phase 5.7B: names (normalized lowercase) of groups this
         #: adapter INSTANCE has already positively verified via a real
@@ -695,6 +718,71 @@ class WindowsXactimateAdapter(XactimateAdapter):
             self._execution_context.source_row = source_row
         if group is not None:
             self._execution_context.group = group
+
+    def record_lifecycle_event(self, event: str, **detail) -> None:
+        """Not part of the abstract contract (Phase 5.9). Appends one
+        entry to `self._row_lifecycle_ledger`, tagged with the CURRENT
+        execution context (run_id/task_id/source_row/group -- see
+        set_execution_context()). Purely observational, like
+        record_protected_commit()'s own audit trail -- never raises,
+        never affects control flow. Callers (orchestrator.py,
+        execution_runner.py) call this duck-typed (`hasattr(adapter,
+        "record_lifecycle_event")`) so a non-Windows/fake adapter is
+        completely unaffected."""
+        try:
+            ctx = self._execution_context
+            self._row_lifecycle_ledger.record(
+                run_id=ctx.run_id, task_id=ctx.task_id, source_row=ctx.source_row,
+                group=ctx.group, event=event, **detail,
+            )
+        except Exception:
+            pass
+
+    #: Phase 5.9 Stage 4: bounded settle-wait before ANY entry point
+    #: that changes/creates group context (~3s total, matching this
+    #: file's other bounded-retry constants) -- long enough to absorb
+    #: the OS's own popup-close animation/repaint lag after recover()'s
+    #: Escape, never unbounded.
+    _GROUP_TRANSITION_SETTLE_ATTEMPTS = 6
+    _GROUP_TRANSITION_SETTLE_POLL_S = 0.5
+
+    def _assert_group_transition_settled(self, *, next_group: str) -> None:
+        """Phase 5.9 Stage 4: the hard invariant this phase exists to
+        prove -- "a new group may not begin while the previous group's
+        final task still has an active dropdown, pending selection, or
+        unfinished commit" -- checked live immediately before this
+        adapter does ANYTHING that changes/creates group context
+        (ensure_group(), select_group(), verify_group()'s probe, and
+        `_reset_group_creation_stickiness()`'s own Components-tab
+        click, which is a group-context-changing action in its own
+        right and was live-caught to run several steps AFTER
+        ensure_group()'s own opening self-heal check, with no fresh
+        check immediately before ITS click -- exactly the gap a
+        reappearing/slow-to-close popup could fall through).
+
+        Polls (bounded, never unbounded) for the results popup and any
+        unexpected dialog to clear on their own. Raises
+        GroupTransitionUnsafeError -- NEVER dismisses anything itself,
+        unlike `_dismiss_stray_results_popup()` -- if either is still
+        present once the wait is exhausted, so the caller's group
+        transition genuinely does not happen (see docs/build-estimate.md
+        Phase 5.9: "Do not dismiss an open results dropdown just to
+        proceed to the next group.")."""
+        popup_hwnd = None
+        dialog_present = False
+        for _attempt in range(self._GROUP_TRANSITION_SETTLE_ATTEMPTS):
+            popup_hwnd = self._find_dropdown_window()
+            dialog_present = self._unexpected_dialog_present()
+            if popup_hwnd is None and not dialog_present:
+                return
+            time.sleep(self._GROUP_TRANSITION_SETTLE_POLL_S)
+        raise GroupTransitionUnsafeError(
+            f"Refusing to enter group {next_group!r}: after a "
+            f"{self._GROUP_TRANSITION_SETTLE_ATTEMPTS * self._GROUP_TRANSITION_SETTLE_POLL_S:.1f}s "
+            f"settle-wait the live UI still shows a results popup (hwnd={popup_hwnd!r}) and/or an "
+            f"unexpected dialog (present={dialog_present!r}) -- the previous group's final task has "
+            f"not actually finished at the UI level."
+        )
 
     def record_protected_commit(
         self, *, category: str | None, selector: str | None, description: str | None = None,
@@ -3690,7 +3778,21 @@ class WindowsXactimateAdapter(XactimateAdapter):
         Without this reset, the second group nested under the first
         every time. Safe to call unconditionally before every group
         creation, including the first in a session (nothing to reset,
-        so it's a no-op in effect)."""
+        so it's a no-op in effect).
+
+        Phase 5.9 (live-caught): this method's own Components-tab click
+        is, itself, a group-context-changing action -- and it runs
+        several steps AFTER `ensure_group()`'s own opening self-heal
+        check (verify_application/verify_project, the "already exists"
+        snapshot, all happen in between). A results popup that
+        reappeared or was still visually closing in that gap would
+        previously go unchecked right up until this blind fixed-
+        coordinate click -- exactly the mechanism a live user report
+        described (a results dropdown still open when the automation
+        moved on to Components/group setup). A fresh settle assertion
+        immediately before the click closes that gap; see
+        _assert_group_transition_settled()."""
+        self._assert_group_transition_settled(next_group="<new group being created>")
         hwnd = self._ensure_main_window()
         l, t, r, b = _ANCHORS["components_tab"]
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
@@ -3880,11 +3982,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         every group-tree entry point checks for and dismisses it first,
         so one earlier miss doesn't cascade into every later group
         looking unreachable ("context menu did not appear") for the
-        rest of the run, exactly as reproduced live. Phase 5.8A: same
-        self-heal for a stray results popup -- see
-        _dismiss_stray_results_popup()."""
+        rest of the run, exactly as reproduced live. Phase 5.9: replaces
+        the earlier silent stray-popup self-heal with a hard, fail-loud
+        settle assertion -- see _assert_group_transition_settled()."""
         self._handle_duplicate_item_dialog()
-        self._dismiss_stray_results_popup()
+        self._assert_group_transition_settled(next_group=group_name)
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"ensure_group({group_name!r}): could not verify the expected project is active.")
 
@@ -4040,10 +4142,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         `group_name` -- a duplicate/ambiguous name must fail closed,
         never resolved by picking one. Phase 5.7B: self-heals from a
         "Duplicate Item(s)" dialog left open by an earlier commit --
-        see ensure_group()'s docstring. Phase 5.8A: same self-heal for
-        a stray results popup -- see _dismiss_stray_results_popup()."""
+        see ensure_group()'s docstring. Phase 5.9: replaces the earlier
+        silent stray-popup self-heal with a hard, fail-loud settle
+        assertion -- see _assert_group_transition_settled()."""
         self._handle_duplicate_item_dialog()
-        self._dismiss_stray_results_popup()
+        self._assert_group_transition_settled(next_group=group_name)
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"select_group({group_name!r}): could not verify the expected project is active.")
 
@@ -4216,7 +4319,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         skip_cleanup = False
         try:
             self._handle_duplicate_item_dialog()  # Phase 5.7B: self-heal, see ensure_group()'s docstring
-            self._dismiss_stray_results_popup()  # Phase 5.8A: same self-heal for a stray results popup
+            self._assert_group_transition_settled(next_group=group_name)  # Phase 5.9: hard settle assert
             if not self.verify_application() or not self.verify_project():
                 return False
             hwnd = self._ensure_main_window()
@@ -4307,6 +4410,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 return False
             subtotal_count_after = self._group_subtotal_pixel_count(image2, header2, target_index)
             return subtotal_count_after > subtotal_count_before + self._VERIFY_GROUP_SUBTOTAL_DELTA_THRESHOLD
+        except GroupTransitionUnsafeError:
+            # Phase 5.9: raised by this method's own opening settle
+            # assertion, BEFORE any probe search/commit ever ran --
+            # nothing to clean up, and cleanup must never run with
+            # row_count_before still at its default 0 (that would
+            # cancel real rows down to zero). Never swallowed -- this
+            # is Stage 4's "DO NOT CHANGE GROUP CONTEXT" hard stop.
+            skip_cleanup = True
+            raise
         except Exception:
             return False
         finally:
@@ -4367,8 +4479,38 @@ class WindowsXactimateAdapter(XactimateAdapter):
         was the wrong one, immediately recreates it (never leaves
         `keep_names` groups missing) before retrying. Bounded retries --
         never loops forever, never silently gives up either (returns
-        False, does not raise, if it exhausts `max_attempts`)."""
+        False, does not raise, if it exhausts `max_attempts`).
+
+        Phase 5.9 Stage 5: this method deletes an ENTIRE group (every
+        row in it), yet -- unlike cancel_current_item() -- had NO
+        protected-row check and NO destructive-action audit trail at
+        all before this phase, even though it is exactly the kind of
+        call Stage 5's "instrument all calls capable of removing an
+        item" requirement names explicitly. Not currently called from
+        the live Execute path (confirmed: only execution_runner.py's
+        ensure/select/verify trio is), but a future/manual caller
+        invoking this against a group holding rows this run already
+        committed would previously have deleted them with zero warning
+        and zero record. Refuses outright (raises
+        ProtectedCommittedRowError, logged) if `group_name` has ANY
+        rows protected this session -- deleting the whole group is
+        strictly more destructive than cancel_current_item()'s single-
+        row floor check, so the bar is "zero protected rows", not "at
+        most N.\""""
         keep_names = keep_names or []
+        protected_count = self._protected_row_ledger.count_for_group(group_name)
+        if protected_count > 0:
+            self._destructive_auditor.record(
+                context=self._execution_context, method="delete_group", reason="user_requested_test_cleanup",
+                caller="delete_group", target_type="group", target_identity=group_name,
+                row_count_before=None, row_identities_before=None, row_count_after=None, row_identities_after=None,
+                result="refused",
+                exception=f"group {group_name!r} has {protected_count} row(s) protected this session -- refusing to delete the whole group",
+            )
+            raise ProtectedCommittedRowError(
+                f"delete_group({group_name!r}): refusing -- this group has {protected_count} row(s) this run "
+                f"already successfully committed and protected."
+            )
         if not self.verify_application() or not self.verify_project():
             return False
         hwnd = self._ensure_main_window()
@@ -4404,6 +4546,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
             missing_keep = [k for k in keep_names if self._find_group_row(rows_after, k) is None]
             if not missing_keep:
+                self._destructive_auditor.record(
+                    context=self._execution_context, method="delete_group", reason="user_requested_test_cleanup",
+                    caller="delete_group", target_type="group", target_identity=group_name,
+                    row_count_before=len(rows_before), row_identities_before=rows_before,
+                    row_count_after=len(rows_after), row_identities_after=rows_after,
+                    result="deleted", exception=None,
+                )
                 return True
             # wrong group vanished -- restore it before retrying
             for k in missing_keep:
@@ -4412,4 +4561,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 except AdapterError:
                     pass
 
+        self._destructive_auditor.record(
+            context=self._execution_context, method="delete_group", reason="user_requested_test_cleanup",
+            caller="delete_group", target_type="group", target_identity=group_name,
+            row_count_before=None, row_identities_before=None, row_count_after=None, row_identities_after=None,
+            result="failed", exception=f"exhausted {max_attempts} attempt(s)",
+        )
         return False

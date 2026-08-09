@@ -751,6 +751,94 @@ def test_observed_mapping_proposal_verified_flag_true_only_for_verified_trust_st
     assert proposals["line_unmapped"]["verified"] is True
 
 
+# ---------------------------------------------------------------------
+# Phase 5.9 (live-caught): a committed-but-imperfectly-verified row must
+# never be treated as "unfinished" -- see execution_plan.task_has_
+# committed_row()/commit_state_from_trust_state(). A live run showed 13
+# of 14 real committed rows carried a non-VERIFIED trust_state; without
+# this, "Reset unfinished TEST execution" would re-search and duplicate
+# every one of them.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "trust_state", ["VERIFIED", "REVIEW_REQUIRED", "UNIT_MISMATCH", "QUANTITY_MISMATCH", "CONFLICTING_ROW"],
+)
+def test_commit_state_is_committed_for_every_trust_state_except_verification_failed(
+    tmp_path, phrase_rules, ranking_config, trust_state,
+):
+    """Every trust_state EXCEPT VERIFICATION_FAILED means the row-count
+    delta was nonzero -- i.e. something structurally landed in the
+    grid -- so commit_state must be COMMITTED for all of them, not just
+    the fully-VERIFIED case."""
+    from estimate_extractor.xactimate_lookup.execution_plan import TASK_COMMIT_STATE_COMMITTED
+
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script, trust_state=trust_state)
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.task_by_id("task_unmapped").commit_state == TASK_COMMIT_STATE_COMMITTED
+
+
+def test_commit_state_is_not_committed_when_verification_failed(tmp_path, phrase_rules, ranking_config):
+    """VERIFICATION_FAILED specifically means the row count never moved
+    off its pre-commit baseline within the polling window -- nothing
+    actually landed, despite commit_item() having been called. Must be
+    the one trust_state that does NOT count as committed."""
+    from estimate_extractor.xactimate_lookup.execution_plan import TASK_COMMIT_STATE_NOT_COMMITTED
+
+    plan = _plan_mapped_and_unmapped()
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script, trust_state="VERIFICATION_FAILED")
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.task_by_id("task_unmapped").commit_state == TASK_COMMIT_STATE_NOT_COMMITTED
+
+
+def test_commit_state_is_not_committed_when_nothing_ever_committed(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    adapter = _adapter_with_test_project(dropdown_script={})  # no candidates for anything -- NO_MATCH
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    from estimate_extractor.xactimate_lookup.execution_plan import TASK_COMMIT_STATE_NOT_COMMITTED
+    assert result.task_by_id("task_unmapped").commit_state == TASK_COMMIT_STATE_NOT_COMMITTED
+    assert result.task_by_id("task_mapped").commit_state == TASK_COMMIT_STATE_NOT_COMMITTED
+
+
+def test_already_committed_task_is_never_re_executed_even_if_pending(tmp_path, phrase_rules, ranking_config):
+    """Defense-in-depth: a task that somehow reaches TASK_PENDING while
+    still carrying commit evidence (trust_state from a prior real
+    commit) must be refused, not re-searched/re-committed -- this must
+    hold independent of reset_unfinished_tasks()'s own protection."""
+    plan = _plan_mapped_and_unmapped()
+    task = plan.task_by_id("task_unmapped")
+    task.state = TASK_PENDING
+    task.trust_state = "QUANTITY_MISMATCH"  # a prior real commit, low confidence
+
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    adapter = _adapter_with_test_project(dropdown_script=script)
+    search_calls = []
+    original_search = adapter.search_by_description
+
+    def _tracking_search(text):
+        search_calls.append(text)
+        return original_search(text)
+
+    adapter.search_by_description = _tracking_search
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    result_task = result.task_by_id("task_unmapped")
+    assert result_task.state == TASK_REVIEW_REQUIRED
+    assert "ALREADY_COMMITTED" in result_task.stop_detail
+    assert "RETRY BLOCKED" in result_task.stop_detail
+    assert search_calls == []  # never re-searched
+
+
 def test_find_trusted_observed_mapping_refuses_unverified_and_missing_entries(tmp_path):
     """Phase 5.6 Stage 6: _find_trusted_observed_mapping() -- the only
     path by which a PRIOR run's observed CAT/SEL can be reused as a

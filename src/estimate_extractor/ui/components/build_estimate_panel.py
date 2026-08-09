@@ -58,6 +58,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     load_execution_plan,
     reset_unfinished_tasks,
     save_execution_plan,
+    task_has_committed_row,
 )
 from estimate_extractor.xactimate_lookup.execution_reports import (
     TASK_CSV_COLUMNS,
@@ -440,7 +441,7 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
                 )
             else:
                 plan = build_execution_plan(project_dir, project_slug)
-            save_execution_plan(plan, project_dir)
+            save_execution_plan(plan, project_dir, allow_shrink=True)
             st.success(f"Built a plan with {len(plan.tasks)} task(s) across {len(plan.groups)} group(s).")
         except ExecutionPlanError as exc:
             st.error(str(exc))
@@ -537,7 +538,7 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
                     project_dir, project_slug,
                     include_unmapped_rows=True, xactimate_project_name=xactimate_project_name.strip(),
                 )
-                save_execution_plan(plan, project_dir)
+                save_execution_plan(plan, project_dir, allow_shrink=True)
                 st.success(f"Rebuilt a fresh plan with {len(plan.tasks)} task(s) across {len(plan.groups)} group(s).")
                 st.rerun()
             except ExecutionPlanError as exc:
@@ -646,7 +647,7 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
                         restricted_plan = build_execution_plan(
                             project_dir, project_slug, restrict_to_group_id=selected_group_id,
                         )
-                    save_execution_plan(restricted_plan, project_dir)
+                    save_execution_plan(restricted_plan, project_dir, allow_shrink=True)
                     st.success(
                         f"Built a one-group plan with {len(restricted_plan.tasks)} task(s) for "
                         f"{group_options[selected_group_id]}."
@@ -747,13 +748,29 @@ def render_build_estimate_panel(project_dir: Path, project_slug: str) -> None:
         )
         if ac2.button("Retry selected row (Resolve)", key="unresolved_retry"):
             task = plan.task_by_id(selected_id)
-            task.state = TASK_PENDING
-            task.stop_reason = None
-            task.stop_detail = None
-            task.error = None
-            save_execution_plan(plan, project_dir)
-            st.success(f"{task.row_label} reset to pending -- click Execute above to retry it.")
-            st.rerun()
+            if task_has_committed_row(task):
+                # Phase 5.9 (live-caught): this button used to reset
+                # straight to TASK_PENDING with no commit-evidence check
+                # at all -- for a task whose row genuinely landed but
+                # carries a low-confidence trust_state (state ==
+                # TASK_REVIEW_REQUIRED), that meant the next Execute
+                # would re-search and re-commit it, duplicating a real
+                # row. Blocked the same way reset_unfinished_tasks() now
+                # is; use "Rebuild TEST plan" (a deliberate full
+                # restart) if this row genuinely needs re-executing.
+                st.error(
+                    f"{task.row_label} has evidence of a prior real commit (trust_state={task.trust_state!r}) -- "
+                    f"refusing to retry automatically, since that would risk a duplicate row in Xactimate. "
+                    f"Reconcile against the live estimate first, or use 'Rebuild TEST plan' for a deliberate full restart."
+                )
+            else:
+                task.state = TASK_PENDING
+                task.stop_reason = None
+                task.stop_detail = None
+                task.error = None
+                save_execution_plan(plan, project_dir)
+                st.success(f"{task.row_label} reset to pending -- click Execute above to retry it.")
+                st.rerun()
         skip_reason = ac3.text_input("Reason (for Skip)", key="unresolved_skip_reason")
         if ac3.button("Skip selected row", key="unresolved_skip", disabled=not skip_reason.strip()):
             skip_task(plan, selected_id, skip_reason, project_dir)
