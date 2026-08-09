@@ -1690,10 +1690,41 @@ def test_select_group_succeeds_on_a_uniquely_nested_group(monkeypatch):
     assert clicked == [(3, 3)]  # clicked row 3, the nested group's own row
 
 
+def _stateful_probe_lifecycle_mocks(monkeypatch, adapter, *, baseline_row_count=0):
+    """Phase 5.9A: shared stateful mock rig for _verify_group_once()'s
+    new probe-lifecycle verification -- _count_grid_rows/_read_
+    category_selector_at/snapshot_grid_identities all track the SAME
+    mutable `state["row_count"]`, incremented when commit_item() runs
+    and decremented when cancel_current_item() runs, so
+    _wait_for_probe_visible() and the pre/post cleanup identity
+    reconciliation see a self-consistent grid throughout."""
+    state = {"row_count": baseline_row_count}
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: state["row_count"])
+    monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: ("SFG", "GUTA"))
+    monkeypatch.setattr(
+        adapter, "snapshot_grid_identities",
+        lambda: [("SFG", "GUTA")] * min(state["row_count"], baseline_row_count),
+    )
+
+    def _commit_item():
+        state["row_count"] = baseline_row_count + 1
+
+    def _cancel_current_item(**kwargs):
+        state["row_count"] = baseline_row_count
+
+    monkeypatch.setattr(adapter, "commit_item", _commit_item)
+    monkeypatch.setattr(adapter, "cancel_current_item", _cancel_current_item)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    return state
+
+
 def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
     """_verify_group_once() must locate and probe a nested group purely
     by name -- ancestry/indentation is never consulted in the
-    probe-commit-and-check verification path."""
+    probe-commit-and-check verification path. Phase 5.9A: verification
+    success now comes from the probe's own observed lifecycle, not the
+    (optional) Subtotal pixel delta."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(adapter, "verify_application", lambda: True)
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
@@ -1705,12 +1736,10 @@ def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
     monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
 
     probed_index = {}
-    call_state = {"n": 0}
 
     def fake_subtotal_seq(image, header, row_index):
         probed_index["index"] = row_index
-        call_state["n"] += 1
-        return 0 if call_state["n"] == 1 else 200  # before, then after the probe commit
+        return 0  # Subtotal never moves -- must NOT affect the result
 
     monkeypatch.setattr(adapter, "_group_subtotal_pixel_count", fake_subtotal_seq)
     monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
@@ -1726,16 +1755,16 @@ def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
     monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
     monkeypatch.setattr(adapter, "select_candidate", lambda target: None)
     monkeypatch.setattr(adapter, "enter_quantity", lambda qty: None)
-    monkeypatch.setattr(adapter, "commit_item", lambda: None)
-    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 0)
-    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
-    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: None)
+    _stateful_probe_lifecycle_mocks(monkeypatch, adapter, baseline_row_count=0)
 
     assert adapter._verify_group_once("Front Elevation") is True
     assert probed_index["index"] == 2  # the nested group's own row, found purely by name
     # Phase 5.8 Stage 8: a real probe run must be counted, per-group.
     assert adapter.probes_run_total == 1
     assert adapter.probes_by_group == {"Front Elevation": 1}
+    # Phase 5.9A: Subtotal evidence is recorded but was NOT the reason
+    # verification passed (it consistently read 0 delta above).
+    assert adapter.last_verify_group_subtotal_evidence == "MISMATCH"
 
 
 # ---------------------------------------------------------------------
@@ -1846,11 +1875,8 @@ def test_verify_group_once_self_heals_duplicate_dialog_from_its_own_probe(monkey
     monkeypatch.setattr(adapter, "_press_key", lambda code: None)
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
     monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
-    subtotal_state = {"n": 0}
-
     def _fake_subtotal(image, header, row_index):
-        subtotal_state["n"] += 1
-        return 0 if subtotal_state["n"] == 1 else 200  # before, then after the probe commit
+        return 0  # Subtotal never moves -- must NOT affect the result
 
     monkeypatch.setattr(adapter, "_group_subtotal_pixel_count", _fake_subtotal)
     monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
@@ -1864,9 +1890,8 @@ def test_verify_group_once_self_heals_duplicate_dialog_from_its_own_probe(monkey
     )
     monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
     monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
-    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 1)
-    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
-    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: None)
+    # Rear Elevation already holds 1 real SFG/GUTA row -- baseline=1.
+    _stateful_probe_lifecycle_mocks(monkeypatch, adapter, baseline_row_count=1)
 
     select_calls = []
 
@@ -1879,8 +1904,14 @@ def test_verify_group_once_self_heals_duplicate_dialog_from_its_own_probe(monkey
     monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: heal_calls.append(1) or True)
     quantity_calls = []
     monkeypatch.setattr(adapter, "enter_quantity", lambda qty: quantity_calls.append(qty))
+    original_commit = adapter.commit_item
     commit_calls = []
-    monkeypatch.setattr(adapter, "commit_item", lambda: commit_calls.append(1))
+
+    def _commit_item_tracked():
+        commit_calls.append(1)
+        original_commit()
+
+    monkeypatch.setattr(adapter, "commit_item", _commit_item_tracked)
 
     assert adapter._verify_group_once("Rear Elevation") is True
     assert select_calls == [1]  # select_candidate() itself is never retried
@@ -1889,7 +1920,9 @@ def test_verify_group_once_self_heals_duplicate_dialog_from_its_own_probe(monkey
     # the dialog select_candidate() actually raised on.
     assert heal_calls == [1, 1]
     assert quantity_calls == [1]  # execution continued straight through to quantity/commit
-    assert commit_calls == [1]
+    # Called twice: once for the probe's own commit, once more by
+    # _cleanup_probe_item()'s final "save after cancel".
+    assert commit_calls == [1, 1]
 
 
 def test_verify_group_once_reraises_when_duplicate_dialog_cannot_be_self_healed(monkeypatch):
@@ -1928,6 +1961,139 @@ def test_verify_group_once_reraises_when_duplicate_dialog_cannot_be_self_healed(
 
     assert adapter._verify_group_once("Rear Elevation") is False  # caught by the outer except, never raises
     assert recover_calls == [1]  # Phase 5.9: best-effort recovery before returning False
+
+
+# ---------------------------------------------------------------------
+# Phase 5.9A: group activation is proven by the probe's own observed
+# lifecycle, not the Grouping panel's Subtotal pixel delta -- the
+# Subtotal column can be genuinely unavailable in the live UI layout,
+# independent of group identity/depth/count.
+# ---------------------------------------------------------------------
+
+
+def test_verify_group_once_succeeds_when_subtotal_header_cannot_be_located(monkeypatch):
+    """The exact live incident: the Grouping panel's Subtotal column is
+    not visible at all, so _locate_group_tree_header()-derived subtotal
+    reads are unavailable/meaningless. Verification must still succeed
+    from the probe's own lifecycle evidence alone."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Fencing"])
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    # The header (and therefore the Subtotal column) can never be
+    # located -- exactly the live-caught condition.
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: None)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    monkeypatch.setattr(
+        adapter, "capture_dropdown",
+        lambda: [DropdownResult(raw_text="SFG GUTA", row_position=0, category="SFG", selector="GUTA")],
+    )
+    monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
+    monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
+    monkeypatch.setattr(adapter, "select_candidate", lambda target: None)
+    monkeypatch.setattr(adapter, "enter_quantity", lambda qty: None)
+    _stateful_probe_lifecycle_mocks(monkeypatch, adapter, baseline_row_count=2)
+
+    subtotal_calls = []
+    monkeypatch.setattr(adapter, "_group_subtotal_pixel_count", lambda *a: subtotal_calls.append(1))
+
+    assert adapter._verify_group_once("Fencing") is True
+    assert subtotal_calls == []  # never even attempted -- header was None
+    assert adapter.last_verify_group_subtotal_evidence == "UNAVAILABLE"
+
+
+def test_verify_group_once_fails_when_probe_never_observed(monkeypatch):
+    """Counterpart: if the probe row is never positively observed
+    (e.g. commit_item() silently failed to add anything), verification
+    must fail even with Subtotal evidence unavailable -- there is no
+    other signal to trust."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Fencing"])
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: None)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    monkeypatch.setattr(
+        adapter, "capture_dropdown",
+        lambda: [DropdownResult(raw_text="SFG GUTA", row_position=0, category="SFG", selector="GUTA")],
+    )
+    monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
+    monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
+    monkeypatch.setattr(adapter, "select_candidate", lambda target: None)
+    monkeypatch.setattr(adapter, "enter_quantity", lambda qty: None)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
+    monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: 2)  # never changes -- commit had no effect
+    monkeypatch.setattr(adapter, "snapshot_grid_identities", lambda: [("FEN", "RAIL"), ("PNT", "FENST")])
+    monkeypatch.setattr(adapter, "commit_item", lambda: None)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    recover_calls = []
+    monkeypatch.setattr(adapter, "recover", lambda: recover_calls.append(1))
+
+    assert adapter._verify_group_once("Fencing") is False
+    assert recover_calls == [1]
+
+
+def test_verify_group_once_raises_if_pre_existing_rows_change_during_cleanup(monkeypatch):
+    """Phase 5.9A Stage 1: cleanup returning the row COUNT to baseline
+    is not sufficient proof -- the pre-existing rows' IDENTITIES must
+    also be unchanged. Simulates cleanup removing/altering a real row
+    instead of the probe."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Fencing"])
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: None)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    monkeypatch.setattr(
+        adapter, "capture_dropdown",
+        lambda: [DropdownResult(raw_text="SFG GUTA", row_position=0, category="SFG", selector="GUTA")],
+    )
+    monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
+    monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
+    monkeypatch.setattr(adapter, "select_candidate", lambda target: None)
+    monkeypatch.setattr(adapter, "enter_quantity", lambda qty: None)
+    _stateful_probe_lifecycle_mocks(monkeypatch, adapter, baseline_row_count=2)
+
+    # Sabotage: AFTER cleanup, the pre-existing rows read back different
+    # from the baseline -- simulates cleanup having touched a real row.
+    call_count = {"n": 0}
+    original_snapshot = adapter.snapshot_grid_identities
+
+    def _sabotaged_snapshot():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return [("FEN", "RAIL"), ("PNT", "FENST")]  # baseline
+        return [("FEN", "RAIL"), ("XXX", "CHANGED")]  # after cleanup -- differs!
+
+    monkeypatch.setattr(adapter, "snapshot_grid_identities", _sabotaged_snapshot)
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
+    with pytest.raises(ProbeCleanupFailedError):
+        adapter._verify_group_once("Fencing")
 
 
 def test_probe_counts_start_at_zero_and_only_increment_on_a_real_probe(monkeypatch):

@@ -711,6 +711,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
         #: redundant probes, not just assumed to.
         self.probes_run_total: int = 0
         self.probes_by_group: dict[str, int] = {}
+        #: Phase 5.9A: "MATCH"/"MISMATCH"/"UNAVAILABLE"/None (never run
+        #: yet) -- the Grouping panel Subtotal pixel-delta check's
+        #: result from the MOST RECENT _verify_group_once() call,
+        #: recorded purely as optional corroborating diagnostic
+        #: evidence. Never consulted by verify_group()/_verify_group_
+        #: once() to decide pass/fail -- see that method's docstring.
+        self.last_verify_group_subtotal_evidence: str | None = None
 
     # ------------------------------------------------------------------
     # Phase 5.5D: committed-row protection + destructive-call audit
@@ -4313,18 +4320,34 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return False
 
     def _verify_group_once(self, group_name: str) -> bool:
-        """One full probe-commit-and-check cycle -- via the SAME
-        ground-truth method Phase 5.1 Stage 2 established (commit one
-        disposable, known-cheap item, read the target group's Subtotal
-        cell, clean up): a passive pixel/visual-highlight check was
-        tried first and found live-unreliable (the visible selection
-        highlight does not always track which group item entry actually
-        targets -- two reproducible live mismatches, see
-        docs/build-estimate.md Phase 5.1 Stage 4). This DOES mutate the
+        """One full probe-commit-and-check cycle. This DOES mutate the
         estimate transiently; it always cleans up before returning,
         including on failure. Returns False, never raises, on anything
         short of a confident match -- callers must never silently
         proceed on an unverified group.
+
+        Phase 5.9A: group activation is now proven by the PROBE'S OWN
+        LIFECYCLE -- select intended group by name, snapshot a full
+        row-identity baseline, commit the disposable probe, POSITIVELY
+        observe it appear (via _wait_for_probe_visible(), identified by
+        CAT/SEL, never by position alone), remove it, and confirm the
+        baseline rows are unchanged afterward. This REPLACES the
+        Grouping panel's Subtotal pixel-delta as the load-bearing
+        signal (see docs/build-estimate.md Phase 5.1 Stage 2 for that
+        original mechanism) because live investigation found the
+        Subtotal column is not always visible in the live Grouping
+        panel layout at all (confirmed independent of window size,
+        group depth, or group count) -- when that happens, the OLD
+        subtotal-only check always read a 0 delta and verify_group()
+        failed for every group, unconditionally, blocking all real work.
+        The probe-lifecycle evidence above is strictly stronger than a
+        pixel count anyway: it structurally proves the exact row that
+        appeared and disappeared, not just that some dollar amount
+        moved somewhere on screen. The Subtotal check is kept as
+        OPTIONAL corroborating evidence (self.last_verify_group_
+        subtotal_evidence, one of "MATCH"/"MISMATCH"/"UNAVAILABLE") --
+        never load-bearing, never a reason to fail verification on its
+        own.
 
         Phase 5.8 Stage 8: every REAL call here (never a cache hit --
         verify_group()'s cache short-circuits before this is ever
@@ -4335,7 +4358,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self.probes_run_total += 1
         self.probes_by_group[group_name] = self.probes_by_group.get(group_name, 0) + 1
         row_count_before = 0
+        baseline_identities: list = []
         skip_cleanup = False
+        self.last_verify_group_subtotal_evidence = None
         try:
             self._handle_duplicate_item_dialog()  # Phase 5.7B: self-heal, see ensure_group()'s docstring
             self._assert_group_transition_settled(next_group=group_name)  # Phase 5.9: hard settle assert
@@ -4359,51 +4384,55 @@ class WindowsXactimateAdapter(XactimateAdapter):
             # brand-new group) can leave the tree control in a
             # transient inline-rename/focus-edit state (a dotted focus
             # rectangle around the name, observed live) instead of a
-            # plain selected state. That transient rendering destabilizes
-            # the pixel baseline below. Escape unconditionally dismisses
-            # it (a no-op if no such state is active) before the
-            # baseline is captured.
+            # plain selected state. Escape unconditionally dismisses it
+            # (a no-op if no such state is active) before anything else.
             self._press_key(0x1B)
             time.sleep(0.3)
 
+            # Phase 5.9A: Subtotal pixel evidence is now OPTIONAL and
+            # best-effort ONLY -- captured if available, never a reason
+            # to return False on its own (see this method's docstring).
+            subtotal_count_before = None
             image_before = self._capture_client_image(hwnd)
             header_before = self._locate_group_tree_header(image_before)
-            if header_before is None:
-                return False
-            subtotal_count_before = self._group_subtotal_pixel_count(image_before, header_before, target_index)
+            if header_before is not None:
+                try:
+                    subtotal_count_before = self._group_subtotal_pixel_count(image_before, header_before, target_index)
+                except Exception:
+                    subtotal_count_before = None
 
             # Live-caught (Phase 5.3): a group being re-verified on
             # resume can already hold real, previously-committed rows
-            # from an earlier task in the SAME group (execution_runner
-            # re-verifies the group once per group-entry, which happens
-            # again on resume even when some of that group's tasks are
-            # already terminal). The probe's cleanup must never assume
-            # the grid started empty -- it must restore exactly this
-            # count, not zero, or it will cancel real committed work
-            # along with its own disposable probe row. Confirmed live:
-            # without this, a resumed group's real committed item was
-            # wiped out by the next task's group re-verification.
+            # from an earlier task in the SAME group. The probe's
+            # cleanup must never assume the grid started empty -- it
+            # must restore exactly this baseline, not zero, or it will
+            # cancel real committed work along with its own disposable
+            # probe row.
             #
-            # Live-caught (follow-up): the line below used to silently
-            # treat "grid could not be located" (grid_offset_before is
-            # None, only returned after _capture_and_locate's own 6
-            # retries are exhausted -- a real failure, not a quick blip)
-            # as "0 rows here" and continued anyway. That let
-            # _cleanup_probe_item(0) below cancel real, already-
-            # committed rows via cancel_current_item() (which always
-            # removes whatever row is currently LAST, not specifically
-            # the probe) when the pre-probe baseline was never actually
-            # known. Fail closed instead: refuse the whole probe -- no
-            # search, no commit, no cleanup, no deletion -- whenever the
-            # starting row count can't be positively established.
+            # Live-caught (follow-up): treating "grid could not be
+            # located" as "0 rows here" and continuing anyway let
+            # cleanup cancel real, already-committed rows. Fail closed
+            # instead: refuse the whole probe whenever the starting
+            # state can't be positively established.
+            #
+            # Phase 5.9A Stage 1: captures the FULL row-identity list,
+            # not just a count -- the post-cleanup reconciliation below
+            # compares identities, not merely "the count went back
+            # down", which could hide a cleanup that removed the wrong
+            # row and re-added a coincidentally-matching count.
+            # _capture_and_locate() is called directly first (rather
+            # than relying solely on snapshot_grid_identities()'s own
+            # internal call) so "grid could not be located at all" is
+            # distinguishable from "grid genuinely has zero rows" --
+            # snapshot_grid_identities() returns [] for both, which
+            # would otherwise silently treat a location FAILURE as an
+            # empty grid and let cleanup cancel real rows down to zero.
             grid_image_before, grid_offset_before = self._capture_and_locate(hwnd)
             if grid_offset_before is None:
                 skip_cleanup = True
                 return False
-            row_count_before = self._count_grid_rows(grid_image_before, grid_offset_before)
-            if row_count_before is None:
-                skip_cleanup = True
-                return False
+            baseline_identities = self.snapshot_grid_identities()
+            row_count_before = len(baseline_identities)
 
             self.focus_search()
             self.clear_search()
@@ -4443,19 +4472,56 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 # whose real content already includes SFG/GUTA would
                 # fail verify_group() on every fresh (uncached) probe,
                 # independent of tree depth/position -- confirmed live
-                # for Rear Elevation and Left Elevation.
+                # for Rear Elevation and Left Elevation. The position-
+                # based probe identification below (last row = the new
+                # one, since Xactimate always appends) still safely
+                # distinguishes this probe from a pre-existing real
+                # SFG/GUTA row in the SAME group -- see Stage 2 of the
+                # Phase 5.9A report.
                 if not self._handle_duplicate_item_dialog():
                     raise
             self.enter_quantity(1)
             self.commit_item()
-            time.sleep(1.0)
 
-            image2 = self._capture_client_image(hwnd)
-            header2 = self._locate_group_tree_header(image2)
-            if header2 is None:
+            # Phase 5.9A: THE verification signal -- positive, bounded-
+            # poll confirmation that a row matching the probe's own
+            # CAT/SEL landed at the end of the grid. This alone proves
+            # group activation: the search, selection, and commit all
+            # necessarily happened against whatever group is currently
+            # active, and that group is uniquely `group_name` (already
+            # confirmed by _find_unique_group_row() above) -- so a
+            # freshly-appeared, correctly-identified probe row IS the
+            # intended group actually accepting a real write.
+            status = self._wait_for_probe_visible(row_count_before)
+            if status != "observed":
+                try:
+                    self.recover()
+                except Exception:
+                    pass
                 return False
-            subtotal_count_after = self._group_subtotal_pixel_count(image2, header2, target_index)
-            return subtotal_count_after > subtotal_count_before + self._VERIFY_GROUP_SUBTOTAL_DELTA_THRESHOLD
+
+            # Optional corroborating evidence only -- never load-bearing
+            # (see this method's docstring). Recorded for diagnostics.
+            if subtotal_count_before is not None:
+                try:
+                    image2 = self._capture_client_image(hwnd)
+                    header2 = self._locate_group_tree_header(image2)
+                    subtotal_count_after = (
+                        self._group_subtotal_pixel_count(image2, header2, target_index)
+                        if header2 is not None else None
+                    )
+                    if subtotal_count_after is None:
+                        self.last_verify_group_subtotal_evidence = "UNAVAILABLE"
+                    elif subtotal_count_after > subtotal_count_before + self._VERIFY_GROUP_SUBTOTAL_DELTA_THRESHOLD:
+                        self.last_verify_group_subtotal_evidence = "MATCH"
+                    else:
+                        self.last_verify_group_subtotal_evidence = "MISMATCH"
+                except Exception:
+                    self.last_verify_group_subtotal_evidence = "UNAVAILABLE"
+            else:
+                self.last_verify_group_subtotal_evidence = "UNAVAILABLE"
+
+            return True
         except GroupTransitionUnsafeError:
             # Phase 5.9: raised by this method's own opening settle
             # assertion, BEFORE any probe search/commit ever ran --
@@ -4483,6 +4549,19 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if not skip_cleanup:
                 try:
                     self._cleanup_probe_item(row_count_before)
+                    # Phase 5.9A Stage 1: verify pre-existing baseline
+                    # rows are unchanged after cleanup -- not merely
+                    # that the COUNT returned to baseline, which alone
+                    # cannot distinguish "cleanup removed the right row"
+                    # from "cleanup removed a different row and the
+                    # counts coincidentally match."
+                    if baseline_identities:
+                        after_identities = self.snapshot_grid_identities()
+                        if after_identities != baseline_identities:
+                            raise ProbeCleanupFailedError(
+                                f"_verify_group_once({group_name!r}): pre-existing rows changed during probe "
+                                f"cleanup -- before={baseline_identities!r} after={after_identities!r}."
+                            )
                 except ProtectedCommittedRowError:
                     # Phase 5.5D: never swallowed -- this means cleaning
                     # up the disposable probe would have deleted a row
@@ -4509,6 +4588,57 @@ class WindowsXactimateAdapter(XactimateAdapter):
     _PROBE_SETTLE_POLL_S = 0.15
     _PROBE_SETTLE_TIMEOUT_S = 3.0
 
+    def _last_row_identity(self, image, offset, row_count) -> tuple[str | None, str | None]:
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        last_row_top = row_1_top + (row_count - 1) * _GRID_ROW_HEIGHT
+        return self._read_category_selector_at(image, offset, last_row_top)
+
+    def _wait_for_probe_visible(self, target_row_count: int) -> str:
+        """Phase 5.9A: bounded-poll for the disposable group-
+        verification probe (CAT/SEL = _VERIFY_GROUP_PROBE_CATEGORY/
+        _VERIFY_GROUP_PROBE_SELECTOR) to become positively observable
+        as the grid's LAST row -- Xactimate always appends new rows at
+        the end, so "last row, identity matches" is a strong, position-
+        AND-identity signal, not a guess. Returns one of:
+
+        - "observed": the probe was seen -- a single positive read is
+          trusted immediately (positive evidence doesn't need the same
+          skepticism a negative result does).
+        - "absent": TWO CONSECUTIVE reads confirm the grid never grew
+          past target_row_count -- genuinely nothing was ever added.
+          A single such read is NOT trusted alone (Phase 5.9 Priority
+          1's live-caught bug: a stale read immediately after commit
+          can still show the pre-probe count, which used to make
+          cleanup silently declare victory without the probe having
+          been removed -- see docs/build-estimate.md Phase 5.9).
+        - "timeout": neither could be confirmed within the bounded
+          settle window.
+
+        Never raises. Shared by _cleanup_probe_item() (where "absent"
+        means nothing to clean up and "timeout" is a hard failure) and
+        _verify_group_once() (Phase 5.9A: where "observed" IS the
+        group-activation verification signal, replacing the Grouping
+        panel's optional/frequently-unavailable Subtotal pixel check)."""
+        hwnd = self._ensure_main_window()
+        probe_identity = (self._VERIFY_GROUP_PROBE_CATEGORY, self._VERIFY_GROUP_PROBE_SELECTOR)
+        deadline = time.time() + self._PROBE_SETTLE_TIMEOUT_S
+        stable_at_baseline_reads = 0
+        while time.time() < deadline:
+            image, offset = self._capture_and_locate(hwnd)
+            row_count = self._count_grid_rows(image, offset) if offset is not None else None
+            if row_count is not None and row_count > target_row_count:
+                stable_at_baseline_reads = 0
+                if self._last_row_identity(image, offset, row_count) == probe_identity:
+                    return "observed"
+            elif row_count is not None:  # row_count <= target_row_count
+                stable_at_baseline_reads += 1
+                if stable_at_baseline_reads >= 2:
+                    return "absent"
+            else:
+                stable_at_baseline_reads = 0
+            time.sleep(self._PROBE_SETTLE_POLL_S)
+        return "timeout"
+
     def _cleanup_probe_item(self, target_row_count: int = 0) -> None:
         """Removes whatever verify_group()'s disposable probe item left
         behind -- EXCEPT ProtectedCommittedRowError (Phase 5.5D), which
@@ -4529,59 +4659,30 @@ class WindowsXactimateAdapter(XactimateAdapter):
         garbage SFG/GUTA rows sitting in Rear Elevation and Left
         Elevation, undetected, with no audit trail (nothing was ever
         attempted, so DestructiveActionAuditor never even saw a call).
-        Now requires POSITIVE, bounded-poll confirmation the probe row
-        is actually visible -- identified by CAT/SEL, never by "last
-        row" position alone -- before attempting to remove it, and
-        POSITIVE confirmation the grid is back at target_row_count
-        afterward. Raises ProbeCleanupFailedError (never silently
-        continues) if either cannot be confirmed within the bounded
-        settle window, or if the last row's identity ever fails to
-        match the probe's own CAT/SEL (refusing to delete some other,
-        unrelated last row 'just because it's last')."""
+        Now requires POSITIVE, bounded-poll confirmation (via
+        _wait_for_probe_visible(), Phase 5.9A) the probe row is
+        actually visible -- identified by CAT/SEL, never by "last row"
+        position alone -- before attempting to remove it, and POSITIVE
+        confirmation the grid is back at target_row_count afterward.
+        Raises ProbeCleanupFailedError (never silently continues) if
+        either cannot be confirmed within the bounded settle window, or
+        if the last row's identity ever fails to match the probe's own
+        CAT/SEL (refusing to delete some other, unrelated last row
+        'just because it's last')."""
         hwnd = self._ensure_main_window()
         probe_identity = (self._VERIFY_GROUP_PROBE_CATEGORY, self._VERIFY_GROUP_PROBE_SELECTOR)
 
-        def _last_row_identity(image, offset, row_count):
-            row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
-            last_row_top = row_1_top + (row_count - 1) * _GRID_ROW_HEIGHT
-            return self._read_category_selector_at(image, offset, last_row_top)
-
-        # Phase 1: positively confirm the probe row is visible. A single
-        # read showing row_count <= target is NOT trusted on its own
-        # (that was the original bug -- a stale read right after commit
-        # can still show the pre-probe count); two CONSECUTIVE such
-        # reads are required before concluding "nothing was ever added"
-        # -- the same stabilization idiom capture_dropdown() already
-        # uses (Phase 5.8) for the equivalent "trust a negative result"
-        # problem. A single positive read (row_count > target WITH
-        # matching identity) is trusted immediately -- positive evidence
-        # doesn't need the same skepticism a negative result does.
-        deadline = time.time() + self._PROBE_SETTLE_TIMEOUT_S
-        probe_seen = False
-        stable_at_baseline_reads = 0
-        while time.time() < deadline:
-            image, offset = self._capture_and_locate(hwnd)
-            row_count = self._count_grid_rows(image, offset) if offset is not None else None
-            if row_count is not None and row_count > target_row_count:
-                stable_at_baseline_reads = 0
-                if _last_row_identity(image, offset, row_count) == probe_identity:
-                    probe_seen = True
-                    break
-            elif row_count is not None:  # row_count <= target_row_count
-                stable_at_baseline_reads += 1
-                if stable_at_baseline_reads >= 2:
-                    return  # positively confirmed, twice: nothing was ever added
-            else:
-                stable_at_baseline_reads = 0
-            time.sleep(self._PROBE_SETTLE_POLL_S)
-        if not probe_seen:
+        status = self._wait_for_probe_visible(target_row_count)
+        if status == "absent":
+            return  # positively confirmed, twice: nothing was ever added
+        if status == "timeout":
             raise ProbeCleanupFailedError(
                 f"_cleanup_probe_item(): could not positively observe the probe row {probe_identity!r} become "
                 f"visible within {self._PROBE_SETTLE_TIMEOUT_S}s -- refusing to guess whether cleanup is needed."
             )
 
-        # Phase 2: remove exactly the identified probe row(s), re-
-        # confirming identity before each deletion.
+        # status == "observed" -- remove exactly the identified probe
+        # row(s), re-confirming identity before each deletion.
         for _attempt in range(6):
             image, offset = self._capture_and_locate(hwnd)
             row_count = self._count_grid_rows(image, offset) if offset is not None else None
@@ -4590,7 +4691,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if row_count is None:
                 time.sleep(0.3)
                 continue
-            identity = _last_row_identity(image, offset, row_count)
+            identity = self._last_row_identity(image, offset, row_count)
             if identity != probe_identity:
                 raise ProbeCleanupFailedError(
                     f"_cleanup_probe_item(): refusing to delete the last row -- its identity {identity!r} does "
