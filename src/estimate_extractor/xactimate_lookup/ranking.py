@@ -24,7 +24,7 @@ from estimate_extractor.xactimate_lookup.models import (
     DropdownResult,
     RankedCandidate,
 )
-from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules
+from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, extract_size_term
 
 DEFAULT_RANKING_PATH = Path(__file__).resolve().parents[3] / "config" / "xactimate_lookup_ranking.yaml"
 
@@ -185,41 +185,127 @@ def score_dropdown_candidate(
                 material = canonical
                 break
 
+    # Phase 5.10A (live-caught): "the candidate doesn't literally
+    # contain the source's material word" was being treated as
+    # equivalent to "the candidate contradicts the source's material" --
+    # the fallback fuzzy-ratio compared the material word against the
+    # ENTIRE candidate description ("aluminum" vs "Gutter splash guard"),
+    # which is almost always a low score for ANY candidate that simply
+    # never mentions a material at all, not just ones that state a
+    # different one. That silently manufactured a wrong_material hard
+    # conflict on the objectively correct "SFG/GSG -- Gutter splash
+    # guard" result for "R&R Gutter splash guard" (source material:
+    # aluminum), capping its score below AUTO_SELECT/at REVIEW_REQUIRED
+    # for no real reason -- the candidate never claimed a different
+    # material, it simply didn't mention one. Absence of information is
+    # not contradiction: a hard conflict now requires the candidate to
+    # explicitly state a DIFFERENT, recognized material -- checked
+    # against the SAME curated material_keywords vocabulary already used
+    # above to backfill a missing source material, never a new word
+    # list. Three states, matching the general principle applied to
+    # size/grade below too:
+    #   MATCH       -- candidate states the SAME material (by literal
+    #                  text, word overlap, or the curated vocabulary).
+    #   CONFLICT     -- candidate explicitly states a DIFFERENT
+    #                  recognized material -- the only case allowed to
+    #                  cap the score.
+    #   UNSPECIFIED -- candidate states no material at all -- neutral,
+    #                  mildly lower-confidence evidence (0.5), never a
+    #                  hard conflict.
     material_ok = True
     material_score = 0.0
     material_applicable = bool(material)
+    material_state = None
     if material:
         material_lower = material.lower()
         material_words = set(re.findall(r"[a-z0-9]+", material_lower))
         if material_lower in candidate_text or candidate_text in material_lower:
             material_score = 1.0
+            material_state = "MATCH"
         elif material_words & candidate_words:
             # At least one material word (e.g. "aluminum") appears
             # literally in the candidate -- treat as a match even if the
             # full material phrase doesn't line up word-for-word.
             material_score = 1.0
+            material_state = "MATCH"
         else:
-            fuzzy = _fuzzy_ratio(material_lower, candidate_text) if config.fuzzy_enabled else 0.0
-            material_score = fuzzy
-            # A real conflict requires BOTH low fuzzy similarity AND zero
-            # literal word overlap -- otherwise this is just a case where
-            # the candidate description doesn't mention material at all,
-            # which is neutral, not a conflict.
-            material_ok = fuzzy >= config.fuzzy_min_score
+            candidate_materials = {
+                canonical for keyword, canonical in rules.material_keywords if keyword in candidate_text
+            }
+            if material_lower in candidate_materials:
+                material_score = 1.0
+                material_state = "MATCH"
+            elif candidate_materials:
+                # The candidate explicitly names a DIFFERENT recognized
+                # material -- real, opposing evidence.
+                material_state = "CONFLICT"
+                material_ok = False
+                material_score = 0.0
+            else:
+                # No material stated in the candidate at all -- absent,
+                # not contradictory. Mild neutral-leaning evidence
+                # rather than a flat 0.0, since it's genuinely unknown
+                # rather than known-wrong.
+                material_state = "UNSPECIFIED"
+                material_ok = True
+                material_score = 0.5
 
+    # Phase 5.10A: same absence-is-not-contradiction principle as
+    # material above -- a candidate that states NO size at all
+    # ("Gutter splash guard") is unspecified, not a conflict, versus one
+    # that states a DIFFERENT size (extracted via the same extract_
+    # size_term() phrase_generator.py already uses to compute size_key
+    # itself, applied here to the CANDIDATE's own text) -- e.g. source
+    # 5" vs candidate stating 6" is a real conflict.
     size_ok = True
     size_score = 0.0
     size_applicable = bool(size_key)
+    size_state = None
     if size_key:
-        size_ok = size_key.lower() in candidate_text
-        size_score = 1.0 if size_ok else 0.0
+        size_key_lower = size_key.lower()
+        if size_key_lower in candidate_text:
+            size_ok = True
+            size_score = 1.0
+            size_state = "MATCH"
+        else:
+            candidate_size = extract_size_term(candidate_text)
+            if candidate_size and candidate_size.lower() != size_key_lower:
+                size_ok = False
+                size_state = "CONFLICT"
+            else:
+                size_ok = True
+                size_score = 0.5
+                size_state = "UNSPECIFIED"
 
+    # Phase 5.10A: same principle for the primary grade/style check --
+    # a candidate stating NO grade/style qualifier at all is unspecified
+    # (e.g. a plain "Composition shingles" candidate against a source
+    # asking for "3-tab"), not a conflict; one stating a DIFFERENT
+    # recognized grade/style is a real conflict. Checked against the
+    # same curated style_keywords/leading_style_keywords vocabulary the
+    # separate "unrequested qualifier" check just below already uses.
     grade_ok = True
     grade_score = 0.0
     grade_applicable = bool(grade_key)
+    grade_state = None
     if grade_key:
-        grade_ok = grade_key.lower() in candidate_text
-        grade_score = 1.0 if grade_ok else 0.0
+        grade_key_lower = grade_key.lower()
+        if grade_key_lower in candidate_text:
+            grade_ok = True
+            grade_score = 1.0
+            grade_state = "MATCH"
+        else:
+            candidate_grades = {
+                canonical for keyword, canonical in (*rules.style_keywords, *rules.leading_style_keywords)
+                if keyword in candidate_text
+            }
+            if candidate_grades and grade_key_lower not in candidate_grades:
+                grade_ok = False
+                grade_state = "CONFLICT"
+            else:
+                grade_ok = True
+                grade_score = 0.5
+                grade_state = "UNSPECIFIED"
 
     # Phase 5.6 (live-caught): the check above is one-directional -- it
     # only asks "does the candidate have the style/grade word the
@@ -294,21 +380,33 @@ def score_dropdown_candidate(
         conflict_reasons.append(f"wrong_component: {sorted(component_words)} not found in candidate description")
     elif component_words:
         match_reasons.append("component matches")
+    # Phase 5.10A: material/size/grade conflicts now fire ONLY on
+    # material_state/size_state/grade_state == "CONFLICT" (an explicit,
+    # different value stated in the candidate) -- material_ok/size_ok/
+    # grade_ok are already True for the UNSPECIFIED case (see above), so
+    # this reads unchanged from Phase 5.6, but the messages now name the
+    # actual conflicting state for a clearer audit trail.
     if material and not material_ok:
         weighted = min(weighted, caps.get("wrong_material", 0.55))
-        conflict_reasons.append(f"wrong_material: {material!r} not found in candidate description")
-    elif material and material_score >= 0.99:
+        conflict_reasons.append(f"wrong_material: candidate states a different material than {material!r}")
+    elif material and material_state == "MATCH":
         match_reasons.append("material matches")
+    elif material and material_state == "UNSPECIFIED":
+        match_reasons.append(f"material {material!r} unspecified in candidate (not a conflict)")
     if size_key and not size_ok:
         weighted = min(weighted, caps.get("wrong_size", 0.60))
-        conflict_reasons.append(f"wrong_size: {size_key!r} not found in candidate description")
-    elif size_key and size_ok:
+        conflict_reasons.append(f"wrong_size: candidate states a different size than {size_key!r}")
+    elif size_key and size_state == "MATCH":
         match_reasons.append("size matches")
+    elif size_key and size_state == "UNSPECIFIED":
+        match_reasons.append(f"size {size_key!r} unspecified in candidate (not a conflict)")
     if grade_key and not grade_ok:
         weighted = min(weighted, caps.get("incompatible_grade_or_style", 0.55))
-        conflict_reasons.append(f"incompatible grade/style: {grade_key!r} not found in candidate description")
-    elif grade_key and grade_ok:
+        conflict_reasons.append(f"incompatible grade/style: {grade_key!r} conflict with candidate")
+    elif grade_key and grade_state == "MATCH":
         match_reasons.append("grade/style matches")
+    elif grade_key and grade_state == "UNSPECIFIED":
+        match_reasons.append(f"grade/style {grade_key!r} unspecified in candidate (not a conflict)")
     if action_term and not action_ok:
         weighted = min(weighted, caps.get("wrong_action", 0.50))
         conflict_reasons.append(f"wrong_action: {action_term!r} not found in candidate description")
