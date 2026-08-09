@@ -1986,6 +1986,28 @@ class WindowsXactimateAdapter(XactimateAdapter):
         time.sleep(0.5)
         return True
 
+    def _dismiss_stray_results_popup(self) -> bool:
+        """Phase 5.8A (live-caught, defense-in-depth). orchestrator.
+        execute_plan() now calls recover() itself on every NO_MATCH/
+        REVIEW_REQUIRED decision (the actual fix for the reproduced
+        defect: a task that never reaches select_candidate() never
+        clicks the results popup closed, so it was still open when the
+        NEXT group's setup started interacting with the window). This
+        is a cheap, independent second line of defense at every group-
+        tree entry point, matching the exact self-heal pattern already
+        used for _handle_duplicate_item_dialog(): if some OTHER, future
+        code path ever returns without dismissing its own popup, this
+        catches it here rather than letting a stray popup interfere
+        with group-tree clicks. Returns True if a popup was found and
+        dismissed, False if none was open. Never raises."""
+        try:
+            if self._find_dropdown_window() is None:
+                return False
+            self.recover()
+            return True
+        except Exception:
+            return False
+
     def commit_item(self) -> None:
         VK_S = 0x53
         self._press_ctrl(VK_S)
@@ -3858,8 +3880,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         every group-tree entry point checks for and dismisses it first,
         so one earlier miss doesn't cascade into every later group
         looking unreachable ("context menu did not appear") for the
-        rest of the run, exactly as reproduced live."""
+        rest of the run, exactly as reproduced live. Phase 5.8A: same
+        self-heal for a stray results popup -- see
+        _dismiss_stray_results_popup()."""
         self._handle_duplicate_item_dialog()
+        self._dismiss_stray_results_popup()
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"ensure_group({group_name!r}): could not verify the expected project is active.")
 
@@ -4015,8 +4040,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
         `group_name` -- a duplicate/ambiguous name must fail closed,
         never resolved by picking one. Phase 5.7B: self-heals from a
         "Duplicate Item(s)" dialog left open by an earlier commit --
-        see ensure_group()'s docstring."""
+        see ensure_group()'s docstring. Phase 5.8A: same self-heal for
+        a stray results popup -- see _dismiss_stray_results_popup()."""
         self._handle_duplicate_item_dialog()
+        self._dismiss_stray_results_popup()
         if not self.verify_application() or not self.verify_project():
             raise AdapterError(f"select_group({group_name!r}): could not verify the expected project is active.")
 
@@ -4189,6 +4216,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         skip_cleanup = False
         try:
             self._handle_duplicate_item_dialog()  # Phase 5.7B: self-heal, see ensure_group()'s docstring
+            self._dismiss_stray_results_popup()  # Phase 5.8A: same self-heal for a stray results popup
             if not self.verify_application() or not self.verify_project():
                 return False
             hwnd = self._ensure_main_window()

@@ -95,6 +95,34 @@ def test_execute_plan_stops_on_no_results(tmp_path, phrase_rules, ranking_config
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
     assert outcome.decision == DECISION_NO_MATCH
     assert outcome.stop_reason == STOP_REASON_NO_RESULTS
+    # Phase 5.8A (live-caught): a NO_MATCH/REVIEW_REQUIRED decision never
+    # calls select_candidate(), so nothing ever closes the results
+    # popup the way a real commit naturally does -- recover() must be
+    # called explicitly, or the popup is still open when execution
+    # moves on to the next task/group (reproduced live: it visibly
+    # stayed open and was still there when the next group's setup
+    # began interacting with the window).
+    assert adapter.log.calls[-1][0] == "recover"
+
+
+def test_execute_plan_stops_on_no_results_after_ranking_scores_too_low(tmp_path, phrase_rules, ranking_config):
+    """Companion to the case above: real candidates WERE captured (the
+    popup genuinely opened and was read -- matches the live-caught
+    "Clean Fence" case, real dropdown rows present but nothing scored
+    high enough even for review), but every one scored below
+    review_required_min -- a DIFFERENT code path (post-ranking, not the
+    empty-dropdown early return) reaching the SAME DECISION_NO_MATCH
+    outcome, and it must ALSO dismiss the popup."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(material="3-tab composition shingles")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    unrelated = _dropdown("Tear off metal roofing panels", cat="RFG", sel="METAL", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [unrelated]})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.decision == DECISION_NO_MATCH
+    assert outcome.stop_reason == STOP_REASON_NO_RESULTS
+    assert adapter.log.calls[-1][0] == "recover"
 
 
 def test_execute_plan_stops_on_extraction_failure(tmp_path, phrase_rules, ranking_config):
@@ -137,6 +165,16 @@ def test_execute_plan_stops_on_ambiguous_candidates(tmp_path, phrase_rules, rank
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
     assert outcome.decision == DECISION_REVIEW_REQUIRED
     assert outcome.stop_reason == STOP_REASON_AMBIGUOUS
+    # Phase 5.8A (live-caught): see test_execute_plan_stops_on_no_results's
+    # comment -- REVIEW_REQUIRED never clicks a candidate either, so the
+    # popup must be explicitly dismissed here too.
+    assert adapter.log.calls[-1][0] == "recover"
+
+    # Note: recover() is called BEFORE the top.has_hard_conflict branch
+    # inside this same `decision == DECISION_REVIEW_REQUIRED` block (see
+    # execute_plan()), so this one assertion structurally covers BOTH
+    # REVIEW_REQUIRED sub-paths (hard-conflict and margin/ambiguity),
+    # not just the margin/ambiguity one exercised above.
 
 
 def test_execute_plan_stops_on_invalid_quantity(tmp_path, phrase_rules, ranking_config):

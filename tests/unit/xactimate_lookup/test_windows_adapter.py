@@ -1473,6 +1473,69 @@ def test_commit_item_dismisses_a_duplicate_item_dialog(monkeypatch):
 
 
 # ---------------------------------------------------------------------
+# Phase 5.8A: live-caught -- a task that ends in NO_MATCH/REVIEW_REQUIRED
+# never calls select_candidate(), so nothing ever clicks the results
+# popup closed. orchestrator.py now calls recover() itself (the real
+# fix); these tests cover the independent, defense-in-depth self-heal
+# at every group-tree entry point (matching the existing "Duplicate
+# Item(s)" dialog self-heal pattern from Phase 5.7B).
+# ---------------------------------------------------------------------
+
+
+def test_dismiss_stray_results_popup_closes_a_popup_when_present(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: 555)
+    recover_calls = []
+    monkeypatch.setattr(adapter, "recover", lambda: recover_calls.append(1))
+
+    assert adapter._dismiss_stray_results_popup() is True
+    assert recover_calls == [1]
+
+
+def test_dismiss_stray_results_popup_is_a_noop_when_absent(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: None)
+    recover_calls = []
+    monkeypatch.setattr(adapter, "recover", lambda: recover_calls.append(1))
+
+    assert adapter._dismiss_stray_results_popup() is False
+    assert recover_calls == []
+
+
+def test_dismiss_stray_results_popup_never_raises(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    def boom():
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(adapter, "_find_dropdown_window", boom)
+    assert adapter._dismiss_stray_results_popup() is False
+
+
+@pytest.mark.parametrize("method_name", ["ensure_group", "select_group"])
+def test_group_entry_points_self_heal_a_stray_results_popup(monkeypatch, method_name):
+    """ensure_group()/select_group() must check for and dismiss a stray
+    results popup left open by a previous task, independent of
+    orchestrator.py's own fix -- defense in depth at the exact point
+    the live defect was reproduced (group-tree interaction beginning
+    while a popup from the prior task was still open)."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    dismiss_calls = []
+    monkeypatch.setattr(adapter, "_dismiss_stray_results_popup", lambda: dismiss_calls.append(1))
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    # Fail fast right after the self-heal calls -- we only care that
+    # they happened, not the rest of the (extensively tested elsewhere)
+    # method body.
+    monkeypatch.setattr(adapter, "verify_application", lambda: False)
+
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+    with pytest.raises(AdapterError):
+        getattr(adapter, method_name)("Dwelling Roof")
+
+    assert dismiss_calls == [1]
+
+
+# ---------------------------------------------------------------------
 # Phase 5.7: group ancestry/nesting depth is no longer a blocking safety
 # condition -- what still must fail closed is genuine AMBIGUITY (more
 # than one row matching a name) and an unlocatable/unverifiable target.

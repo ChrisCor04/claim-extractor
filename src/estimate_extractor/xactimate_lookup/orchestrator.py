@@ -229,6 +229,20 @@ def execute_plan(
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_EXTRACTION_FAILED, str(exc))
 
     if not dropdowns:
+        # Phase 5.8A (live-caught): a NO_MATCH/REVIEW_REQUIRED decision
+        # never calls select_candidate() -- nothing ever clicks the
+        # results popup closed the way an AUTO_SELECT commit naturally
+        # does. Live-verified: the popup stays open after this return
+        # unless explicitly dismissed here, exactly like the exception
+        # paths above already do. Left open, it was still on screen
+        # when the NEXT group's setup (ensure_group()'s Components-tab
+        # click, in particular) started interacting with the window --
+        # the reproduced "final item's dropdown is still open when the
+        # automation moves on to the next group" defect. recover() only
+        # touches adapter-internal popup bookkeeping and presses
+        # Escape; it never touches the `candidates`/outcome data already
+        # computed for this return.
+        adapter.recover()
         return _stop(item.line_item_id, plan, DECISION_NO_MATCH, STOP_REASON_NO_RESULTS, f"No dropdown results for {plan.search_input!r}.")
 
     size_key = signature_mod.compute_size_key(item.original_description or "")
@@ -242,10 +256,12 @@ def execute_plan(
     decision = classify_decision(candidates, ranking_config)
 
     if decision == DECISION_NO_MATCH:
+        adapter.recover()  # Phase 5.8A: same popup-left-open fix as above
         return _stop(item.line_item_id, plan, DECISION_NO_MATCH, STOP_REASON_NO_RESULTS, "No candidate scored above the review-required threshold.", candidates=candidates)
 
     if decision == DECISION_REVIEW_REQUIRED:
         top = candidates[0]
+        adapter.recover()  # Phase 5.8A: same popup-left-open fix as above
         if top.has_hard_conflict:
             return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_HARD_CONFLICT, "; ".join(top.conflict_reasons), candidates=candidates, selected=top)
         return _stop(
