@@ -1998,6 +1998,156 @@ def test_ensure_group_raises_on_ambiguous_existing_name(monkeypatch):
         adapter.ensure_group("Fence")
 
 
+# ---------------------------------------------------------------------
+# Phase 6.1 (live-caught): ensure_group()'s post-creation discovery loop
+# widened from 3 attempts to _GROUP_DISCOVERY_MAX_ATTEMPTS (8) after a
+# real production run hit "group still not found after the creation
+# sequence completed" creating the very first group ("Roof") in an
+# otherwise-empty TEST estimate -- direct instrumentation of the real,
+# unmodified method measured newly-created-group discoverability taking
+# as long as ~4.5s past the Attach click, uncomfortably close to the old
+# budget. These tests exercise the widened loop directly: found late
+# but within budget, never found (fails closed, same error), and the
+# already-fast case incurring zero extra retries.
+# ---------------------------------------------------------------------
+
+
+def _mock_ensure_group_create_path(monkeypatch, adapter, *, found_on_attempt):
+    """Wires the full ensure_group() CREATE path (no-op check -> reset
+    stickiness -> parent lookup -> New Group dialog -> post-creation
+    discovery loop), with the post-creation snapshot_group_names() only
+    reporting the new group as present starting from the
+    `found_on_attempt`-th call within the discovery loop (0-indexed) --
+    or never, if `found_on_attempt` is None. Returns the call/sleep
+    counters so tests can assert exactly how many retries actually
+    happened."""
+    counters = {"discovery_snapshot_calls": 0, "sleep_calls": 0}
+    pre_rows = ["TEST"]
+    post_rows_absent = ["TEST"]
+    post_rows_present = ["TEST", "Roof"]
+
+    calls = {"n": 0}
+
+    def fake_snapshot():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return pre_rows  # the two pre-creation checks (no-op + post-stickiness-reset)
+        discovery_call_index = calls["n"] - 3  # 0-indexed within the discovery loop
+        counters["discovery_snapshot_calls"] = discovery_call_index + 1
+        if found_on_attempt is not None and discovery_call_index >= found_on_attempt:
+            return post_rows_present
+        return post_rows_absent
+
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "_reset_group_creation_stickiness", lambda: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", fake_snapshot)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
+    monkeypatch.setattr(adapter, "_ocr_group_tree_row_text", lambda image, header, row_index: "TEST")
+    monkeypatch.setattr(adapter, "_group_tree_row_indent_x", lambda image, header, row_index: 35)
+    monkeypatch.setattr(adapter, "_open_group_tree_context_menu", lambda hwnd, header, row_index: [object()] * adapter._GROUP_MENU_EXPECTED_ITEM_COUNT)
+    monkeypatch.setattr(adapter, "_click_group_menu_item", lambda items, index: None)
+    monkeypatch.setattr(adapter, "_find_window_by_title", lambda title: 456 if title == "New Group" else None)
+
+    # Attach's own click coordinates mark "the discovery loop is about to
+    # start" -- an EARLIER, unrelated time.sleep(0.8) already happens
+    # right after the "New" menu item is clicked (ensure_group()'s own
+    # code, not the discovery loop), which would otherwise be
+    # indistinguishable from a discovery-loop retry sleep since both
+    # happen to share the same 0.8s duration.
+    ATTACH_BUTTON = (305, 75)
+    state = {"attach_clicked": False}
+
+    def fake_click_client(hwnd, x, y):
+        if (x, y) == ATTACH_BUTTON:
+            state["attach_clicked"] = True
+
+    monkeypatch.setattr(adapter, "_click_client", fake_click_client)
+    monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+
+    def fake_sleep(seconds):
+        if state["attach_clicked"] and seconds == adapter._GROUP_DISCOVERY_RETRY_INTERVAL_S:
+            counters["sleep_calls"] += 1
+
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+    return counters
+
+
+def test_ensure_group_not_visible_on_first_post_creation_check(monkeypatch):
+    """Item 1: a newly-created group absent from the very first
+    post-creation snapshot must not immediately fail -- it's the
+    ordinary, already-covered case (found on discovery attempt 1), kept
+    here as an explicit anchor for the widened-loop test group."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    counters = _mock_ensure_group_create_path(monkeypatch, adapter, found_on_attempt=1)
+    adapter.ensure_group("Roof")  # must not raise
+    assert counters["discovery_snapshot_calls"] == 2
+
+
+def test_ensure_group_appears_on_a_later_bounded_poll(monkeypatch):
+    """Items 2 and 5: live-caught shape -- the group isn't discoverable
+    until several retries in (measured live as late as ~4.5s/2 coarse
+    polls past Attach), well past the OLD 3-attempt budget but within
+    the widened one. Must succeed, not fail closed."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    counters = _mock_ensure_group_create_path(monkeypatch, adapter, found_on_attempt=6)
+    result = adapter.ensure_group("Roof")
+    assert result is None  # succeeded, no position warning
+    assert counters["discovery_snapshot_calls"] == 7  # attempts 0-6, found on the 7th
+    assert counters["sleep_calls"] == 6  # one sleep per failed attempt (0-5) -- the successful 7th check returns immediately, no sleep
+
+
+def test_ensure_group_fails_closed_after_exhausting_the_widened_budget(monkeypatch):
+    """Item 6: a group that never becomes discoverable must still fail
+    closed with the same error, never silently proceed as if creation
+    had succeeded -- this is the core Stage 7 safety requirement: WAIT/
+    RETRY through the real window, never bypass verification."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    counters = _mock_ensure_group_create_path(monkeypatch, adapter, found_on_attempt=None)
+
+    from estimate_extractor.xactimate_lookup.adapter import AdapterError
+    with pytest.raises(AdapterError, match="still not found after the creation sequence completed"):
+        adapter.ensure_group("Roof")
+
+    assert counters["discovery_snapshot_calls"] == adapter._GROUP_DISCOVERY_MAX_ATTEMPTS
+
+
+def test_ensure_group_already_ready_group_incurs_zero_extra_retries(monkeypatch):
+    """Item 8: the widened budget must never slow down the common,
+    already-fast case -- a group discoverable on the very first
+    post-creation check exits the loop immediately, with zero sleeps
+    spent on retries that were never needed."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    counters = _mock_ensure_group_create_path(monkeypatch, adapter, found_on_attempt=0)
+    adapter.ensure_group("Roof")
+    assert counters["discovery_snapshot_calls"] == 1
+    assert counters["sleep_calls"] == 0
+
+
+def test_ensure_group_existing_group_behavior_is_unaffected_by_the_widened_budget(monkeypatch):
+    """Item 7: the no-op ("already exists") path never touches the
+    discovery loop at all -- unchanged by this phase's fix."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Roof"])
+    sleep_calls = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleep_calls.append(s))
+
+    result = adapter.ensure_group("Roof")
+
+    assert result is None
+    assert sleep_calls == []
+
+
 def test_select_group_raises_on_ambiguous_name(monkeypatch):
     """select_group() must refuse to guess which of two same-named rows
     is the intended target."""

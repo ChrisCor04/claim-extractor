@@ -2522,6 +2522,34 @@ class WindowsXactimateAdapter(XactimateAdapter):
     _GROUP_MENU_NEW_INDEX = 15
     _GROUP_MENU_DELETE_INDEX = 17
 
+    #: Phase 6.1 (live-caught): ensure_group()'s post-creation discovery
+    #: loop used to be range(3)/0.8s (~2.4s of sleeps, but each
+    #: snapshot_group_names() call itself costs ~2.1-2.5s live, so the
+    #: REAL bounded window was already closer to ~8-9s) -- yet a genuine
+    #: production run still hit "group still not found after the
+    #: creation sequence completed" creating the very first group
+    #: ("Roof") in an otherwise-empty TEST estimate (Phase 6.0), cascading
+    #: all 17 of that group's tasks to REVIEW_REQUIRED without ever
+    #: attempting a search. Direct instrumentation of the real, unmodified
+    #: method (never a hand-rolled reimplementation) measured newly-
+    #: created-group discoverability taking as long as ~4.5s past the
+    #: Attach click across repeated empty-TEST trials, uncomfortably
+    #: close to the old budget -- consistent with the one observed live
+    #: failure being a genuine, intermittent settle-timing race (slower
+    #: under real multi-task run conditions than in an isolated
+    #: diagnostic), not a hard creation failure (Roof always physically
+    #: existed, empty, once the run moved on). Widened, not removed --
+    #: still a bounded, checked-every-time retry (never a blind sleep,
+    #: never a weakened/skipped verification), just with real headroom
+    #: above the worst latency actually measured. Applies to every
+    #: ensure_group() call uniformly (not just "the first group" or
+    #: group_name == "Roof") -- an already-fast, already-discoverable
+    #: group still exits this loop on its first iteration, so this
+    #: only extends how long a genuinely slow-to-appear case gets before
+    #: failing closed.
+    _GROUP_DISCOVERY_MAX_ATTEMPTS = 8
+    _GROUP_DISCOVERY_RETRY_INTERVAL_S = 0.8
+
     #: Live-measured, self-contained relative to the group tree's own
     #: "Group" column header text (NOT the grid's "Cat" anchor -- that
     #: anchor was found live-unreliable whenever the grid has zero rows,
@@ -4472,8 +4500,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # actually created (confirmed by a subsequent independent
         # snapshot moments later) -- the tree can take slightly longer
         # than 1.0s to settle for some creations. Bounded retry with an
-        # extra settle sleep, never an unbounded wait.
-        for _attempt in range(3):
+        # extra settle sleep, never an unbounded wait. Widened in Phase
+        # 6.1 -- see _GROUP_DISCOVERY_MAX_ATTEMPTS's own docstring.
+        for _attempt in range(self._GROUP_DISCOVERY_MAX_ATTEMPTS):
             rows_after = self.snapshot_group_names()
             # Phase 5.7: uniqueness, not mere presence, is what's load-
             # bearing now -- raises AdapterError if creation somehow
@@ -4526,7 +4555,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                             f"use; reorganize the visual tree manually later if a specific layout is desired."
                         )
                 return position_warning
-            time.sleep(0.8)
+            time.sleep(self._GROUP_DISCOVERY_RETRY_INTERVAL_S)
         raise AdapterError(
             f"ensure_group({group_name!r}): group still not found after the creation sequence completed."
         )
