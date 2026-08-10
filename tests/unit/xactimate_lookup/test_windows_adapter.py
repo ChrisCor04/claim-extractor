@@ -750,10 +750,14 @@ def _adapter_with_fake_commit_grid(monkeypatch, row_sequence, unit_reads=None, q
         return (len(state["grid"]), 0) if state["grid"] else None
 
     monkeypatch.setattr(adapter, "_last_row_geometry", last_row_geometry)
-    monkeypatch.setattr(
-        adapter, "_read_category_selector_at",
-        lambda image, offset, row_top: state["grid"][row_top // _GRID_ROW_HEIGHT],
-    )
+    fake_read = lambda image, offset, row_top: state["grid"][row_top // _GRID_ROW_HEIGHT]
+    # snapshot_grid_identities() (used for verify_commit()'s "after"
+    # pre-existing-rows comparison) still calls the shared, unchanged
+    # _read_category_selector_at() -- see _read_category_selector_for_
+    # verify_commit()'s own docstring for why that method is
+    # deliberately separate and left untouched. Both need mocking here.
+    monkeypatch.setattr(adapter, "_read_category_selector_at", fake_read)
+    monkeypatch.setattr(adapter, "_read_category_selector_for_verify_commit", fake_read)
     monkeypatch.setattr(adapter, "_read_description_at", lambda image, offset, row_top: "desc")
     qty_iter = iter(quantity_reads or [])
     monkeypatch.setattr(adapter, "_read_quantity_at", lambda image, offset, row_top: next(qty_iter, None))
@@ -2327,17 +2331,71 @@ def test_verify_group_once_raises_if_pre_existing_rows_change_during_cleanup(mon
     call_count = {"n": 0}
     original_snapshot = adapter.snapshot_grid_identities
 
-    def _sabotaged_snapshot():
+    def _sabotaged_snapshot(row_top_nudge=0):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return [("FEN", "RAIL"), ("PNT", "FENST")]  # baseline
-        return [("FEN", "RAIL"), ("XXX", "CHANGED")]  # after cleanup -- differs!
+        return [("FEN", "RAIL"), ("XXX", "CHANGED")]  # after cleanup -- differs, at every nudge too
 
     monkeypatch.setattr(adapter, "snapshot_grid_identities", _sabotaged_snapshot)
 
     from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
     with pytest.raises(ProbeCleanupFailedError):
         adapter._verify_group_once("Fencing")
+
+
+def test_verify_group_once_tolerates_single_char_selector_noise_on_recheck(monkeypatch):
+    """Phase 5.15 Pass 2 (live-caught): on a heavily-populated group,
+    the post-cleanup re-read can land a few px off from the row it
+    means to read (the header-to-row1 gap measured a few px short of
+    calibration on a real, densely-populated grid), producing an
+    unnudged read that looks like every pre-existing row changed. A
+    small vertical nudge search recovers clean reads for most rows,
+    but real live data still showed a handful of one-character
+    selector substitutions (e.g. "300S" -> "3008") even at the best
+    nudge -- ordinary OCR noise, not evidence cleanup touched the
+    wrong row (category matches exactly; length matches exactly; only
+    one character differs). This must NOT raise ProbeCleanupFailedError."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Fencing"])
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: None)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "focus_search", lambda: None)
+    monkeypatch.setattr(adapter, "clear_search", lambda: None)
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    monkeypatch.setattr(
+        adapter, "capture_dropdown",
+        lambda: [DropdownResult(raw_text="SFG GUTA", row_position=0, category="SFG", selector="GUTA")],
+    )
+    monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
+    monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
+    monkeypatch.setattr(adapter, "select_candidate", lambda target: None)
+    monkeypatch.setattr(adapter, "enter_quantity", lambda qty: None)
+    _stateful_probe_lifecycle_mocks(monkeypatch, adapter, baseline_row_count=2)
+
+    baseline = [("RFG", "300S"), ("PNT", "FENST")]
+    call_count = {"n": 0}
+
+    def _misaligned_then_recovering_snapshot(row_top_nudge=0):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return baseline  # the pre-cleanup baseline read
+        if row_top_nudge == 0:
+            return [("XXX", "GARBLED"), ("YYY", "NOISE")]  # unnudged post-cleanup read: garbage
+        if row_top_nudge == -10:
+            return [("RFG", "3008"), ("PNT", "FENST")]  # best nudge: one-char selector noise only
+        return [("XXX", "GARBLED"), ("YYY", "NOISE")]  # other nudges: still garbage
+
+    monkeypatch.setattr(adapter, "snapshot_grid_identities", _misaligned_then_recovering_snapshot)
+
+    assert adapter._verify_group_once("Fencing") is True
 
 
 def test_probe_counts_start_at_zero_and_only_increment_on_a_real_probe(monkeypatch):

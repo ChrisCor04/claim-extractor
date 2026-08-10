@@ -6,11 +6,16 @@ from estimate_extractor.xactimate_lookup.models import (
     DECISION_NO_MATCH,
     DECISION_REVIEW_REQUIRED,
     DropdownResult,
+    RankedCandidate,
 )
 
 
 def _dropdown(text, cat="RFG", sel="X", desc=None, pos=0, conf=0.95):
     return DropdownResult(raw_text=text, row_position=pos, category=cat, selector=sel, description=desc or text, extraction_confidence=conf)
+
+
+def _ranked(score, cat="RFG", sel="X", desc="d", pos=0, conflict_reasons=None):
+    return RankedCandidate(dropdown=_dropdown(desc, cat=cat, sel=sel, pos=pos), score=score, conflict_reasons=conflict_reasons or [])
 
 
 def test_exact_strong_match_yields_auto_select(phrase_rules, ranking_config):
@@ -298,3 +303,74 @@ def test_does_not_automatically_choose_first_result_when_second_is_equally_stron
         size_key=None, grade_key=None, dropdowns=[a, b], rules=phrase_rules, config=ranking_config,
     )
     assert ranking.classify_decision(candidates, ranking_config) == DECISION_REVIEW_REQUIRED
+
+
+# ---------------------------------------------------------------------
+# Phase 5.15 Pass 2 (ground-truth-guided against the completed Aranda
+# reference estimate): classify_decision()'s semantic-dominance
+# override. score_dropdown_candidate()'s weighted-AVERAGE formula (see
+# its own comment) makes exactly 1.0 reachable ONLY when the
+# description is a literal/near-exact text match AND every other
+# applicable dimension (component/material/size/grade/action)
+# independently scored a full MATCH -- there is no partial-credit path
+# to exactly 1.0. Live-reproduced on 10 real Aranda rows: the top
+# candidate scored this maximum reachable 1.0 while a real, textually-
+# close runner-up (that differs from the source in some dimension the
+# ranker already checks -- grade upgrade, coat count, single/double,
+# activity, different real component) could not also reach it.
+# ---------------------------------------------------------------------
+
+
+def test_exact_top_beats_close_non_exact_runner_up_despite_thin_margin(ranking_config):
+    """The core recovery case: top scores the maximum reachable 1.0,
+    runner-up is close (0.9868, margin 0.0132 << auto_select_margin
+    0.08) but NOT exact -- e.g. '1 coat' vs '2 coats'. Must AUTO_SELECT."""
+    top = _ranked(1.0, sel="OH>1")
+    runner_up = _ranked(0.9868, sel="OH>")
+    assert ranking.classify_decision([top, runner_up], ranking_config) == DECISION_AUTO_SELECT
+
+
+def test_exact_tie_between_two_perfect_scores_stays_review_required(ranking_config):
+    """Counterpart -- the negative-control guard: when the runner-up
+    ALSO reaches exactly 1.0 (a genuine tie, e.g. the real 3-way
+    'Lighting Installer - Electrician - per hour' tie against LIT/LAB,
+    ELE/LAB, LAB/ELE), the override must never fire. This is precisely
+    what stops the rule from being a disguised 'margin = 0'."""
+    top = _ranked(1.0, sel="LIT")
+    tied = _ranked(1.0, sel="ELE")
+    assert ranking.classify_decision([top, tied], ranking_config) == DECISION_REVIEW_REQUIRED
+
+
+def test_near_exact_top_below_threshold_does_not_trigger_override(ranking_config):
+    """Top is very strong (0.9167) but not at the exact-match bar --
+    the override must not apply merely because a score is 'high', only
+    when it hits the maximum reachable value. Ordinary margin logic
+    still governs."""
+    top = _ranked(0.9167, sel="STEEP")
+    runner_up = _ranked(0.8409, sel="STEEP>>")
+    assert ranking.classify_decision([top, runner_up], ranking_config) == DECISION_REVIEW_REQUIRED
+
+
+def test_exact_top_with_hard_conflict_is_not_overridden(ranking_config):
+    """The override sits AFTER the existing has_hard_conflict gate in
+    classify_decision() -- a conflicting top candidate must still be
+    refused even if its raw score is 1.0."""
+    top = _ranked(1.0, sel="X", conflict_reasons=["wrong_material: candidate states a different material"])
+    runner_up = _ranked(0.5, sel="Y")
+    assert ranking.classify_decision([top, runner_up], ranking_config) == DECISION_REVIEW_REQUIRED
+
+
+def test_exact_top_alone_still_auto_selects(ranking_config):
+    """No runner-up at all -- the override's guard clauses must not
+    accidentally require a second candidate to exist."""
+    top = _ranked(1.0, sel="X")
+    assert ranking.classify_decision([top], ranking_config) == DECISION_AUTO_SELECT
+
+
+def test_exact_top_already_clearing_ordinary_margin_is_unaffected(ranking_config):
+    """When the ordinary margin check already passes on its own (top
+    exact, runner-up far below), the override branch is never even
+    reached -- this just confirms no regression in the common case."""
+    top = _ranked(1.0, sel="X")
+    runner_up = _ranked(0.5, sel="Y")
+    assert ranking.classify_decision([top, runner_up], ranking_config) == DECISION_AUTO_SELECT

@@ -2626,7 +2626,50 @@ class WindowsXactimateAdapter(XactimateAdapter):
         sel = sel_raw.split()[0] if sel_raw else None
         return cat, sel
 
-    def snapshot_grid_identities(self) -> list[tuple[str | None, str | None]]:
+    def _read_category_selector_for_verify_commit(self, image, offset: tuple[int, int], row_top: int) -> tuple[str | None, str | None]:
+        """Phase 5.15 Pass 2 (ground-truth-guided, live-verified against
+        the completed Aranda reference estimate): a dedicated sibling of
+        `_read_category_selector_at()`, used ONLY by `verify_commit()`.
+        Applies the SAME OCR fixes Phase 5.12 already proved live for
+        `read_populated_fields()` -- psm=6 (not the `_ocr_text()`
+        default psm=7) for the selector crop, and picking the LONGEST
+        whitespace-separated token (not `split()[0]`) so a stray
+        leading OR trailing artifact never wins over the real code --
+        plus the same locally-widened, letters-only category crop.
+        Live-caught: this exact class of noise (RFG misread as RFC,
+        DOR misread as DO!) was independently confirmed still present
+        in `verify_commit()`'s OCR during Phase 5.14/5.15 ground-truth
+        comparison, downgrading objectively correct commits to
+        QUANTITY_MISMATCH/REVIEW_REQUIRED trust states for no real
+        reason -- see verify_commit()'s own docstring point 7.
+
+        Deliberately NOT a change to `_read_category_selector_at()`
+        itself, which `snapshot_grid_identities()` (and therefore group
+        verification's probe-lifecycle proof, Phase 5.9A/5.10C) also
+        depends on -- this phase's instructions are explicit that group
+        verification must not be touched without a new, independently
+        reproduced defect, and none was found there this phase."""
+        dx = offset[0]
+
+        def crop_col(col_name):
+            col_l, col_r = _GRID_COLUMNS[col_name]
+            return image.crop((col_l + dx, row_top, col_r + dx, row_top + _GRID_ROW_HEIGHT))
+
+        cat_l, _cat_r = _GRID_COLUMNS["category"]
+        sel_l, _sel_r = _GRID_COLUMNS["selector"]
+        cat_crop = image.crop((cat_l + dx, row_top, sel_l + dx, row_top + _GRID_ROW_HEIGHT))
+        cat_crop = cat_crop.resize((cat_crop.width * 4, cat_crop.height * 4))
+        cat_raw = self._ocr_text(cat_crop, psm=6).strip()
+        cat_letters_match = re.match(r"[A-Za-z]+", cat_raw)
+        cat = (cat_letters_match.group(0) if cat_letters_match else cat_raw) or None
+
+        sel_crop = crop_col("selector")
+        sel_crop = sel_crop.resize((sel_crop.width * 4, sel_crop.height * 4))
+        sel_raw = self._ocr_text(sel_crop, psm=6).strip()
+        sel = max(sel_raw.split(), key=len) if sel_raw else None
+        return cat, sel
+
+    def snapshot_grid_identities(self, row_top_nudge: int = 0) -> list[tuple[str | None, str | None]]:
         """Returns [(category, selector), ...] top-to-bottom for every
         row currently in the grid. Used by `delete_existing_item()` to
         independently verify, before AND after, that exactly the
@@ -2637,7 +2680,27 @@ class WindowsXactimateAdapter(XactimateAdapter):
         before `commit_item()` -- so the committed row can be
         identified structurally (row-count delta across the whole
         select-through-commit sequence) rather than by searching OCR
-        text across every row."""
+        text across every row.
+
+        `row_top_nudge` (Phase 5.15 Pass 2, default 0 -- identical to
+        every existing caller's behavior): shifts every row crop by
+        this many pixels before OCR. Added ONLY for
+        `_verify_group_once()`'s post-cleanup re-verification, which
+        live-caught a heavily-populated group (Roof, 15 pre-existing
+        rows -- the first time this session a probe cycle ran against
+        a group this large) reproducibly reading every row as garbage
+        even though the grid content was visibly, confirmably
+        unchanged: the header's own "Cat" label was independently
+        re-located correctly (`_anchor_offset()` is fine), but the
+        FIXED header-to-first-data-row gap baked into
+        `_ANCHORS["grid_row_1"]` (24px) measured ~6px too tall for
+        this specific window state (real gap ~18px), so a crop exactly
+        one row-height tall landed on a thin sliver of two different
+        rows instead of one whole row -- confirmed by direct pixel
+        measurement and by sweeping small vertical nudges until clean
+        reads reappeared. Not a transient timing issue (identical,
+        stable misread across 5+ independent re-captures over
+        multiple seconds), so a bare retry loop would not have helped."""
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
@@ -2646,7 +2709,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if geom is None:
             return []
         row_count, _ = geom
-        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1] + row_top_nudge
         return [
             self._read_category_selector_at(image, offset, row_1_top + i * _GRID_ROW_HEIGHT)
             for i in range(row_count)
@@ -2859,7 +2922,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     )
                 row_top = self._shifted_anchor("grid_row_1", offset)[1] + row_index * _GRID_ROW_HEIGHT
 
-                cat_observed, sel_observed = self._read_category_selector_at(image, offset, row_top)
+                cat_observed, sel_observed = self._read_category_selector_for_verify_commit(image, offset, row_top)
                 description_observed = self._read_description_at(image, offset, row_top)
                 quantity_observed = self._read_quantity_at(image, offset, row_top)
                 unit_raw, _unit_norm_unused = self._read_unit_at(image, offset, row_top)
@@ -3982,13 +4045,31 @@ class WindowsXactimateAdapter(XactimateAdapter):
         reasonable shortcut for read-only display of an immutable
         label, but not safe to trust immediately before a MUTATING
         operation like right-clicking it to create a new group under
-        it -- see `ensure_group()`)."""
+        it -- see `ensure_group()`).
+
+        Live-caught (Phase 5.15 Pass 2, Stage 17): this crop is only
+        ~18px tall at native resolution, which reproduced as
+        unreliable on its own -- the SAME unscaled row-0 crop of a
+        clearly-legible "TEST" label OCR'd as pure empty string in one
+        capture and as "TESTO"-type noise in another, on a tree with
+        very few rows (2 groups) where this method had not previously
+        been exercised. A 4x upscale before OCR (the same factor
+        already used for reliable small-text reads elsewhere in this
+        file, e.g. `_read_category_selector_for_verify_commit`) was
+        verified live to consistently keep the real text as the
+        leading recognized token; a wider test sweep (3x-8x) showed
+        6x+ actually makes recognition worse, so 4x -- not "more is
+        better" -- is the deliberate choice. `_group_name_matches()`
+        already tolerates the residual trailing OCR noise via
+        substring/fuzzy matching, so this only needs to get the real
+        text recognized at all, not pixel-perfect."""
         left, top = header_pos[0], header_pos[1]
         row_top = self._group_tree_row_crop_top(top, row_index)
         crop = image.crop((
             left + self._GROUP_TREE_TEXT_DX, row_top,
             left + self._GROUP_TREE_TEXT_DX + self._GROUP_TREE_TEXT_WIDTH, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT,
         ))
+        crop = crop.resize((crop.width * 4, crop.height * 4))
         return self._ocr_text(crop, psm=7).strip()
 
     def _reset_group_creation_stickiness(self) -> None:
@@ -4817,10 +4898,70 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     if baseline_identities:
                         after_identities = self.snapshot_grid_identities()
                         if after_identities != baseline_identities:
-                            raise ProbeCleanupFailedError(
-                                f"_verify_group_once({group_name!r}): pre-existing rows changed during probe "
-                                f"cleanup -- before={baseline_identities!r} after={after_identities!r}."
-                            )
+                            # Phase 5.15 Pass 2 (live-caught): a heavily
+                            # populated group's fixed header-to-row1
+                            # pixel gap can measure a few px off from
+                            # the general calibration (confirmed: the
+                            # header's own position independently
+                            # re-locates correctly, but the row crop
+                            # then straddles two real rows instead of
+                            # one, garbling every read identically and
+                            # stably -- not a one-off timing fluke, see
+                            # `snapshot_grid_identities()`'s
+                            # `row_top_nudge` docstring). Re-derive it
+                            # with a small bounded vertical search,
+                            # picking the nudge whose row set matches
+                            # the known-correct baseline most closely.
+                            #
+                            # Live-caught, same investigation: even at
+                            # the best-aligned nudge, 3 of 15 selectors
+                            # (all otherwise correct: same category,
+                            # same length) each showed exactly ONE
+                            # substituted character ("300S" -> "3008",
+                            # "VENTCP5" -> "VENTCP:", "ALUSW+" ->
+                            # "ALUSW:") -- ordinary small-crop OCR
+                            # noise on a densely-populated grid, not a
+                            # sign cleanup touched the wrong row (row
+                            # count and every category already agree
+                            # exactly; `_cleanup_probe_item()` also
+                            # independently re-confirms the deleted
+                            # row's own identity before every deletion,
+                            # so a wrong-row cancel is already guarded
+                            # against upstream of this check). Reusing
+                            # `check_category_selector_match()`'s
+                            # existing truncation tolerance is not
+                            # enough here (mid-string substitution, not
+                            # a prefix drop), so this adds one narrow,
+                            # evidence-matched tolerance on top of it:
+                            # a single same-position character swap in
+                            # an equal-length selector. Never tolerates
+                            # a category mismatch, a length mismatch,
+                            # or more than one differing character.
+                            def _row_close_enough(expected, observed) -> bool:
+                                match = check_category_selector_match(*expected, *observed)
+                                if match.match_state in ("exact_match", "normalized_match"):
+                                    return True
+                                exp_cat, exp_sel = expected
+                                obs_cat, obs_sel = observed
+                                if exp_cat != obs_cat or not exp_sel or not obs_sel:
+                                    return False
+                                if len(exp_sel) != len(obs_sel):
+                                    return False
+                                return sum(1 for a, b in zip(exp_sel, obs_sel) if a != b) <= 1
+
+                            recovered = False
+                            for nudge in (0, -10, -8, -6, -4, -2, 2, 4):
+                                candidate = after_identities if nudge == 0 else self.snapshot_grid_identities(row_top_nudge=nudge)
+                                if len(candidate) == len(baseline_identities) and all(
+                                    _row_close_enough(exp, obs) for exp, obs in zip(baseline_identities, candidate)
+                                ):
+                                    recovered = True
+                                    break
+                            if not recovered:
+                                raise ProbeCleanupFailedError(
+                                    f"_verify_group_once({group_name!r}): pre-existing rows changed during probe "
+                                    f"cleanup -- before={baseline_identities!r} after={after_identities!r}."
+                                )
                 except ProtectedCommittedRowError:
                     # Phase 5.5D: never swallowed -- this means cleaning
                     # up the disposable probe would have deleted a row
@@ -4847,10 +4988,37 @@ class WindowsXactimateAdapter(XactimateAdapter):
     _PROBE_SETTLE_POLL_S = 0.15
     _PROBE_SETTLE_TIMEOUT_S = 3.0
 
-    def _last_row_identity(self, image, offset, row_count) -> tuple[str | None, str | None]:
-        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+    def _last_row_identity(self, image, offset, row_count, row_top_nudge: int = 0) -> tuple[str | None, str | None]:
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1] + row_top_nudge
         last_row_top = row_1_top + (row_count - 1) * _GRID_ROW_HEIGHT
         return self._read_category_selector_at(image, offset, last_row_top)
+
+    def _last_row_identity_matching_probe(self, image, offset, row_count) -> tuple[str | None, str | None]:
+        """Phase 5.15 Pass 2 (live-caught): same root cause as
+        `snapshot_grid_identities()`'s `row_top_nudge` (see its
+        docstring) -- on a group already holding many rows, appending
+        the probe pushes the grid past whatever triggers the
+        header-to-row1 gap drift, so the UNNUDGED read of the probe's
+        own last row can come back as something else entirely (live-
+        reproduced on Roof at 16 rows: read as neither the probe's own
+        CAT/SEL nor anything resembling the real last row, twice in a
+        row -- `_cleanup_probe_item()` correctly refused to guess and
+        raised rather than delete an unidentified row). Tries a small,
+        bounded set of vertical nudges and returns the FIRST one that
+        reads back as EXACTLY the probe's own known CAT/SEL (never a
+        fuzzy/tolerant match -- there is no ambiguity to resolve here,
+        only a fixed constant to find). Falls back to the unnudged
+        read, unchanged, if no nudge finds it -- preserving the exact
+        original "genuinely a different row" contradiction-detection
+        behavior when the last row really isn't the probe."""
+        probe_identity = (self._VERIFY_GROUP_PROBE_CATEGORY, self._VERIFY_GROUP_PROBE_SELECTOR)
+        unnudged = self._last_row_identity(image, offset, row_count)
+        if unnudged == probe_identity:
+            return unnudged
+        for nudge in (-10, -8, -6, -4, -2, 2, 4):
+            if self._last_row_identity(image, offset, row_count, row_top_nudge=nudge) == probe_identity:
+                return probe_identity
+        return unnudged
 
     def _wait_for_probe_visible(self, target_row_count: int) -> str:
         """Phase 5.9A/5.10C: bounded-poll for the disposable group-
@@ -4910,7 +5078,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             last_identity = None
             outcome = None
             if row_count is not None and row_count > target_row_count:
-                last_identity = self._last_row_identity(image, offset, row_count)
+                last_identity = self._last_row_identity_matching_probe(image, offset, row_count)
                 if last_identity == probe_identity:
                     outcome = "observed"
                 elif last_identity in ((None, None), (None, ""), ("", None), ("", "")) or not any(last_identity):
@@ -5005,7 +5173,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if row_count is None:
                 time.sleep(0.3)
                 continue
-            identity = self._last_row_identity(image, offset, row_count)
+            identity = self._last_row_identity_matching_probe(image, offset, row_count)
             if identity != probe_identity:
                 raise ProbeCleanupFailedError(
                     f"_cleanup_probe_item(): refusing to delete the last row -- its identity {identity!r} does "

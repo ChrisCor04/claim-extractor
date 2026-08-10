@@ -164,7 +164,24 @@ def score_dropdown_candidate(
     component_clean = component if component and component != "unknown" else ""
     component_words = {w for w in re.findall(r"[a-z0-9]+", component_clean.replace("_", " "))}
     candidate_words = set(re.findall(r"[a-z0-9]+", candidate_text))
-    component_ok = not component_words or _any_word_matches(component_words, candidate_words)
+    # Phase 5.15 Pass 2 (ground-truth-guided, live-caught): a candidate
+    # like "Clean {V}" is Xactimate's own GENERIC TEMPLATE entry for a
+    # cleaning labor item applicable to any surface -- the literal "{v}"
+    # placeholder (still present after normalize_description(), which
+    # only touches punctuation/whitespace/case) is Xactimate's OWN
+    # catalog-formatting signal that this description was never meant
+    # to restate a specific component word at all, structurally unlike
+    # every other component check here. Requiring a literal component-
+    # word match against a placeholder is not evidence of a real
+    # mismatch -- confirmed live: "Clean Fence" (component="fence")
+    # against "Clean {V}" hard-capped to 0.45 (wrong_component) even
+    # though this is exactly the correct reference answer for generic
+    # surface-cleaning carrier rows this catalog has no per-component
+    # selector for. Narrow and objective (checks Xactimate's own
+    # placeholder syntax, not source vocabulary) -- never fires for an
+    # ordinary candidate that simply omits the component word.
+    candidate_is_generic_template = "{v}" in candidate_text
+    component_ok = not component_words or candidate_is_generic_template or _any_word_matches(component_words, candidate_words)
     component_score = 1.0 if component_ok else 0.0
 
     # Phase 5.6 (live-caught): when normalization didn't extract a
@@ -474,6 +491,19 @@ def rank_dropdown_results(
     return scored
 
 
+#: Phase 5.15 Pass 2 (ground-truth-guided, live-verified against the
+#: completed Aranda reference estimate): score_dropdown_candidate()'s
+#: weighted-AVERAGE formula (see its own comment) makes 1.0 reachable
+#: ONLY when description_score is a literal exact/near-exact text match
+#: AND every other APPLICABLE dimension (component/material/size/
+#: grade/action) independently scored a full MATCH -- there is no
+#: partial-credit path to exactly 1.0. This is categorically stronger
+#: evidence than "close by raw score": it means the source description
+#: and the candidate agree on every dimension the ranker actually
+#: checked. See classify_decision()'s own use of this threshold below.
+_EXACT_MATCH_SCORE_THRESHOLD = 0.999
+
+
 def classify_decision(candidates: list[RankedCandidate], config: RankingConfig) -> str:
     """Never automatically returns AUTO_SELECT for an empty or single
     weak result -- see build spec 'Do not automatically choose the first
@@ -494,6 +524,38 @@ def classify_decision(candidates: list[RankedCandidate], config: RankingConfig) 
 
     second_score = candidates[1].score if len(candidates) > 1 else 0.0
     if (top.score - second_score) < config.auto_select_margin:
-        return DECISION_REVIEW_REQUIRED
+        # Phase 5.15 Pass 2 (live-caught against ground truth):
+        # margin alone was refusing candidates that are, semantically,
+        # not really "close" at all -- live-reproduced against the
+        # completed Aranda reference on 10 separate rows (gable
+        # cornice return vs cornice STRIP, roof jack vs roof vent,
+        # 1 coat vs 2 coats, single vs double garage door opening,
+        # steep-profile "Standard" vs "High", color vs mill finish,
+        # dump TRAILER vs dump TRUCK, R&R door opener vs its CLEAN-only
+        # variant, laminated shingles w/out felt vs w/ felt): in every
+        # one, the top candidate scored the maximum reachable 1.0
+        # (full agreement across every checked dimension -- see
+        # _EXACT_MATCH_SCORE_THRESHOLD's own docstring) while the
+        # runner-up, despite scoring close by raw fuzzy-text distance,
+        # could never also reach 1.0 -- its own description genuinely
+        # differs from the source in some dimension the ranker already
+        # checks. A numeric gap between "everything matches" and
+        # "something doesn't" is not the kind of ambiguity margin
+        # exists to catch -- margin exists to catch two candidates
+        # that are BOTH strong, equally-plausible answers (confirmed
+        # against two genuine reference ties: two identically-worded
+        # candidates in different real categories, and a real 3-way
+        # tie for "Lighting Installer - Electrician - per hour",
+        # where the reference itself uses a different selector in
+        # different instances -- this override never fires for either,
+        # since the runner-up is ALSO exactly 1.0 there). Deliberately
+        # NOT "lower the margin" (a global threshold change) and NOT
+        # per-row/per-selector special-casing -- this is a single,
+        # narrow, evidence-based exception keyed only on the ranker's
+        # own strongest possible signal.
+        exact_top = top.score >= _EXACT_MATCH_SCORE_THRESHOLD
+        exact_tie = second_score >= _EXACT_MATCH_SCORE_THRESHOLD
+        if not (exact_top and not exact_tie):
+            return DECISION_REVIEW_REQUIRED
 
     return DECISION_AUTO_SELECT

@@ -472,6 +472,12 @@ SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION = "verified_search_description"
 SEARCH_TYPE_EXACT_DESCRIPTION = "exact_description"
 SEARCH_TYPE_NORMALIZED_DESCRIPTION = "normalized_description"
 SEARCH_TYPE_COMPACT_GENERATED_PHRASE = "compact_generated_phrase"
+#: Phase 5.15 Pass 2: last-resort fallback for cleaning-intent rows
+#: whose component-specific search cannot reach Xactimate's own
+#: generic "Clean {V}"-style template catalog entries -- see
+#: _description_first_search_attempts()'s own comment for the live
+#: evidence and exact scope (action_search_terms resolves to "clean").
+SEARCH_TYPE_GENERIC_CLEANING_FALLBACK = "generic_cleaning_fallback"
 SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL = "trusted_observed_cat_sel"
 
 #: Decision/stop_reason combinations that mean "try the next attempt" --
@@ -541,6 +547,30 @@ def _description_first_search_attempts(
         task.description, task.normalized_component, task.normalized_material, task.normalized_action, phrase_rules,
     )
     _add(SEARCH_TYPE_COMPACT_GENERATED_PHRASE, phrase_result.phrase, phrase_result=phrase_result)
+
+    # Phase 5.15 Pass 2 (ground-truth-guided, live-verified against the
+    # completed Aranda reference estimate): a component-specific
+    # cleaning search (e.g. "Clean Fence") structurally cannot find
+    # Xactimate's own GENERIC "Clean {V}"-style template entries --
+    # every component-specific search above (exact/normalized/compact,
+    # all of which include the component word "fence") returns
+    # component-specific candidates whose descriptions genuinely never
+    # mention "clean" (wrong_action-capped), while a search for "clean"
+    # alone live-confirmed CLN/AV ("Clean {V}") as the top Xactimate
+    # result -- the reference's own actual answer for "Clean Fence".
+    # Scoped narrowly and evidence-based: ONLY when the resolved action
+    # search term is literally "clean" (the one case actually live-
+    # tested), tried only as a LAST-RESORT attempt after every
+    # component-specific attempt above has already failed to produce a
+    # defensible result -- never a replacement for searching the real
+    # source wording first. Not fence-specific: the same "clean" action
+    # term fires for any "Clean [component]" carrier row (wall, siding,
+    # floor, ...), matching score_dropdown_candidate()'s companion
+    # fix that stops a template candidate's missing component word
+    # from being scored as a hard conflict.
+    action_term = phrase_rules.action_search_terms.get(task.normalized_action or "")
+    if action_term == "clean":
+        _add(SEARCH_TYPE_GENERIC_CLEANING_FALLBACK, action_term)
 
     # Phase 5.7A: CAT/SEL remains the LAST resort -- every description
     # attempt above is tried and must fail (no_results/extraction-

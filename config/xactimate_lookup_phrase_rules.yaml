@@ -92,6 +92,7 @@ material_keywords:
   - ["copper", "copper"]
   - ["fiberglass", "fiberglass"]
   - ["laminate", "laminate"]
+  - ["concrete", "concrete"]
   - ["granite", "granite"]
   - ["marble", "marble"]
   - ["quartz", "quartz"]
