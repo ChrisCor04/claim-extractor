@@ -257,6 +257,41 @@ class PopupCaptureFailedError(AdapterError):
     be silently reported as if Xactimate found nothing."""
 
 
+class RowOffscreenError(AdapterError):
+    """Phase 6.2 (live-caught): raised by enter_quantity() when the
+    pending row's computed screen position still falls outside the
+    captured client area after the bounded scroll-into-view sequence
+    exhausts its attempts. Every row-position calculation in this file
+    is document-coordinate arithmetic (row_1_top + row_index *
+    _GRID_ROW_HEIGHT) with no awareness of the actual visible viewport
+    -- fine as long as a group never grows past ~15 rows (true for
+    every group in this project's history until Phase 6.0's clean-
+    TEST benchmark first grew Roof past that boundary), but silently
+    unsafe once it does: clicking a Y coordinate beyond the window's
+    own client height either hits nothing or hits whatever else is at
+    that pixel, live-reproduced as two RFG/STEEP logical items (#171,
+    #172) both landing at quantity 0 instead of their real 33.66/35.67
+    -- the click for each item's "+" row computed a Y past the visible
+    window and missed the quantity cell entirely. Raising here instead
+    of clicking blind is the actual fix: fail closed, never silently
+    write into an unverified location."""
+
+
+class QuantityNotConfirmedError(AdapterError):
+    """Phase 6.2 (live-caught): raised by enter_quantity() when the
+    quantity cell, read back immediately after typing (before any
+    caller can call commit_item()), does not show the value that was
+    just typed. This is the safety net that catches ANY targeting
+    failure -- not just the off-screen case RowOffscreenError guards
+    against, but also a stale/wrong row position, a click that missed
+    the cell for some other reason, or the value failing to take for
+    any reason -- by requiring positive, read-back proof the source
+    quantity is visible on the pending item BEFORE commit, rather than
+    discovering a $0 row only after the fact (exactly what happened
+    live to task_line_0018/0019: both committed successfully per the
+    plan's own bookkeeping, with quantity silently left at 0)."""
+
+
 @dataclass(slots=True)
 class DropdownCaptureDiagnostics:
     """Phase 5.8: one search's popup-lifecycle timeline, in monotonic
@@ -1485,7 +1520,21 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # height and PSM for the same reason: take the max valid count
         # across everything tried rather than trust any single
         # combination.
-        combos = [(100, 6, 2), (100, 6, 3), (400, 11, 2), (400, 6, 2)]
+        # Phase 6.2 (live-caught): the original 400px ceiling here is
+        # exactly 16 rows (400 / _GRID_ROW_HEIGHT) -- a second, INDEPENDENT
+        # cap from the scroll-into-view fix in enter_quantity(): even
+        # after scrolling genuinely brings a 17th+ row into the visible
+        # client area, this method's own crop never extended far enough
+        # to include it, live-reproduced as a hard ceiling of 16
+        # regardless of scroll position (the crop is anchored to, and
+        # moves WITH, the header -- scrolling shifts what's captured,
+        # never how MUCH). Added two larger-crop combos rather than
+        # raising the existing ones in place, preserving every
+        # previously-tuned (height, psm, scale) combination exactly as
+        # calibrated; max() below already takes the largest count found
+        # across all combos, so this can only ever increase, never
+        # decrease, an otherwise-correct read.
+        combos = [(100, 6, 2), (100, 6, 3), (400, 11, 2), (400, 6, 2), (600, 11, 2), (600, 6, 2)]
         counts = [len(rows_at(h, psm, scale)) for h, psm, scale in combos]
         return max(counts)
 
@@ -2121,6 +2170,61 @@ class WindowsXactimateAdapter(XactimateAdapter):
             item_number=None,
         )
 
+    def _scroll_grid_body(self, hwnd: int, notches: int = 2) -> None:
+        """Phase 6.2 (live-caught): scrolls the estimate items pane via
+        a simulated mouse wheel, always downward -- the only direction
+        ever needed, since a newly-added row is always the last one.
+        Live-confirmed this scrolls the WHOLE right-side content pane
+        (search box, thumbnail gallery, and Quick Entry all shrink away
+        first, before the grid itself gains visible rows), not a grid-
+        only scroll region -- fine for every caller here, since nothing
+        downstream of a quantity-entry/row-read depends on the search
+        box or thumbnails staying visible, and every row-position
+        calculation in this file is anchor-relative (the 'Cat:' header
+        is re-located fresh from each new capture), so it transparently
+        benefits once the header itself has scrolled higher on screen.
+        The scroll target point is computed from the CURRENT grid
+        anchor (never a fixed/cached screen position), so this remains
+        correct across window sizes and after earlier scrolling."""
+        image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+        if offset is None:
+            return
+        row_1 = self._shifted_anchor("grid_row_1", offset)
+        gx, gy = row_1[0] + 300, row_1[1] + 100
+        ctypes, _ = self._win32()
+        user32 = ctypes.windll.user32
+        ox, oy = self._get_client_origin(hwnd)
+        user32.SetCursorPos(ox + gx, oy + gy)
+        time.sleep(0.05)
+        MOUSEEVENTF_WHEEL = 0x0800
+        WHEEL_DELTA = 120
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -WHEEL_DELTA * notches, 0)
+
+    #: Phase 6.2: bounded scroll-into-view budget -- live-measured 3
+    #: notches (~0.6s settle each) reliably brought a row 1 position
+    #: beyond the original 15-row-tall viewport into view; this is a
+    #: multiple of that observed requirement, not a guess, and remains
+    #: a bounded, fail-closed retry (never an unbounded wait/scroll).
+    _SCROLL_INTO_VIEW_MAX_ATTEMPTS = 8
+
+    #: Phase 6.2 (live-caught): a row sitting exactly at the ragged
+    #: bottom edge of the captured client area -- technically within
+    #: `image.height`, per pure arithmetic -- is where _count_grid_rows()
+    #: itself is least reliable: its own OCR of that row's '#' column
+    #: can fail right at the edge, silently undercounting the TRUE row
+    #: count by one and making a caller compute "last row" one row too
+    #: high. Live-reproduced: a targeted click landed on the confirmed-
+    #: correct row directly ABOVE the true newest (still-pending, still
+    #: at quantity 0) row. Requiring a full extra row of margin below
+    #: the target -- not just "the target's own row fits" -- gives the
+    #: count itself room to be trustworthy before this file ever acts
+    #: on it.
+    _ROW_VISIBILITY_MARGIN_ROWS = 1
+
+    def _row_is_visible(self, image, row_top: int) -> bool:
+        margin = self._ROW_VISIBILITY_MARGIN_ROWS * _GRID_ROW_HEIGHT
+        return row_top >= 0 and row_top + _GRID_ROW_HEIGHT + margin <= image.height
+
     def enter_quantity(self, quantity: float) -> None:
         hwnd = self._ensure_main_window()
 
@@ -2134,8 +2238,24 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # verify_quantity_committed() below; bounded polling replaces
         # what was previously a single-shot check-and-raise. See
         # docs/xactimate-lookup.md Phase 4.5.
+        #
+        # Phase 6.2 (live-caught): _count_grid_rows()/_last_row_geometry()
+        # can ONLY see rows within the current captured client area --
+        # once a group already holds enough rows to fill the visible
+        # viewport, a genuinely-added new row is invisible to this same
+        # read, indistinguishable from "nothing happened yet" (live-
+        # reproduced: row_count stuck at a hard ceiling of 15 in a
+        # controlled long-grid trial, "row count did not increase"
+        # raised even though Xactimate had, in fact, added the row).
+        # Scrolling down is always a safe, correct action to interleave
+        # with the wait here -- if the new row is off-screen, this
+        # reveals it (row_count genuinely increases past the old
+        # ceiling); if there's truly nothing new, scrolling is a no-op
+        # and this still times out exactly as before.
         start = time.time()
         geom = None
+        scroll_attempts = 0
+        scrolled = False
         while True:
             image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
             if offset is not None:
@@ -2146,19 +2266,91 @@ class WindowsXactimateAdapter(XactimateAdapter):
                         break
             if self._unexpected_dialog_present():
                 raise AdapterError("enter_quantity(): an unexpected dialog appeared while waiting for the new grid row.")
-            if time.time() - start >= 3.0:
+            if time.time() - start >= 3.0 and scroll_attempts < self._SCROLL_INTO_VIEW_MAX_ATTEMPTS:
+                self._scroll_grid_body(hwnd, notches=2)
+                scrolled = True
+                scroll_attempts += 1
+                time.sleep(0.5)
+                continue
+            if time.time() - start >= 8.0:
                 if offset is None:
                     raise AdapterError("Could not locate the grid to enter quantity.")
                 if geom is None:
                     raise AdapterError("No grid row found to enter quantity into.")
                 raise AdapterError(
                     f"Expected a new grid row after selection but row count did not increase "
-                    f"within 3.0s (last observed row_count={geom[0]}, "
-                    f"expected > {self._last_selected_row_count_before})."
+                    f"within 8.0s, including {scroll_attempts} scroll-into-view attempts (last observed "
+                    f"row_count={geom[0]}, expected > {self._last_selected_row_count_before})."
                 )
             time.sleep(0.3)
 
         row_count, last_row_top = geom
+
+        # Phase 6.2 (live-caught): row_count having increased proves the
+        # row EXISTS, but says nothing about whether its computed screen
+        # Y position is actually within the visible client area --
+        # live-reproduced root cause of task_line_0018/0019 both landing
+        # at quantity 0: clicking a Y coordinate past the window's own
+        # client height either misses everything or hits whatever else
+        # happens to be there. Never click blind here -- bounded,
+        # feedback-driven scroll until the target row is positively
+        # visible, or fail closed. Only runs when actually needed (an
+        # earlier version of this scrolled unconditionally on every
+        # call, which regressed the ordinary short-grid case -- see
+        # _row_is_visible's own margin, already generous, as the single
+        # source of truth for "needs scrolling").
+        if not self._row_is_visible(image, last_row_top):
+            for _attempt in range(self._SCROLL_INTO_VIEW_MAX_ATTEMPTS):
+                self._scroll_grid_body(hwnd, notches=2)
+                scrolled = True
+                time.sleep(0.5)
+                image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+                if offset is None:
+                    continue
+                geom = self._last_row_geometry(image, offset)
+                if geom is None:
+                    continue
+                row_count, last_row_top = geom
+                if self._row_is_visible(image, last_row_top):
+                    break
+            else:
+                raise RowOffscreenError(
+                    f"enter_quantity(): the pending row (computed y={last_row_top}) never became visible "
+                    f"within the client area (height={image.height}) after "
+                    f"{self._SCROLL_INTO_VIEW_MAX_ATTEMPTS} scroll-into-view attempts -- refusing to click "
+                    f"a coordinate outside the captured viewport."
+                )
+
+        # Phase 6.2 (live-caught): _count_grid_rows() can still undercount
+        # by exactly one even once the computed row IS comfortably
+        # visible -- live-reproduced: a click landed on the row ABOVE the
+        # true newest one, which sat untouched at quantity 0 one row
+        # further down. The only fully reliable signal that a row is the
+        # genuine pending target is its OWN content: a freshly-added,
+        # not-yet-quantified row reads back as 0/blank. If the row this
+        # arithmetic landed on is NOT blank, the true pending row is the
+        # very next one down. Checked only once (never looped): a real,
+        # still-blank target is the overwhelmingly common case, and this
+        # is a correction for a specific, bounded failure mode, not a
+        # general search. Only fires when the existing row already has
+        # a real quantity -- an ordinary blank/new row is left alone.
+        existing_qty = self._read_quantity_at(image, offset, last_row_top)
+        if existing_qty is not None and existing_qty != 0:
+            candidate_row_top = last_row_top + _GRID_ROW_HEIGHT
+            if self._row_is_visible(image, candidate_row_top):
+                last_row_top = candidate_row_top
+            else:
+                self._scroll_grid_body(hwnd, notches=2)
+                scrolled = True
+                time.sleep(0.5)
+                image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+                if offset is not None:
+                    geom = self._last_row_geometry(image, offset)
+                    if geom is not None and geom[0] > row_count:
+                        row_count, last_row_top = geom
+                    else:
+                        last_row_top = candidate_row_top
+
         col_l, col_r = _GRID_COLUMNS["quantity"]
         dx = offset[0]
         qx = (col_l + col_r) // 2 + dx
@@ -2182,6 +2374,50 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # margin. See docs/xactimate-lookup.md Phase 4.4.
         time.sleep(1.0)
 
+        # Phase 6.2 (live-caught): read back the value BEFORE any caller
+        # can call commit_item() -- this is the actual safety net, not
+        # just the off-screen guard above: it also catches a stale/wrong
+        # row position, a click that missed the cell for any other
+        # reason, or a value that simply failed to take. Never commit a
+        # quantity that cannot be positively confirmed on-screen first
+        # (exactly the gap that let task_line_0018/0019 both commit
+        # successfully, per the plan's own bookkeeping, with quantity
+        # silently left at 0).
+        #
+        # Live-caught while building this very check: reusing the PRE-
+        # edit `last_row_top` here is itself unsafe -- committing the
+        # Tab keypress can shift the grid's own repaint/scroll position
+        # (confirmed live: a correct, successfully-typed value read back
+        # as None because the row had moved by the time this ran).
+        # Re-locates the row fresh, same as every other read in this
+        # file, rather than trusting a coordinate computed before the
+        # edit that just happened.
+        image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+        observed = None
+        if offset is not None:
+            geom = self._last_row_geometry(image, offset)
+            if geom is not None:
+                _, confirm_row_top = geom
+                observed = self._read_quantity_at(image, offset, confirm_row_top, min_votes=1, enhance_contrast=True)
+        if observed is None or abs(observed - quantity) > 0.01:
+            raise QuantityNotConfirmedError(
+                f"enter_quantity({quantity:g}): read back {observed!r} from the pending row immediately "
+                f"after typing -- refusing to let this proceed to commit with an unconfirmed quantity."
+            )
+
+        # Phase 6.2 (live-caught): _scroll_grid_body() scrolls the WHOLE
+        # right-side content pane, not just the grid -- live-reproduced
+        # a subsequent, unrelated search_by_category_selector() call
+        # malfunctioning (typed straight into the wrong field) after an
+        # earlier enter_quantity() call left the page scrolled away from
+        # its expected top position. Every OTHER method in this file
+        # implicitly assumes the page starts at the top (the same
+        # invariant _reset_scroll_state() exists to restore elsewhere);
+        # restoring it here, but ONLY if this call actually scrolled,
+        # keeps the ordinary short-grid case exactly as fast as before.
+        if scrolled:
+            self._reset_scroll_state()
+
     def read_quantity(self) -> float | None:
         """Not part of the abstract XactimateAdapter contract -- an
         adapter-specific helper used by the quantity validation trials
@@ -2199,15 +2435,44 @@ class WindowsXactimateAdapter(XactimateAdapter):
         _row_count, last_row_top = geom
         return self._read_quantity_at(image, offset, last_row_top)
 
-    def _read_quantity_at(self, image, offset: tuple[int, int], row_top: int) -> float | None:
+    def _read_quantity_at(
+        self, image, offset: tuple[int, int], row_top: int, *, min_votes: int = 2, enhance_contrast: bool = False
+    ) -> float | None:
         """Crops and reads the Quantity cell at an ARBITRARY row_top --
         extracted from `read_quantity()` (Phase 4.7) so the same
         live-verified reading strategy can be applied to a specific,
         identity-verified row (`verify_commit()`), not just "whatever
-        the last row is"."""
+        the last row is".
+
+        `min_votes`/`enhance_contrast` (Phase 6.2, defaults identical to
+        every existing caller's behavior): every PRIOR caller reads an
+        already-committed, no-longer-selected row (plain white
+        background) -- exactly what the careful multi-scale calibration
+        below was tuned against. enter_quantity()'s new pre-commit
+        read-back (Stage 11) reads the row WHILE still selected/
+        highlighted (light blue background, live-confirmed via a saved
+        crop), which broke that calibration outright: a real, clearly-
+        legible "5" got zero of three scales agreeing (native read "5"
+        correctly but alone; 4x/6x both misread the identical crop),
+        and a real "1" got EVERY scale misreading it as a bare "|" with
+        no digit for the numeric regex to find at all -- not a close
+        call, a totally different failure mode from the tuned-for
+        white-background case. `enhance_contrast=True` grayscales then
+        binarizes (threshold 160) the crop before OCR, which fixed the
+        "1" case at every scale live -- but live-verified to actively
+        REGRESS the untouched white-background case (a known-good
+        "33.66" read back as pure noise at every scale once binarized),
+        so it is opt-in, never the default. `min_votes=1` accepts a
+        single confident read once contrast is enhanced -- proportionate
+        given this check only needs to catch GROSS failures (a click
+        that missed entirely, reading back None/0), not replace the
+        stricter, independent, unweakened post-commit
+        verify_quantity_committed() that still runs afterward."""
         col_l, col_r = _GRID_COLUMNS["quantity"]
         dx = offset[0]
         crop = image.crop((col_l + dx, row_top, col_r + dx, row_top + _GRID_ROW_HEIGHT))
+        if enhance_contrast:
+            crop = crop.convert("L").point(lambda p: 0 if p < 160 else 255)
         # Live-caught (Phase 4.3): at native resolution Tesseract can drop
         # a decimal point entirely (visually present but sub-pixel at this
         # crop size) -- "2.5" read back as "25" with no punctuation at
@@ -2253,7 +2518,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if not votes:
             return None
         best_value, best_count = max(votes.items(), key=lambda kv: kv[1])
-        return best_value if best_count >= 2 else None
+        return best_value if best_count >= min_votes else None
 
     def _read_unit_at(self, image, offset: tuple[int, int], row_top: int) -> tuple[str | None, str | None]:
         """Crops and reads the Unit cell at an ARBITRARY row_top,

@@ -26,8 +26,10 @@ from estimate_extractor.xactimate_lookup.windows_adapter import (
     GroupRowSnapshot,
     PopupCaptureFailedError,
     PopupNotFoundError,
+    QuantityNotConfirmedError,
     QuantityVerificationResult,
     ReconciliationResult,
+    RowOffscreenError,
     StaleCandidateError,
     UnitVerificationResult,
     WindowsXactimateAdapter,
@@ -3431,3 +3433,222 @@ def test_destructive_action_auditor_writes_one_json_line_per_call(tmp_path):
     assert entry["reason"] == "disposable_group_probe"
     assert entry["run_id"] == "run_1"
     assert entry["result"] == "deleted"
+
+
+# ---------------------------------------------------------------------
+# Phase 6.2 (live-caught): task_line_0018/0019 both committed
+# successfully, per the plan's own bookkeeping, with quantity silently
+# left at 0. Root cause: every row-position calculation in enter_
+# quantity() is pure document-coordinate arithmetic (row_1_top +
+# row_index * _GRID_ROW_HEIGHT) with no awareness of whether that
+# position is actually within the captured client area -- safe as long
+# as a group never grew past ~15-16 rows (true for this project's
+# entire history until Phase 6.0's clean-TEST benchmark first grew
+# Roof past it), silently unsafe once it does. Fix: scroll the pending
+# row into view before ever clicking it (bounded, feedback-driven,
+# fails closed), then positively read back the typed value before
+# returning success (so a caller can never proceed to commit_item()
+# with an unconfirmed quantity). These tests exercise both mechanisms
+# directly, plus the specific undercount-by-one correction and the
+# short-grid negative control.
+# ---------------------------------------------------------------------
+
+
+class _FakeImage:
+    """Minimal stand-in for a captured screenshot -- enter_quantity()
+    only ever reads `.height` off it (via _row_is_visible()) and passes
+    it opaquely to mocked crop/read methods."""
+
+    def __init__(self, height=1023):
+        self.height = height
+
+
+def _mock_enter_quantity(
+    monkeypatch, adapter, *,
+    row_count, row_top, image_height=1023,
+    existing_qty_at_target=0.0,
+    scroll_effect=None,
+    confirmed_qty_offset=0.0,
+):
+    """Wires up every internal dependency enter_quantity() touches.
+    `scroll_effect`, if given, is called each time _scroll_grid_body()
+    is invoked and returns the NEW (row_count, row_top) the next
+    _capture_and_locate()/_last_row_geometry() pair should report --
+    lets a test simulate "scrolling reveals the row" without any real
+    UI. `confirmed_qty_offset` is added to the typed quantity for the
+    post-type read-back, so a test can simulate a mismatch."""
+    state = {"row_count": row_count, "row_top": row_top}
+    calls = {"scroll": 0, "reset_scroll": 0}
+
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=1, delay_s=0: (_FakeImage(image_height), (0, 0)))
+    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (state["row_count"], state["row_top"]))
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
+    monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: None)
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: calls.__setitem__("reset_scroll", calls["reset_scroll"] + 1))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    def fake_scroll(hwnd, notches=2):
+        calls["scroll"] += 1
+        if scroll_effect is not None:
+            new_count, new_top = scroll_effect(calls["scroll"])
+            state["row_count"], state["row_top"] = new_count, new_top
+
+    monkeypatch.setattr(adapter, "_scroll_grid_body", fake_scroll)
+
+    typed = {}
+
+    def fake_read_quantity_at(image, offset, row_top, *, min_votes=2, enhance_contrast=False):
+        if enhance_contrast:
+            # the post-type confirmation read -- answer relative to
+            # whatever was actually typed, at the CURRENT row_top
+            return typed.get("value", 0.0) + confirmed_qty_offset if row_top == state["row_top"] else None
+        # the "is this row already populated" check, keyed by row_top
+        return existing_qty_at_target if row_top == row_top else None
+
+    monkeypatch.setattr(adapter, "_read_quantity_at", fake_read_quantity_at)
+
+    original_enter_quantity = adapter.enter_quantity
+
+    def tracking_enter_quantity(quantity):
+        typed["value"] = quantity
+        return original_enter_quantity(quantity)
+
+    monkeypatch.setattr(adapter, "enter_quantity", tracking_enter_quantity)
+    return state, calls
+
+
+def test_enter_quantity_scrolls_when_target_row_is_below_viewport(monkeypatch):
+    """Item 1: a target row computed below the visible client area
+    must trigger scrolling, not an immediate blind click."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected_row_count_before = 15
+
+    def reveal(scroll_call_n):
+        return (16, 500)  # second read reports the row now comfortably on-screen
+
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=16, row_top=1050, image_height=1023,  # 1050 is off-screen
+        scroll_effect=reveal,
+    )
+    adapter.enter_quantity(1.0)
+    assert calls["scroll"] >= 1
+
+
+def test_enter_quantity_stops_scrolling_once_target_visible(monkeypatch):
+    """Item 2: scrolling must stop as soon as the target becomes
+    visible -- not continue for the full bounded budget regardless."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected_row_count_before = 15
+
+    def reveal(scroll_call_n):
+        return (16, 500)  # visible on the very first scroll attempt
+
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=16, row_top=1050, image_height=1023,
+        scroll_effect=reveal,
+    )
+    adapter.enter_quantity(1.0)
+    assert calls["scroll"] == 1  # never scrolled again once visible
+
+
+def test_enter_quantity_fails_closed_when_never_visible(monkeypatch):
+    """Item 3: a target row that never becomes visible within the
+    bounded budget must fail closed (RowOffscreenError), never click a
+    coordinate outside the captured viewport."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected_row_count_before = 15
+
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=16, row_top=1050, image_height=1023,
+        scroll_effect=lambda n: (16, 1050),  # never moves into view
+    )
+    with pytest.raises(RowOffscreenError):
+        adapter.enter_quantity(1.0)
+    assert calls["scroll"] == adapter._SCROLL_INTO_VIEW_MAX_ATTEMPTS
+
+
+def test_enter_quantity_does_not_scroll_when_already_visible(monkeypatch):
+    """Item 4: the ordinary, common case (target already comfortably
+    on-screen) must never scroll at all -- the fix must not slow down
+    or destabilize a short grid that never needed it."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected_row_count_before = None  # first row ever -- always "an increase"
+
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
+    )
+    adapter.enter_quantity(1.0)
+    assert calls["scroll"] == 0
+    assert calls["reset_scroll"] == 0  # never scrolled -- nothing to reset either
+
+
+def test_enter_quantity_confirms_quantity_before_returning(monkeypatch):
+    """Item 5: a successful call must have positively read back the
+    typed value -- not merely assume the click+type worked."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected_row_count_before = None
+
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
+    )
+    adapter.enter_quantity(33.66)  # must not raise -- read-back mock echoes the typed value
+
+
+def test_enter_quantity_raises_when_confirmation_mismatches(monkeypatch):
+    """Item 6: a read-back that disagrees with the typed value must
+    hard-block -- this is the actual safety net that catches a
+    targeting failure enter_quantity()'s other checks might miss."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected_row_count_before = None
+
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
+        confirmed_qty_offset=-33.66,  # read-back always comes back as 0
+    )
+    with pytest.raises(QuantityNotConfirmedError):
+        adapter.enter_quantity(33.66)
+
+
+def test_enter_quantity_advances_past_an_already_populated_row(monkeypatch):
+    """Item 8: live-caught undercount-by-one -- if the row the
+    arithmetic landed on already has a real (non-zero) quantity, that
+    is evidence it's an EXISTING row, not the new pending one; the true
+    target is the next row down. A task must never be able to silently
+    overwrite a different, already-committed row's quantity."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected_row_count_before = 15
+
+    written_rows = []
+    orig_click = None
+
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=16, row_top=600, image_height=1023,
+        existing_qty_at_target=9.0,  # the computed row is already populated
+    )
+
+    def tracking_click(hwnd, x, y):
+        written_rows.append(y)
+
+    monkeypatch.setattr(adapter, "_click_client", tracking_click)
+    adapter.enter_quantity(1.0)
+    assert written_rows[-1] > 600  # clicked a row further down than the (already-populated) computed one
+
+
+def test_enter_quantity_resets_scroll_state_after_scrolling(monkeypatch):
+    """Complement of item 4: when scrolling WAS needed, the page must
+    be returned to its expected top position afterward -- live-caught
+    a subsequent, unrelated search malfunctioning after a prior
+    enter_quantity() call left the page scrolled away mid-page."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected_row_count_before = 15
+
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=16, row_top=1050, image_height=1023,
+        scroll_effect=lambda n: (16, 500),
+    )
+    adapter.enter_quantity(1.0)
+    assert calls["reset_scroll"] == 1
