@@ -324,7 +324,31 @@ def execute_plan(
 
     outcome.populated_fields = populated
 
-    if (populated.category, populated.selector) != (top.dropdown.category, top.dropdown.selector):
+    # Phase 5.12 (live-caught): select_candidate() already independently
+    # proves the correct candidate was clicked via an exact live UI-
+    # Automation TEXT match (never OCR) -- this check is defense-in-
+    # depth against Xactimate itself doing something unexpected post-
+    # click, not a re-litigation of a click already proven correct by
+    # stronger evidence. A raw strict-equality comparison here was
+    # cancelling objectively correct, already-verified selections purely
+    # on OCR noise (live-reproduced: WDR/SCRN< read back as WD/. --
+    # see check_category_selector_match()'s own docstring for the full
+    # mechanism). Duck-typed (only WindowsXactimateAdapter implements
+    # it, like check_unit_compatibility above) -- adapters without it
+    # keep the original strict-equality behavior unchanged.
+    if hasattr(adapter, "check_category_selector_match"):
+        match_result = adapter.check_category_selector_match(
+            top.dropdown.category, top.dropdown.selector, populated.category, populated.selector,
+        )
+        if match_result.match_state not in ("exact_match", "normalized_match"):
+            _cancel_pending_selection(adapter)
+            return _stop(
+                item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_FIELD_MISMATCH,
+                f"Populated fields ({populated.category}/{populated.selector}) differ from the selected "
+                f"candidate ({top.dropdown.category}/{top.dropdown.selector}): {match_result.reason}",
+                candidates=candidates, selected=top,
+            )
+    elif (populated.category, populated.selector) != (top.dropdown.category, top.dropdown.selector):
         _cancel_pending_selection(adapter)
         return _stop(
             item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_FIELD_MISMATCH,

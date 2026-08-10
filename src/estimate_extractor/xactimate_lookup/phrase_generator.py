@@ -27,6 +27,20 @@ DEFAULT_PHRASE_RULES_PATH = Path(__file__).resolve().parents[3] / "config" / "xa
 # confirmed against real Phase 3.6 catalog entries like '1/2° drywall -
 # hung, taped...').
 _NUM = r"\d+(?:[./]\d+)?"
+#: Phase 5.12 (live-caught): a two-dimension size like "16' x 7'" was
+#: being reduced to just "16" by the single-number pattern below (the
+#: first NUM match anywhere in the text), making it indistinguishable
+#: from a genuinely different "16' x 8'" candidate -- live-reproduced
+#: as R&R Overhead door & hardware - 16' x 7' scoring only an 0.0338
+#: margin over the wrong 16'x8' variant, too thin to clear AUTO_SELECT
+#: even though the correct candidate scored a perfect 1.0. Used ONLY by
+#: extract_dimension_pair() below (ranking's size comparison), never by
+#: extract_size_term() (search-phrase generation) -- see that
+#: function's own docstring for why the two must stay separate.
+#: Deliberately only captures the first two numbers (not a third, e.g.
+#: lumber's "2\" x 4\" x 8'") -- narrow fix for the cited case, not a
+#: general N-dimension parser.
+_DIMENSION_PATTERN = re.compile(rf"\b({_NUM})\s*['\"]?\s*x\s*({_NUM})\s*['\"]?")
 _SIZE_PATTERNS = [
     re.compile(rf"\bup to {_NUM}\b"),
     re.compile(rf"\b{_NUM}\s*(?:-|to)\s*{_NUM}\b"),
@@ -83,7 +97,20 @@ def _strip_filler_phrases(text: str, filler_phrases: tuple[str, ...]) -> str:
 def extract_size_term(text: str) -> str | None:
     """Returns a canonical size term (unit word dropped, numeric/qualifier
     kept) or None. Always runs against the raw description text -- size
-    information is rarely present in Phase 2's normalized fields."""
+    information is rarely present in Phase 2's normalized fields.
+
+    Deliberately UNCHANGED by Phase 5.12's two-dimension work (see
+    extract_dimension_pair() below) -- this function's output also
+    feeds generate_search_phrase()'s literal Xactimate search-box query
+    text, and live testing proved a compound "16x7" token in the SEARCH
+    BOX (not just in ranking's own comparison) makes Xactimate's search
+    silently drop the correct candidate entirely (confirmed live:
+    'door 16x7' returns a completely different 10-row set than 'door
+    16', missing DOR/OH16 altogether), unlike 'fence wood 2x4' which
+    happened to work. Changing this shared function was too broad a
+    blast radius for a narrow fix -- extract_dimension_pair() is a
+    separate, additive function used ONLY by ranking.py's size
+    comparison, never by search-phrase generation."""
     for index, pattern in enumerate(_SIZE_PATTERNS):
         match = pattern.search(text)
         if not match:
@@ -98,6 +125,20 @@ def extract_size_term(text: str) -> str | None:
             term = _RANGE_SPACING.sub("-", term)
         return term
     return None
+
+
+def extract_dimension_pair(text: str) -> str | None:
+    """Returns a canonical "AxB" two-dimension term (e.g. "16x7") when
+    the text contains an "A x B" spec, or None. Phase 5.12: used ONLY by
+    ranking.py's size comparison to distinguish a source stating "16' x
+    7'" from a candidate stating a different second dimension ("16' x
+    8'") -- see _DIMENSION_PATTERN's docstring for why this is a
+    separate function from extract_size_term(), never fed into the
+    literal Xactimate search-box query text."""
+    match = _DIMENSION_PATTERN.search(text)
+    if not match:
+        return None
+    return f"{match.group(1)}x{match.group(2)}"
 
 
 def _word_boundary_search(keyword: str, text: str) -> bool:

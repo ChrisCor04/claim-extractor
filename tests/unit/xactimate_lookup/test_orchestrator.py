@@ -360,6 +360,67 @@ def test_field_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phra
     assert cancel_calls == [1]
 
 
+def test_category_selector_match_duck_typed_check_prevents_a_false_cancellation(tmp_path, phrase_rules, ranking_config, monkeypatch):
+    """Phase 5.12 (live-caught): a truncated/noisy OCR read of the
+    populated CAT/SEL (here simulating the live-reproduced 'WDR' ->
+    'WD' truncation) must NOT cancel an otherwise-correct, already
+    UI-Automation-verified selection when the adapter implements
+    check_category_selector_match() -- proves the orchestrator-level
+    wiring, not just the pure function in isolation."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", cat="RFG", sel="ARMV", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]})
+    adapter.supports_live_execution = True
+
+    from estimate_extractor.xactimate_lookup.models import PopulatedFields
+    from estimate_extractor.xactimate_lookup.windows_adapter import check_category_selector_match
+
+    # Truncated category ("RF" instead of "RFG"), matching the live-
+    # reproduced "WDR" -> "WD" case exactly.
+    monkeypatch.setattr(
+        adapter, "read_populated_fields",
+        lambda: PopulatedFields(category="RF", selector="ARMV", description=d.description, unit=None, action=None, item_number=None),
+    )
+    monkeypatch.setattr(adapter, "check_category_selector_match", check_category_selector_match, raising=False)
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+    assert outcome.stop_reason is None
+    assert outcome.committed is True
+
+
+def test_category_selector_match_duck_typed_check_still_catches_a_real_mismatch(tmp_path, phrase_rules, ranking_config, monkeypatch):
+    """Counterpart: a genuinely different, unrelated selector must still
+    stop and cancel even when check_category_selector_match() is
+    available -- the tolerant comparison must never become a rubber
+    stamp."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", cat="RFG", sel="ARMV", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]})
+    adapter.supports_live_execution = True
+
+    from estimate_extractor.xactimate_lookup.models import PopulatedFields
+    from estimate_extractor.xactimate_lookup.windows_adapter import check_category_selector_match
+
+    monkeypatch.setattr(
+        adapter, "read_populated_fields",
+        lambda: PopulatedFields(category="WRONG", selector="MISMATCH", description=None, unit=None, action=None, item_number=None),
+    )
+    monkeypatch.setattr(adapter, "check_category_selector_match", check_category_selector_match, raising=False)
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+    assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
+    assert outcome.committed is False
+    assert cancel_calls == [1]
+
+
 def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phrase_rules, ranking_config, monkeypatch):
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item(source_unit="SQ")

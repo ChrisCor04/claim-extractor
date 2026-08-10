@@ -24,7 +24,7 @@ from estimate_extractor.xactimate_lookup.models import (
     DropdownResult,
     RankedCandidate,
 )
-from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, extract_size_term
+from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, extract_dimension_pair, extract_size_term
 
 DEFAULT_RANKING_PATH = Path(__file__).resolve().parents[3] / "config" / "xactimate_lookup_ranking.yaml"
 
@@ -276,6 +276,28 @@ def score_dropdown_candidate(
                 size_ok = True
                 size_score = 0.5
                 size_state = "UNSPECIFIED"
+
+    # Phase 5.12 (live-caught): a two-dimension size ("16' x 7'") only
+    # ever contributed its FIRST number to size_key above (e.g. "16"),
+    # so a candidate stating a DIFFERENT second dimension ("16' x 8'")
+    # still counted as size_state=MATCH -- live-reproduced as "Overhead
+    # door & hardware - 16' x 7'" scoring 1.0 with the wrong 8'-tall
+    # variant right behind it at 0.9662, a margin too thin to clear
+    # AUTO_SELECT despite the correct candidate being an unambiguous
+    # exact match. extract_dimension_pair() (phrase_generator.py) is
+    # deliberately a SEPARATE function from the one that feeds the
+    # search-box query text (see its own docstring for why) -- this
+    # only ever STRENGTHENS an existing verdict to CONFLICT when the
+    # candidate explicitly states a different second dimension; it
+    # never downgrades an existing CONFLICT, and never fires when the
+    # source has no two-dimension spec at all.
+    source_dimension = extract_dimension_pair(original_description or "")
+    if source_dimension and size_state != "CONFLICT":
+        candidate_dimension = extract_dimension_pair(candidate_text)
+        if candidate_dimension and candidate_dimension != source_dimension:
+            size_ok = False
+            size_score = 0.0
+            size_state = "CONFLICT"
 
     # Phase 5.10A: same principle for the primary grade/style check --
     # a candidate stating NO grade/style qualifier at all is unspecified

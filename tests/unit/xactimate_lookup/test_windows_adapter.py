@@ -40,6 +40,7 @@ from estimate_extractor.xactimate_lookup.windows_adapter import (
     _normalize_unit_text,
     _resolve_observed_unit_vocab,
     _split_category_selector,
+    check_category_selector_match,
     check_unit_compatibility,
 )
 
@@ -629,6 +630,78 @@ def test_explicit_verified_conversion_is_used_when_present():
     finally:
         wa_mod._VERIFIED_UNIT_CONVERSIONS.clear()
         wa_mod._VERIFIED_UNIT_CONVERSIONS.update(original)
+
+
+# ---------------------------------------------------------------------
+# Phase 5.12 (live-caught): check_category_selector_match() -- pure
+# logic, no live session. select_candidate() already independently
+# proves the correct candidate was clicked via UI-Automation text
+# match; this function governs the SECOND, defense-in-depth check on
+# read_populated_fields()'s OCR read, which must tolerate known OCR
+# noise/truncation without ever tolerating a genuinely different real
+# catalog code.
+# ---------------------------------------------------------------------
+
+
+def test_category_selector_exact_match():
+    result = check_category_selector_match("SFG", "GUTA", "SFG", "GUTA")
+    assert result.match_state == "exact_match"
+
+
+def test_category_selector_truncated_category_is_normalized_match():
+    """Live-caught: 'WDR' read back as 'WD' (the category crop cutting
+    off the row's real 3rd letter) must not cancel an otherwise-correct
+    selection."""
+    result = check_category_selector_match("WDR", "SCRN<", "WD", "SCRN<")
+    assert result.match_state == "normalized_match"
+
+
+def test_category_selector_noisy_leading_character_is_normalized_match():
+    """Live-caught: a stray leading OCR artifact ('.') picked up
+    alongside a fully-legible real selector must not be treated as the
+    whole observed value once the real text is present too."""
+    result = check_category_selector_match("DOR", "OH16", "DOR", "OH16")
+    assert result.match_state == "exact_match"
+
+
+def test_category_selector_trailing_display_symbol_normalizes():
+    """The '<' in 'SCRN<' is a real, load-bearing part of this specific
+    catalog code (not noise) -- when both sides carry it, it's an exact
+    match; this just confirms the noise-stripping regex doesn't touch
+    '<' at all (see _CODE_OCR_NOISE_CHARS's own docstring)."""
+    result = check_category_selector_match("WDR", "SCRN<", "WDR", "SCRN<")
+    assert result.match_state == "exact_match"
+
+
+def test_category_selector_genuinely_different_selector_is_a_mismatch():
+    """A real grade variant (OH16- 'Standard grade') must NEVER be
+    tolerated as a truncation/noise match against a different real item
+    (OH16) -- catching a genuine wrong-click/wrong-item case is the
+    entire point of this check surviving at all."""
+    result = check_category_selector_match("DOR", "OH16", "DOR", "OH16-")
+    assert result.match_state == "mismatch"
+
+
+def test_category_selector_reverse_truncation_not_tolerated():
+    """One-directional only: observed being LONGER than / not a prefix
+    of expected must never be tolerated, even if superficially close --
+    every real OCR failure mode seen in this codebase drops characters,
+    it never invents ones that spell out a longer, different code."""
+    result = check_category_selector_match("OH16", "OH16", "OH16-", "OH16-")
+    assert result.match_state == "mismatch"
+
+
+def test_category_selector_unreadable_observed_is_not_a_mismatch():
+    """Matches check_unit_compatibility()'s own principle: OCR
+    producing nothing at all is inconclusive, not evidence of a wrong
+    selection -- reported as a distinct, honest 'unreadable' state."""
+    result = check_category_selector_match("SFG", "GUTA", None, None)
+    assert result.match_state == "unreadable"
+
+
+def test_category_selector_genuinely_different_category_is_a_mismatch():
+    result = check_category_selector_match("SFG", "GUTA", "RFG", "GUTA")
+    assert result.match_state == "mismatch"
 
 
 def test_quantity_match_does_not_override_unit_conflict():

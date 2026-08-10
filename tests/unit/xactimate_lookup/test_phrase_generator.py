@@ -125,3 +125,41 @@ def test_fraction_size_is_captured(phrase_rules):
 def test_fraction_size_with_word_unit(phrase_rules):
     r = pg.generate_search_phrase('Pipe insulation 1/2 inch', "pipe", None, None, rules=phrase_rules)
     assert "1/2" in r.phrase.split()
+
+
+# ---------------------------------------------------------------------
+# Phase 5.12 (live-caught): extract_dimension_pair() -- a two-dimension
+# size spec ("16' x 7'") deliberately kept SEPARATE from
+# extract_size_term() (used by generate_search_phrase()'s literal
+# Xactimate search-box query text) -- live testing proved a compound
+# "16x7" token in the search box itself makes Xactimate silently drop
+# the correct candidate (confirmed live: 'door 16x7' returns a
+# completely different 10-row set than 'door 16', missing the correct
+# DOR/OH16 entirely). extract_dimension_pair() is used ONLY by
+# ranking.py's size comparison, never fed into a live search query.
+# ---------------------------------------------------------------------
+
+
+def test_extract_dimension_pair_finds_a_two_dimension_spec():
+    assert pg.extract_dimension_pair("overhead door & hardware - 16' x 7'") == "16x7"
+
+
+def test_extract_dimension_pair_none_when_no_dimension_present():
+    assert pg.extract_dimension_pair("gutter splash guard") is None
+
+
+def test_extract_dimension_pair_none_for_a_single_number():
+    assert pg.extract_dimension_pair("roofing felt - 15 lb.") is None
+
+
+def test_extract_dimension_pair_distinguishes_a_different_second_dimension():
+    a = pg.extract_dimension_pair("overhead door & hardware - 16' x 7'")
+    b = pg.extract_dimension_pair("overhead door & hardware - 16' x 8'")
+    assert a != b
+
+
+def test_extract_size_term_unaffected_by_dimension_pair_work():
+    """Regression guard: extract_size_term() (search-phrase generation)
+    must keep returning just the first number for a two-dimension spec
+    -- extract_dimension_pair() is additive, never a replacement."""
+    assert pg.extract_size_term("overhead door & hardware - 16' x 7'") == "16"

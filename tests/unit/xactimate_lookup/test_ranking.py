@@ -194,6 +194,73 @@ def test_size_explicit_different_value_is_still_a_hard_conflict(phrase_rules, ra
     assert any("wrong_size" in r for r in candidates[0].conflict_reasons)
 
 
+# ---------------------------------------------------------------------
+# Phase 5.12 (live-caught): a two-dimension size ("16' x 7'") only ever
+# contributed its FIRST number to size_key (e.g. "16"), so a candidate
+# stating a DIFFERENT second dimension ("16' x 8'") still counted as
+# size_state=MATCH -- live-reproduced as "Overhead door & hardware -
+# 16' x 7'" scoring a perfect 1.0 with the wrong 8'-tall variant right
+# behind it at 0.9662, too thin a margin to clear AUTO_SELECT despite
+# the correct candidate being an unambiguous exact match.
+# ---------------------------------------------------------------------
+
+
+def test_two_dimension_size_conflict_is_caught_even_though_first_number_matches(phrase_rules, ranking_config):
+    source = "R&R Overhead door & hardware - 16' x 7'"
+    wrong_height = _dropdown("Overhead door & hardware - 16' x 8'", sel="OH16>")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="doors", component="garage_door", material=None,
+        action="remove_and_replace", unit="EA", size_key="16", grade_key=None,
+        dropdowns=[wrong_height], rules=phrase_rules, config=ranking_config,
+    )
+    assert candidates[0].has_hard_conflict
+    assert any("wrong_size" in r for r in candidates[0].conflict_reasons)
+
+
+def test_two_dimension_size_match_is_not_penalized(phrase_rules, ranking_config):
+    source = "R&R Overhead door & hardware - 16' x 7'"
+    correct = _dropdown("Overhead door & hardware - 16' x 7'", sel="OH16")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="doors", component="garage_door", material=None,
+        action="remove_and_replace", unit="EA", size_key="16", grade_key=None,
+        dropdowns=[correct], rules=phrase_rules, config=ranking_config,
+    )
+    assert not candidates[0].has_hard_conflict
+
+
+def test_two_dimension_conflict_gives_the_correct_candidate_a_real_margin(phrase_rules, ranking_config):
+    """The actual live bug: BOTH candidates used to score close enough
+    (1.0 vs 0.9662) that classify_decision() stayed REVIEW_REQUIRED even
+    though only one of them is the real match. This is the end-to-end
+    proof the fix restores a decisive margin."""
+    source = "R&R Overhead door & hardware - 16' x 7'"
+    correct = _dropdown("Overhead door & hardware - 16' x 7'", sel="OH16", pos=0)
+    wrong_height = _dropdown("Overhead door & hardware - 16' x 8'", sel="OH16>", pos=1)
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="doors", component="garage_door", material=None,
+        action="remove_and_replace", unit="EA", size_key="16", grade_key=None,
+        dropdowns=[correct, wrong_height], rules=phrase_rules, config=ranking_config,
+    )
+    assert candidates[0].dropdown.selector == "OH16"
+    assert (candidates[0].score - candidates[1].score) >= ranking_config.auto_select_margin
+    assert ranking.classify_decision(candidates, ranking_config) == DECISION_AUTO_SELECT
+
+
+def test_single_dimension_source_does_not_trigger_two_dimension_check(phrase_rules, ranking_config):
+    """No two-dimension spec in the source at all -- the new check must
+    never fire (source_dimension is None), leaving ordinary single-
+    number size comparison completely unaffected."""
+    d = _dropdown("Gutter - aluminum - up to 6\"", sel="GUTA6")
+    candidates = ranking.rank_dropdown_results(
+        original_description="R&R Gutter - aluminum - up to 5\"", trade="gutters", component="gutter",
+        material="aluminum", action="remove_and_replace", unit="LF", size_key="up to 5\"", grade_key=None,
+        dropdowns=[d], rules=phrase_rules, config=ranking_config,
+    )
+    # unchanged from the pre-existing single-number-size CONFLICT path --
+    # still caught, but via the original mechanism, not the new one.
+    assert any("wrong_size" in r for r in candidates[0].conflict_reasons)
+
+
 def test_prior_verified_mapping_boosts_score(phrase_rules, ranking_config):
     d = _dropdown("Roofing felt - 15 lb.", sel="FELT")
     without = ranking.rank_dropdown_results(

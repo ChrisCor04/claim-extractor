@@ -56,6 +56,7 @@ Windows.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -592,6 +593,114 @@ def check_unit_compatibility(
     )
 
 
+@dataclass(slots=True)
+class CategorySelectorMatchResult:
+    """Phase 5.12: same shape/philosophy as UnitVerificationResult above
+    -- pure, side-effect-free, directly unit-testable. `match_state` is
+    one of: "exact_match", "normalized_match", "unreadable", "mismatch".
+    See check_category_selector_match()'s own docstring."""
+
+    expected_category: str | None
+    expected_selector: str | None
+    observed_category: str | None
+    observed_selector: str | None
+    match_state: str
+    reason: str
+
+
+#: Phase 5.12 (live-caught): characters confirmed, live, to be OCR
+#: NOISE on this specific crop (a stray leading "." misread as the
+#: entire selector, a trailing "|" gridline-bleed artifact) -- never
+#: characters that distinguish one real catalog code from another.
+#: Deliberately EXCLUDES '<', '>', '+', '-': those are load-bearing
+#: parts of real, DIFFERENT selectors in this exact catalog (e.g.
+#: DOR/OH16 vs DOR/OH16- "Standard grade" vs DOR/OH16+ "High grade" vs
+#: DOR/OH16> "16'x8'" are four genuinely different items) -- stripping
+#: them would make check_category_selector_match() below silently
+#: treat different real items as the same one.
+_CODE_OCR_NOISE_CHARS = re.compile(r"[.|_\s]")
+
+
+def _clean_code_for_comparison(text: str | None) -> str:
+    return _CODE_OCR_NOISE_CHARS.sub("", text.strip().upper()) if text else ""
+
+
+def check_category_selector_match(
+    expected_category: str | None, expected_selector: str | None,
+    observed_category: str | None, observed_selector: str | None,
+) -> CategorySelectorMatchResult:
+    """Phase 5.12 (live-caught): `select_candidate()` already
+    independently proves the correct candidate was clicked, via an
+    exact live UI-Automation TEXT match against candidate.category/
+    selector (see that method's docstring) -- never OCR. This function
+    is what runs AFTER that, on the OCR read of the row's own cells
+    (`read_populated_fields()`), which exists as defense-in-depth
+    against Xactimate itself doing something unexpected post-click, not
+    to re-litigate a click already proven correct by stronger evidence.
+    A strict raw-equality comparison there was cancelling correct,
+    verified selections purely on OCR noise -- live-reproduced:
+    expected WDR/SCRN< read back as WD/. (a stray leading OCR artifact
+    picked as the "selector", and the category crop truncating a real
+    3-letter code by one character), which used to hard-cancel an
+    objectively correct match.
+
+    Tolerates, in EITHER category or selector independently:
+    - whitespace and the specific noise characters confirmed live
+      (".", "|", "_") -- never '<>+-', which are real, meaningful parts
+      of distinct catalog codes here (see _CODE_OCR_NOISE_CHARS).
+    - a ONE-DIRECTIONAL truncation: the observed text is a genuine
+      PREFIX of the expected text (e.g. "WD" prefix of "WDR", "SCRN"
+      prefix of "SCRN<") of at least 2 characters. Deliberately never
+      the reverse (observed longer than / not a prefix of expected) --
+      every OCR failure mode observed live in this codebase has been
+      characters DROPPED, never invented, so this can never mistake a
+      genuinely different, longer/unrelated code for a match.
+
+    Returns "unreadable" (not "mismatch") when the observed text is
+    empty/None -- OCR producing nothing is inconclusive, not evidence
+    of a wrong selection, matching check_unit_compatibility()'s own
+    "unreadable observed is not evidence of a mismatch" principle.
+    Still a stop condition downstream (an unreadable field can't
+    positively confirm anything either) -- just reported with an
+    honest, distinct reason."""
+
+    def result(state: str, reason: str) -> CategorySelectorMatchResult:
+        return CategorySelectorMatchResult(
+            expected_category=expected_category, expected_selector=expected_selector,
+            observed_category=observed_category, observed_selector=observed_selector,
+            match_state=state, reason=reason,
+        )
+
+    exp_cat, exp_sel = _clean_code_for_comparison(expected_category), _clean_code_for_comparison(expected_selector)
+    obs_cat, obs_sel = _clean_code_for_comparison(observed_category), _clean_code_for_comparison(observed_selector)
+
+    if not obs_cat or not obs_sel:
+        return result("unreadable", f"observed category/selector ({observed_category!r}/{observed_selector!r}) could not be read at all")
+
+    if exp_cat == obs_cat and exp_sel == obs_sel:
+        exact = (expected_category, expected_selector) == (observed_category, observed_selector)
+        return result(
+            "exact_match" if exact else "normalized_match",
+            "observed matches expected" + ("" if exact else " after normalizing whitespace/OCR noise characters"),
+        )
+
+    def is_tolerable(expected: str, observed: str) -> bool:
+        return expected == observed or (len(observed) >= 2 and expected.startswith(observed))
+
+    if is_tolerable(exp_cat, obs_cat) and is_tolerable(exp_sel, obs_sel):
+        return result(
+            "normalized_match",
+            f"observed {observed_category!r}/{observed_selector!r} is a truncated/noisy OCR read of "
+            f"expected {expected_category!r}/{expected_selector!r}",
+        )
+
+    return result(
+        "mismatch",
+        f"observed {observed_category!r}/{observed_selector!r} does not match, normalize to, or truncate from "
+        f"expected {expected_category!r}/{expected_selector!r}",
+    )
+
+
 def _split_category_selector(code: str) -> tuple[str, str]:
     """Xactimate catalog codes are always a fixed 3-letter category
     prefix followed by a variable-length selector, e.g. "SFGGUTA" ->
@@ -723,6 +832,22 @@ class WindowsXactimateAdapter(XactimateAdapter):
         #: docstring. Live diagnostics only, never consulted for
         #: pass/fail decisions.
         self.last_probe_visibility_polls: list[dict] = []
+        #: Phase 5.12: click-target diagnostics from the MOST RECENT
+        #: select_candidate() call -- row index/bounds/click x,y and the
+        #: row's own UIA text immediately before the click, proving (or
+        #: disproving) that the automation clicked the intended
+        #: candidate row. Never consulted for pass/fail decisions --
+        #: select_candidate()'s own live text-match against
+        #: candidate.category/selector (see its docstring) is what
+        #: already guarantees correctness; this is diagnostic-only.
+        self.last_candidate_click: dict | None = None
+        #: Phase 5.12: the 3 individual OCR reads read_populated_fields()
+        #: majority-votes over (see that method's docstring), kept
+        #: separately so a caller diagnosing a populated-fields mismatch
+        #: can see whether the 3 reads agreed (a stable, real read) or
+        #: disagreed (transient OCR noise) instead of only the final
+        #: voted value.
+        self.last_populated_fields_reads: list[dict] = []
 
     # ------------------------------------------------------------------
     # Phase 5.5D: committed-row protection + destructive-call audit
@@ -1715,6 +1840,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
         rect = target_elem.CurrentBoundingRectangle
         cx = (rect.left + rect.right) // 2
         cy = (rect.top + rect.bottom) // 2
+        #: Phase 5.12 Stage 3: recorded BEFORE the click -- row_text is
+        #: the row's own live UIA text (the same text select_candidate()
+        #: just verified matches candidate.category/selector above), not
+        #: OCR, so this is authoritative proof of which row was about to
+        #: be clicked.
+        self.last_candidate_click = {
+            "expected_category": candidate.category, "expected_selector": candidate.selector,
+            "row_position": match.row_position,
+            "row_text_before_click": match.code_text,
+            "row_bounds": (rect.left, rect.top, rect.right, rect.bottom),
+            "click_xy": (cx, cy),
+        }
         self._click_screen(cx, cy)
         if self.last_dropdown_diagnostics is not None:
             self.last_dropdown_diagnostics.selection_clicked_at = time.monotonic()
@@ -1798,6 +1935,17 @@ class WindowsXactimateAdapter(XactimateAdapter):
         #: genuinely wrong selection, so this is a reliability
         #: improvement, not a substitute for that safety check.
         reads = [self._read_populated_fields_once() for _ in range(3)]
+        #: Phase 5.12 Stage 2: the 3 raw reads BEFORE majority voting --
+        #: see self.last_populated_fields_reads' own docstring in
+        #: __init__. Distinguishes "all 3 reads agree on a genuinely
+        #: different value" (a real OCR/alignment problem) from "reads
+        #: disagree with each other" (ordinary per-read noise the vote
+        #: already absorbs).
+        self.last_populated_fields_reads = [
+            {"category": r.category, "selector": r.selector, "description": r.description,
+             "unit": r.unit, "action": r.action}
+            for r in reads
+        ]
 
         def majority(values):
             counts: dict[str | None, int] = {}
@@ -1841,22 +1989,57 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # psm=7 (single line) misreads "RFG" as "RFC" on this crop size --
         # psm=6 (single uniform block) reads it correctly at every scale
         # tested (1x-8x); see docs/xactimate-lookup.md Phase 4.4 Stage 3.
-        cat_crop = crop_col("category")
+        #
+        # Phase 5.12 (live-caught): _GRID_COLUMNS["category"]'s right
+        # edge (539, 559) is calibrated tight enough that a real
+        # 3-letter code can lose its last glyph entirely ("WDR" -> "WD",
+        # a clean drop, tolerated by check_category_selector_match()'s
+        # truncation logic) OR have it PARTIALLY cropped into noise
+        # ("DOR" -> "DO!", live-reproduced -- not a clean truncation,
+        # which the same tolerance correctly refuses to accept, since a
+        # partial glyph misread as a different real character isn't
+        # distinguishable from a genuine wrong-selector case by that
+        # logic alone). Widened LOCALLY here (not in the shared
+        # _GRID_COLUMNS dict, which _read_category_selector_at() also
+        # uses for probe/commit identity verification -- Phase 5.9/
+        # 5.10C's extensively-validated mechanism -- and must not be
+        # touched by this fix) up to column boundary's own left edge,
+        # using all the real gap available before the selector column
+        # legitimately starts.
+        cat_l, _cat_r = _GRID_COLUMNS["category"]
+        sel_l, _sel_r = _GRID_COLUMNS["selector"]
+        cat_crop = image.crop((cat_l + dx, row_top, sel_l + dx, row_top + _GRID_ROW_HEIGHT))
         cat_crop = cat_crop.resize((cat_crop.width * 4, cat_crop.height * 4))
-        cat = self._ocr_text(cat_crop, psm=6)
+        cat_raw = self._ocr_text(cat_crop, psm=6).strip()
+        # A real category code is always pure letters (RFG, WDR, DOR,
+        # HVC, ...) -- the wider crop above can now legitimately bleed
+        # into the selector column's leading character for a short
+        # selector, so only the leading alphabetic run is kept,
+        # discarding anything from the first non-letter character on.
+        cat_letters_match = re.match(r"[A-Za-z]+", cat_raw)
+        cat = cat_letters_match.group(0) if cat_letters_match else cat_raw
         sel_crop = crop_col("selector")
         sel_crop = sel_crop.resize((sel_crop.width * 4, sel_crop.height * 4))
         # Live-caught (Phase 4.7): the selector crop can visually
         # include the neighboring activity symbol for a short code
         # (e.g. real "GUTA" OCR'd as "GUTA &") -- see
         # `_read_category_selector_at()`'s docstring for the full
-        # explanation. Keeping only the first whitespace-separated
-        # token is safe since a real selector never contains a space.
-        sel_raw = self._ocr_text(sel_crop).strip()
-        sel = sel_raw.split()[0] if sel_raw else ""
+        # explanation. Phase 5.12 (live-caught): that fix assumed the
+        # stray token always TRAILS the real selector -- reproduced
+        # live, a freshly-selected (not yet quantity-entered) row's
+        # selector crop OCR'd as ". SCRN<" (a stray LEADING artifact),
+        # which the original `split()[0]` picked as "." instead of the
+        # real "SCRN<". A real selector code is always the LONGEST
+        # whitespace-separated token (stray artifacts observed live are
+        # always 1-2 characters: ".", "|", "&"; every real selector
+        # seen is 3+), so picking the longest token handles both the
+        # leading- and trailing-artifact cases without assuming which
+        # side the noise lands on.
+        sel_raw = self._ocr_text(sel_crop, psm=6).strip()
+        sel = max(sel_raw.split(), key=len) if sel_raw else ""
         act_crop = crop_col("activity")
         act_crop = act_crop.resize((act_crop.width * 4, act_crop.height * 4))
-        act = self._ocr_text(act_crop)
+        act = self._ocr_text(act_crop, psm=6)
         desc = self._normalize_inch_mark(self._ocr_text(crop_col("description"), psm=6))
         # Unit renders as an active combobox (with a dropdown-arrow glyph
         # immediately to its right, text shifted ~13px left) if the row
@@ -1874,7 +2057,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # sign at that scale); 6x reads it correctly across every PSM
         # tested. See docs/xactimate-lookup.md Phase 4.4 Stage 3.
         unit_crop = unit_crop.resize((unit_crop.width * 6, unit_crop.height * 6))
-        unit = self._ocr_text(unit_crop)
+        # Phase 5.12 (live-caught): this call never got the psm=6 fix
+        # applied to category/description/selector/activity above --
+        # left at _ocr_text()'s default psm=7, which live-reproduced a
+        # clean, correctly-cropped "EA" (confirmed by saving and
+        # visually inspecting the actual crop) reading back as garbage
+        # ("_|FA |") purely from the wrong page-segmentation mode, not a
+        # crop/alignment problem. psm=6 reads the identical crop
+        # correctly.
+        unit = self._ocr_text(unit_crop, psm=6)
 
         return PopulatedFields(
             category=cat or None,
@@ -2501,6 +2692,17 @@ class WindowsXactimateAdapter(XactimateAdapter):
         See the module-level function's own docstring for the actual
         compatibility logic (unchanged, reused as-is)."""
         return check_unit_compatibility(source_unit, expected_xactimate_unit, observed_xactimate_unit)
+
+    def check_category_selector_match(
+        self, expected_category: str | None, expected_selector: str | None,
+        observed_category: str | None, observed_selector: str | None,
+    ) -> CategorySelectorMatchResult:
+        """Not part of the abstract contract (Phase 5.12). Thin instance
+        wrapper around the pure, module-level
+        `check_category_selector_match()`, exactly like
+        `check_unit_compatibility` above -- see that function's own
+        docstring for the actual comparison logic."""
+        return check_category_selector_match(expected_category, expected_selector, observed_category, observed_selector)
 
     def verify_commit(
         self,
