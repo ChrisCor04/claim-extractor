@@ -538,3 +538,139 @@ def test_light_qualifier_marker_does_not_false_positive_on_unrelated_light_candi
         dropdowns=[unrelated], rules=phrase_rules, config=ranking_config,
     )
     assert not any("grade" in r or "style" in r for r in candidates[0].conflict_reasons)
+
+
+# ---------------------------------------------------------------------
+# Phase 5.18: _below_floor_semantic_dominance() -- 0016 (Power Attic Vent
+# Cover) and 0039 (Clean Fence) both scored below auto_select_min
+# (0.88) despite being the correct, unambiguous top candidate, because
+# an absolute score floor alone can't tell a genuinely uncertain match
+# apart from one that's just missing a component/material/size/grade
+# signal that was never present in the source text to begin with. The
+# override is deliberately narrow -- score >= 0.70, no hard conflict,
+# reliable extraction, a genuine positive action-match signal, a strict
+# 0.20 margin (2.5x the ordinary 0.08), and a runner-up ceiling of 0.60
+# -- and every condition below is tested in isolation so a future edit
+# can't loosen one without a targeted test catching it. These are the
+# Stage 3 negative controls: real near-miss shapes the override must
+# NOT fire on, built BEFORE (well, alongside -- see phase log)
+# broadening this override any further.
+# ---------------------------------------------------------------------
+
+
+def _below_floor_ranked(score, match_reasons=None, conflict_reasons=None, conf=0.95, cat="RFG", sel="X"):
+    return RankedCandidate(
+        dropdown=_dropdown("d", cat=cat, sel=sel, conf=conf), score=score,
+        match_reasons=match_reasons or [], conflict_reasons=conflict_reasons or [],
+    )
+
+
+def test_below_floor_dominance_fires_when_every_condition_is_met(ranking_config):
+    top = _below_floor_ranked(0.80, match_reasons=["action 'install' matches"])
+    runner_up = _below_floor_ranked(0.55, sel="Y")
+    assert ranking.classify_decision([top, runner_up], ranking_config) == DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_blocked_by_hard_conflict():
+    """Negative control: 'different component/material' shape -- a
+    conflict caps the practical score anyway, but even if a conflicted
+    candidate somehow still posted a high score, has_hard_conflict must
+    veto the override on its own."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.80, match_reasons=["action 'install' matches"], conflict_reasons=["wrong_material: 'copper' not found"])
+    runner_up = _below_floor_ranked(0.55, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) != DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_blocked_by_wrong_size_conflict():
+    """Negative control: 'wrong dimensions' shape."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.80, match_reasons=["action 'install' matches"], conflict_reasons=["wrong_size: '12' not found"])
+    runner_up = _below_floor_ranked(0.55, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) != DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_blocked_by_wrong_component_conflict():
+    """Negative control: 'different component' shape."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.80, match_reasons=["action 'install' matches"], conflict_reasons=["wrong_component: candidate is 'gutter', source is 'fence'"])
+    runner_up = _below_floor_ranked(0.55, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) != DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_blocked_by_thin_margin():
+    """Negative control: 'multiple generic items close together' shape
+    -- score and no-conflict alone are not enough if the runner-up is
+    close (0.15 margin, under the strict 0.20 requirement), even though
+    that margin would clear the ordinary 0.08 auto_select_margin."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.80, match_reasons=["action 'install' matches"])
+    runner_up = _below_floor_ranked(0.65, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) != DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_blocked_by_runner_up_ceiling_even_with_wide_margin():
+    """Negative control: 'genuine close low-score alternative' shape --
+    live-caught (0016 vs the real RFG/PAVRS competitor): a runner-up
+    scoring >= 0.60 represents a real, defensible competing
+    interpretation and must veto the override even when the raw margin
+    arithmetic alone would clear 0.20 (0.85 - 0.60 == 0.25)."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.85, match_reasons=["action 'install' matches"])
+    runner_up = _below_floor_ranked(0.60, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) != DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_blocked_without_a_positive_action_match_signal():
+    """Negative control: score/margin/no-conflict alone must not be
+    read as 'action intent confirmed' -- e.g. a source with no action
+    verb at all (action_term is None) trivially never conflicts, but
+    that is not the same as positive evidence the action is right."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.80)  # no "action ... matches" entry
+    runner_up = _below_floor_ranked(0.55, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) != DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_blocked_below_the_absolute_minimum_score():
+    """Negative control: even a clean, wide-margin, action-confirmed
+    top candidate must not be promoted if its own absolute score is
+    still genuinely weak (< 0.70) -- the override raises confidence in
+    an uncertain-but-plausible match, it does not manufacture certainty
+    out of a low score."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.65, match_reasons=["action 'install' matches"])
+    runner_up = _below_floor_ranked(0.30, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) != DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_blocked_by_low_extraction_confidence():
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.80, match_reasons=["action 'install' matches"], conf=0.5)
+    runner_up = _below_floor_ranked(0.55, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) != DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_untouched_when_top_already_clears_the_ordinary_floor():
+    """The new branch lives strictly inside `top.score < auto_select_min`
+    in classify_decision() -- confirms it cannot suppress an ordinary
+    AUTO_SELECT that never needed it."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.95)  # no action-match reason, no override needed
+    runner_up = _below_floor_ranked(0.30, sel="Y")
+    assert ranking.classify_decision([top, runner_up], config) == DECISION_AUTO_SELECT
+
+
+def test_below_floor_dominance_real_0016_shape_correctly_refuses_to_fire():
+    """Live-caught regression lock (Phase 5.18): 0016's real full
+    candidate list (RFG/PAVCRS top, RFG/PAVRS runner-up) reduces to a
+    true margin of ~0.0555 once the genuine competing candidate is
+    included -- well under the strict 0.20 requirement. An earlier,
+    simplified 2-candidate offline reconstruction of this row (omitting
+    PAVRS) showed a misleadingly wide 0.31 margin and would have wrongly
+    cleared the override; this test locks in the real, full-candidate
+    shape so that mistake can't silently recur."""
+    config = ranking.load_ranking_config()
+    top = _below_floor_ranked(0.7958, match_reasons=["action 'install' matches"], cat="RFG", sel="PAVCRS")
+    runner_up = _below_floor_ranked(0.7403, cat="RFG", sel="PAVRS")
+    assert ranking.classify_decision([top, runner_up], config) == DECISION_REVIEW_REQUIRED

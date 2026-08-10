@@ -1891,14 +1891,29 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # active group pops a real "Duplicate Item(s)" modal ("SFG GUTA
         # already exists in UTILITY_ROO2, Continue?", Yes/No) instead of
         # silently adding/updating anything. Per the adapter contract this
-        # is always a hard stop -- never guessed through, never
-        # auto-dismissed here. recover() is what presses Escape afterward.
+        # is a hard stop by default -- never guessed through -- UNLESS
+        # _is_intentional_duplicate() (Phase 5.18) can positively prove,
+        # from THIS session's own ProtectedRowLedger, that the existing
+        # row was committed by a DIFFERENT task than the one running now
+        # (a genuinely separate source line legitimately mapping to the
+        # same CAT/SEL in the same group -- live-confirmed real for
+        # Xactimate's own paired add/remove steep-roof-surcharge
+        # convention, both entries sharing RFG/STEEP). Still fails closed
+        # for every uncertain case: no execution context, nothing
+        # protected yet with this CAT/SEL, or -- the actual dangerous
+        # case this guards against -- the CURRENT task's own task_id
+        # already appears among the protected rows (a retry of an
+        # already-committed task, which must never silently double-add).
+        # recover() is what presses Escape after a genuine hard stop.
         if self._unexpected_dialog_present():
-            raise UnexpectedDialogError(
-                f"Unexpected dialog appeared after selecting {candidate.category}/{candidate.selector} "
-                f"(observed live: Xactimate's own 'Duplicate Item(s)' confirmation when the candidate "
-                f"already exists in the active group)."
-            )
+            if self._is_intentional_duplicate(candidate):
+                self._handle_duplicate_item_dialog()
+            else:
+                raise UnexpectedDialogError(
+                    f"Unexpected dialog appeared after selecting {candidate.category}/{candidate.selector} "
+                    f"(observed live: Xactimate's own 'Duplicate Item(s)' confirmation when the candidate "
+                    f"already exists in the active group)."
+                )
 
         self._last_selected = candidate
 
@@ -2324,6 +2339,33 @@ class WindowsXactimateAdapter(XactimateAdapter):
         cy = (yes_pos[1] + yes_pos[3]) // 2
         self._click_client(hwnd, cx, cy)
         time.sleep(0.5)
+        return True
+
+    def _is_intentional_duplicate(self, candidate: DropdownResult) -> bool:
+        """Phase 5.18 (live-caught): a REAL task's own Duplicate Item(s)
+        dialog (select_candidate()'s hard-stop above) is legitimate to
+        confirm -- not merely tolerable, like the disposable probe's --
+        ONLY when this session's own ProtectedRowLedger proves the
+        existing row was committed by a DIFFERENT task than the one
+        running now (e.g. Xactimate's own paired add/remove steep-roof-
+        surcharge convention, where two separate source lines both
+        legitimately map to RFG/STEEP in the same group). Fails closed
+        -- returns False -- for every case that isn't positively proven:
+        no execution context set, nothing protected yet in this group
+        with this exact CAT/SEL (a genuinely unexpected duplicate has no
+        such record to point to), or -- the actual danger this guards
+        against -- the CURRENT task's own task_id already appears among
+        the protected rows for this CAT/SEL (a retry of an already-
+        committed task, which must never silently double-add a row)."""
+        ctx = self._execution_context
+        if ctx is None or not ctx.task_id:
+            return False
+        existing = self._protected_row_ledger.records_for_group(ctx.group)
+        matching = [r for r in existing if r.category == candidate.category and r.selector == candidate.selector]
+        if not matching:
+            return False
+        if any(r.task_id == ctx.task_id for r in matching):
+            return False
         return True
 
     def _dismiss_stray_results_popup(self) -> bool:
@@ -3563,6 +3605,19 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 left + self._GROUP_TREE_TEXT_DX, row_top,
                 left + self._GROUP_TREE_TEXT_DX + self._GROUP_TREE_TEXT_WIDTH, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT,
             ))
+            # Phase 5.18 (live-caught): this is the SAME ~18px-tall
+            # native-resolution crop _ocr_group_tree_row_text() was
+            # already fixed for in Phase 5.15 -- a separate, duplicate
+            # inline crop+OCR call here never got the same fix. Live-
+            # reproduced: a real "Fencing" row (5th row, after two
+            # nested Elevation children) read as just "ee" here while
+            # _ocr_group_tree_row_text() on the identical crop position
+            # correctly read "is Fencing | ee" -- same crop rectangle,
+            # only the missing upscale differs. See that method's own
+            # docstring for the full live-caught evidence and the 4x
+            # choice (a wider sweep found 6x+ actually makes recognition
+            # worse, so this is deliberately not "more is better").
+            crop = crop.resize((crop.width * 4, crop.height * 4))
             rows.append(self._ocr_text(crop, psm=7).strip())
         return rows
 

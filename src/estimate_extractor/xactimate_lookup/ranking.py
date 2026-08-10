@@ -566,6 +566,16 @@ def score_dropdown_candidate(
     if action_term and not action_ok:
         weighted = min(weighted, caps.get("wrong_action", 0.50))
         conflict_reasons.append(f"wrong_action: {action_term!r} not found in candidate description")
+    elif action_term and action_ok:
+        # Phase 5.18: unlike component/material/size/grade above, a
+        # genuine action match previously had no POSITIVE match_reasons
+        # entry at all (only the negative wrong_action conflict was
+        # recorded) -- needed as a real, checkable signal for the new
+        # below-score-floor semantic-dominance rule in classify_
+        # decision(), which requires confirmed action evidence, not
+        # merely "no conflict" (a trivial pass when action_term is None
+        # looks identical to a genuine match without this).
+        match_reasons.append(f"action {action_term!r} matches")
     if prior_verified_mapping:
         match_reasons.append("backed by a prior verified internal mapping")
 
@@ -621,6 +631,67 @@ def rank_dropdown_results(
 _EXACT_MATCH_SCORE_THRESHOLD = 0.999
 
 
+#: Phase 5.18 (live-caught): auto_select_min protects against a LOW
+#: fuzzy text-similarity score, which is usually real evidence of
+#: uncertainty -- but not always. Two live-reproduced cases (Power
+#: attic vent cover, action "Detach & Reset", vs Xactimate's own
+#: "...- Detach & reset" wording; "Clean Fence" vs Xactimate's generic
+#: "Clean {V}" template) score only ~0.72-0.81 purely because the
+#: CORRECT candidate's own catalog text is worded very differently
+#: from the source (reordered action phrase; a placeholder that
+#: structurally can't restate the component) -- not because the match
+#: is actually uncertain. `_below_floor_semantic_dominance()` is a
+#: SEPARATE, stricter gate for exactly this situation -- see its own
+#: docstring for the full condition set and why each one is required.
+_BELOW_FLOOR_MIN_SCORE = 0.70
+_BELOW_FLOOR_STRICT_MARGIN = 0.20
+_BELOW_FLOOR_RUNNER_UP_CEILING = 0.60
+
+
+def _below_floor_semantic_dominance(candidates: list[RankedCandidate], config: RankingConfig) -> bool:
+    """Live-reproduced negative controls this deliberately does NOT
+    fire for (see test_ranking.py's own below-floor negative-control
+    tests): a lone low-scoring candidate with no real competing
+    evidence (fails the absolute floor below); a wrong-material/wrong-
+    size/wrong-component candidate (fails has_hard_conflict, which is
+    checked first); two candidates that are both plausibly close
+    (fails the strict margin or the runner-up ceiling). Every condition
+    is required -- this is deliberately NOT "big margin alone":
+      - top.score >= _BELOW_FLOOR_MIN_SCORE: substantially above
+        review_required_min (0.55) -- a genuinely weak match never
+        qualifies just because nothing else competes.
+      - no hard conflict, adequate extraction confidence: the same
+        safety nets classify_decision() already requires above
+        auto_select_min, unweakened here.
+      - a CONFIRMED action match (a "action '...' matches" match_
+        reasons entry -- see score_dropdown_candidate()'s own Phase
+        5.18 addition): real, positive intent evidence, not merely
+        "no action conflict" (which is also true when there's no
+        action signal to check at all -- e.g. component="unknown"
+        cases like the Power attic vent cover row, where this is the
+        ONLY dimension offering genuine corroborating evidence).
+      - margin >= _BELOW_FLOOR_STRICT_MARGIN (0.20, 2.5x the ordinary
+        auto_select_margin) AND the runner-up's own absolute score is
+        capped low (< 0.60): the gap must come from the runner-up
+        being genuinely weak, not merely from the top candidate being
+        unusually low."""
+    top = candidates[0]
+    if top.score < _BELOW_FLOOR_MIN_SCORE:
+        return False
+    if top.has_hard_conflict:
+        return False
+    if top.dropdown.extraction_confidence < config.min_extraction_confidence:
+        return False
+    if not any(r.startswith("action ") and "matches" in r for r in top.match_reasons):
+        return False
+    second_score = candidates[1].score if len(candidates) > 1 else 0.0
+    if (top.score - second_score) < _BELOW_FLOOR_STRICT_MARGIN:
+        return False
+    if second_score >= _BELOW_FLOOR_RUNNER_UP_CEILING:
+        return False
+    return True
+
+
 def classify_decision(candidates: list[RankedCandidate], config: RankingConfig) -> str:
     """Never automatically returns AUTO_SELECT for an empty or single
     weak result -- see build spec 'Do not automatically choose the first
@@ -633,6 +704,8 @@ def classify_decision(candidates: list[RankedCandidate], config: RankingConfig) 
         return DECISION_NO_MATCH
 
     if top.score < config.auto_select_min:
+        if _below_floor_semantic_dominance(candidates, config):
+            return DECISION_AUTO_SELECT
         return DECISION_REVIEW_REQUIRED
     if top.has_hard_conflict:
         return DECISION_REVIEW_REQUIRED

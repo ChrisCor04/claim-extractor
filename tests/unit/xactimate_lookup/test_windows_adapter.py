@@ -1032,10 +1032,17 @@ def test_snapshot_group_names_reads_well_past_the_old_8_row_default(monkeypatch)
     monkeypatch.setattr(adapter, "_ocr_text", lambda crop, psm=7: crop)
     monkeypatch.setattr(adapter, "_group_tree_row_crop_top", lambda header_top, row_index: row_index)
 
+    class _FakeCrop(str):
+        width = 1
+        height = 1
+
+        def resize(self, size):
+            return self
+
     class _FakeImage:
         def crop(self, box):
             row_top = box[1]
-            return real_rows[row_top - 1] if 1 <= row_top <= len(real_rows) else ""
+            return _FakeCrop(real_rows[row_top - 1] if 1 <= row_top <= len(real_rows) else "")
 
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: _FakeImage())
 
@@ -1745,6 +1752,74 @@ def test_handle_duplicate_item_dialog_is_a_noop_when_absent(monkeypatch):
 
     assert adapter._handle_duplicate_item_dialog() is False
     assert clicked == []
+
+
+# ---------------------------------------------------------------------
+# Phase 5.18 (live-caught): select_candidate()'s Duplicate Item(s) hard
+# stop is correct by default, but too broad for Xactimate's own paired
+# add/remove steep-roof-surcharge convention, where two separate source
+# rows legitimately map to the same RFG/STEEP CAT/SEL in the same group.
+# _is_intentional_duplicate() is the narrow, fail-closed exception.
+# ---------------------------------------------------------------------
+
+
+def _protected_record(task_id, category, selector, group="Dwelling Roof"):
+    from estimate_extractor.xactimate_lookup.destructive_audit import ProtectedRowRecord
+    return ProtectedRowRecord(
+        task_id=task_id, source_row=None, group=group, category=category, selector=selector,
+        description=None, quantity=None, unit=None, xactimate_item_number=None,
+        committed_row_identity=(category, selector), row_count_after_commit=None,
+        timestamp="now", verification_state=None,
+    )
+
+
+def _dropdown_result(cat, sel):
+    return DropdownResult(raw_text=f"{cat} {sel}", row_position=0, category=cat, selector=sel, description=f"{cat}/{sel}")
+
+
+def test_intentional_duplicate_allowed_when_a_different_task_already_committed_it(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter.set_execution_context(run_id="run_1", task_id="task_line_0019", source_row="line_0019", group="Dwelling Roof")
+    adapter._protected_row_ledger.record("Dwelling Roof", _protected_record("task_line_0018", "RFG", "STEEP"))
+
+    assert adapter._is_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is True
+
+
+def test_intentional_duplicate_blocked_when_the_same_task_already_committed_it(monkeypatch):
+    """The actual danger this guards against: retrying a task that
+    already succeeded must never silently double-add a row."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter.set_execution_context(run_id="run_1", task_id="task_line_0018", source_row="line_0018", group="Dwelling Roof")
+    adapter._protected_row_ledger.record("Dwelling Roof", _protected_record("task_line_0018", "RFG", "STEEP"))
+
+    assert adapter._is_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is False
+
+
+def test_intentional_duplicate_blocked_when_nothing_protected_yet(monkeypatch):
+    """Fail closed: a genuinely unexpected duplicate (nothing this
+    session protected under this CAT/SEL at all) has no record to
+    point to and must not be waved through."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter.set_execution_context(run_id="run_1", task_id="task_line_0019", source_row="line_0019", group="Dwelling Roof")
+
+    assert adapter._is_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is False
+
+
+def test_intentional_duplicate_blocked_without_execution_context(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._protected_row_ledger.record("Dwelling Roof", _protected_record("task_line_0018", "RFG", "STEEP"))
+
+    assert adapter._is_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is False
+
+
+def test_intentional_duplicate_blocked_for_a_different_group(monkeypatch):
+    """A protected row in a DIFFERENT group must not corroborate a
+    duplicate in the current one -- the ledger is checked per-group."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter.set_execution_context(run_id="run_1", task_id="task_line_0030", source_row="line_0030", group="Right Elevation")
+    adapter._protected_row_ledger.record("Dwelling Roof", _protected_record("task_line_0018", "RFG", "STEEP"))
+
+    assert adapter._is_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is False
 
 
 def test_commit_item_dismisses_a_duplicate_item_dialog(monkeypatch):
