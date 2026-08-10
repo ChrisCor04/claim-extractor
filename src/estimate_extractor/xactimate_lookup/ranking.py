@@ -105,6 +105,36 @@ def _any_word_matches(words_a: set[str], words_b: set[str]) -> bool:
     return any(_words_match_with_catalog_tolerance(a, b) for a in words_a for b in words_b)
 
 
+#: Phase 5.16 (live-caught): Xactimate's steep-roof/steep-sheathing
+#: surcharge family distinguishes items by an explicit slope RANGE
+#: ("7/12 to 9/12 slope", recognized by extract_size_term() above) vs a
+#: THRESHOLD phrasing ("greater than 12/12 slope" / "over 12/12
+#: slope") that extract_size_term() does not recognize at all (it only
+#: handles "N-M"/"up to N"/"N <unit>"). A source asking for a specific
+#: slope range and a candidate stating an unrelated higher threshold
+#: both fell through to size_state="UNSPECIFIED" (neutral, not a
+#: conflict) instead of "CONFLICT" -- live-reproduced as a 0.0758
+#: margin, just under auto_select_margin, between the correct
+#: RFG/STEEP ("7/12 to 9/12 slope", exact range match) and the wrong
+#: RFG/STEEP>> ("greater than 12/12 slope").
+_SLOPE_THRESHOLD_PATTERN = re.compile(r"(?:greater than|over)\s+(\d+/\d+)\s*slope")
+
+
+def _slope_threshold_conflicts(size_key_lower: str, candidate_text: str) -> bool:
+    """Ranking-only, additive -- mirrors extract_dimension_pair()'s own
+    precedent (score_dropdown_candidate() below): only ever STRENGTHENS
+    an already-UNSPECIFIED size verdict to CONFLICT, never downgrades a
+    MATCH, and only fires when the source's own size_key is itself a
+    fraction-range (contains "/"), so it can never affect an ordinary
+    linear/area/weight size comparison."""
+    if "/" not in size_key_lower:
+        return False
+    match = _SLOPE_THRESHOLD_PATTERN.search(candidate_text)
+    if not match:
+        return False
+    return match.group(1) not in size_key_lower
+
+
 def score_dropdown_candidate(
     *,
     original_description: str,
@@ -287,6 +317,9 @@ def score_dropdown_candidate(
         else:
             candidate_size = extract_size_term(candidate_text)
             if candidate_size and candidate_size.lower() != size_key_lower:
+                size_ok = False
+                size_state = "CONFLICT"
+            elif _slope_threshold_conflicts(size_key_lower, candidate_text):
                 size_ok = False
                 size_state = "CONFLICT"
             else:

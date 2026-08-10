@@ -694,6 +694,36 @@ def check_category_selector_match(
             f"expected {expected_category!r}/{expected_selector!r}",
         )
 
+    # Phase 5.16 (live-caught): the tolerance above only ever handles a
+    # DROPPED character (a clean truncation) -- it has no answer for a
+    # SUBSTITUTED one. Live-reproduced twice independently this
+    # engagement, both times on the exact same selector: "RFG/300S"
+    # read back as "RFG/3008" (S misread as the visually similar digit
+    # 8) immediately after select_candidate() had ALREADY independently
+    # proven the correct row was clicked via live UI-Automation TEXT
+    # (never OCR) -- this check runs strictly as defense-in-depth on
+    # top of that stronger evidence, exactly the situation this
+    # function's own docstring describes. Scoped narrowly and
+    # symmetrically with that upstream guarantee: the CATEGORY must
+    # still match EXACTLY. A same-length, single-character category
+    # substitution was DELIBERATELY tried and reverted here (live-
+    # caught: "WDR" read back as "WDI") -- "SFG" vs "RFG" is a real,
+    # genuinely-different, easily-confusable category pair already
+    # guarded by a dedicated regression test below, and a 3-letter code
+    # has too little room for a substituted character to reliably stay
+    # inside the same family. Only the SELECTOR tolerates exactly one
+    # substituted character in an otherwise equal-length string --
+    # never a length difference, never more than one differing
+    # character, never the category.
+    if exp_cat == obs_cat and len(exp_sel) == len(obs_sel):
+        differing = sum(1 for a, b in zip(exp_sel, obs_sel) if a != b)
+        if differing == 1:
+            return result(
+                "normalized_match",
+                f"observed {observed_category!r}/{observed_selector!r} is a single-character OCR "
+                f"substitution of expected {expected_category!r}/{expected_selector!r}",
+            )
+
     return result(
         "mismatch",
         f"observed {observed_category!r}/{observed_selector!r} does not match, normalize to, or truncate from "

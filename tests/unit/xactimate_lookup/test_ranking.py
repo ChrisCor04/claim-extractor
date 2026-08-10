@@ -374,3 +374,46 @@ def test_exact_top_already_clearing_ordinary_margin_is_unaffected(ranking_config
     top = _ranked(1.0, sel="X")
     runner_up = _ranked(0.5, sel="Y")
     assert ranking.classify_decision([top, runner_up], ranking_config) == DECISION_AUTO_SELECT
+
+
+# ---------------------------------------------------------------------
+# Phase 5.16 (live-caught): Xactimate's steep-roof surcharge family
+# distinguishes items by an explicit slope RANGE ("7/12 to 9/12 slope")
+# vs a THRESHOLD phrasing ("greater than 12/12 slope" / "over 12/12
+# slope") that extract_size_term() doesn't recognize at all -- both
+# fell through to size_state=UNSPECIFIED (neutral) instead of CONFLICT,
+# live-reproduced as a 0.0758 margin (just under auto_select_margin)
+# between the correct RFG/STEEP and the wrong RFG/STEEP>>.
+# ---------------------------------------------------------------------
+
+
+def test_slope_threshold_phrasing_is_a_real_size_conflict(phrase_rules, ranking_config):
+    source = "Additional charge for steep roof - 7/12 to 9/12 slope"
+    correct = _dropdown("Additional charge for steep roof - 7/12 to 9/12 slope", sel="STEEP")
+    wrong_threshold = _dropdown("Additional charge for steep roof greater than 12/12 slope", sel="STEEP>>")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="roofing", component="roof", material=None,
+        action="install", unit="SQ", size_key="7/12-9/12", grade_key=None,
+        dropdowns=[correct, wrong_threshold], rules=phrase_rules, config=ranking_config,
+    )
+    top, runner_up = candidates[0], candidates[1]
+    assert top.dropdown.selector == "STEEP"
+    assert runner_up.has_hard_conflict
+    assert any("wrong_size" in r for r in runner_up.conflict_reasons)
+    assert top.score - runner_up.score >= ranking_config.auto_select_margin
+    assert ranking.classify_decision(candidates, ranking_config) == DECISION_AUTO_SELECT
+
+
+def test_slope_range_match_is_not_penalized_as_a_conflict(phrase_rules, ranking_config):
+    """A sibling item stating the SAME slope range (just a different
+    component, e.g. framing sheathing) must not be caught by the new
+    threshold-conflict check -- it never fires when the candidate's
+    slope wording actually matches the source's range."""
+    source = "Additional charge for steep roof - 7/12 to 9/12 slope"
+    same_range_other_component = _dropdown("Add charge for sheathing steep roof - 7/12 - 9/12 slope", sel="SHSTP")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="roofing", component="roof", material=None,
+        action="install", unit="SQ", size_key="7/12-9/12", grade_key=None,
+        dropdowns=[same_range_other_component], rules=phrase_rules, config=ranking_config,
+    )
+    assert not any("wrong_size" in r for r in candidates[0].conflict_reasons)

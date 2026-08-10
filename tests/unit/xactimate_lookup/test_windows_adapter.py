@@ -704,6 +704,46 @@ def test_category_selector_genuinely_different_category_is_a_mismatch():
     assert result.match_state == "mismatch"
 
 
+# ---------------------------------------------------------------------
+# Phase 5.16 (live-caught): "RFG/300S" read back as "RFG/3008" (S
+# misread as the visually similar digit 8) immediately after
+# select_candidate() had already independently proven the correct row
+# was clicked via live UI-Automation TEXT (never OCR) -- reproduced
+# twice independently this engagement on the exact same selector.
+# ---------------------------------------------------------------------
+
+
+def test_category_selector_single_char_substitution_in_selector_is_tolerated():
+    result = check_category_selector_match("RFG", "300S", "RFG", "3008")
+    assert result.match_state == "normalized_match"
+
+
+def test_category_selector_substitution_tolerance_requires_exact_category():
+    """The category must still match exactly -- a substitution there
+    could plausibly land on a genuinely different real category (a
+    3-letter code has little room for a substituted character to stay
+    safely within the same family)."""
+    result = check_category_selector_match("RFG", "300S", "RFC", "300S")
+    assert result.match_state == "mismatch"
+
+
+def test_category_selector_substitution_tolerance_requires_equal_length():
+    """A length difference is a truncation/insertion, not a same-
+    position substitution -- must not be tolerated by this branch.
+    (A clean prefix truncation, e.g. "300S" -> "300", is a DIFFERENT,
+    pre-existing tolerance branch and is intentionally not what this
+    test isolates.)"""
+    result = check_category_selector_match("RFG", "300S", "RFG", "30089")
+    assert result.match_state == "mismatch"
+
+
+def test_category_selector_substitution_tolerance_requires_exactly_one_diff():
+    """Two or more differing characters is real evidence of a
+    different selector, not OCR noise on the same one."""
+    result = check_category_selector_match("RFG", "300S", "RFG", "3188")
+    assert result.match_state == "mismatch"
+
+
 def test_quantity_match_does_not_override_unit_conflict():
     """Regression guard (Phase 4.7 Stage 8, carried into Phase 4.8): a
     CommitVerification with a quantity match but an incompatible unit
