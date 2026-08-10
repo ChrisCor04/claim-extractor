@@ -19,6 +19,7 @@ from estimate_extractor.xactimate_lookup.models import (
     STOP_REASON_UNSUPPORTED_ADAPTER,
     DropdownResult,
     InternalMappingRecord,
+    LookupPlan,
     MAPPING_STATUS_APPROVED,
     RecommendationInput,
 )
@@ -419,6 +420,177 @@ def test_category_selector_match_duck_typed_check_still_catches_a_real_mismatch(
     assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
     assert outcome.committed is False
     assert cancel_calls == [1]
+
+
+def test_category_ocr_uncertain_but_corroborated_by_selector_and_absent_from_results(tmp_path, phrase_rules, ranking_config, monkeypatch):
+    """Phase 5.17 (live-caught): "WDR" stably misread as "WDI" (and,
+    across a wide sweep of alternate OCR settings, never once as any
+    OTHER category this same search's results actually offered) after
+    select_candidate() had already independently proven the correct row
+    via live UI-Automation TEXT. When the selector independently agrees
+    in two fresh reads AND the observed category isn't one of the real
+    candidates this search returned, the corroborating evidence must
+    outweigh the uncertain OCR read and the commit must proceed."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    top = _dropdown("Tear off composition shingles - 3 tab (no haul off)", cat="RFG", sel="ARMVN", pos=0)
+    other = _dropdown("Some unrelated real candidate", cat="SFG", sel="OTHER", pos=1)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [top, other]})
+    adapter.supports_live_execution = True
+
+    from estimate_extractor.xactimate_lookup.models import PopulatedFields
+    from estimate_extractor.xactimate_lookup.windows_adapter import check_category_selector_match
+
+    # "WDI"-style: selector matches exactly, category is garbled OCR
+    # noise that is NOT "SFG" (the only other real candidate's category).
+    monkeypatch.setattr(
+        adapter, "read_populated_fields",
+        lambda: PopulatedFields(category="XYZ", selector="ARMVN", description=top.description, unit=None, action=None, item_number=None),
+    )
+    monkeypatch.setattr(adapter, "check_category_selector_match", check_category_selector_match, raising=False)
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+    assert outcome.stop_reason is None
+    assert outcome.committed is True
+    assert cancel_calls == []
+
+
+def test_category_ocr_matching_a_real_alternate_candidate_still_fails_closed(tmp_path, phrase_rules, ranking_config, monkeypatch):
+    """Counterpart: if the observed (wrong) category matches one of the
+    OTHER real candidates this same search actually returned, that is
+    genuine evidence a different item may have been affected -- the
+    Phase 5.17 corroboration override must NOT apply, and this must
+    still stop and cancel exactly like an ordinary field mismatch."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    top = _dropdown("Tear off composition shingles - 3 tab (no haul off)", cat="RFG", sel="ARMVN", pos=0)
+    other = _dropdown("Some unrelated real candidate", cat="SFG", sel="OTHER", pos=1)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [top, other]})
+    adapter.supports_live_execution = True
+
+    from estimate_extractor.xactimate_lookup.models import PopulatedFields
+    from estimate_extractor.xactimate_lookup.windows_adapter import check_category_selector_match
+
+    # Selector still agrees, but the observed category ("SFG") is a
+    # REAL category from this same search's own results.
+    monkeypatch.setattr(
+        adapter, "read_populated_fields",
+        lambda: PopulatedFields(category="SFG", selector="ARMVN", description=top.description, unit=None, action=None, item_number=None),
+    )
+    monkeypatch.setattr(adapter, "check_category_selector_match", check_category_selector_match, raising=False)
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+    assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
+    assert outcome.committed is False
+    assert cancel_calls == [1]
+
+
+def test_category_ocr_corroboration_requires_selector_to_also_agree(tmp_path, phrase_rules, ranking_config, monkeypatch):
+    """The corroboration override requires the SELECTOR to independently
+    agree too -- if the selector is also wrong, this is ordinary
+    evidence of a real mismatch, not category-only OCR noise."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    top = _dropdown("Tear off composition shingles - 3 tab (no haul off)", cat="RFG", sel="ARMVN", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [top]})
+    adapter.supports_live_execution = True
+
+    from estimate_extractor.xactimate_lookup.models import PopulatedFields
+    from estimate_extractor.xactimate_lookup.windows_adapter import check_category_selector_match
+
+    monkeypatch.setattr(
+        adapter, "read_populated_fields",
+        lambda: PopulatedFields(category="XYZ", selector="TOTALLYDIFFERENT", description=None, unit=None, action=None, item_number=None),
+    )
+    monkeypatch.setattr(adapter, "check_category_selector_match", check_category_selector_match, raising=False)
+    cancel_calls = []
+    monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+    assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
+    assert outcome.committed is False
+    assert cancel_calls == [1]
+
+
+def _trusted_plan(item, category, selector):
+    return LookupPlan(
+        line_item_id=item.line_item_id, path=LOOKUP_PATH_TRUSTED, item_signature="",
+        search_input=f"{category} {selector}",
+        trusted_mapping=InternalMappingRecord(
+            mapping_id="teach", item_signature="", source_description=item.original_description, search_phrase="",
+            category=category, selector=selector, xactimate_description=item.original_description,
+            unit=item.source_unit, action=None, reviewer="tester", approval_reason="manual teach", status=MAPPING_STATUS_APPROVED,
+        ),
+    )
+
+
+def test_force_auto_select_for_trusted_mapping_commits_a_low_scoring_special_item(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.17 (live-caught): a genuine special/bid-item catalog
+    entry ("Light Fixtures (Bid Item)") scores only ~0.70 against a
+    dissimilar source ("String Light") on ordinary text-similarity --
+    classify_decision() alone would never AUTO_SELECT it. The opt-in
+    force_auto_select_for_trusted_mapping parameter, used ONLY by a
+    reviewer's own explicit teach-and-commit script, must still commit
+    it once the top candidate is confirmed to be exactly the trusted
+    mapping's own CAT/SEL with no hard conflict."""
+    item = _item(original_description="String Light", component="unknown", material=None, action="unknown")
+    plan = _trusted_plan(item, "LIT", "BIDITM")
+    d = _dropdown("Light Fixtures (Bid Item)", cat="LIT", sel="BIDITM", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]})
+    adapter.supports_live_execution = True
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False, force_auto_select_for_trusted_mapping=True)
+
+    assert outcome.decision == DECISION_AUTO_SELECT
+    assert outcome.committed is True
+    assert outcome.selected.dropdown.category == "LIT"
+    assert outcome.selected.dropdown.selector == "BIDITM"
+
+
+def test_force_auto_select_for_trusted_mapping_does_not_affect_ordinary_description_search(tmp_path, phrase_rules, ranking_config):
+    """The opt-in override only ever applies to a LOOKUP_PATH_TRUSTED
+    plan -- an ordinary description-search plan's ambiguous outcome
+    must be completely unaffected even if the caller passes True."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d1 = _dropdown("Gutter - aluminum", cat="SFG", sel="GUTA", pos=0)
+    d2 = _dropdown("Gutter - steel", cat="SFG", sel="GUTAS", pos=1)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d1, d2]})
+    adapter.supports_live_execution = True
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False, force_auto_select_for_trusted_mapping=True)
+
+    assert outcome.committed is False
+
+
+def test_force_auto_select_for_trusted_mapping_still_refuses_a_hard_conflict(tmp_path, phrase_rules, ranking_config):
+    """The override still requires the top candidate to have no hard
+    conflict -- it elevates trust in the score/margin gates only, never
+    bypasses actual conflict evidence."""
+    item = _item(original_description="String Light", component="lamp", material="crystal", action="unknown")
+    plan = _trusted_plan(item, "LIT", "BIDITM")
+    d = _dropdown("Light Fixtures (Bid Item)", cat="LIT", sel="BIDITM", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]})
+    adapter.supports_live_execution = True
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False, force_auto_select_for_trusted_mapping=True)
+
+    # "crystal"/"lamp" won't literally appear in "Light Fixtures (Bid
+    # Item)", so this is expected to still carry a wrong_component/
+    # wrong_material hard conflict and NOT auto-commit.
+    assert outcome.committed is False
 
 
 def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phrase_rules, ranking_config, monkeypatch):

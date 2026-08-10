@@ -26,6 +26,7 @@ from estimate_extractor.xactimate_lookup.adapter import (
     XactimateAdapter,
 )
 from estimate_extractor.xactimate_lookup.models import (
+    DECISION_AUTO_SELECT,
     DECISION_NO_MATCH,
     DECISION_REVIEW_REQUIRED,
     MAPPING_STATUS_APPROVED,
@@ -210,7 +211,31 @@ def execute_plan(
     phrase_rules: PhraseRules,
     *,
     dry_run: bool = True,
+    force_auto_select_for_trusted_mapping: bool = False,
 ) -> LookupOutcome:
+    """`force_auto_select_for_trusted_mapping` (Phase 5.17, default
+    False -- every existing/production call site is unaffected): for a
+    LOOKUP_PATH_TRUSTED plan ONLY, treats the top candidate as
+    AUTO_SELECT once it's confirmed to be exactly the trusted mapping's
+    own category/selector with no hard conflict, bypassing classify_
+    decision()'s ordinary score/margin gates. Reserved for a human
+    reviewer's own explicit, one-time confirmation of a special/bid-
+    item mapping (a "LEARNED_SPECIAL_ITEM" teach-and-commit) -- NOT
+    wired into classify_decision() itself, which stays exactly as it
+    was before this phase. Live-caught: a genuine bid-item catalog
+    entry ("Light Fixtures (Bid Item)" for "String Light") scores only
+    ~0.70 on ordinary text-similarity dimensions despite being the
+    human-confirmed correct answer, because nothing about its terse
+    catalog description resembles the source wording -- exactly the
+    class of item classify_decision()'s ordinary gates are not equipped
+    to recognize, and exactly why a trusted mapping exists as a
+    separate path in the first place. An EARLIER attempt to fold this
+    into classify_decision() itself (treating ANY prior_verified_
+    mapping-backed candidate as AUTO_SELECT) was reverted after it
+    proved too broad: ordinary review-approved/pre-mapped tasks ALSO
+    route through LOOKUP_PATH_TRUSTED and legitimately need their own
+    ambiguous-candidate cases caught -- this parameter's caller-must-
+    opt-in shape is what keeps that regression from recurring."""
     if not dry_run and not adapter.supports_live_execution:
         return _stop(
             item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNSUPPORTED_ADAPTER,
@@ -270,6 +295,18 @@ def execute_plan(
     )
     decision = classify_decision(candidates, ranking_config)
     _record_lifecycle(adapter, "DECISION_MADE", decision=decision)
+
+    if (
+        force_auto_select_for_trusted_mapping
+        and decision != DECISION_AUTO_SELECT
+        and plan.path == LOOKUP_PATH_TRUSTED
+        and candidates
+        and not candidates[0].has_hard_conflict
+        and candidates[0].dropdown.category == plan.trusted_mapping.category
+        and candidates[0].dropdown.selector == plan.trusted_mapping.selector
+    ):
+        decision = DECISION_AUTO_SELECT
+        _record_lifecycle(adapter, "DECISION_OVERRIDDEN_TRUSTED_MAPPING_REVIEWER_CONFIRMED", original_score=candidates[0].score)
 
     if decision == DECISION_NO_MATCH:
         adapter.recover()  # Phase 5.8A: same popup-left-open fix as above
@@ -340,7 +377,53 @@ def execute_plan(
         match_result = adapter.check_category_selector_match(
             top.dropdown.category, top.dropdown.selector, populated.category, populated.selector,
         )
-        if match_result.match_state not in ("exact_match", "normalized_match"):
+        if match_result.match_state not in ("exact_match", "normalized_match") and hasattr(adapter, "read_populated_fields"):
+            # Phase 5.17 (live-caught): select_candidate() already
+            # independently proved the correct row was clicked via live
+            # UI-Automation TEXT (never OCR) -- live-reproduced, "WDR"
+            # was stably misread as "WDI" (and, across a wide sweep of
+            # alternate crop/scale/psm/whitelist settings, as "WDF" /
+            # "WDE" / "WDFI" -- never once as "WDR" itself, and never
+            # once as any OTHER category this same search actually
+            # returned). A bare retry of the same OCR settings cannot
+            # help here (read_populated_fields() already internally
+            # majority-votes 3 same-settings reads, and this misread is
+            # stable, not per-read noise) -- what actually distinguishes
+            # "OCR garbled an otherwise-proven click" from "a genuinely
+            # different item got clicked" is whether the SELECTOR
+            # independently agrees AND whether the observed category is
+            # even one of the real categories this search's own results
+            # offered. If a wrong click had landed on some OTHER real
+            # candidate, ITS category would appear in `candidates`; pure
+            # OCR noise on the right row does not. One fresh independent
+            # re-read is still attempted first (in case this specific
+            # instance's noise is transient after all), but the
+            # corroboration check -- not the retry's outcome alone -- is
+            # what ultimately justifies trusting the UIA-proven
+            # selection over a category read that never once confirmed
+            # ANY real alternative. Selector must independently agree in
+            # BOTH reads; only the category may be excused. Falls
+            # through to the ordinary cancel/stop if the observed
+            # category matches a real candidate from this same search
+            # (genuine evidence of a possible different item) -- that
+            # case fails closed exactly as before, no exception.
+            selector_agrees = str(populated.selector or "").strip().upper() == str(top.dropdown.selector or "").strip().upper()
+            candidate_categories = {str(c.dropdown.category or "").strip().upper() for c in candidates}
+            observed_category_is_a_real_candidate = str(populated.category or "").strip().upper() in candidate_categories
+            if selector_agrees and not observed_category_is_a_real_candidate:
+                populated_retry = adapter.read_populated_fields()
+                retry_selector_agrees = str(populated_retry.selector or "").strip().upper() == str(top.dropdown.selector or "").strip().upper()
+                retry_category_is_a_real_candidate = str(populated_retry.category or "").strip().upper() in candidate_categories
+                if retry_selector_agrees and not retry_category_is_a_real_candidate:
+                    _record_lifecycle(
+                        adapter, "CATEGORY_OCR_UNCERTAIN_TRUSTED_UIA_SELECTION",
+                        expected=f"{top.dropdown.category}/{top.dropdown.selector}",
+                        observed_first=f"{populated.category}/{populated.selector}",
+                        observed_retry=f"{populated_retry.category}/{populated_retry.selector}",
+                    )
+                    populated = populated_retry
+                    match_result = None
+        if match_result is not None and match_result.match_state not in ("exact_match", "normalized_match"):
             _cancel_pending_selection(adapter)
             return _stop(
                 item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_FIELD_MISMATCH,

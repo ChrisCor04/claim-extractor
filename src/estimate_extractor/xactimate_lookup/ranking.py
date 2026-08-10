@@ -59,6 +59,31 @@ def load_ranking_config(path: Path = DEFAULT_RANKING_PATH) -> RankingConfig:
     )
 
 
+#: Phase 5.17 (live-caught): ranking-only, additive supplement to
+#: PhraseRules.action_search_terms -- NEVER used for search-phrase
+#: generation (that field feeds generate_search_phrase()'s literal
+#: Xactimate search-box query text; a Phase 5.16 attempt to give
+#: "detach_and_reset" a real action_search_terms value broke that
+#: shared path and was reverted). Used ONLY by score_dropdown_
+#: candidate()'s substring-bonus check below, to recognize when an
+#: OMITTED prefix/suffix is a real, catalog-family-distinguishing
+#: action phrase rather than generic filler -- see that check's own
+#: docstring for the live-caught evidence.
+_RANKING_ONLY_ACTION_PHRASES = {
+    "detach_and_reset": "detach & reset",
+}
+
+#: Phase 5.17 (live-caught): see score_dropdown_candidate()'s
+#: "unrequested structural component marker" check for the full
+#: rationale. A candidate word from this set that the source never
+#: mentions at all is treated as a genuinely different structural
+#: component, not incidental detail -- deliberately just the one
+#: live-evidenced word ("sheathing", live-reproduced beating the
+#: correct RFG/STEEP candidate for a steep-roof surcharge line via
+#: shared "roof" wording alone) rather than a broad guessed vocabulary.
+_UNREQUESTED_COMPONENT_MARKERS = {"sheathing"}
+
+
 def _fuzzy_ratio(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
@@ -182,7 +207,37 @@ def score_dropdown_candidate(
             # full 1.0 it always scored.
             description_score = len(item_text) / len(candidate_text)
         elif candidate_text in item_text:
-            description_score = 1.0
+            # Phase 5.17 (live-caught): granting a flat 1.0 whenever the
+            # candidate is a substring of the source assumes whatever's
+            # OMITTED is generic filler (an action prefix like "R&R"
+            # with no distinguishing catalog-family effect -- the
+            # normal, intended case this branch exists for). Live-
+            # reproduced: source "Detach & Reset Power attic vent cover
+            # only - plastic" matched candidate "Power attic vent cover
+            # only - plastic" (a generic-action variant) this way at a
+            # flat 1.0, while the CORRECT, action-specific candidate
+            # ("...- Detach & reset") lost to word-order and fell to a
+            # plain fuzzy-ratio score -- the omitted text was exactly
+            # "detach & reset", a real, catalog-family-distinguishing
+            # action phrase (this catalog keeps a SEPARATE "Detach &
+            # reset" entry apart from the plain default-action one),
+            # not filler. Narrow, general check: if the omitted text
+            # contains a recognized action phrase (checked against
+            # action_search_terms' own real values -- clean/paint/
+            # repair/etc. -- plus the ranking-only supplement above)
+            # that the candidate itself doesn't also state, this isn't
+            # the "normal narrative source" case the flat 1.0 is for;
+            # fall through to the ordinary fuzzy-ratio comparison
+            # instead, exactly like a non-substring candidate would get.
+            omitted = item_text.replace(candidate_text, "", 1)
+            action_phrase = (
+                _RANKING_ONLY_ACTION_PHRASES.get(action or "")
+                or (rules.action_search_terms.get(action or "") if action else None)
+            )
+            if action_phrase and action_phrase in omitted and action_phrase not in candidate_text:
+                description_score = _fuzzy_ratio(item_text, candidate_text)
+            else:
+                description_score = 1.0
         else:
             description_score = _fuzzy_ratio(item_text, candidate_text)
 
@@ -213,6 +268,30 @@ def score_dropdown_candidate(
     candidate_is_generic_template = "{v}" in candidate_text
     component_ok = not component_words or candidate_is_generic_template or _any_word_matches(component_words, candidate_words)
     component_score = 1.0 if component_ok else 0.0
+
+    # Phase 5.17 (live-caught): the word-overlap check above treats ANY
+    # shared word as a full pass -- live-reproduced, "Additional charge
+    # for steep roof - 7/12 to 9/12 slope" (component "roof_surcharge")
+    # scored component_ok=True against "Add charge for sheathing steep
+    # roof - 7/12 - 9/12 slope", a genuinely different FRAMING item
+    # (charged for sheathing labor, not the roofing surcharge itself)
+    # that only shares the word "roof" as a qualifier of "sheathing",
+    # not as its own subject. Mirrors the grade/style "unrequested
+    # qualifier" check just below (score_dropdown_candidate is the only
+    # place either lives): a candidate stating an UNREQUESTED, distinct
+    # structural-component word the source never mentions at all is
+    # real evidence of a different item, not merely extra detail --
+    # same principle, a new narrow vocabulary (currently just the one
+    # live-evidenced word) rather than reusing material/style_keywords,
+    # since "sheathing" is neither. Deliberately narrow: this can only
+    # ever downgrade an otherwise-passing component_ok, never fire when
+    # component_words is already empty (no real signal to protect).
+    if component_ok and component_words:
+        for marker in _UNREQUESTED_COMPONENT_MARKERS:
+            if marker in candidate_words and marker not in component_words and marker not in item_text:
+                component_ok = False
+                component_score = 0.0
+                break
 
     # Phase 5.6 (live-caught): when normalization didn't extract a
     # material at all (material=None/empty -- e.g. "Roof vent - turtle
@@ -399,7 +478,12 @@ def score_dropdown_candidate(
                 grade_key = grade_key or keyword  # only for the conflict message below
                 break
 
-    action_term = rules.action_search_terms.get(action or "") if action else None
+    # Phase 5.17: falls back to the ranking-only supplement (see its own
+    # docstring above) when action_search_terms has no real value for
+    # this action (e.g. "detach_and_reset", deliberately null there
+    # since it also drives search-phrase text) -- this dimension only
+    # ever affects scoring, never what gets typed into the search box.
+    action_term = (rules.action_search_terms.get(action or "") or _RANKING_ONLY_ACTION_PHRASES.get(action or "")) if action else None
     action_ok = True
     action_score = 0.0
     action_applicable = bool(action_term)

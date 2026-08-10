@@ -417,3 +417,124 @@ def test_slope_range_match_is_not_penalized_as_a_conflict(phrase_rules, ranking_
         dropdowns=[same_range_other_component], rules=phrase_rules, config=ranking_config,
     )
     assert not any("wrong_size" in r for r in candidates[0].conflict_reasons)
+
+
+# ---------------------------------------------------------------------
+# Phase 5.17 (live-caught): a candidate that's a substring of the
+# source used to always score a flat 1.0, even when the OMITTED prefix
+# is a real, catalog-family-distinguishing action phrase (this catalog
+# keeps a SEPARATE "Detach & reset" entry apart from a same-component
+# default-action one) -- live-reproduced, "RFG/PAVCRS" ("...- Detach &
+# reset") lost to "HVC/PAVC-" ("...- plastic", a generic default-action
+# variant) purely because the latter's text happened to be a substring
+# of the source.
+# ---------------------------------------------------------------------
+
+
+def test_omitted_action_phrase_denies_the_free_substring_score(phrase_rules, ranking_config):
+    source = "Detach & Reset Power attic vent cover only - plastic"
+    generic_default_action = _dropdown("Power attic vent cover only - plastic", cat="HVC", sel="PAVC-")
+    action_specific = _dropdown("Power attic vent cover only - Detach & reset", cat="RFG", sel="PAVCRS")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="roofing", component="unknown", material=None,
+        action="detach_and_reset", unit="EA", size_key=None, grade_key=None,
+        dropdowns=[generic_default_action, action_specific], rules=phrase_rules, config=ranking_config,
+    )
+    top = candidates[0]
+    assert top.dropdown.selector == "PAVCRS"
+    assert not top.has_hard_conflict
+    runner_up = next(c for c in candidates if c.dropdown.selector == "PAVC-")
+    assert runner_up.has_hard_conflict
+    assert any("wrong_action" in r for r in runner_up.conflict_reasons)
+
+
+def test_omitted_generic_action_prefix_still_gets_the_free_substring_score(phrase_rules, ranking_config):
+    """The normal, intended case the substring-bonus branch exists for
+    must be completely unaffected -- an omitted GENERIC action prefix
+    (e.g. "R&R", which has no action_search_terms/ranking-only phrase
+    value at all) is still treated as harmless filler, not evidence of
+    a different item."""
+    source = "R&R Gutter - aluminum - up to 5\""
+    d = _dropdown("Gutter - aluminum - up to 5\"", sel="GUTA")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="gutters", component="gutter", material="aluminum",
+        action="remove_and_replace", unit="LF", size_key="up to 5\"", grade_key=None,
+        dropdowns=[d], rules=phrase_rules, config=ranking_config,
+    )
+    assert candidates[0].score == 1.0
+
+
+# ---------------------------------------------------------------------
+# Phase 5.17 (live-caught): the component word-overlap check treats
+# ANY shared word as a full pass -- "Additional charge for steep roof"
+# (component "roof_surcharge") scored component_ok=True against "Add
+# charge for sheathing steep roof", a genuinely different FRAMING item,
+# purely because both mention "roof".
+# ---------------------------------------------------------------------
+
+
+def test_unrequested_sheathing_marker_is_a_component_conflict(phrase_rules, ranking_config):
+    source = "Additional charge for steep roof - 7/12 to 9/12 slope"
+    wrong_component = _dropdown("Add charge for sheathing steep roof - 7/12 - 9/12 slope", cat="FRM", sel="SHSTP")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="roofing", component="roof_surcharge", material=None,
+        action="install", unit="SQ", size_key="7/12-9/12", grade_key=None,
+        dropdowns=[wrong_component], rules=phrase_rules, config=ranking_config,
+    )
+    assert candidates[0].has_hard_conflict
+    assert any("wrong_component" in r for r in candidates[0].conflict_reasons)
+
+
+def test_sheathing_marker_does_not_fire_when_source_itself_mentions_it(phrase_rules, ranking_config):
+    """The marker only ever fires when the SOURCE never mentions the
+    word at all -- if the source itself is genuinely about sheathing,
+    this must not manufacture a false conflict."""
+    source = "Add charge for sheathing steep roof - 7/12 to 9/12 slope"
+    d = _dropdown("Add charge for sheathing steep roof - 7/12 - 9/12 slope", cat="FRM", sel="SHSTP")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade="framing", component="sheathing", material=None,
+        action="install", unit="SQ", size_key="7/12-9/12", grade_key=None,
+        dropdowns=[d], rules=phrase_rules, config=ranking_config,
+    )
+    assert not any("wrong_component" in r for r in candidates[0].conflict_reasons)
+
+
+# ---------------------------------------------------------------------
+# Phase 5.17 (live-caught): Xactimate's generic cleaning-template family
+# ("Clean {V}") has a "- Light" (reduced-intensity) sibling variant --
+# "Clean Fence" scored the base "Clean {V}" only ~0.057 above the
+# "- Light" sibling, below auto_select_margin, since neither candidate's
+# unrequested qualifier was previously recognized as real evidence.
+# ---------------------------------------------------------------------
+
+
+def test_unrequested_light_cleaning_qualifier_is_a_grade_conflict(phrase_rules, ranking_config):
+    source = "Clean Fence"
+    base = _dropdown("Clean {V}", cat="CLN", sel="AV")
+    light = _dropdown("Clean {V} - Light", cat="CLN", sel="AV-")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade=None, component="fence", material=None,
+        action="clean", unit="SF", size_key=None, grade_key=None,
+        dropdowns=[base, light], rules=phrase_rules, config=ranking_config,
+    )
+    top = candidates[0]
+    assert top.dropdown.selector == "AV"
+    assert not top.has_hard_conflict
+    runner_up = next(c for c in candidates if c.dropdown.selector == "AV-")
+    assert runner_up.has_hard_conflict
+    assert top.score - runner_up.score >= ranking_config.auto_select_margin
+
+
+def test_light_qualifier_marker_does_not_false_positive_on_unrelated_light_candidates(phrase_rules, ranking_config):
+    """The marker is matched as the FULL "{v} - light" template phrase,
+    not a bare "light" substring -- an unrelated candidate that merely
+    mentions "light" for a completely different reason (e.g. a light
+    fixture item) must never be caught by this check."""
+    source = "Clean Fence"
+    unrelated = _dropdown("Light Fixtures (Bid Item)", cat="LIT", sel="BIDITM")
+    candidates = ranking.rank_dropdown_results(
+        original_description=source, trade=None, component="fence", material=None,
+        action="clean", unit="SF", size_key=None, grade_key=None,
+        dropdowns=[unrelated], rules=phrase_rules, config=ranking_config,
+    )
+    assert not any("grade" in r or "style" in r for r in candidates[0].conflict_reasons)

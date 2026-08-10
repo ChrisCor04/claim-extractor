@@ -143,6 +143,19 @@ style_keywords:
   # the AUTO_SELECT margin on an otherwise-unambiguous exact match.
   - ["half round", "half round"]
   - ["treated", "treated"]
+  # Phase 5.17 (live-caught): Xactimate's generic cleaning-template
+  # family ("Clean {V}") has a "- Light" (reduced-intensity) sibling
+  # variant, e.g. "Clean {V} - Light" vs the plain "Clean {V}" -- a
+  # source that never says "light cleaning" should not lose the base
+  # variant to this unrequested qualifier (live-reproduced: "Clean
+  # Fence" scored the base "Clean {V}" only ~0.057 above the "- Light"
+  # sibling, below auto_select_margin). Deliberately matched as the
+  # FULL "{v} - light" template phrase (not a bare "light" substring,
+  # which would false-positive on any unrelated candidate merely
+  # mentioning "light" -- e.g. "Light Fixtures (Bid Item)") -- this can
+  # only ever match Xactimate's own generic-template "- Light" variant
+  # naming convention.
+  - ["{v} - light", "light"]
 
 # Modifiers that must be preserved even though they're neither
 # component/material/size/style -- confirmed real and recurring in the
