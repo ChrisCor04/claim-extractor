@@ -409,12 +409,36 @@ def test_search_locator_uses_breadcrumb_corroboration_when_focused_heading_is_ab
     from PIL import Image, ImageDraw
 
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    image = Image.new("RGB", (400, 180), "white")
+    image = Image.new("RGB", (400, 210), "white")
+    ImageDraw.Draw(image).rectangle((50, 80, 250, 102), outline=(100, 120, 140), width=1)
+    data = {
+        "text": ["Home", "Price", "List", "Searches", "Search"],
+        "left": [55, 55, 90, 115, 280],
+        "top": [58, 125, 125, 125, 85],
+        "width": [30, 30, 20, 50, 40],
+        "height": [10, 10, 10, 10, 10],
+    }
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(*args, **kwargs):
+            return data
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._locate_search_field(image) == (50, 80, 251, 103)
+
+
+def test_search_locator_focused_fallback_requires_full_price_list_heading(monkeypatch):
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 210), "white")
     ImageDraw.Draw(image).rectangle((50, 80, 250, 102), outline=(100, 120, 140), width=1)
     data = {
         "text": ["Home", "Price", "Search"],
-        "left": [55, 105, 280],
-        "top": [58, 58, 85],
+        "left": [55, 55, 280],
+        "top": [58, 125, 85],
         "width": [30, 30, 40],
         "height": [10, 10, 10],
     }
@@ -426,7 +450,7 @@ def test_search_locator_uses_breadcrumb_corroboration_when_focused_heading_is_ab
 
     monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
 
-    assert adapter._locate_search_field(image) == (50, 80, 251, 103)
+    assert adapter._locate_search_field(image) is None
 
 
 def test_reset_scroll_state_does_not_click_when_items_search_is_already_ready(monkeypatch):

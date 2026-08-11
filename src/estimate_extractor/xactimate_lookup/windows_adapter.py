@@ -1472,22 +1472,31 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         # Focused-state live evidence: clicking this WPF Search field can
         # make OCR omit the section-heading "Search" while the Search
-        # button, Home/Price List breadcrumb, and input borders remain
-        # unchanged and readable.  Corroborate the button against BOTH
-        # breadcrumb words instead of requiring the transient heading.
+        # button, Home breadcrumb, Price List Searches heading below the
+        # input, and input borders remain unchanged and readable. Require
+        # that complete vertical relationship rather than treating Price
+        # as if it shared Home's breadcrumb row (it does not).
         for bx, by, bw, bh in words:
             button = (bx, by, bx + bw, by + bh)
             for home in word_boxes.get("home", []):
                 for price in word_boxes.get("price", []):
-                    home_mid_y = (home[1] + home[3]) // 2
-                    price_mid_y = (price[1] + price[3]) // 2
-                    if not (10 <= by - home[1] <= 50):
-                        continue
-                    if abs(home_mid_y - price_mid_y) > 12:
-                        continue
-                    if not (home[0] < price[0] < bx and bx - home[0] >= 140):
-                        continue
-                    relationships.append((min(home[0], price[0]) - 16, button))
+                    for list_box in word_boxes.get("list", []):
+                        for searches in word_boxes.get("searches", []):
+                            heading_mid_y = (price[1] + price[3]) // 2
+                            if not (10 <= by - home[1] <= 50):
+                                continue
+                            if not (20 <= price[1] - by <= 60):
+                                continue
+                            if not (
+                                abs(heading_mid_y - (list_box[1] + list_box[3]) // 2) <= 8
+                                and abs(heading_mid_y - (searches[1] + searches[3]) // 2) <= 8
+                            ):
+                                continue
+                            if not (price[0] < list_box[0] < searches[0] < bx):
+                                continue
+                            if abs(price[0] - home[0]) > 30 or bx - home[0] < 140:
+                                continue
+                            relationships.append((min(home[0], price[0]) - 16, button))
 
         seen_relationships = set()
         for left_hint, button in relationships:
