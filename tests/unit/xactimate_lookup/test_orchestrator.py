@@ -39,6 +39,87 @@ def _dropdown(text, cat="RFG", sel="ARMVN", desc=None, pos=0, conf=0.97):
     return DropdownResult(raw_text=text, row_position=pos, category=cat, selector=sel, description=desc or text, extraction_confidence=conf)
 
 
+class _PendingAwareAdapter(FakeXactimateAdapter):
+    supports_live_execution = True
+
+    def __init__(self, *args, pending_results=(False, True), duplicate_allowed=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pending_results = list(pending_results)
+        self.duplicate_allowed = duplicate_allowed
+
+    def snapshot_grid_identities(self):
+        return [("EXISTING", "ROW")]
+
+    def pending_item_created(self, before_snapshot):
+        self.log.record("pending_item_created")
+        return self.pending_results.pop(0)
+
+    def allows_intentional_duplicate(self, candidate):
+        self.log.record("allows_intentional_duplicate", candidate.category, candidate.selector)
+        return self.duplicate_allowed
+
+
+def test_description_duplicate_without_pending_item_uses_exact_cat_sel_only_for_instantiation(
+    tmp_path, phrase_rules, ranking_config,
+):
+    item = _item()
+    conn = registry.create_database(tmp_path / "reg.db")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    selected = _dropdown(item.original_description, cat="RFG", sel="ARMVN")
+    adapter = _PendingAwareAdapter(dropdown_script={
+        plan.search_input: [selected],
+        "RFG ARMVN": [selected],
+    })
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.committed is True
+    assert outcome.selected.dropdown.category == "RFG"
+    assert outcome.selected.dropdown.selector == "ARMVN"
+    names = [name for name, _args, _kwargs in adapter.log.calls]
+    assert names.count("search_by_description") == 1
+    assert names.count("search_by_category_selector") == 1
+    assert names.count("select_candidate") == 2
+    assert names.index("search_by_description") < names.index("allows_intentional_duplicate")
+    assert names.index("allows_intentional_duplicate") < names.index("search_by_category_selector")
+
+
+def test_description_duplicate_fallback_wrong_cat_sel_fails_closed(tmp_path, phrase_rules, ranking_config):
+    item = _item()
+    conn = registry.create_database(tmp_path / "reg.db")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    selected = _dropdown(item.original_description, cat="RFG", sel="ARMVN")
+    wrong = _dropdown("Wrong", cat="RFG", sel="WRONG")
+    adapter = _PendingAwareAdapter(dropdown_script={plan.search_input: [selected], "RFG ARMVN": [wrong]})
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.committed is False
+    assert outcome.physical_item_created is False
+    assert "no exact match" in outcome.stop_detail
+    assert not any(name == "enter_quantity" for name, _args, _kwargs in adapter.log.calls)
+
+
+def test_description_no_pending_item_does_not_fallback_without_distinct_task_proof(
+    tmp_path, phrase_rules, ranking_config,
+):
+    item = _item()
+    conn = registry.create_database(tmp_path / "reg.db")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    selected = _dropdown(item.original_description, cat="RFG", sel="ARMVN")
+    adapter = _PendingAwareAdapter(
+        dropdown_script={plan.search_input: [selected]}, pending_results=(False,), duplicate_allowed=False,
+    )
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.committed is False
+    assert not any(name == "search_by_category_selector" for name, _args, _kwargs in adapter.log.calls)
+
+
 def test_build_lookup_plan_uses_description_search_when_no_trusted_mapping(tmp_path, phrase_rules):
     conn = registry.create_database(tmp_path / "reg.db")
     plan = orchestrator.build_lookup_plan(_item(), conn, phrase_rules)

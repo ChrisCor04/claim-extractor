@@ -54,6 +54,7 @@ VALID_TASK_STATES = frozenset({TASK_PENDING, TASK_COMPLETED, TASK_SKIPPED, TASK_
 # TASK_REVIEW_REQUIRED because their post-commit OCR verification came
 # back below VERIFIED confidence, not because nothing committed.
 TASK_COMMIT_STATE_NOT_COMMITTED = "not_committed"
+TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED = "physical_item_created_unconfirmed"
 TASK_COMMIT_STATE_COMMITTED = "committed"
 
 #: verify_commit()'s trust_state values that mean the row-count delta
@@ -168,6 +169,8 @@ def task_has_committed_row(task: "ExecutionTask") -> bool:
     if task.state == TASK_COMPLETED:
         return True
     if task.commit_state == TASK_COMMIT_STATE_COMMITTED:
+        return True
+    if task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED:
         return True
     if task.commit_state == TASK_COMMIT_STATE_NOT_COMMITTED:
         return False

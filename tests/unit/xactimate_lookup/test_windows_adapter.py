@@ -1785,6 +1785,7 @@ def test_intentional_duplicate_allowed_when_a_different_task_already_committed_i
     adapter._protected_row_ledger.record("Dwelling Roof", _protected_record("task_line_0018", "RFG", "STEEP"))
 
     assert adapter._is_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is True
+    assert adapter.allows_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is True
 
 
 def test_intentional_duplicate_blocked_when_the_same_task_already_committed_it(monkeypatch):
@@ -1795,6 +1796,7 @@ def test_intentional_duplicate_blocked_when_the_same_task_already_committed_it(m
     adapter._protected_row_ledger.record("Dwelling Roof", _protected_record("task_line_0018", "RFG", "STEEP"))
 
     assert adapter._is_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is False
+    assert adapter.allows_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is False
 
 
 def test_intentional_duplicate_blocked_when_nothing_protected_yet(monkeypatch):
@@ -1822,6 +1824,27 @@ def test_intentional_duplicate_blocked_for_a_different_group(monkeypatch):
     adapter._protected_row_ledger.record("Dwelling Roof", _protected_record("task_line_0018", "RFG", "STEEP"))
 
     assert adapter._is_intentional_duplicate(_dropdown_result("RFG", "STEEP")) is False
+
+
+def test_activation_baseline_adds_one_readable_viewport_edge_row_without_scrolling(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    initial = [("RFG", str(i)) for i in range(15)]
+    monkeypatch.setattr(adapter, "snapshot_grid_identities", lambda: list(initial))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = type("Image", (), {"height": 500})()
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: (image, (0, 0)))
+    monkeypatch.setattr(adapter, "_shifted_anchor", lambda name, offset: (0, 100, 0, 0))
+    reads = []
+    monkeypatch.setattr(
+        adapter, "_read_category_selector_at",
+        lambda image, offset, row_top: reads.append(row_top) or ("RFG", "STEEP"),
+    )
+
+    baseline = adapter.snapshot_grid_identities_for_activation()
+
+    assert len(baseline) == 16
+    assert baseline[-1] == ("RFG", "STEEP")
+    assert reads == [100 + 15 * 25]
 
 
 def test_commit_item_dismisses_a_duplicate_item_dialog(monkeypatch):

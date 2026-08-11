@@ -32,6 +32,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TASK_FAILED,
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
+    TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED,
     TASK_SKIPPED,
     is_plan_stale,
     load_execution_plan,
@@ -807,6 +808,31 @@ def test_commit_state_is_not_committed_when_nothing_ever_committed(tmp_path, phr
     from estimate_extractor.xactimate_lookup.execution_plan import TASK_COMMIT_STATE_NOT_COMMITTED
     assert result.task_by_id("task_unmapped").commit_state == TASK_COMMIT_STATE_NOT_COMMITTED
     assert result.task_by_id("task_mapped").commit_state == TASK_COMMIT_STATE_NOT_COMMITTED
+
+
+def test_physical_created_unconfirmed_is_not_blindly_retryable(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    # Run only the mapped task in this focused test.
+    plan.groups[0].task_ids = ["task_mapped"]
+    plan.tasks = [plan.task_by_id("task_mapped")]
+    task = plan.tasks[0]
+    adapter = _adapter_with_test_project(dropdown_script={"RFG 3TAB": [_dropdown("RFG", "3TAB")]})
+    adapter.pending_item_created = lambda before: True
+
+    def fail_after_creation(_quantity):
+        raise AdapterError("simulated failure after the physical row appeared")
+
+    adapter.enter_quantity = fail_after_creation
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.tasks[0].commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+    # A second run must hit the independent retry gate before any search.
+    result.tasks[0].state = TASK_PENDING
+    searches_before = len([c for c in adapter.log.calls if c[0] == "search_by_category_selector"])
+    rerun = run_execution_plan(result, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+    searches_after = len([c for c in adapter.log.calls if c[0] == "search_by_category_selector"])
+    assert searches_after == searches_before
+    assert "RETRY BLOCKED" in rerun.tasks[0].stop_detail
 
 
 def test_already_committed_task_is_never_re_executed_even_if_pending(tmp_path, phrase_rules, ranking_config):

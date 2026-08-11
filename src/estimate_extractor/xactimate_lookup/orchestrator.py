@@ -203,6 +203,71 @@ def _record_lifecycle(adapter: XactimateAdapter, event: str, **detail) -> None:
             pass
 
 
+def _activate_description_selected_candidate(
+    adapter: XactimateAdapter,
+    plan: LookupPlan,
+    candidate,
+    before_snapshot,
+) -> bool:
+    """Activate the description-ranked candidate and prove a pending
+    row exists.  Some Xactimate builds silently ignore a duplicate item
+    clicked from description results, while exact CAT/SEL search opens
+    the intentional-duplicate flow.  Description remains the sole
+    decision/ranking path; CAT/SEL is used only to instantiate that
+    already-chosen identity, and only after the first activation was
+    positively observed to create nothing.
+
+    Adapters without the two narrow hooks retain their prior behavior.
+    The Windows adapter implements both and fails closed unless its
+    existing distinct-task duplicate ledger authorizes the fallback.
+    """
+    adapter.select_candidate(candidate)
+    if not hasattr(adapter, "pending_item_created"):
+        return True
+    if adapter.pending_item_created(before_snapshot):
+        return True
+
+    allowed = (
+        plan.path == LOOKUP_PATH_DESCRIPTION_SEARCH
+        and hasattr(adapter, "allows_intentional_duplicate")
+        and adapter.allows_intentional_duplicate(candidate)
+    )
+    if not allowed:
+        return False
+
+    _record_lifecycle(
+        adapter, "DESCRIPTION_SELECTION_CREATED_NO_PENDING_ITEM",
+        category=candidate.category, selector=candidate.selector,
+    )
+    adapter.focus_search()
+    adapter.clear_search()
+    adapter.search_by_category_selector(candidate.category, candidate.selector)
+    raw = adapter.capture_dropdown()
+    exact_results = [
+        result for result in adapter.parse_dropdown(raw)
+        if (result.category, result.selector) == (candidate.category, candidate.selector)
+    ]
+    if not exact_results:
+        raise AdapterError(
+            "CAT/SEL instantiation fallback returned no exact match for the "
+            f"description-selected candidate {candidate.category}/{candidate.selector}."
+        )
+    adapter.select_candidate(exact_results[0])
+    _record_lifecycle(
+        adapter, "CAT_SEL_INSTANTIATION_FALLBACK_SELECTED",
+        category=candidate.category, selector=candidate.selector,
+    )
+    return bool(adapter.pending_item_created(before_snapshot))
+
+
+def _stop_existing(outcome: LookupOutcome, reason: str, detail: str) -> LookupOutcome:
+    """Stop after activation without discarding physical-row evidence."""
+    outcome.decision = DECISION_REVIEW_REQUIRED
+    outcome.stop_reason = reason
+    outcome.stop_detail = detail
+    return outcome
+
+
 def execute_plan(
     plan: LookupPlan,
     item: RecommendationInput,
@@ -345,19 +410,36 @@ def execute_plan(
     # that implement snapshot_grid_identities()/verify_commit() (today,
     # WindowsXactimateAdapter) get independent post-commit verification;
     # everything else behaves exactly as before this change.
-    before_snapshot = adapter.snapshot_grid_identities() if hasattr(adapter, "snapshot_grid_identities") else None
+    if hasattr(adapter, "snapshot_grid_identities_for_activation"):
+        before_snapshot = adapter.snapshot_grid_identities_for_activation()
+    else:
+        before_snapshot = adapter.snapshot_grid_identities() if hasattr(adapter, "snapshot_grid_identities") else None
 
     try:
-        adapter.select_candidate(top.dropdown)
+        pending_item_created = _activate_description_selected_candidate(
+            adapter, plan, top.dropdown, before_snapshot,
+        )
+        if not pending_item_created:
+            raise AdapterError(
+                "Candidate activation created no pending physical item; "
+                "CAT/SEL instantiation fallback was unavailable or also created nothing."
+            )
+        outcome.physical_item_created = True
         _record_lifecycle(adapter, "CANDIDATE_SELECTED", category=top.dropdown.category, selector=top.dropdown.selector)
         populated = adapter.read_populated_fields()
         _record_lifecycle(adapter, "QUICK_ENTRY_POPULATED")
     except UnexpectedDialogError as exc:
         adapter.recover()
-        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNEXPECTED_DIALOG, str(exc), candidates=candidates, selected=top)
+        outcome.decision = DECISION_REVIEW_REQUIRED
+        outcome.stop_reason = STOP_REASON_UNEXPECTED_DIALOG
+        outcome.stop_detail = str(exc)
+        return outcome
     except AdapterError as exc:
         adapter.recover()
-        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_ADAPTER_ERROR, str(exc), candidates=candidates, selected=top)
+        outcome.decision = DECISION_REVIEW_REQUIRED
+        outcome.stop_reason = STOP_REASON_ADAPTER_ERROR
+        outcome.stop_detail = str(exc)
+        return outcome
 
     outcome.populated_fields = populated
 
@@ -425,19 +507,17 @@ def execute_plan(
                     match_result = None
         if match_result is not None and match_result.match_state not in ("exact_match", "normalized_match"):
             _cancel_pending_selection(adapter)
-            return _stop(
-                item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_FIELD_MISMATCH,
+            return _stop_existing(
+                outcome, STOP_REASON_FIELD_MISMATCH,
                 f"Populated fields ({populated.category}/{populated.selector}) differ from the selected "
                 f"candidate ({top.dropdown.category}/{top.dropdown.selector}): {match_result.reason}",
-                candidates=candidates, selected=top,
             )
     elif (populated.category, populated.selector) != (top.dropdown.category, top.dropdown.selector):
         _cancel_pending_selection(adapter)
-        return _stop(
-            item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_FIELD_MISMATCH,
+        return _stop_existing(
+            outcome, STOP_REASON_FIELD_MISMATCH,
             f"Populated fields ({populated.category}/{populated.selector}) differ from the selected "
             f"candidate ({top.dropdown.category}/{top.dropdown.selector}).",
-            candidates=candidates, selected=top,
         )
 
     # Phase 5.6 Stage 4 (live-caught): the naive strict-equality check
@@ -461,18 +541,16 @@ def execute_plan(
             unit_result = adapter.check_unit_compatibility(item.source_unit, item.source_unit, populated.unit)
             if unit_result.unit_match_state == "incompatible":
                 _cancel_pending_selection(adapter)
-                return _stop(
-                    item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_MISMATCH,
+                return _stop_existing(
+                    outcome, STOP_REASON_UNIT_MISMATCH,
                     f"Populated unit ({populated.unit!r}) is incompatible with the source line item's unit "
                     f"({item.source_unit!r}): {unit_result.unit_match_reason}",
-                    candidates=candidates, selected=top,
                 )
         elif item.source_unit.strip().upper() != populated.unit.strip().upper():
             _cancel_pending_selection(adapter)
-            return _stop(
-                item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_MISMATCH,
+            return _stop_existing(
+                outcome, STOP_REASON_UNIT_MISMATCH,
                 f"Populated unit ({populated.unit!r}) differs from the source line item's unit ({item.source_unit!r}).",
-                candidates=candidates, selected=top,
             )
 
     try:
@@ -483,7 +561,10 @@ def execute_plan(
         _record_lifecycle(adapter, "COMMIT_RETURNED")
     except AdapterError as exc:
         adapter.recover()
-        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_EXTRACTION_FAILED, str(exc), candidates=candidates, selected=top)
+        outcome.decision = DECISION_REVIEW_REQUIRED
+        outcome.stop_reason = STOP_REASON_EXTRACTION_FAILED
+        outcome.stop_detail = str(exc)
+        return outcome
 
     outcome.committed = True
 

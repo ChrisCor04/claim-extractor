@@ -246,6 +246,11 @@ class LookupOutcome:
     stop_detail: str | None = None
     evidence_reference: str | None = None
     committed: bool = False
+    #: True as soon as the adapter positively observes the row-count
+    #: increase caused by candidate activation.  This is deliberately
+    #: separate from ``committed``: a later OCR/quantity/commit error
+    #: must not make a physically-created row look like nothing landed.
+    physical_item_created: bool = False
     #: The adapter's independent post-commit verification result (Phase
     #: 4.8's `CommitVerification`, from `WindowsXactimateAdapter.
     #: verify_commit()`), when the adapter supports it. Deliberately

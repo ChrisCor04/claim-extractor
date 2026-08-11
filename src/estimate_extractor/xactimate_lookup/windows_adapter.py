@@ -2733,6 +2733,42 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return False
         return True
 
+    def allows_intentional_duplicate(self, candidate: DropdownResult) -> bool:
+        """Public duck-typed gate used by the orchestrator's narrow
+        description-to-CAT/SEL instantiation fallback.  It deliberately
+        reuses the exact same distinct-task/same-task protections as the
+        Duplicate Item(s) dialog handler."""
+        return self._is_intentional_duplicate(candidate)
+
+    def pending_item_created(self, before_snapshot, timeout_s: float = 8.0) -> bool:
+        """Positively detect candidate activation via a row-count delta.
+
+        This is intentionally smaller than commit verification: before
+        quantity entry we only need to know whether one new physical row
+        exists. Polling absorbs the render delay already observed by
+        ``enter_quantity()``. The same bounded viewport-edge identity
+        probe is used for both baseline and current reads, so a
+        pre-existing trailing row cannot masquerade as the delta.
+        """
+        expected = len(before_snapshot)
+        start = time.time()
+        while True:
+            current = self.snapshot_grid_identities_for_activation()
+            if len(current) == expected + 1:
+                return True
+            if len(current) > expected + 1:
+                raise AdapterError(
+                    "Candidate activation changed the grid by more than one row; refusing to guess "
+                    f"which item was created (before={expected}, after={len(current)})."
+                )
+            if self._unexpected_dialog_present():
+                raise AdapterError(
+                    "An unexpected dialog appeared while confirming pending-item creation."
+                )
+            if time.time() - start >= timeout_s:
+                return False
+            time.sleep(0.25)
+
     def _dismiss_stray_results_popup(self) -> bool:
         """Phase 5.8A (live-caught, defense-in-depth). orchestrator.
         execute_plan() now calls recover() itself on every NO_MATCH/
@@ -3179,6 +3215,34 @@ class WindowsXactimateAdapter(XactimateAdapter):
             self._read_category_selector_at(image, offset, row_1_top + i * _GRID_ROW_HEIGHT)
             for i in range(row_count)
         ]
+
+    def snapshot_grid_identities_for_activation(self) -> list[tuple[str | None, str | None]]:
+        """Capture the activation baseline without changing viewport.
+
+        A 16-row Roof grid was reproducibly counted as 15 because the
+        bottom row's narrow item-number crop sat at the viewport edge,
+        even though that row's wider CAT/SEL cells were still readable.
+        Probe at most the next two physical row positions and append
+        each only when both identity cells are readable.  Two covers
+        the known one-row undercount plus one newly-created row.  This
+        performs no scrolling and therefore cannot strand the
+        following search on a displaced Price List screen.
+        """
+        identities = self.snapshot_grid_identities()
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+        if offset is None:
+            return identities
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        for _probe in range(2):
+            next_row_top = row_1_top + len(identities) * _GRID_ROW_HEIGHT
+            if next_row_top < 0 or next_row_top + _GRID_ROW_HEIGHT > image.height:
+                break
+            trailing = self._read_category_selector_at(image, offset, next_row_top)
+            if not all(str(value or "").strip() for value in trailing):
+                break
+            identities.append(trailing)
+        return identities
 
     def _read_description_at(self, image, offset: tuple[int, int], row_top: int) -> str | None:
         """Lighter-weight description-only read at an ARBITRARY

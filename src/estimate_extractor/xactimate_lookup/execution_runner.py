@@ -67,6 +67,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     STOP_REASON_TASK_LEVEL_STOPS,
     TASK_COMMIT_STATE_COMMITTED,
     TASK_COMMIT_STATE_NOT_COMMITTED,
+    TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
@@ -292,7 +293,11 @@ def _apply_outcome_to_task(task: ExecutionTask, outcome, dry_run: bool) -> None:
         return
 
     if not outcome.committed:
-        task.commit_state = TASK_COMMIT_STATE_NOT_COMMITTED
+        task.commit_state = (
+            TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+            if getattr(outcome, "physical_item_created", False)
+            else TASK_COMMIT_STATE_NOT_COMMITTED
+        )
         task.state = TASK_FAILED if outcome.decision == DECISION_NO_MATCH else TASK_REVIEW_REQUIRED
         return
 
