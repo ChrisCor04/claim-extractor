@@ -2148,6 +2148,7 @@ def test_activation_baseline_adds_one_readable_viewport_edge_row_without_scrolli
     assert len(baseline) == 16
     assert baseline[-1] == ("RFG", "STEEP")
     assert reads == [100 + index * 25 for index in range(16)]
+    assert len(adapter._last_activation_baseline_rows) == 16
 
 
 def _activation_row(cat="RFG", sel="STEEP", desc="Steep charge", activity="-"):
@@ -2156,7 +2157,7 @@ def _activation_row(cat="RFG", sel="STEEP", desc="Steep charge", activity="-"):
 
 def test_pending_detector_accepts_one_new_physical_row(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row()])
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row(activity=None)])
 
     assert adapter.pending_item_created([], timeout_s=0) is True
 
@@ -2173,6 +2174,7 @@ def test_pending_detector_accepts_new_pair_after_existing_rows(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     existing = _activation_row(cat="SFG", sel="GUTA", desc="Gutter", activity="+")
     pair = [_activation_row(activity="-"), _activation_row(activity="+")]
+    adapter._last_activation_baseline_rows = [existing]
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [existing, *pair])
 
     assert adapter.pending_item_created([("SFG", "GUTA")], timeout_s=0) is True
@@ -2183,7 +2185,7 @@ def test_pending_detector_rejects_two_unrelated_new_rows(monkeypatch):
     rows = [_activation_row(), _activation_row(cat="SFG", sel="GUTA", desc="Gutter", activity="+")]
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: rows)
 
-    with pytest.raises(AdapterError, match="not a corroborated adjacent R&R"):
+    with pytest.raises(AdapterError, match="logical multiset delta was not exactly one R&R"):
         adapter.pending_item_created([], timeout_s=0)
 
 
@@ -2198,7 +2200,58 @@ def test_pending_detector_rejects_invalid_same_identity_pair(monkeypatch, second
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row(), second])
 
-    with pytest.raises(AdapterError, match="not a corroborated adjacent R&R"):
+    with pytest.raises(AdapterError, match="logical multiset delta was not exactly one R&R"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+def test_pending_detector_accepts_activity_grouped_duplicate_rr_delta(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [_activation_row(activity="-"), _activation_row(activity="+")]
+    after = [
+        _activation_row(activity="-"), _activation_row(activity="-"),
+        _activation_row(activity="+"), _activation_row(activity="+"),
+    ]
+    adapter._last_activation_baseline_rows = before
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    assert adapter.pending_item_created([("RFG", "STEEP"), ("RFG", "STEEP")], timeout_s=0) is True
+
+
+@pytest.mark.parametrize("activity", ["-", "+"])
+def test_pending_detector_rejects_lone_rr_activity(monkeypatch, activity):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row(activity=activity)])
+
+    with pytest.raises(AdapterError, match="not one ordinary non-R&R row"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        [_activation_row(activity="-"), _activation_row(activity="-")],
+        [_activation_row(activity="+"), _activation_row(activity="+")],
+        [_activation_row(activity="-"), _activation_row(cat="SFG", sel="GUTA", activity="+")],
+        [_activation_row(activity="-"), _activation_row(desc="Different description", activity="+")],
+    ],
+)
+def test_pending_detector_rejects_non_pair_two_row_multiset_deltas(monkeypatch, after):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    with pytest.raises(AdapterError, match="logical multiset delta was not exactly one R&R"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+def test_pending_detector_rejects_more_than_one_logical_rr_item(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    after = [
+        _activation_row(activity="-"), _activation_row(activity="-"),
+        _activation_row(activity="+"), _activation_row(activity="+"),
+    ]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    with pytest.raises(AdapterError, match="more than one logical item"):
         adapter.pending_item_created([], timeout_s=0)
 
 

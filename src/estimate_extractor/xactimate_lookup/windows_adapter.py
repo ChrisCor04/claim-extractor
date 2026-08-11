@@ -866,6 +866,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_dropdown_rows: list[_RawDropdownRow] = []
         self._last_selected: DropdownResult | None = None
         self._last_selected_row_count_before: int | None = None
+        # Rich counterpart to snapshot_grid_identities_for_activation()'s
+        # public tuple baseline. Xactimate can regroup duplicate R&R rows
+        # by activity (-,-,+,+), so pending detection must compare a
+        # logical multiset rather than assume the old rows stay a prefix.
+        self._last_activation_baseline_rows: list[ActivationRowSnapshot] | None = None
         self._current_query: str | None = None
         #: Phase 5.8: monotonic timestamp of the most recent
         #: search_by_description()/search_by_category_selector() call
@@ -2982,36 +2987,49 @@ class WindowsXactimateAdapter(XactimateAdapter):
         """Positively detect one newly-created logical item.
 
         Xactimate may instantiate one logical R&R item as either one
-        physical row or an adjacent remove/add pair.  A two-row delta is
-        accepted only when both appended rows have the same CAT/SEL and
-        compatible descriptions, and every readable activity cell agrees
-        with the expected ``-`` then ``+`` ordering.  Arbitrary two-row
-        growth still fails closed.
+        physical row or a remove/add pair, and may regroup multiple
+        identical pairs by activity (``-,-,+,+``). The rich baseline is
+        therefore reconciled as a logical multiset, not a positional
+        prefix. Arbitrary two-row growth still fails closed.
         """
         expected = len(before_snapshot)
+        baseline_rows = self._last_activation_baseline_rows
+        if baseline_rows is None:
+            baseline_rows = [] if expected == 0 else None
+        if baseline_rows is None or len(baseline_rows) != expected:
+            raise AdapterError(
+                "Pending-item detection has no matching rich activation baseline; refusing to infer a row delta."
+            )
+        baseline_identities = [(row.category, row.selector) for row in baseline_rows]
+        if baseline_identities != list(before_snapshot):
+            raise AdapterError(
+                "Pending-item detection's rich baseline does not match the supplied physical-row baseline."
+            )
         start = time.time()
         while True:
             rows = self._snapshot_activation_rows()
-            current = [(row.category, row.selector) for row in rows]
-            if current[:expected] != list(before_snapshot):
-                raise AdapterError(
-                    "Candidate activation changed the pre-existing grid rows; refusing to infer a pending item."
-                )
-            delta = rows[expected:]
-            if len(delta) == 1:
-                return True
-            if len(delta) == 2:
-                if self._is_logical_rr_pair(delta[0], delta[1]):
+            physical_delta = len(rows) - expected
+            if physical_delta == 1:
+                if self._is_one_safe_single_row_delta(baseline_rows, rows):
                     return True
                 raise AdapterError(
-                    "Candidate activation added two physical rows that were not a corroborated adjacent "
-                    f"R&R -/+ pair (before={expected}, after={len(current)})."
+                    "Candidate activation added one physical row, but the logical multiset delta was not "
+                    "one ordinary non-R&R row."
                 )
-            if len(delta) > 2:
+            if physical_delta == 2:
+                if self._is_one_logical_rr_multiset_delta(baseline_rows, rows):
+                    return True
+                raise AdapterError(
+                    "Candidate activation added two physical rows, but the logical multiset delta was not "
+                    f"exactly one R&R -/+ item (before={expected}, after={len(rows)})."
+                )
+            if physical_delta > 2:
                 raise AdapterError(
                     "Candidate activation changed the grid by more than one logical item; refusing to guess "
-                    f"which item was created (before={expected}, after={len(current)})."
+                    f"which item was created (before={expected}, after={len(rows)})."
                 )
+            if physical_delta < 0:
+                raise AdapterError("Candidate activation removed physical rows; refusing to infer a pending item.")
             if self._unexpected_dialog_present():
                 raise AdapterError(
                     "An unexpected dialog appeared while confirming pending-item creation."
@@ -3019,6 +3037,144 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if time.time() - start >= timeout_s:
                 return False
             time.sleep(0.25)
+
+    @classmethod
+    def _activation_identity(cls, row: ActivationRowSnapshot) -> tuple[str, str, str]:
+        return (
+            cls._normalized_pair_text(row.category),
+            cls._normalized_pair_text(row.selector),
+            cls._normalized_pair_text(row.description),
+        )
+
+    @staticmethod
+    def _activity_token(row: ActivationRowSnapshot) -> str | None:
+        value = str(row.activity or "").strip()
+        return value or None
+
+    @classmethod
+    def _rows_by_activation_identity(
+        cls, rows: list[ActivationRowSnapshot],
+    ) -> dict[tuple[str, str, str], list[ActivationRowSnapshot]]:
+        grouped: dict[tuple[str, str, str], list[ActivationRowSnapshot]] = {}
+        for row in rows:
+            identity = cls._activation_identity(row)
+            if not all(identity):
+                return {}
+            grouped.setdefault(identity, []).append(row)
+        return grouped
+
+    @classmethod
+    def _activity_remainder(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> tuple[dict[str | None, int], int] | None:
+        """Account for baseline activities and return the unexplained remainder.
+
+        A missing OCR activity is treated only as a wildcard for a
+        baseline row already known to exist. It can consume one after
+        row but can never itself supply the required new ``-``/``+``
+        evidence.
+        """
+        after_counts: dict[str | None, int] = {}
+        for row in after_rows:
+            token = cls._activity_token(row)
+            after_counts[token] = after_counts.get(token, 0) + 1
+
+        before_unknown = 0
+        for row in before_rows:
+            token = cls._activity_token(row)
+            if token is None:
+                before_unknown += 1
+                continue
+            if after_counts.get(token, 0) > 0:
+                after_counts[token] -= 1
+            elif after_counts.get(None, 0) > 0:
+                after_counts[None] -= 1
+            else:
+                return None
+        return after_counts, before_unknown
+
+    @classmethod
+    def _is_one_logical_rr_multiset_delta(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> bool:
+        if len(after_rows) != len(before_rows) + 2:
+            return False
+        before_groups = cls._rows_by_activation_identity(before_rows)
+        after_groups = cls._rows_by_activation_identity(after_rows)
+        if (before_rows and not before_groups) or not after_groups:
+            return False
+
+        changed_identity = None
+        for identity in set(before_groups) | set(after_groups):
+            before_group = before_groups.get(identity, [])
+            after_group = after_groups.get(identity, [])
+            count_delta = len(after_group) - len(before_group)
+            if count_delta not in (0, 2):
+                return False
+            if count_delta == 2:
+                if changed_identity is not None:
+                    return False
+                changed_identity = identity
+            remainder = cls._activity_remainder(before_group, after_group)
+            if remainder is None:
+                return False
+            remaining, before_unknown = remainder
+            remaining_total = sum(remaining.values())
+            if count_delta == 0:
+                if remaining_total != before_unknown:
+                    return False
+            else:
+                # Baseline unknowns may consume any existing activity,
+                # but the two rows left over must be a readable -/+ pair.
+                if remaining_total != before_unknown + 2:
+                    return False
+                if remaining.get("-", 0) < 1 or remaining.get("+", 0) < 1:
+                    return False
+        return changed_identity is not None
+
+    @classmethod
+    def _is_one_safe_single_row_delta(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> bool:
+        if len(after_rows) != len(before_rows) + 1:
+            return False
+        before_groups = cls._rows_by_activation_identity(before_rows)
+        after_groups = cls._rows_by_activation_identity(after_rows)
+        if (before_rows and not before_groups) or not after_groups:
+            return False
+        changed = 0
+        for identity in set(before_groups) | set(after_groups):
+            before_group = before_groups.get(identity, [])
+            after_group = after_groups.get(identity, [])
+            delta = len(after_group) - len(before_group)
+            if delta not in (0, 1):
+                return False
+            remainder = cls._activity_remainder(before_group, after_group)
+            if remainder is None:
+                return False
+            remaining, before_unknown = remainder
+            if delta == 0:
+                if sum(remaining.values()) != before_unknown:
+                    return False
+                continue
+            changed += 1
+            # The sole unexplained row may be an ordinary item, but a
+            # lone readable R&R activity is explicitly incomplete.
+            possible_new = [
+                token for token, count in remaining.items()
+                for _ in range(count)
+            ]
+            if len(possible_new) != before_unknown + 1:
+                return False
+            if before_unknown == 0 and possible_new[0] in ("-", "+"):
+                return False
+        return changed == 1
 
     @staticmethod
     def _normalized_pair_text(value: str | None) -> str:
@@ -3506,7 +3662,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         performs no scrolling and therefore cannot strand the
         following search on a displaced Price List screen.
         """
-        return [(row.category, row.selector) for row in self._snapshot_activation_rows()]
+        rows = self._snapshot_activation_rows()
+        self._last_activation_baseline_rows = list(rows)
+        return [(row.category, row.selector) for row in rows]
 
     def _snapshot_activation_rows(self) -> list[ActivationRowSnapshot]:
         """Capture physical rows plus pair evidence without scrolling."""
