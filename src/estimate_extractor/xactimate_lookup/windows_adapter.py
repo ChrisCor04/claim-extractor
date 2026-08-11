@@ -5989,7 +5989,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if grid_offset_before is None:
                 skip_cleanup = True
                 return False
-            baseline_identities = self.snapshot_grid_identities()
+            # The disposable probe follows the same physical-
+            # instantiation contract as a source task.  Retain the rich
+            # before-snapshot here so pending_item_created() can prove
+            # the exact probe row appeared. A plain identity snapshot
+            # cannot establish the logical before/after row delta.
+            baseline_identities = self.snapshot_grid_identities_for_activation()
             row_count_before = len(baseline_identities)
 
             self.focus_search()
@@ -6038,7 +6043,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 # Phase 5.9A report.
                 if not self._handle_duplicate_item_dialog():
                     raise
-            self.enter_quantity(1)
+            if not self.pending_item_created(baseline_identities):
+                return False
+            # Group activation is already positively proven by the
+            # exact candidate plus its new physical-row delta.  Do not
+            # route this disposable probe through source-task quantity
+            # entry: selected-row quantity OCR can misread Xactimate's
+            # default value, and enter_quantity() correctly refuses to
+            # overwrite a non-zero read.  Commit/visible/identity-based
+            # cleanup below remain the fail-closed lifecycle proof.
             self.commit_item()
 
             # Phase 5.9A: THE verification signal -- positive, bounded-

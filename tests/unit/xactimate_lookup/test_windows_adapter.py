@@ -2886,6 +2886,11 @@ def _stateful_probe_lifecycle_mocks(monkeypatch, adapter, *, baseline_row_count=
         adapter, "snapshot_grid_identities",
         lambda: [("SFG", "GUTA")] * min(state["row_count"], baseline_row_count),
     )
+    monkeypatch.setattr(
+        adapter, "snapshot_grid_identities_for_activation",
+        lambda: [("SFG", "GUTA")] * min(state["row_count"], baseline_row_count),
+    )
+    monkeypatch.setattr(adapter, "pending_item_created", lambda before: True)
 
     def _commit_item():
         state["row_count"] = baseline_row_count + 1
@@ -2934,9 +2939,24 @@ def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
     )
     monkeypatch.setattr(adapter, "parse_dropdown", lambda raw: raw)
     monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
-    monkeypatch.setattr(adapter, "select_candidate", lambda target: None)
-    monkeypatch.setattr(adapter, "enter_quantity", lambda qty: None)
+    probe_order = []
+    monkeypatch.setattr(adapter, "select_candidate", lambda target: probe_order.append("select"))
+    monkeypatch.setattr(
+        adapter,
+        "enter_quantity",
+        lambda qty: (_ for _ in ()).throw(AssertionError("group verification must not use source-task quantity entry")),
+    )
     _stateful_probe_lifecycle_mocks(monkeypatch, adapter, baseline_row_count=0)
+    commit_probe = adapter.commit_item
+    monkeypatch.setattr(adapter, "commit_item", lambda: probe_order.append("commit") or commit_probe())
+    monkeypatch.setattr(
+        adapter, "snapshot_grid_identities_for_activation",
+        lambda: probe_order.append("activation_baseline") or [],
+    )
+    monkeypatch.setattr(
+        adapter, "pending_item_created",
+        lambda before: probe_order.append("pending_detected") or True,
+    )
 
     assert adapter._verify_group_once("Front Elevation") is True
     assert items_resets == ["verified-items", "verified-items"]
@@ -2944,6 +2964,8 @@ def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
     # Phase 5.8 Stage 8: a real probe run must be counted, per-group.
     assert adapter.probes_run_total == 1
     assert adapter.probes_by_group == {"Front Elevation": 1}
+    # First commit saves the probe; the second saves its confirmed cleanup.
+    assert probe_order == ["activation_baseline", "select", "pending_detected", "commit", "commit"]
     # Phase 5.9A: Subtotal evidence is recorded but was NOT the reason
     # verification passed (it consistently read 0 delta above).
     assert adapter.last_verify_group_subtotal_evidence == "MISMATCH"
@@ -3074,8 +3096,8 @@ def test_verify_group_once_self_heals_duplicate_dialog_from_its_own_probe(monkey
     select_candidate()'s click, raising UnexpectedDialogError -- before
     this fix, _verify_group_once()'s broad except swallowed that as a
     bare False without ever reaching commit/cleanup. Must now self-heal
-    via _handle_duplicate_item_dialog() and continue to
-    enter_quantity()/commit_item()."""
+    via _handle_duplicate_item_dialog() and continue to commit/cleanup;
+    group probes never use source-task quantity entry."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(adapter, "verify_application", lambda: True)
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
@@ -3129,7 +3151,7 @@ def test_verify_group_once_self_heals_duplicate_dialog_from_its_own_probe(monkey
     # heal check (a no-op here, nothing open yet), once more to heal
     # the dialog select_candidate() actually raised on.
     assert heal_calls == [1, 1]
-    assert quantity_calls == [1]  # execution continued straight through to quantity/commit
+    assert quantity_calls == []  # group verification never invokes source-task quantity entry
     # Called twice: once for the probe's own commit, once more by
     # _cleanup_probe_item()'s final "save after cancel".
     assert commit_calls == [1, 1]
@@ -3340,9 +3362,9 @@ def test_verify_group_once_tolerates_single_char_selector_noise_on_recheck(monke
     monkeypatch.setattr(adapter, "search_by_category_selector", lambda cat, sel: None)
     monkeypatch.setattr(adapter, "select_candidate", lambda target: None)
     monkeypatch.setattr(adapter, "enter_quantity", lambda qty: None)
-    _stateful_probe_lifecycle_mocks(monkeypatch, adapter, baseline_row_count=2)
-
     baseline = [("RFG", "300S"), ("PNT", "FENST")]
+    _stateful_probe_lifecycle_mocks(monkeypatch, adapter, baseline_row_count=2)
+    monkeypatch.setattr(adapter, "snapshot_grid_identities_for_activation", lambda: baseline)
     call_count = {"n": 0}
 
     def _misaligned_then_recovering_snapshot(row_top_nudge=0):
