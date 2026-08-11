@@ -3652,17 +3652,19 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         1. Poll (bounded by `timeout_s`) until the grid's row count
            differs from `len(before_snapshot)`.
-        2. `delta == 1` (exactly one row appended) is the only
-           structurally trustworthy outcome -- every row insertion
-           observed anywhere in this project has always appended at
-           the end, so the new row is deterministically
-           `row_index = row_count_after - 1`. No text match is needed
-           to find it.
+        2. `delta == 1` identifies one appended physical row. A
+           `delta == 2` is also one logical item only when the two
+           appended rows pass the same strict adjacent R&R-pair proof
+           used by pending-item detection (same CAT/SEL, compatible
+           description, readable activities agreeing with ``-/+``).
+           The quantity-bearing add row is then deterministically the
+           last row. No text search across unrelated rows is used.
         3. The first `len(before_snapshot)` rows after commit must
            equal `before_snapshot` exactly (`preexisting_rows_
            unchanged`). If not, the state is not trustworthy even
            though the count delta looks right.
-        4. `delta` not in `{0, 1}`, or pre-existing rows changed ->
+        4. A delta other than one physical row or one corroborated R&R
+           pair, or changed pre-existing rows ->
            `trust_state="CONFLICTING_ROW"` (refuses to guess which
            row is the committed one).
         5. `delta == 0` through `timeout_s` ->
@@ -3708,7 +3710,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
            -- fuzzy-matching noisy OCR description text reliably is
            exactly the kind of new OCR-tuning work this phase does
            not do.
-        8. `trust_state="VERIFIED"` requires ALL of: delta==1,
+        8. `trust_state="VERIFIED"` requires ALL of: one logical item
+           appended (one row or one corroborated R&R pair),
            pre-existing rows unchanged, quantity read and matched
            exactly, unit compatible, and category/selector OCR either
            agrees or is unreadable (never contradicts).
@@ -3752,7 +3755,40 @@ class WindowsXactimateAdapter(XactimateAdapter):
             sample: dict = {"elapsed_s": round(elapsed, 3), "row_count_after": row_count_after, "delta": delta}
             samples.append(sample)
 
-            if delta == 1:
+            logical_rr_pair = False
+            if delta == 2:
+                activation_rows = self._snapshot_activation_rows()
+                activation_identities = [(row.category, row.selector) for row in activation_rows]
+                activation_delta = activation_rows[row_count_before:]
+                logical_rr_pair = (
+                    len(activation_rows) == row_count_after
+                    and activation_identities[:row_count_before] == before_snapshot
+                    and len(activation_delta) == 2
+                    and self._is_logical_rr_pair(activation_delta[0], activation_delta[1])
+                )
+                sample["rr_pair_evidence"] = [
+                    {
+                        "category": row.category,
+                        "selector": row.selector,
+                        "description": row.description,
+                        "activity": row.activity,
+                    }
+                    for row in activation_delta
+                ]
+                sample["logical_rr_pair"] = logical_rr_pair
+                if not logical_rr_pair:
+                    return fail(
+                        "CONFLICTING_ROW",
+                        "row count increased by 2, but the appended rows were not a corroborated "
+                        "adjacent R&R -/+ pair -- refusing to guess which row is the committed item",
+                        row_count_after=row_count_after,
+                        preexisting_rows_unchanged=(
+                            activation_identities[:row_count_before] == before_snapshot
+                            if len(activation_rows) >= row_count_before else False
+                        ),
+                    )
+
+            if delta == 1 or logical_rr_pair:
                 preexisting_unchanged = after[:row_count_before] == before_snapshot
                 if not preexisting_unchanged:
                     return fail(
@@ -3844,7 +3880,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 else:
                     trust_state = "VERIFIED"
                     reason = (
-                        "exactly one row appended at the deterministic last position, pre-existing rows unchanged, "
+                        ("one corroborated R&R -/+ logical item appended" if logical_rr_pair
+                         else "exactly one physical row appended")
+                        + " at the deterministic last position, pre-existing rows unchanged, "
                         "quantity matched, unit compatible, and category/selector OCR "
                         + ("agrees" if cat_sel_agrees else "was unreadable (not treated as a conflict)")
                     )

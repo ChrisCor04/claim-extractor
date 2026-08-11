@@ -1110,19 +1110,68 @@ def test_verify_commit_category_ocr_contradiction_downgrades_to_review_required(
     assert result.category_selector_ocr_agrees is False
 
 
-def test_verify_commit_row_count_delta_other_than_one_is_conflicting_row(monkeypatch):
-    """Regression test (Phase 4.8): a row-count delta that isn't
-    exactly 1 (here: 2 rows appeared instead of 1) must never be
-    silently resolved by guessing which one is the committed row --
-    reports CONFLICTING_ROW instead, immediately, without waiting for
-    timeout."""
+def test_verify_commit_two_unrelated_rows_remain_conflicting(monkeypatch):
+    """Two physical rows are not accepted merely because the delta is 2."""
     adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
         row_sequence=[[("SFG", "GUTA"), ("SFG", "GUTB")]],
     )
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        _activation_row(cat="SFG", sel="GUTA", desc="Gutter", activity="-"),
+        _activation_row(cat="SFG", sel="GUTB", desc="Downspout", activity="+"),
+    ])
     result = adapter.verify_commit([], "SFG", "GUTA", 5.0, timeout_s=3.0)
     assert result.trust_state == "CONFLICTING_ROW"
     assert result.row_index is None
+
+
+def test_verify_commit_accepts_valid_rr_pair_as_one_logical_item(monkeypatch):
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("RFG", "STEEP"), ("RFG", "STEEP")]],
+        unit_reads=[("SQ", "SQ")],
+        quantity_reads=[33.66],
+    )
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        _activation_row(activity="-"),
+        _activation_row(activity="+"),
+    ])
+
+    result = adapter.verify_commit(
+        [], "RFG", "STEEP", 33.66,
+        source_unit="SQ", expected_xactimate_unit="SQ", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.row_count_before == 0
+    assert result.row_count_after == 2
+    assert result.row_index == 1
+    assert result.quantity_observed == 33.66
+    assert result.samples[0]["logical_rr_pair"] is True
+
+
+def test_verify_commit_accepts_valid_rr_pair_after_unchanged_existing_rows(monkeypatch):
+    before = [("SFG", "GUTA")]
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[*before, ("RFG", "STEEP"), ("RFG", "STEEP")]],
+        unit_reads=[("SQ", "SQ")],
+        quantity_reads=[35.67],
+    )
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        _activation_row(cat="SFG", sel="GUTA", desc="Gutter", activity="+"),
+        _activation_row(activity="-"),
+        _activation_row(activity="+"),
+    ])
+
+    result = adapter.verify_commit(
+        before, "RFG", "STEEP", 35.67,
+        source_unit="SQ", expected_xactimate_unit="SQ", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.preexisting_rows_unchanged is True
+    assert result.row_index == 2
 
 
 def test_verify_commit_preexisting_rows_changed_is_conflicting_row(monkeypatch):
