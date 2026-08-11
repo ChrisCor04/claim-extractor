@@ -546,6 +546,68 @@ def test_components_active_state_is_restored_to_verified_items_before_search(mon
     assert clicks == [(101, 20, 15)]
 
 
+def test_group_name_ocr_keeps_normal_unselected_result(monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    reads = []
+    monkeypatch.setattr(adapter, "_ocr_text", lambda image, psm=7: reads.append(image.size) or "Exterior")
+
+    assert adapter._ocr_group_tree_name_crop(Image.new("RGB", (245, 18), "white")) == "Exterior"
+    assert reads == [(980, 72)]
+
+
+def test_group_name_ocr_retries_selected_highlight_interior(monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    reads = iter(["", "aa Fence |"])
+    sizes = []
+
+    def read(image, psm=7):
+        sizes.append(image.size)
+        return next(reads)
+
+    monkeypatch.setattr(adapter, "_ocr_text", read)
+
+    assert adapter._ocr_group_tree_name_crop(Image.new("RGB", (245, 18), "white")) == "aa Fence |"
+    assert sizes == [(980, 72), (980, 56)]
+
+
+def test_group_name_ocr_blank_row_remains_blank(monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ocr_text", lambda image, psm=7: "")
+
+    assert adapter._ocr_group_tree_name_crop(Image.new("RGB", (245, 18), "white")) == ""
+
+
+def test_group_name_ocr_unreadable_row_does_not_fabricate_identity(monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    reads = iter(["", "||"])
+    monkeypatch.setattr(adapter, "_ocr_text", lambda image, psm=7: next(reads))
+
+    observed = adapter._ocr_group_tree_name_crop(Image.new("RGB", (245, 18), "white"))
+    assert observed == "||"
+    assert adapter._find_unique_group_row(["TEST", observed], "Fence") is None
+
+
+def test_group_name_ocr_fallback_preserves_duplicate_name_ambiguity(monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    reads = iter(["", "Fence", "", "Fence"])
+    monkeypatch.setattr(adapter, "_ocr_text", lambda image, psm=7: next(reads))
+    crop = Image.new("RGB", (245, 18), "white")
+    rows = ["TEST", adapter._ocr_group_tree_name_crop(crop), adapter._ocr_group_tree_name_crop(crop)]
+
+    with pytest.raises(AdapterError, match="2 groups"):
+        adapter._find_unique_group_row(rows, "Fence")
+
+
 def test_group_stickiness_reset_freshly_locates_and_verifies_both_tabs(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     state = {"pane": "items"}

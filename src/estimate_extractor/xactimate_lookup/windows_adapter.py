@@ -4616,6 +4616,24 @@ class WindowsXactimateAdapter(XactimateAdapter):
             - self._GROUP_TREE_ROW_CROP_MARGIN_TOP
         )
 
+    def _ocr_group_tree_name_crop(self, crop) -> str:
+        """Read one group-name crop, retrying only a blank selected row.
+
+        Live-caught on the selected Fence row: the selection highlight's
+        full-width border makes Tesseract PSM 7 return an empty string even
+        though the crop geometry and glyph pixels are correct. The ordinary
+        pass remains first and unchanged. Only when it is blank, remove the
+        crop-relative highlight margins and retry the same pixels once. No
+        name, row index, or screen coordinate is inferred by this fallback.
+        """
+        scaled = crop.resize((crop.width * 4, crop.height * 4))
+        text = self._ocr_text(scaled, psm=7).strip()
+        if text or crop.height <= 4:
+            return text
+        interior = crop.crop((0, 3, crop.width, crop.height - 1))
+        interior = interior.resize((interior.width * 4, interior.height * 4))
+        return self._ocr_text(interior, psm=7).strip()
+
     #: Wheel-scroll "clicks" (each WHEEL_DELTA=120) sent to scroll the
     #: group tree panel back to its top -- enough to clear any drift
     #: observed live (a handful of rows), bounded so this never becomes
@@ -4700,8 +4718,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             # docstring for the full live-caught evidence and the 4x
             # choice (a wider sweep found 6x+ actually makes recognition
             # worse, so this is deliberately not "more is better").
-            crop = crop.resize((crop.width * 4, crop.height * 4))
-            rows.append(self._ocr_text(crop, psm=7).strip())
+            rows.append(self._ocr_group_tree_name_crop(crop))
         return rows
 
     #: Grand Total's own label+value block is FIXED left-sidebar chrome
@@ -5237,8 +5254,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             left + self._GROUP_TREE_TEXT_DX, row_top,
             left + self._GROUP_TREE_TEXT_DX + self._GROUP_TREE_TEXT_WIDTH, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT,
         ))
-        crop = crop.resize((crop.width * 4, crop.height * 4))
-        return self._ocr_text(crop, psm=7).strip()
+        return self._ocr_group_tree_name_crop(crop)
 
     def _reset_group_creation_stickiness(self) -> None:
         """Not part of the abstract contract (Phase 5.5C Stage 4).
