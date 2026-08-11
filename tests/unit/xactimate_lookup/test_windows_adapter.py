@@ -3652,3 +3652,134 @@ def test_enter_quantity_resets_scroll_state_after_scrolling(monkeypatch):
     )
     adapter.enter_quantity(1.0)
     assert calls["reset_scroll"] == 1
+
+
+# ---------------------------------------------------------------------
+# Phase 6.3 (live-caught): task_line_0019's `populated_fields_mismatch`
+# ("owe"/"eee", later "None"/"None") traced to the exact same viewport-
+# blindness Phase 6.2 fixed for enter_quantity() -- but in the SIBLING
+# method _read_populated_fields_once(), never patched. The 17th row's
+# computed y (1056) exceeded the 1023px captured client area by 33px,
+# so every one of read_populated_fields()'s 3 majority-vote reads
+# cropped from entirely outside the real image: stably garbled/empty on
+# every attempt, not per-read OCR noise. _ensure_last_row_visible() is
+# the shared fix, plus a bounded "grow the window" last resort for when
+# scrolling alone has a real floor (live-confirmed: 8 scroll attempts
+# with zero position change once the content pane above the grid can't
+# shrink any further).
+# ---------------------------------------------------------------------
+
+
+def test_ensure_last_row_visible_scrolls_when_offscreen(monkeypatch):
+    """A row below the viewport must be scrolled into view, not read
+    blind -- same contract as enter_quantity()'s own scroll-into-view."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    calls = {"scroll": 0}
+
+    def fake_scroll(hwnd, notches=2):
+        calls["scroll"] += 1
+
+    monkeypatch.setattr(adapter, "_scroll_grid_body", fake_scroll)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    state = {"top": 1050}
+
+    def fake_capture(hwnd, attempts=1, delay_s=0):
+        if calls["scroll"] >= 1:
+            state["top"] = 500
+        return _FakeImage(1023), (0, 0)
+
+    monkeypatch.setattr(adapter, "_capture_and_locate", fake_capture)
+    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (16, state["top"]))
+
+    image, offset, geom, scrolled = adapter._ensure_last_row_visible(123, _FakeImage(1023), (0, 0), (16, 1050))
+    assert scrolled is True
+    assert geom[1] == 500
+
+
+def test_ensure_last_row_visible_skips_scroll_when_already_visible(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    calls = {"scroll": 0}
+    monkeypatch.setattr(adapter, "_scroll_grid_body", lambda hwnd, notches=2: calls.__setitem__("scroll", calls["scroll"] + 1))
+
+    image, offset, geom, scrolled = adapter._ensure_last_row_visible(123, _FakeImage(1023), (0, 0), (16, 500))
+    assert scrolled is False
+    assert calls["scroll"] == 0
+
+
+def test_ensure_last_row_visible_grows_window_when_scroll_has_no_effect(monkeypatch):
+    """Live-caught: scrolling can hit a real floor (the content pane
+    above the grid only shrinks so far) where repeated attempts produce
+    NO position change at all. The bounded last resort is to grow the
+    window, not fail immediately -- resolution-independent because it
+    ADAPTS rather than assumes a large window up front."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(adapter, "_scroll_grid_body", lambda hwnd, notches=2: None)
+
+    class _FakePlacement:
+        def __getitem__(self, i):
+            return 1  # SW_SHOWNORMAL, i.e. not already maximized
+
+    class _FakeWin32Gui:
+        def GetWindowPlacement(self, hwnd):
+            return _FakePlacement()
+
+        def ShowWindow(self, hwnd, cmd):
+            state["maximized"] = True
+
+    state = {"maximized": False}
+    monkeypatch.setattr(adapter, "_win32gui", lambda: _FakeWin32Gui())
+
+    def fake_capture(hwnd, attempts=1, delay_s=0):
+        # scrolling alone (before "maximize") never moves the row;
+        # once "maximized", the row becomes visible.
+        return _FakeImage(1023 if not state["maximized"] else 1400), (0, 0)
+
+    monkeypatch.setattr(adapter, "_capture_and_locate", fake_capture)
+    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (16, 1050))
+
+    image, offset, geom, scrolled = adapter._ensure_last_row_visible(123, _FakeImage(1023), (0, 0), (16, 1050))
+    assert state["maximized"] is True
+    assert scrolled is True
+
+
+def test_ensure_last_row_visible_fails_closed_when_never_visible(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(adapter, "_scroll_grid_body", lambda hwnd, notches=2: None)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=1, delay_s=0: (_FakeImage(1023), (0, 0)))
+    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (16, 1050))
+
+    class _FakePlacement:
+        def __getitem__(self, i):
+            return 3  # SW_SHOWMAXIMIZED -- already maximized, no point trying to grow further
+
+    class _FakeWin32Gui:
+        def GetWindowPlacement(self, hwnd):
+            return _FakePlacement()
+
+    monkeypatch.setattr(adapter, "_win32gui", lambda: _FakeWin32Gui())
+
+    with pytest.raises(RowOffscreenError):
+        adapter._ensure_last_row_visible(123, _FakeImage(1023), (0, 0), (16, 1050))
+
+
+def test_read_populated_fields_resets_scroll_state_only_when_scrolled(monkeypatch):
+    """The public wrapper must clean up after itself exactly like
+    enter_quantity() does -- never leak a scroll into a later,
+    unrelated operation."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    calls = {"reset": 0}
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: calls.__setitem__("reset", calls["reset"] + 1))
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import PopulatedFields
+
+    fake_fields = PopulatedFields(category="RFG", selector="STEEP", description="d", unit="SQ", action="+", item_number=None)
+    monkeypatch.setattr(adapter, "_read_populated_fields_once", lambda: (fake_fields, False))
+
+    adapter.read_populated_fields()
+    assert calls["reset"] == 0
+
+    monkeypatch.setattr(adapter, "_read_populated_fields_once", lambda: (fake_fields, True))
+    adapter.read_populated_fields()
+    assert calls["reset"] == 1

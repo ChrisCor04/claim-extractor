@@ -2028,7 +2028,17 @@ class WindowsXactimateAdapter(XactimateAdapter):
         #: populated_fields_mismatch check is what actually catches a
         #: genuinely wrong selection, so this is a reliability
         #: improvement, not a substitute for that safety check.
-        reads = [self._read_populated_fields_once() for _ in range(3)]
+        raw = [self._read_populated_fields_once() for _ in range(3)]
+        reads = [r for r, _scrolled in raw]
+        # Phase 6.3: reset scroll state if ANY of the 3 reads needed to
+        # scroll the pending row into view -- same "never leak a scroll
+        # into a later, unrelated operation" discipline as
+        # enter_quantity() (Phase 6.2). Only the first read ever
+        # actually scrolls in practice (the row stays visible for the
+        # other two once scrolled), but this checks all three rather
+        # than assuming that.
+        if any(scrolled for _r, scrolled in raw):
+            self._reset_scroll_state()
         #: Phase 5.12 Stage 2: the 3 raw reads BEFORE majority voting --
         #: see self.last_populated_fields_reads' own docstring in
         #: __init__. Distinguishes "all 3 reads agree on a genuinely
@@ -2057,7 +2067,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             item_number=None,  # not visible anywhere in the observed UI -- honestly None, never guessed
         )
 
-    def _read_populated_fields_once(self) -> PopulatedFields:
+    def _read_populated_fields_once(self) -> tuple[PopulatedFields, bool]:
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
@@ -2066,6 +2076,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
         geom = self._last_row_geometry(image, offset)
         if geom is None:
             raise AdapterError("No grid row found to read populated fields from -- was select_candidate() called?")
+
+        # Phase 6.3 (live-caught): see _ensure_last_row_visible()'s own
+        # docstring -- this read is exposed to the EXACT SAME viewport-
+        # blindness that Phase 6.2 fixed for enter_quantity(), and
+        # live-reproduced as the true root cause of task_line_0019's
+        # "populated_fields_mismatch" (a stably garbled/empty read, not
+        # per-attempt OCR noise, because the crop was landing entirely
+        # outside the captured client area).
+        image, offset, geom, scrolled = self._ensure_last_row_visible(hwnd, image, offset, geom)
         _row_count, row_top = geom
         dx = offset[0]
 
@@ -2168,7 +2187,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             unit=unit or None,
             action=act or None,
             item_number=None,
-        )
+        ), scrolled
 
     def _scroll_grid_body(self, hwnd: int, notches: int = 2) -> None:
         """Phase 6.2 (live-caught): scrolls the estimate items pane via
@@ -2224,6 +2243,87 @@ class WindowsXactimateAdapter(XactimateAdapter):
     def _row_is_visible(self, image, row_top: int) -> bool:
         margin = self._ROW_VISIBILITY_MARGIN_ROWS * _GRID_ROW_HEIGHT
         return row_top >= 0 and row_top + _GRID_ROW_HEIGHT + margin <= image.height
+
+    def _ensure_last_row_visible(self, hwnd: int, image, offset, geom):
+        """Phase 6.3 (live-caught): shared scroll-into-view logic,
+        extracted from enter_quantity() (Phase 6.2) so
+        _read_populated_fields_once() can use the identical mechanism.
+        Both read/click the grid's "last row" via the same viewport-
+        blind _last_row_geometry() arithmetic, and both are equally
+        exposed to a computed position landing beyond the captured
+        client area -- live-reproduced as the actual root cause of
+        task_line_0019's `populated_fields_mismatch` ("owe"/"eee",
+        later "None"/"None"): the 17th row's computed y (1056) exceeded
+        the 1023px-tall captured client area by 33px, so every one of
+        read_populated_fields()'s 3 majority-vote reads cropped from
+        entirely outside the real image -- stably garbled/empty on
+        every attempt, not per-read OCR noise (which is exactly why
+        Phase 5.17's category-only OCR-noise tolerance never rescued
+        it: that mechanism requires the SELECTOR to independently
+        agree, and an off-screen crop corrupts selector too).
+
+        Returns the (possibly refreshed after scrolling) (image,
+        offset, geom, scrolled) -- `scrolled` lets the caller decide
+        whether it is responsible for eventually resetting scroll
+        state. Raises RowOffscreenError if the row never becomes
+        visible within the bounded budget."""
+        row_count, last_row_top = geom
+        if self._row_is_visible(image, last_row_top):
+            return image, offset, geom, False
+        for _attempt in range(self._SCROLL_INTO_VIEW_MAX_ATTEMPTS):
+            self._scroll_grid_body(hwnd, notches=2)
+            time.sleep(0.5)
+            image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+            if offset is None:
+                continue
+            geom2 = self._last_row_geometry(image, offset)
+            if geom2 is None:
+                continue
+            if self._row_is_visible(image, geom2[1]):
+                return image, offset, geom2, True
+
+        # Phase 6.3 (live-caught): scrolling alone has a real floor --
+        # the content pane above the grid (search box, thumbnails) only
+        # shrinks so far, live-confirmed by 8 scroll attempts producing
+        # NO position change at all once that floor is hit. This is not
+        # a bug in the scroll loop above; it is a genuine "this window
+        # is too short to ever reveal this row, no matter how much we
+        # scroll" limit. The general, resolution-independent fix is NOT
+        # to assume a large window up front (a small-monitor deployment
+        # would break) -- it is to actively grow the window, as a
+        # bounded LAST RESORT, only once scrolling alone has proven
+        # insufficient. Never shrinks it back down mid-task (a later
+        # step in the same task benefits from the same extra room); a
+        # caller that cares about restoring the original size can do so
+        # once the whole task is known to be finished.
+        try:
+            win32gui = self._win32gui()
+            import win32con
+            placement = win32gui.GetWindowPlacement(hwnd)
+            already_maximized = placement[1] == win32con.SW_SHOWMAXIMIZED
+        except Exception:
+            already_maximized = True  # can't tell -- don't loop forever retrying a resize that won't help
+        if not already_maximized:
+            try:
+                win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+            except Exception:
+                pass
+            time.sleep(1.0)
+            for _attempt in range(self._SCROLL_INTO_VIEW_MAX_ATTEMPTS):
+                image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+                if offset is not None:
+                    geom2 = self._last_row_geometry(image, offset)
+                    if geom2 is not None and self._row_is_visible(image, geom2[1]):
+                        return image, offset, geom2, True
+                self._scroll_grid_body(hwnd, notches=2)
+                time.sleep(0.5)
+
+        raise RowOffscreenError(
+            f"the pending row (computed y={last_row_top}) never became visible within the client area "
+            f"(height={image.height}) after {self._SCROLL_INTO_VIEW_MAX_ATTEMPTS} scroll-into-view "
+            f"attempts and maximizing the window -- refusing to read/click a coordinate outside the "
+            f"captured viewport."
+        )
 
     def enter_quantity(self, quantity: float) -> None:
         hwnd = self._ensure_main_window()
