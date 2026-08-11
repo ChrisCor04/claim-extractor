@@ -64,6 +64,7 @@ from pathlib import Path
 from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
     ProtectedCommittedRowError,
+    QuantityConfirmationError,
     UnexpectedDialogError,
     XactimateAdapter,
 )
@@ -267,7 +268,7 @@ class SearchFocusError(AdapterError):
     positively verified.  Callers must not clear or type after this."""
 
 
-class RowOffscreenError(AdapterError):
+class RowOffscreenError(QuantityConfirmationError):
     """Phase 6.2 (live-caught): raised by enter_quantity() when the
     pending row's computed screen position still falls outside the
     captured client area after the bounded scroll-into-view sequence
@@ -287,7 +288,7 @@ class RowOffscreenError(AdapterError):
     write into an unverified location."""
 
 
-class QuantityNotConfirmedError(AdapterError):
+class QuantityNotConfirmedError(QuantityConfirmationError):
     """Phase 6.2 (live-caught): raised by enter_quantity() when the
     quantity cell, read back immediately after typing (before any
     caller can call commit_item()), does not show the value that was
@@ -518,6 +519,21 @@ class ActivationRowSnapshot:
     selector: str | None
     description: str | None
     activity: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class PendingQuantityTarget:
+    """Logical identity retained from the proven activation delta.
+
+    ``after_index`` and ``activity_ordinal`` are corroborating position
+    evidence from the same after-snapshot; every later use still
+    re-reads and verifies the row identity before clicking or reading.
+    """
+
+    identity: tuple[str, str, str]
+    activity: str | None
+    after_index: int
+    activity_ordinal: int
 
 
 @dataclass(slots=True)
@@ -872,6 +888,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # by activity (-,-,+,+), so pending detection must compare a
         # logical multiset rather than assume the old rows stay a prefix.
         self._last_activation_baseline_rows: list[ActivationRowSnapshot] | None = None
+        self._pending_quantity_target: PendingQuantityTarget | None = None
         self._current_query: str | None = None
         #: Phase 5.8: monotonic timestamp of the most recent
         #: search_by_description()/search_by_category_selector() call
@@ -2642,196 +2659,128 @@ class WindowsXactimateAdapter(XactimateAdapter):
             f"captured viewport."
         )
 
+    def _quantity_target_candidates(self, image, offset, target: PendingQuantityTarget):
+        """Read all currently visible rows matching the retained target."""
+        geom = self._last_row_geometry(image, offset)
+        if geom is None:
+            return []
+        row_count, _last_row_top = geom
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        matches = []
+        # Retain the activation snapshot's two-row undercount guard.
+        for index in range(row_count + 2):
+            row_top = row_1_top + index * _GRID_ROW_HEIGHT
+            if row_top < 0 or row_top + _GRID_ROW_HEIGHT > image.height:
+                continue
+            row = self._read_activation_row_at(image, offset, row_top)
+            identity = self._activation_identity(row)
+            if index >= row_count and not all(identity[:2]):
+                break
+            if identity != target.identity:
+                continue
+            if target.activity is not None and self._activity_token(row) != target.activity:
+                continue
+            observed = self._read_quantity_at(image, offset, row_top)
+            if observed is None:
+                observed = self._read_quantity_at(
+                    image, offset, row_top, min_votes=1, enhance_contrast=True,
+                )
+            matches.append((index, row_top, observed))
+        return matches
+
+    def _locate_pending_quantity_row(
+        self,
+        hwnd: int,
+        *,
+        confirmation_ordinal: int | None = None,
+    ):
+        """Locate the task's retained logical row, never the bottom row.
+
+        Before entry, an identical R&R duplicate is disambiguated by
+        requiring exactly one matching ``+`` row to remain blank/zero.
+        After entry, the same identity/activity occurrence is re-read
+        at freshly captured geometry.  Every coordinate is therefore
+        current and identity-verified before use.
+        """
+        target = self._pending_quantity_target
+        if target is None:
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): no positively identified pending-item delta is retained; refusing to target a row."
+            )
+
+        scrolled = False
+        last_height = None
+        for attempt in range(self._SCROLL_INTO_VIEW_MAX_ATTEMPTS + 1):
+            image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+            last_height = getattr(image, "height", None)
+            if offset is not None:
+                matches = self._quantity_target_candidates(image, offset, target)
+                if confirmation_ordinal is not None:
+                    if 1 <= confirmation_ordinal <= len(matches):
+                        _index, row_top, observed = matches[confirmation_ordinal - 1]
+                        return image, offset, row_top, confirmation_ordinal, observed, scrolled
+                elif len(matches) == 1:
+                    _index, row_top, observed = matches[0]
+                    if observed is None or abs(observed) <= 0.01:
+                        return image, offset, row_top, 1, observed, scrolled
+                    raise QuantityNotConfirmedError(
+                        "enter_quantity(): the only identity-matched pending target already has a non-zero quantity; "
+                        "refusing to overwrite it."
+                    )
+                elif len(matches) > 1:
+                    blank = [entry for entry in matches if entry[2] is None or abs(entry[2]) <= 0.01]
+                    if len(blank) == 1:
+                        chosen = blank[0]
+                        ordinal = matches.index(chosen) + 1
+                        return image, offset, chosen[1], ordinal, chosen[2], scrolled
+                    raise QuantityNotConfirmedError(
+                        "enter_quantity(): identical target rows could not be uniquely resolved to one blank pending row."
+                    )
+            if self._unexpected_dialog_present():
+                raise QuantityNotConfirmedError(
+                    "enter_quantity(): an unexpected dialog appeared while locating the pending row."
+                )
+            if attempt < self._SCROLL_INTO_VIEW_MAX_ATTEMPTS:
+                self._scroll_grid_body(hwnd, notches=2)
+                scrolled = True
+                time.sleep(0.5)
+
+        raise RowOffscreenError(
+            "enter_quantity(): the identity-verified pending row never became locatable within the current grid "
+            f"after {self._SCROLL_INTO_VIEW_MAX_ATTEMPTS} bounded scroll attempts "
+            f"(last client height={last_height!r}); refusing to click a guessed row."
+        )
+
     def enter_quantity(self, quantity: float) -> None:
         hwnd = self._ensure_main_window()
-
-        # Live-caught (Phase 4.5): a single-shot read of the grid
-        # immediately after select_candidate()'s click can transiently
-        # undercount rows -- reproduced live: a correctly-added third
-        # row was reported as "row count did not increase" (raising
-        # AdapterError) even though the row was visibly present and
-        # correctly counted a moment later. Same class of post-
-        # mutation render/OCR settle-timing gap as
-        # verify_quantity_committed() below; bounded polling replaces
-        # what was previously a single-shot check-and-raise. See
-        # docs/xactimate-lookup.md Phase 4.5.
-        #
-        # Phase 6.2 (live-caught): _count_grid_rows()/_last_row_geometry()
-        # can ONLY see rows within the current captured client area --
-        # once a group already holds enough rows to fill the visible
-        # viewport, a genuinely-added new row is invisible to this same
-        # read, indistinguishable from "nothing happened yet" (live-
-        # reproduced: row_count stuck at a hard ceiling of 15 in a
-        # controlled long-grid trial, "row count did not increase"
-        # raised even though Xactimate had, in fact, added the row).
-        # Scrolling down is always a safe, correct action to interleave
-        # with the wait here -- if the new row is off-screen, this
-        # reveals it (row_count genuinely increases past the old
-        # ceiling); if there's truly nothing new, scrolling is a no-op
-        # and this still times out exactly as before.
-        start = time.time()
-        geom = None
-        scroll_attempts = 0
-        scrolled = False
-        while True:
-            image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
-            if offset is not None:
-                geom = self._last_row_geometry(image, offset)
-                if geom is not None:
-                    row_count, _ = geom
-                    if self._last_selected_row_count_before is None or row_count > self._last_selected_row_count_before:
-                        break
-            if self._unexpected_dialog_present():
-                raise AdapterError("enter_quantity(): an unexpected dialog appeared while waiting for the new grid row.")
-            if time.time() - start >= 3.0 and scroll_attempts < self._SCROLL_INTO_VIEW_MAX_ATTEMPTS:
-                self._scroll_grid_body(hwnd, notches=2)
-                scrolled = True
-                scroll_attempts += 1
-                time.sleep(0.5)
-                continue
-            if time.time() - start >= 8.0:
-                if offset is None:
-                    raise AdapterError("Could not locate the grid to enter quantity.")
-                if geom is None:
-                    raise AdapterError("No grid row found to enter quantity into.")
-                raise AdapterError(
-                    f"Expected a new grid row after selection but row count did not increase "
-                    f"within 8.0s, including {scroll_attempts} scroll-into-view attempts (last observed "
-                    f"row_count={geom[0]}, expected > {self._last_selected_row_count_before})."
-                )
-            time.sleep(0.3)
-
-        row_count, last_row_top = geom
-
-        # Phase 6.2 (live-caught): row_count having increased proves the
-        # row EXISTS, but says nothing about whether its computed screen
-        # Y position is actually within the visible client area --
-        # live-reproduced root cause of task_line_0018/0019 both landing
-        # at quantity 0: clicking a Y coordinate past the window's own
-        # client height either misses everything or hits whatever else
-        # happens to be there. Never click blind here -- bounded,
-        # feedback-driven scroll until the target row is positively
-        # visible, or fail closed. Only runs when actually needed (an
-        # earlier version of this scrolled unconditionally on every
-        # call, which regressed the ordinary short-grid case -- see
-        # _row_is_visible's own margin, already generous, as the single
-        # source of truth for "needs scrolling").
-        if not self._row_is_visible(image, last_row_top):
-            for _attempt in range(self._SCROLL_INTO_VIEW_MAX_ATTEMPTS):
-                self._scroll_grid_body(hwnd, notches=2)
-                scrolled = True
-                time.sleep(0.5)
-                image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
-                if offset is None:
-                    continue
-                geom = self._last_row_geometry(image, offset)
-                if geom is None:
-                    continue
-                row_count, last_row_top = geom
-                if self._row_is_visible(image, last_row_top):
-                    break
-            else:
-                raise RowOffscreenError(
-                    f"enter_quantity(): the pending row (computed y={last_row_top}) never became visible "
-                    f"within the client area (height={image.height}) after "
-                    f"{self._SCROLL_INTO_VIEW_MAX_ATTEMPTS} scroll-into-view attempts -- refusing to click "
-                    f"a coordinate outside the captured viewport."
-                )
-
-        # Phase 6.2 (live-caught): _count_grid_rows() can still undercount
-        # by exactly one even once the computed row IS comfortably
-        # visible -- live-reproduced: a click landed on the row ABOVE the
-        # true newest one, which sat untouched at quantity 0 one row
-        # further down. The only fully reliable signal that a row is the
-        # genuine pending target is its OWN content: a freshly-added,
-        # not-yet-quantified row reads back as 0/blank. If the row this
-        # arithmetic landed on is NOT blank, the true pending row is the
-        # very next one down. Checked only once (never looped): a real,
-        # still-blank target is the overwhelmingly common case, and this
-        # is a correction for a specific, bounded failure mode, not a
-        # general search. Only fires when the existing row already has
-        # a real quantity -- an ordinary blank/new row is left alone.
-        existing_qty = self._read_quantity_at(image, offset, last_row_top)
-        if existing_qty is not None and existing_qty != 0:
-            candidate_row_top = last_row_top + _GRID_ROW_HEIGHT
-            if self._row_is_visible(image, candidate_row_top):
-                last_row_top = candidate_row_top
-            else:
-                self._scroll_grid_body(hwnd, notches=2)
-                scrolled = True
-                time.sleep(0.5)
-                image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
-                if offset is not None:
-                    geom = self._last_row_geometry(image, offset)
-                    if geom is not None and geom[0] > row_count:
-                        row_count, last_row_top = geom
-                    else:
-                        last_row_top = candidate_row_top
+        image, offset, row_top, ordinal, _before_quantity, scrolled = self._locate_pending_quantity_row(hwnd)
 
         col_l, col_r = _GRID_COLUMNS["quantity"]
-        dx = offset[0]
-        qx = (col_l + col_r) // 2 + dx
-        qy = last_row_top + _GRID_ROW_HEIGHT // 2
-
+        qx = (col_l + col_r) // 2 + offset[0]
+        qy = row_top + _GRID_ROW_HEIGHT // 2
         self._click_client(hwnd, qx, qy)
         time.sleep(0.2)
         self._select_all_and_delete()
-
-        qty_text = f"{quantity:g}"
-        self._type_keybdevent(qty_text)
+        self._type_keybdevent(f"{quantity:g}")
         time.sleep(0.2)
-        VK_TAB = 0x09
-        self._press_key(VK_TAB)
-        # Live-caught: the grid re-render/recalculation (RCV, group
-        # subtotal, etc.) triggered by committing a quantity edit isn't
-        # instantaneous -- a screenshot taken too soon after can land
-        # mid-transition, causing anchor detection to intermittently fail
-        # for a caller that reads the grid immediately afterward. 0.5s
-        # was observed to be too short at least once; extended for
-        # margin. See docs/xactimate-lookup.md Phase 4.4.
+        self._press_key(0x09)  # Tab commits the cell edit; never Enter.
         time.sleep(1.0)
 
-        # Phase 6.2 (live-caught): read back the value BEFORE any caller
-        # can call commit_item() -- this is the actual safety net, not
-        # just the off-screen guard above: it also catches a stale/wrong
-        # row position, a click that missed the cell for any other
-        # reason, or a value that simply failed to take. Never commit a
-        # quantity that cannot be positively confirmed on-screen first
-        # (exactly the gap that let task_line_0018/0019 both commit
-        # successfully, per the plan's own bookkeeping, with quantity
-        # silently left at 0).
-        #
-        # Live-caught while building this very check: reusing the PRE-
-        # edit `last_row_top` here is itself unsafe -- committing the
-        # Tab keypress can shift the grid's own repaint/scroll position
-        # (confirmed live: a correct, successfully-typed value read back
-        # as None because the row had moved by the time this ran).
-        # Re-locates the row fresh, same as every other read in this
-        # file, rather than trusting a coordinate computed before the
-        # edit that just happened.
-        image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
-        observed = None
-        if offset is not None:
-            geom = self._last_row_geometry(image, offset)
-            if geom is not None:
-                _, confirm_row_top = geom
-                observed = self._read_quantity_at(image, offset, confirm_row_top, min_votes=1, enhance_contrast=True)
+        # Re-capture geometry and re-resolve the SAME logical
+        # identity/activity occurrence.  Never read the last/bottom row
+        # as a proxy for the row just edited.
+        _image, _offset, _row_top, _ordinal, observed, confirm_scrolled = self._locate_pending_quantity_row(
+            hwnd, confirmation_ordinal=ordinal,
+        )
+        scrolled = scrolled or confirm_scrolled
         if observed is None or abs(observed - quantity) > 0.01:
+            target = self._pending_quantity_target
             raise QuantityNotConfirmedError(
-                f"enter_quantity({quantity:g}): read back {observed!r} from the pending row immediately "
-                f"after typing -- refusing to let this proceed to commit with an unconfirmed quantity."
+                f"enter_quantity({quantity:g}): read back {observed!r} from retained target "
+                f"identity={target.identity if target else None}, activity={target.activity if target else None}, "
+                f"occurrence={ordinal}; refusing to commit an unconfirmed quantity."
             )
 
-        # Phase 6.2 (live-caught): _scroll_grid_body() scrolls the WHOLE
-        # right-side content pane, not just the grid -- live-reproduced
-        # a subsequent, unrelated search_by_category_selector() call
-        # malfunctioning (typed straight into the wrong field) after an
-        # earlier enter_quantity() call left the page scrolled away from
-        # its expected top position. Every OTHER method in this file
-        # implicitly assumes the page starts at the top (the same
-        # invariant _reset_scroll_state() exists to restore elsewhere);
-        # restoring it here, but ONLY if this call actually scrolled,
-        # keeps the ordinary short-grid case exactly as fast as before.
         if scrolled:
             self._reset_scroll_state()
 
@@ -3067,6 +3016,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         prefix. Arbitrary two-row growth still fails closed.
         """
         expected = len(before_snapshot)
+        self._pending_quantity_target = None
         baseline_rows = self._last_activation_baseline_rows
         if baseline_rows is None:
             baseline_rows = [] if expected == 0 else None
@@ -3084,14 +3034,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
             rows = self._snapshot_activation_rows()
             physical_delta = len(rows) - expected
             if physical_delta == 1:
-                if self._is_one_safe_single_row_delta(baseline_rows, rows):
+                target = self._pending_quantity_target_from_delta(baseline_rows, rows)
+                if target is not None and self._is_one_safe_single_row_delta(baseline_rows, rows):
+                    self._pending_quantity_target = target
                     return True
                 raise AdapterError(
                     "Candidate activation added one physical row, but the logical multiset delta was not "
                     "one ordinary non-R&R row."
                 )
             if physical_delta == 2:
-                if self._is_one_logical_rr_multiset_delta(baseline_rows, rows):
+                target = self._pending_quantity_target_from_delta(baseline_rows, rows)
+                if target is not None and self._is_one_logical_rr_multiset_delta(baseline_rows, rows):
+                    self._pending_quantity_target = target
                     return True
                 raise AdapterError(
                     "Candidate activation added two physical rows, but the logical multiset delta was not "
@@ -3124,6 +3078,66 @@ class WindowsXactimateAdapter(XactimateAdapter):
     def _activity_token(row: ActivationRowSnapshot) -> str | None:
         value = str(row.activity or "").strip()
         return value or None
+
+    @classmethod
+    def _pending_quantity_target_from_delta(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> PendingQuantityTarget | None:
+        """Return the quantity-bearing row descriptor for one safe delta.
+
+        Validation remains delegated to the existing single-row/R&R
+        multiset rules.  This helper only retains which validated
+        identity was added and, for R&R, the ``+`` occurrence that owns
+        quantity.  It never converts an invalid delta into a target.
+        """
+        is_single = cls._is_one_safe_single_row_delta(before_rows, after_rows)
+        is_rr = cls._is_one_logical_rr_multiset_delta(before_rows, after_rows)
+        if not (is_single or is_rr):
+            return None
+
+        before_groups = cls._rows_by_activation_identity(before_rows)
+        after_groups = cls._rows_by_activation_identity(after_rows)
+        required_delta = 1 if is_single else 2
+        changed = [
+            identity for identity, group in after_groups.items()
+            if len(group) - len(before_groups.get(identity, [])) == required_delta
+        ]
+        if len(changed) != 1:
+            return None
+        identity = changed[0]
+
+        if is_rr:
+            activity = "+"
+        else:
+            before_tokens = [cls._activity_token(row) for row in before_groups.get(identity, [])]
+            after_tokens = [cls._activity_token(row) for row in after_groups[identity]]
+            remaining = list(after_tokens)
+            for token in before_tokens:
+                if token in remaining:
+                    remaining.remove(token)
+                elif None in remaining:
+                    remaining.remove(None)
+                else:
+                    return None
+            if len(remaining) != 1:
+                return None
+            activity = remaining[0]
+
+        matching_indices = [
+            index for index, row in enumerate(after_rows)
+            if cls._activation_identity(row) == identity
+            and (activity is None or cls._activity_token(row) == activity)
+        ]
+        if not matching_indices:
+            return None
+        return PendingQuantityTarget(
+            identity=identity,
+            activity=activity,
+            after_index=matching_indices[-1],
+            activity_ordinal=len(matching_indices),
+        )
 
     @classmethod
     def _rows_by_activation_identity(
@@ -3736,6 +3750,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         performs no scrolling and therefore cannot strand the
         following search on a displaced Price List screen.
         """
+        self._pending_quantity_target = None
         rows = self._snapshot_activation_rows()
         self._last_activation_baseline_rows = list(rows)
         return [(row.category, row.selector) for row in rows]

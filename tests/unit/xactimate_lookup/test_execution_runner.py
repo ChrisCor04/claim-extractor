@@ -16,6 +16,7 @@ from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
     FakeXactimateAdapter,
     ProtectedCommittedRowError,
+    QuantityConfirmationError,
     UnexpectedDialogError,
 )
 from estimate_extractor.xactimate_lookup.execution_plan import (
@@ -34,6 +35,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     STOP_REASON_NORMAL_COMPLETION,
     STOP_REASON_GROUP_SETUP_BLOCKED,
     STOP_REASON_PROTECTED_ROW_REFUSAL,
+    STOP_REASON_PROJECT_LEVEL_HARD_STOP,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PENDING,
@@ -63,6 +65,8 @@ from estimate_extractor.xactimate_lookup.models import (
     LOOKUP_PATH_DESCRIPTION_SEARCH,
     LOOKUP_PATH_TRUSTED,
     DropdownResult,
+    STOP_REASON_EXTRACTION_FAILED,
+    STOP_REASON_QUANTITY_CONFIRMATION_FAILED,
 )
 
 
@@ -178,6 +182,55 @@ def _dropdown(cat, sel):
 
 def _dropdown_script(*tasks):
     return {f"{t.category} {t.selector}": [_dropdown(t.category, t.selector)] for t in tasks}
+
+
+class QuantityFailureFakeAdapter(GroupAwareFakeAdapter):
+    """Physically instantiates the first task, then fails its read-back."""
+
+    def enter_quantity(self, quantity: float) -> None:
+        self.log.record("enter_quantity", quantity)
+        raise QuantityConfirmationError("expected 1 from SFG/GSG, observed 200 from prior SFG/GUTA")
+
+
+def test_physical_unconfirmed_quantity_failure_hard_stops_entire_run(
+    tmp_path, phrase_rules, ranking_config,
+):
+    plan = _plan_two_groups()
+    adapter = QuantityFailureFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    first, second, third = result.tasks
+    assert first.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+    assert first.stop_reason == STOP_REASON_QUANTITY_CONFIRMATION_FAILED
+    assert first.stop_reason != STOP_REASON_EXTRACTION_FAILED
+    assert result.run_state == RUN_STATE_PAUSED
+    assert result.stop_reason_category == STOP_REASON_PROJECT_LEVEL_HARD_STOP
+    assert second.state == TASK_PENDING and second.attempts == 0
+    assert third.state == TASK_PENDING and third.attempts == 0
+    assert adapter.ensure_group_calls == ["Dwelling Roof"]
+    assert "Fence" not in adapter.select_group_calls
+    search_calls = [call for call in adapter.log.calls if call[0] in ("search_by_description", "search_by_category_selector")]
+    assert len(search_calls) == 1
+
+
+def test_resumed_physical_unconfirmed_checkpoint_stops_before_any_task_or_later_group(
+    tmp_path, phrase_rules, ranking_config,
+):
+    plan = _plan_two_groups()
+    plan.tasks[0].commit_state = TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.run_state == RUN_STATE_PAUSED
+    assert result.stop_reason_category == STOP_REASON_PROJECT_LEVEL_HARD_STOP
+    assert all(task.state == TASK_PENDING and task.attempts == 0 for task in result.tasks)
+    assert not any(call[0] in ("search_by_description", "search_by_category_selector") for call in adapter.log.calls)
+    assert adapter.ensure_group_calls == []
+    assert "Fence" not in adapter.select_group_calls
 
 
 def test_happy_path_all_groups_verified_all_tasks_completed(tmp_path, phrase_rules, ranking_config):

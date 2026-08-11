@@ -700,6 +700,29 @@ def run_execution_plan(
         save_execution_plan(plan, project_dir)
         return plan
 
+    resumed_physical = next(
+        (
+            task for task in plan.tasks
+            if task.state == TASK_PENDING
+            and task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+        ),
+        None,
+    )
+    if not dry_run and resumed_physical is not None:
+        plan.run_state = RUN_STATE_PAUSED
+        plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
+        plan.resume_cursor = plan.tasks.index(resumed_physical)
+        prior_detail = (resumed_physical.stop_detail or "").strip()
+        retry_detail = (
+            "RETRY BLOCKED: physical_item_created_unconfirmed checkpoint exists; "
+            "reconcile the live row before resuming."
+        )
+        if retry_detail not in prior_detail:
+            resumed_physical.stop_detail = f"{prior_detail} {retry_detail}".strip()
+        save_execution_plan(plan, project_dir)
+        write_all_execution_reports(plan, project_dir)
+        return plan
+
     plan.run_state = RUN_STATE_IN_PROGRESS
     tasks_by_id = {t.task_id: t for t in plan.tasks}
 
@@ -749,6 +772,19 @@ def run_execution_plan(
                 continue
 
         for task in pending_tasks:
+            # A crash can leave the immediate physical-created
+            # checkpoint persisted while the task itself is still
+            # PENDING.  Treat that resumed shape exactly like an
+            # in-process post-creation failure: stop before touching
+            # this task, any sibling task, or any later group.
+            if not dry_run and task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED:
+                plan.run_state = RUN_STATE_PAUSED
+                plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
+                plan.resume_cursor = plan.tasks.index(task)
+                save_execution_plan(plan, project_dir)
+                write_all_execution_reports(plan, project_dir)
+                return plan
+
             # Phase 5.9: defense-in-depth, independent of reset_
             # unfinished_tasks()'s own protection -- a task should never
             # legitimately reach TASK_PENDING with commit evidence still
@@ -881,6 +917,18 @@ def run_execution_plan(
 
             _record_terminal(adapter, task)
             if not dry_run:
+                # A physical row exists but this task did not reach a
+                # reconciled commit.  Continuing would make every later
+                # task/group operate on dirty, divergent state.  Leave
+                # all untouched work PENDING with attempts=0 and pause
+                # at this task until a human reconciles the physical row.
+                if task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED:
+                    plan.run_state = RUN_STATE_PAUSED
+                    plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
+                    plan.resume_cursor = plan.tasks.index(task)
+                    save_execution_plan(plan, project_dir)
+                    write_all_execution_reports(plan, project_dir)
+                    return plan
                 plan.resume_cursor = plan.tasks.index(task) + 1
                 save_execution_plan(plan, project_dir)
 

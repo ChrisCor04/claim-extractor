@@ -33,6 +33,7 @@ LOOKUP_PATH_DESCRIPTION_SEARCH = "description_search"
 
 STOP_REASON_NO_RESULTS = "no_results"
 STOP_REASON_EXTRACTION_FAILED = "dropdown_extraction_failed"
+STOP_REASON_QUANTITY_CONFIRMATION_FAILED = "quantity_confirmation_failed"
 STOP_REASON_AMBIGUOUS = "ambiguous_candidates"
 STOP_REASON_HARD_CONFLICT = "hard_conflict"
 STOP_REASON_FIELD_MISMATCH = "populated_fields_mismatch"

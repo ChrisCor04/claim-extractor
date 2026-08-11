@@ -22,6 +22,7 @@ from estimate_extractor.xactimate_lookup import registry, signature as signature
 from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
     ProtectedCommittedRowError,
+    QuantityConfirmationError,
     UnexpectedDialogError,
     XactimateAdapter,
 )
@@ -39,6 +40,7 @@ from estimate_extractor.xactimate_lookup.models import (
     STOP_REASON_FIELD_MISMATCH,
     STOP_REASON_HARD_CONFLICT,
     STOP_REASON_NO_RESULTS,
+    STOP_REASON_QUANTITY_CONFIRMATION_FAILED,
     STOP_REASON_UNEXPECTED_DIALOG,
     STOP_REASON_UNIT_MISMATCH,
     STOP_REASON_UNIT_QUANTITY_INVALID,
@@ -466,6 +468,12 @@ def execute_plan(
         _record_lifecycle(adapter, "COMMIT_STARTED")
         adapter.commit_item()
         _record_lifecycle(adapter, "COMMIT_RETURNED")
+    except QuantityConfirmationError as exc:
+        adapter.recover()
+        outcome.decision = DECISION_REVIEW_REQUIRED
+        outcome.stop_reason = STOP_REASON_QUANTITY_CONFIRMATION_FAILED
+        outcome.stop_detail = str(exc)
+        return outcome
     except AdapterError as exc:
         adapter.recover()
         outcome.decision = DECISION_REVIEW_REQUIRED

@@ -36,6 +36,13 @@ class AdapterError(Exception):
     error")."""
 
 
+class QuantityConfirmationError(AdapterError):
+    """Raised after physical instantiation when quantity targeting or
+    read-back cannot be positively confirmed.  This distinct adapter-
+    boundary type lets orchestration report the real failure stage
+    instead of misclassifying it as dropdown extraction."""
+
+
 class UnexpectedDialogError(AdapterError):
     """Raised when the adapter detects a dialog/prompt it did not expect
     (a license warning, an unsaved-changes prompt, a crash reporter,
