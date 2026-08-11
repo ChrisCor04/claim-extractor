@@ -1056,6 +1056,80 @@ def test_verify_commit_falls_back_to_post_commit_ocr_when_populated_unit_unreada
     assert result.compatibility == "review_required"
 
 
+@pytest.mark.parametrize("raw_unit", ["SQ", "sQ"])
+def test_verify_commit_accepts_voted_sq_unit_read(monkeypatch, raw_unit):
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("RFG", "STEEP")]],
+        unit_reads=[(raw_unit, "SQ")],
+        quantity_reads=[33.66],
+    )
+
+    result = adapter.verify_commit(
+        [], "RFG", "STEEP", 33.66,
+        source_unit="SQ", expected_xactimate_unit="SQ", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.unit.unit_normalized == "SQ"
+    assert result.unit.observed_xactimate_unit == raw_unit
+
+
+def test_verify_commit_accepts_real_sa_artifact_when_unit_vote_is_uniquely_sq(monkeypatch):
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("RFG", "STEEP")]],
+        unit_reads=[("sa", "SQ")],
+        quantity_reads=[33.66],
+    )
+
+    result = adapter.verify_commit(
+        [], "RFG", "STEEP", 33.66,
+        source_unit="SQ", expected_xactimate_unit="SQ", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.unit.observed_xactimate_unit == "sa"
+    assert result.unit.unit_normalized == "SQ"
+    assert result.samples[0]["unit_raw"] == "sa"
+    assert result.samples[0]["unit_normalized"] == "SQ"
+
+
+@pytest.mark.parametrize("real_incompatible", ["LF", "EA"])
+def test_verify_commit_voted_real_unit_still_fails_against_expected_sq(monkeypatch, real_incompatible):
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("RFG", "STEEP")]],
+        unit_reads=[(real_incompatible, real_incompatible)],
+        quantity_reads=[33.66],
+    )
+
+    result = adapter.verify_commit(
+        [], "RFG", "STEEP", 33.66,
+        source_unit="SQ", expected_xactimate_unit="SQ", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "UNIT_MISMATCH"
+    assert result.compatibility == "hard_stop"
+
+
+def test_verify_commit_uncertain_unit_vote_remains_review_required(monkeypatch):
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("RFG", "STEEP")]],
+        unit_reads=[("??", None)],
+        quantity_reads=[33.66],
+    )
+
+    result = adapter.verify_commit(
+        [], "RFG", "STEEP", 33.66,
+        source_unit="SQ", expected_xactimate_unit="SQ", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "REVIEW_REQUIRED"
+    assert result.unit.unit_match_state == "unreadable"
+
+
 def test_verify_commit_still_catches_genuine_unit_mismatch_with_populated_unit(monkeypatch):
     """The populated_unit preference must not create a bypass: a
     populated_unit that itself resolves to a genuinely incompatible

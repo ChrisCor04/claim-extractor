@@ -3812,7 +3812,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 cat_observed, sel_observed = self._read_category_selector_for_verify_commit(image, offset, row_top)
                 description_observed = self._read_description_at(image, offset, row_top)
                 quantity_observed = self._read_quantity_at(image, offset, row_top)
-                unit_raw, _unit_norm_unused = self._read_unit_at(image, offset, row_top)
+                unit_raw, unit_normalized = self._read_unit_at(image, offset, row_top)
 
                 # Live-caught (Phase 4.8): immediately after the
                 # row-count delta is first observed, the row's own
@@ -3831,13 +3831,14 @@ class WindowsXactimateAdapter(XactimateAdapter):
                         if quantity_observed is None:
                             quantity_observed = self._read_quantity_at(image, offset, row_top)
                         if unit_raw is None:
-                            unit_raw, _unit_norm_unused = self._read_unit_at(image, offset, row_top)
+                            unit_raw, unit_normalized = self._read_unit_at(image, offset, row_top)
 
                 sample["category_observed"] = cat_observed
                 sample["selector_observed"] = sel_observed
                 sample["description_observed"] = description_observed
                 sample["quantity_observed"] = quantity_observed
                 sample["unit_raw"] = unit_raw
+                sample["unit_normalized"] = unit_normalized
 
                 quantity_matched = quantity_observed is not None and quantity_observed == expected_quantity
 
@@ -3847,9 +3848,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 # to a known unit -- see class docstring above.
                 populated_unit_vocab = _resolve_observed_unit_vocab(populated_unit)
                 unit_source = "populated_field" if populated_unit_vocab is not None else "post_commit_ocr"
-                observed_unit_for_check = populated_unit if populated_unit_vocab is not None else unit_raw
+                observed_unit_for_check = (
+                    populated_unit if populated_unit_vocab is not None
+                    else (unit_normalized or unit_raw)
+                )
 
                 unit_result = check_unit_compatibility(source_unit, expected_xactimate_unit, observed_unit_for_check)
+                # _read_unit_at() keeps the literal first OCR read and
+                # independently requires a 2+ vote among known units.
+                # Verify against that voted value, but retain the raw
+                # artifact in evidence rather than rewriting history.
+                if populated_unit_vocab is None and unit_normalized is not None:
+                    unit_result.observed_xactimate_unit = unit_raw
                 compatibility = self._UNIT_STATE_TO_COMPATIBILITY.get(unit_result.unit_match_state, "review_required")
                 sample["unit_source"] = unit_source
 
