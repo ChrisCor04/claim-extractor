@@ -12,7 +12,12 @@ import json
 
 import pytest
 
-from estimate_extractor.xactimate_lookup.adapter import AdapterError, FakeXactimateAdapter, ProtectedCommittedRowError
+from estimate_extractor.xactimate_lookup.adapter import (
+    AdapterError,
+    FakeXactimateAdapter,
+    ProtectedCommittedRowError,
+    UnexpectedDialogError,
+)
 from estimate_extractor.xactimate_lookup.execution_plan import (
     CURRENT_SCHEMA_VERSION,
     ExecutionPlan,
@@ -40,7 +45,10 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
 )
 from estimate_extractor.xactimate_lookup.execution_runner import (
     OBSERVED_MAPPING_STATE,
+    SEARCH_TYPE_GENERIC_CLEANING_FALLBACK,
     SEARCH_TYPE_EXACT_DESCRIPTION,
+    SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL,
+    SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION,
     UnsafeLookupRouting,
     _description_first_search_attempts,
     _find_trusted_observed_mapping,
@@ -941,8 +949,7 @@ def test_find_verified_search_description_refuses_unverified_and_missing_entries
     assert _find_verified_search_description(tmp_path, "line_never_seen") is None
 
 
-def test_unmapped_task_uses_only_full_description_even_with_a_verified_mapping(tmp_path, phrase_rules):
-    """Learned CAT/SEL data must never add an alternate task lookup."""
+def test_unmapped_task_keeps_cat_sel_as_retrieval_only_last_resort(tmp_path, phrase_rules):
     path = _observed_mappings_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -960,14 +967,14 @@ def test_unmapped_task_uses_only_full_description_even_with_a_verified_mapping(t
 
     attempts = _description_first_search_attempts(task, phrase_rules, tmp_path)
 
-    assert len(attempts) == 1
     assert attempts[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
     assert attempts[0][1].search_input == 'R&R Gutter - aluminum - up to 5"'
     assert attempts[0][1].path == "description_search"
+    assert attempts[-1][0] == SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL
+    assert attempts[-1][1].search_input == "SFG GUTA"
 
 
-def test_verified_search_description_never_replaces_full_source_description(tmp_path, phrase_rules):
-    """A prior search phrase is evidence, not authorization for another query."""
+def test_verified_search_description_is_after_full_source_description(tmp_path, phrase_rules):
     path = _observed_mappings_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -985,14 +992,14 @@ def test_verified_search_description_never_replaces_full_source_description(tmp_
 
     attempts = _description_first_search_attempts(task, phrase_rules, tmp_path)
 
-    assert len(attempts) == 1
     assert attempts[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
     assert attempts[0][1].search_input == 'R&R Gutter - aluminum - up to 5"'
     assert attempts[0][1].path == "description_search"
+    assert attempts[1][0] == SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION
+    assert attempts[1][1].search_input == "Gutter / downspout - aluminum - up to 5\""
 
 
-def test_no_result_from_full_description_does_not_trigger_cat_sel_alternative(tmp_path, phrase_rules, ranking_config):
-    """A failed full-description lookup is final for that source task."""
+def test_true_zero_results_can_reach_trusted_cat_sel_last_resort(tmp_path, phrase_rules, ranking_config):
     path = _observed_mappings_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -1014,12 +1021,13 @@ def test_no_result_from_full_description_does_not_trigger_cat_sel_alternative(tm
 
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
 
-    assert result.task_by_id("task_unmapped").state in (TASK_REVIEW_REQUIRED, TASK_FAILED)
+    assert result.task_by_id("task_unmapped").state == TASK_COMPLETED
     search_desc_calls = [c for c in adapter.log.calls if c[0] == "search_by_description"]
     search_cs_calls = [c for c in adapter.log.calls if c[0] == "search_by_category_selector"]
-    assert search_desc_calls == [("search_by_description", ("Roofing felt - 15 lb.",), {})]
-    assert search_cs_calls == [("search_by_category_selector", ("RFG", "3TAB"), {})]
-    assert result.task_by_id("task_unmapped").search_attempts[0]["advanced_to_next_attempt"] is False
+    assert search_desc_calls[0] == ("search_by_description", ("Roofing felt - 15 lb.",), {})
+    assert len(search_desc_calls) >= 2
+    assert ("search_by_category_selector", ("RFG", "FELT15"), {}) in search_cs_calls
+    assert result.task_by_id("task_unmapped").search_attempts[0]["advanced_to_next_attempt"] is True
 
 
 def test_full_description_failure_never_searches_an_alternative(tmp_path, phrase_rules, ranking_config):
@@ -1040,6 +1048,164 @@ def test_full_description_failure_never_searches_an_alternative(tmp_path, phrase
     assert task.search_attempts[0]["search_type"] == SEARCH_TYPE_EXACT_DESCRIPTION
     assert task.search_attempts[0]["advanced_to_next_attempt"] is False
     assert ("search_by_category_selector", ("RFG", "FELT15"), {}) not in adapter.log.calls
+
+
+def test_exact_description_review_required_is_terminal(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    tied = [
+        DropdownResult(
+            raw_text="RFG FELT15A", row_position=0, category="RFG", selector="FELT15A",
+            description=_FELT_FULL_DESCRIPTION, extraction_confidence=1.0,
+        ),
+        DropdownResult(
+            raw_text="RFG FELT15B", row_position=1, category="RFG", selector="FELT15B",
+            description=_FELT_FULL_DESCRIPTION, extraction_confidence=1.0,
+        ),
+    ]
+    adapter = _adapter_with_test_project(dropdown_script={
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        _FELT_FULL_DESCRIPTION: tied,
+    })
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert task.state == TASK_REVIEW_REQUIRED
+    assert task.stop_reason == "ambiguous_candidates"
+    assert [call for call in adapter.log.calls if call[0] == "search_by_description"] == [
+        ("search_by_description", (_FELT_FULL_DESCRIPTION,), {}),
+    ]
+    assert task.search_attempts[0]["advanced_to_next_attempt"] is False
+
+
+def test_exact_description_hard_conflict_is_terminal(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    conflict = DropdownResult(
+        raw_text="RFG FELT30", row_position=0, category="RFG", selector="FELT30",
+        description="Roofing felt - 30 lb.", extraction_confidence=1.0,
+    )
+    adapter = _adapter_with_test_project(dropdown_script={
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        _FELT_FULL_DESCRIPTION: [conflict],
+    })
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert task.stop_reason == "hard_conflict"
+    assert len(task.search_attempts) == 1
+    assert task.search_attempts[0]["advanced_to_next_attempt"] is False
+
+
+def test_candidate_click_then_duplicate_dialog_is_terminal(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    adapter = _adapter_with_test_project(dropdown_script={
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        _FELT_FULL_DESCRIPTION: [_felt_dropdown()],
+    })
+    original_select = adapter.select_candidate
+
+    def duplicate_dialog(candidate):
+        original_select(candidate)
+        if candidate.selector == "FELT15":
+            raise UnexpectedDialogError("Duplicate Item(s)")
+
+    adapter.select_candidate = duplicate_dialog
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert task.stop_reason == "unexpected_dialog"
+    assert len(task.search_attempts) == 1
+    assert task.search_attempts[0]["advanced_to_next_attempt"] is False
+
+
+def test_pending_physical_checkpoint_prohibits_later_search(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    adapter = _adapter_with_test_project(dropdown_script={
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        _FELT_FULL_DESCRIPTION: [_felt_dropdown()],
+    })
+    original_enter = adapter.enter_quantity
+
+    def fail_after_pending(quantity):
+        if adapter._selected and adapter._selected.selector == "FELT15":
+            raise AdapterError("quantity control unavailable")
+        return original_enter(quantity)
+
+    adapter.enter_quantity = fail_after_pending
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+    assert len(task.search_attempts) == 1
+    assert task.search_attempts[0]["advanced_to_next_attempt"] is False
+
+
+def test_dropdown_capture_failure_can_advance_when_state_is_clean(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    attempts = _description_first_search_attempts(plan.task_by_id("task_unmapped"), phrase_rules, tmp_path)
+    fallback_text = attempts[1][1].search_input
+    adapter = _adapter_with_test_project(
+        dropdown_script={
+            "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+            fallback_text: [_felt_dropdown()],
+        },
+        fail_on_capture_for={_FELT_FULL_DESCRIPTION},
+    )
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert task.state == TASK_COMPLETED
+    assert [attempt["search_text"] for attempt in task.search_attempts] == [
+        _FELT_FULL_DESCRIPTION, fallback_text,
+    ]
+    assert task.search_attempts[0]["advanced_to_next_attempt"] is True
+
+
+def test_retrieval_fallback_is_blocked_when_adapter_state_is_dirty(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    adapter = _adapter_with_test_project(dropdown_script={"RFG 3TAB": [_dropdown("RFG", "3TAB")]})
+    adapter.verify_search_fallback_state = lambda baseline: (False, "pending physical item exists")
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert [call for call in adapter.log.calls if call[0] == "search_by_description"] == [
+        ("search_by_description", (_FELT_FULL_DESCRIPTION,), {}),
+    ]
+    assert task.search_attempts[0]["advanced_to_next_attempt"] is False
+    assert "pending physical item" in task.search_attempts[0]["advance_reason"]
+
+
+def test_generic_cleaning_fallback_remains_available_after_clean_zero_results(
+    tmp_path, phrase_rules, ranking_config,
+):
+    plan = _plan_mapped_and_unmapped()
+    task = plan.task_by_id("task_unmapped")
+    task.description = "Clean Fence"
+    task.normalized_trade = "fencing"
+    task.normalized_component = "fence"
+    task.normalized_material = "wood"
+    task.normalized_action = "clean"
+    attempts = _description_first_search_attempts(task, phrase_rules, tmp_path)
+    assert attempts[0][1].search_input == "Clean Fence"
+    assert any(kind == SEARCH_TYPE_GENERIC_CLEANING_FALLBACK for kind, _plan in attempts)
+    adapter = _adapter_with_test_project(dropdown_script={
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        "clean": [DropdownResult(
+            raw_text="CLN AV", row_position=0, category="CLN", selector="AV",
+            description="Clean {V}", extraction_confidence=1.0,
+        )],
+    })
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    executed = result.task_by_id("task_unmapped").search_attempts
+    assert any(attempt["search_type"] == SEARCH_TYPE_GENERIC_CLEANING_FALLBACK for attempt in executed)
+    assert ("search_by_description", ("clean",), {}) in adapter.log.calls
 
 
 def test_review_approved_task_still_uses_trusted_cat_sel_directly(phrase_rules):
@@ -1088,10 +1254,9 @@ def test_gutter_and_downspout_each_keep_their_own_full_description(tmp_path, phr
     gutter_attempts_2 = _description_first_search_attempts(gutter, phrase_rules, tmp_path)
     downspout_attempts_2 = _description_first_search_attempts(downspout, phrase_rules, tmp_path)
 
-    assert len(gutter_attempts_2) == 1
     assert gutter_attempts_2[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
     assert gutter_attempts_2[0][1].search_input == 'R&R Gutter - aluminum - up to 5"'
-    assert len(downspout_attempts_2) == 1
+    assert gutter_attempts_2[1][0] == SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION
     assert downspout_attempts_2[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
     assert downspout_attempts_2[0][1].search_input == 'R&R Downspout - aluminum - up to 5"'
     assert _find_trusted_observed_mapping(tmp_path, "line_never_seen") is None

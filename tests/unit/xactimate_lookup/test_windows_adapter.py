@@ -68,6 +68,48 @@ def test_supports_live_execution_reflects_the_phase_5_4_pilot_gate_sign_off():
     assert adapter.supports_live_execution is True
 
 
+def test_search_fallback_state_accepts_unchanged_read_only_grid(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("RFG", "STEEP", "Steep charge", "+")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda **_kwargs: list(rows))
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+
+    baseline = adapter.snapshot_search_fallback_state()
+
+    assert adapter.verify_search_fallback_state(baseline)[0] is True
+
+
+def test_search_fallback_state_rejects_prior_candidate_click_even_after_recovery(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda **_kwargs: [])
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    baseline = adapter.snapshot_search_fallback_state()
+    adapter._candidate_selection_count += 1
+    adapter._last_selected = None  # recover() cannot erase the monotonic click evidence
+
+    clean, reason = adapter.verify_search_fallback_state(baseline)
+
+    assert clean is False
+    assert "clicked" in reason
+
+
+@pytest.mark.parametrize("dialog_present, rows_changed", [(True, False), (False, True)])
+def test_search_fallback_state_rejects_dialog_or_physical_grid_delta(
+    monkeypatch, dialog_present, rows_changed,
+):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("RFG", "STEEP", "Steep charge", "+")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda **_kwargs: list(rows))
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: dialog_present)
+    baseline = adapter.snapshot_search_fallback_state()
+    if rows_changed:
+        rows.append(ActivationRowSnapshot("RFG", "STEEP", "Steep charge", "-"))
+
+    clean, _reason = adapter.verify_search_fallback_state(baseline)
+
+    assert clean is False
+
+
 @pytest.mark.parametrize(
     "code, expected_cat, expected_sel",
     [

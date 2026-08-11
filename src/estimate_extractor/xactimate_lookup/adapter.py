@@ -170,6 +170,19 @@ class XactimateAdapter(ABC):
         if callback is not None:
             callback()
 
+    def snapshot_search_fallback_state(self):
+        """Capture adapter-specific proof used to gate a later query.
+
+        Adapters that support multi-query retrieval fallback must
+        override this and ``verify_search_fallback_state``.  The base
+        implementation fails closed so a new adapter cannot silently
+        claim that selection/dialog/physical state is clean.
+        """
+        raise AdapterError("Adapter cannot prove a clean search-fallback baseline.")
+
+    def verify_search_fallback_state(self, baseline) -> tuple[bool, str]:
+        raise AdapterError("Adapter cannot prove clean state before a fallback search.")
+
 
 @dataclass(slots=True)
 class AdapterCallLog:
@@ -213,6 +226,8 @@ class FakeXactimateAdapter(XactimateAdapter):
         self.log = AdapterCallLog()
         self._current_query: str | None = None
         self._selected: DropdownResult | None = None
+        self._candidate_selection_count = 0
+        self._pending_physical_item = False
         self._quantity: float | None = None
         self._committed = False
 
@@ -255,7 +270,9 @@ class FakeXactimateAdapter(XactimateAdapter):
 
     def select_candidate(self, candidate: DropdownResult) -> None:
         self.log.record("select_candidate", candidate.raw_text)
+        self._candidate_selection_count += 1
         self._selected = candidate
+        self._pending_physical_item = True
 
     def read_populated_fields(self) -> PopulatedFields:
         self.log.record("read_populated_fields")
@@ -277,6 +294,7 @@ class FakeXactimateAdapter(XactimateAdapter):
     def commit_item(self) -> None:
         self.log.record("commit_item")
         self._committed = True
+        self._pending_physical_item = False
 
     def capture_evidence(self) -> str:
         self.log.record("capture_evidence")
@@ -286,3 +304,17 @@ class FakeXactimateAdapter(XactimateAdapter):
         self.log.record("recover")
         self._current_query = None
         self._selected = None
+
+    def snapshot_search_fallback_state(self):
+        self.log.record("snapshot_search_fallback_state")
+        return {"candidate_selection_count": self._candidate_selection_count}
+
+    def verify_search_fallback_state(self, baseline) -> tuple[bool, str]:
+        self.log.record("verify_search_fallback_state")
+        if self._candidate_selection_count != baseline["candidate_selection_count"]:
+            return False, "a candidate was selected during the prior search attempt"
+        if self._selected is not None:
+            return False, "an adapter candidate remains selected"
+        if self._pending_physical_item:
+            return False, "a pending physical item exists"
+        return True, "no selection, pending item, or dialog state is present"

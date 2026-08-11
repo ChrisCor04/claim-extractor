@@ -865,6 +865,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_dropdown_hwnd: int | None = None
         self._last_dropdown_rows: list[_RawDropdownRow] = []
         self._last_selected: DropdownResult | None = None
+        self._candidate_selection_count = 0
         self._last_selected_row_count_before: int | None = None
         # Rich counterpart to snapshot_grid_identities_for_activation()'s
         # public tuple baseline. Xactimate can regroup duplicate R&R rows
@@ -2174,6 +2175,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
             "row_bounds": (rect.left, rect.top, rect.right, rect.bottom),
             "click_xy": (cx, cy),
         }
+        # Monotonic dirty-state evidence: recover() may clear
+        # _last_selected, but it cannot erase the fact that a click
+        # was attempted during this task's lookup attempt. Record it
+        # before the OS interaction so even a click API failure is
+        # conservatively treated as dirty.
+        self._candidate_selection_count += 1
         self._click_screen(cx, cy)
         if self.last_dropdown_diagnostics is not None:
             self.last_dropdown_diagnostics.selection_clicked_at = time.monotonic()
@@ -3666,11 +3673,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_activation_baseline_rows = list(rows)
         return [(row.category, row.selector) for row in rows]
 
-    def _snapshot_activation_rows(self) -> list[ActivationRowSnapshot]:
+    def _snapshot_activation_rows(self, *, require_located: bool = False) -> list[ActivationRowSnapshot]:
         """Capture physical rows plus pair evidence without scrolling."""
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
+            if require_located:
+                raise AdapterError(
+                    "Cannot positively locate the current Items grid for search-fallback state verification."
+                )
             return []
         geom = self._last_row_geometry(image, offset)
         row_count = geom[0] if geom is not None else 0
@@ -4352,6 +4363,26 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_dropdown_rows = []
         self._last_selected = None
         self._current_query = None
+
+    def snapshot_search_fallback_state(self):
+        """Capture read-only proof before a multi-query retrieval sequence."""
+        return {
+            "candidate_selection_count": self._candidate_selection_count,
+            "physical_rows": self._snapshot_activation_rows(require_located=True),
+        }
+
+    def verify_search_fallback_state(self, baseline) -> tuple[bool, str]:
+        """Fail closed unless another query is safe in the unchanged pane."""
+        if self._candidate_selection_count != baseline.get("candidate_selection_count"):
+            return False, "a candidate-result row was clicked during the prior attempt"
+        if self._last_selected is not None:
+            return False, "a candidate remains selected"
+        if self._unexpected_dialog_present():
+            return False, "a dialog remains open"
+        current_rows = self._snapshot_activation_rows(require_located=True)
+        if current_rows != baseline.get("physical_rows"):
+            return False, "the physical grid changed during the prior attempt"
+        return True, "no candidate click, dialog, or physical-row delta was observed"
 
     def get_adapter_diagnostics(self) -> dict:
         """Not part of the abstract contract -- a read-only status

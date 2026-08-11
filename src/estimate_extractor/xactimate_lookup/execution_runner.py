@@ -90,6 +90,8 @@ from estimate_extractor.xactimate_lookup.models import (
     LookupPlan,
     MAPPING_STATUS_APPROVED,
     RecommendationInput,
+    STOP_REASON_EXTRACTION_FAILED,
+    STOP_REASON_NO_RESULTS,
 )
 from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, generate_search_phrase
 from estimate_extractor.xactimate_lookup.ranking import RankingConfig
@@ -467,47 +469,110 @@ def _find_verified_search_description(project_dir: Path, line_item_id: str) -> s
         return None
 
 
-#: The only search type permitted for a began-unmapped production task.
-#: Historical alternative labels were removed when live evidence showed
-#: that retrying alternate text could instantiate the same task again.
+#: Ordered search-attempt labels recorded in ExecutionTask.search_attempts.
+#: The complete source description is always first; later types are
+#: retrieval-only fallbacks and are never ranking/execution retries.
+SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION = "verified_search_description"
 SEARCH_TYPE_EXACT_DESCRIPTION = "exact_description"
+SEARCH_TYPE_NORMALIZED_DESCRIPTION = "normalized_description"
+SEARCH_TYPE_COMPACT_GENERATED_PHRASE = "compact_generated_phrase"
+SEARCH_TYPE_GENERIC_CLEANING_FALLBACK = "generic_cleaning_fallback"
+SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL = "trusted_observed_cat_sel"
+
+_RETRIEVAL_FAILURE_STOP_REASONS = frozenset({STOP_REASON_NO_RESULTS, STOP_REASON_EXTRACTION_FAILED})
 
 def _description_first_search_attempts(
     task: ExecutionTask, phrase_rules: PhraseRules, project_dir: Path,
 ) -> list[tuple[str, LookupPlan]]:
-    """Build the sole lookup allowed for a began-unmapped task.
+    """Build exact-description-first retrieval attempts.
 
-    Production evidence showed that continuing with normalized,
-    generated, learned-description, or CAT/SEL alternatives after the
-    source description had already selected an item could instantiate
-    the same task repeatedly.  Search the complete source description
-    exactly once and let that attempt's normal safety result stand.
-    ``phrase_rules`` and ``project_dir`` remain in the signature for
-    caller compatibility; neither may alter the lookup text.
+    Attempt 1 is always the complete original source description.
+    Learned, normalized, compact, generic-cleaning, and trusted CAT/SEL
+    plans remain available only to the runner's clean retrieval-failure
+    transition. Duplicate text is skipped.
     """
-    description = task.description.strip()
-    if not description:
-        return []
-    return [(
-        SEARCH_TYPE_EXACT_DESCRIPTION,
-        LookupPlan(
+    attempts: list[tuple[str, LookupPlan]] = []
+    seen_texts: set[str] = set()
+
+    def _add(search_type: str, value: str | None, *, phrase_result=None) -> None:
+        if not value or not value.strip():
+            return
+        text = value.strip()
+        if text.casefold() in seen_texts:
+            return
+        seen_texts.add(text.casefold())
+        attempts.append((search_type, LookupPlan(
             line_item_id=task.line_item_id,
             path=LOOKUP_PATH_DESCRIPTION_SEARCH,
             item_signature="",
-            search_input=description,
-        ),
-    )]
+            search_input=text,
+            phrase_result=phrase_result,
+        )))
+
+    _add(SEARCH_TYPE_EXACT_DESCRIPTION, task.description)
+    _add(
+        SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION,
+        _find_verified_search_description(project_dir, task.line_item_id),
+    )
+    _add(SEARCH_TYPE_NORMALIZED_DESCRIPTION, compute_normalized_description(
+        task.normalized_trade, task.normalized_component, task.normalized_material, task.normalized_action,
+    ))
+    phrase_result = generate_search_phrase(
+        task.description, task.normalized_component, task.normalized_material, task.normalized_action, phrase_rules,
+    )
+    _add(SEARCH_TYPE_COMPACT_GENERATED_PHRASE, phrase_result.phrase, phrase_result=phrase_result)
+
+    action_term = phrase_rules.action_search_terms.get(task.normalized_action or "")
+    if action_term == "clean":
+        _add(SEARCH_TYPE_GENERIC_CLEANING_FALLBACK, action_term)
+
+    trusted = _find_trusted_observed_mapping(project_dir, task.line_item_id)
+    if trusted is not None:
+        category, selector = trusted
+        attempts.append((SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL, LookupPlan(
+            line_item_id=task.line_item_id,
+            path=LOOKUP_PATH_TRUSTED,
+            item_signature="",
+            search_input=f"{category} {selector}",
+            trusted_mapping=InternalMappingRecord(
+                mapping_id=f"observed_mapping:{task.line_item_id}",
+                item_signature="",
+                source_description=task.description,
+                search_phrase="",
+                category=category,
+                selector=selector,
+                xactimate_description=task.description,
+                unit=task.expected_unit,
+                action=None,
+                reviewer="",
+                approval_reason="Previous VERIFIED commit of this exact source task.",
+                status=MAPPING_STATUS_APPROVED,
+            ),
+        )))
+    return attempts
+
+
+def _is_clean_retrieval_failure(outcome) -> bool:
+    """True only when lookup ended before ranking or physical interaction."""
+    return (
+        not outcome.candidates
+        and outcome.selected is None
+        and not outcome.physical_item_created
+        and not outcome.committed
+        and outcome.stop_reason in _RETRIEVAL_FAILURE_STOP_REASONS
+    )
 
 
 def _run_description_first_task(
     task: ExecutionTask, item: RecommendationInput, adapter, ranking_config: RankingConfig,
     phrase_rules: PhraseRules, project_dir: Path, dry_run: bool,
 ):
-    """Run the single complete-source-description lookup.
+    """Run fallbacks only across positively clean retrieval failures.
 
-    Ranking, safety-stop, commit, and verification remain delegated to
-    orchestrator.execute_plan() unchanged.  No alternate query is
-    permitted after this attempt, irrespective of its outcome.
+    Any candidate-bearing ranking decision or physical interaction is
+    terminal. Before every later query, both persisted task state and
+    the adapter's read-only selection/dialog/grid checkpoint must prove
+    the task is still clean.
     """
     attempts = _description_first_search_attempts(task, phrase_rules, project_dir)
     if not attempts:
@@ -515,28 +580,64 @@ def _run_description_first_task(
             f"{task.task_id}: no search attempt could be built (empty full description) -- "
             f"refusing to guess."
         )
-    if len(attempts) != 1:
-        raise UnsafeLookupRouting(
-            f"{task.task_id}: expected exactly one full-description search, got {len(attempts)} -- "
-            f"refusing alternate lookups."
-        )
+    fallback_baseline = None
+    fallback_baseline_error = None
+    if len(attempts) > 1:
+        try:
+            fallback_baseline = adapter.snapshot_search_fallback_state()
+        except Exception as exc:
+            fallback_baseline_error = str(exc)
 
-    search_type, attempt_plan = attempts[0]
-    outcome = orchestrator.execute_plan(attempt_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
-    top = outcome.candidates[0] if outcome.candidates else None
-    task.search_attempts.append({
-        "attempt_number": 1,
-        "search_type": search_type,
-        "search_text": attempt_plan.search_input,
-        "result_count": len(outcome.candidates),
-        "top_candidate_category": top.dropdown.category if top is not None else None,
-        "top_candidate_selector": top.dropdown.selector if top is not None else None,
-        "top_candidate_score": top.score if top is not None else None,
-        "decision": outcome.decision,
-        "stop_reason": outcome.stop_reason,
-        "advanced_to_next_attempt": False,
-        "advance_reason": "single full-description attempt; alternatives disabled",
-    })
+    outcome = None
+    for attempt_number, (search_type, attempt_plan) in enumerate(attempts, start=1):
+        outcome = orchestrator.execute_plan(
+            attempt_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run,
+        )
+        is_last_attempt = attempt_number == len(attempts)
+        retrieval_failure = _is_clean_retrieval_failure(outcome)
+        fallback_blocked_reason = None
+        should_advance = False
+
+        if retrieval_failure and not is_last_attempt:
+            if task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED:
+                fallback_blocked_reason = "physical_item_created_unconfirmed checkpoint exists"
+            elif fallback_baseline_error is not None:
+                fallback_blocked_reason = f"clean fallback baseline unavailable: {fallback_baseline_error}"
+            else:
+                try:
+                    clean, detail = adapter.verify_search_fallback_state(fallback_baseline)
+                except Exception as exc:
+                    clean, detail = False, f"clean-state verification failed: {exc}"
+                if clean:
+                    should_advance = True
+                else:
+                    fallback_blocked_reason = detail
+
+        if should_advance:
+            advance_reason = "clean retrieval failure; adapter/task state verified clean"
+        elif fallback_blocked_reason:
+            advance_reason = f"fallback blocked: {fallback_blocked_reason}"
+        elif not retrieval_failure:
+            advance_reason = "terminal candidate/ranking/execution outcome; fallback prohibited"
+        else:
+            advance_reason = "final retrieval attempt"
+
+        top = outcome.candidates[0] if outcome.candidates else None
+        task.search_attempts.append({
+            "attempt_number": attempt_number,
+            "search_type": search_type,
+            "search_text": attempt_plan.search_input,
+            "result_count": len(outcome.candidates),
+            "top_candidate_category": top.dropdown.category if top is not None else None,
+            "top_candidate_selector": top.dropdown.selector if top is not None else None,
+            "top_candidate_score": top.score if top is not None else None,
+            "decision": outcome.decision,
+            "stop_reason": outcome.stop_reason,
+            "advanced_to_next_attempt": should_advance,
+            "advance_reason": advance_reason,
+        })
+        if not should_advance:
+            break
 
     reason = (
         f"test_description_first: attempt {len(task.search_attempts)}/{len(attempts)} "
@@ -704,9 +805,10 @@ def run_execution_plan(
 
             item = _task_to_recommendation_input(task)
             try:
-                # A began_unmapped task gets exactly one complete-source-
-                # description search. No normalized/generated/learned or
-                # CAT/SEL alternative may follow it -- see
+                # A began_unmapped task starts with the complete source
+                # description. Retrieval-only fallbacks require a clean
+                # adapter/task checkpoint; candidate-bearing outcomes
+                # are terminal -- see
                 # _run_description_first_task()'s docstring. Every other
                 # (today, only review_approved) task is completely
                 # unchanged: one _task_to_lookup_plan() call, one
