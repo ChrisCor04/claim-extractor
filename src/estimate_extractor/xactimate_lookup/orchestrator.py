@@ -46,6 +46,7 @@ from estimate_extractor.xactimate_lookup.models import (
     InternalMappingRecord,
     LookupOutcome,
     LookupPlan,
+    PopulatedFields,
     RecommendationInput,
 )
 from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, generate_search_phrase
@@ -426,8 +427,6 @@ def execute_plan(
             )
         outcome.physical_item_created = True
         _record_lifecycle(adapter, "CANDIDATE_SELECTED", category=top.dropdown.category, selector=top.dropdown.selector)
-        populated = adapter.read_populated_fields()
-        _record_lifecycle(adapter, "QUICK_ENTRY_POPULATED")
     except UnexpectedDialogError as exc:
         adapter.recover()
         outcome.decision = DECISION_REVIEW_REQUIRED
@@ -441,117 +440,20 @@ def execute_plan(
         outcome.stop_detail = str(exc)
         return outcome
 
-    outcome.populated_fields = populated
-
-    # Phase 5.12 (live-caught): select_candidate() already independently
-    # proves the correct candidate was clicked via an exact live UI-
-    # Automation TEXT match (never OCR) -- this check is defense-in-
-    # depth against Xactimate itself doing something unexpected post-
-    # click, not a re-litigation of a click already proven correct by
-    # stronger evidence. A raw strict-equality comparison here was
-    # cancelling objectively correct, already-verified selections purely
-    # on OCR noise (live-reproduced: WDR/SCRN< read back as WD/. --
-    # see check_category_selector_match()'s own docstring for the full
-    # mechanism). Duck-typed (only WindowsXactimateAdapter implements
-    # it, like check_unit_compatibility above) -- adapters without it
-    # keep the original strict-equality behavior unchanged.
-    if hasattr(adapter, "check_category_selector_match"):
-        match_result = adapter.check_category_selector_match(
-            top.dropdown.category, top.dropdown.selector, populated.category, populated.selector,
-        )
-        if match_result.match_state not in ("exact_match", "normalized_match") and hasattr(adapter, "read_populated_fields"):
-            # Phase 5.17 (live-caught): select_candidate() already
-            # independently proved the correct row was clicked via live
-            # UI-Automation TEXT (never OCR) -- live-reproduced, "WDR"
-            # was stably misread as "WDI" (and, across a wide sweep of
-            # alternate crop/scale/psm/whitelist settings, as "WDF" /
-            # "WDE" / "WDFI" -- never once as "WDR" itself, and never
-            # once as any OTHER category this same search actually
-            # returned). A bare retry of the same OCR settings cannot
-            # help here (read_populated_fields() already internally
-            # majority-votes 3 same-settings reads, and this misread is
-            # stable, not per-read noise) -- what actually distinguishes
-            # "OCR garbled an otherwise-proven click" from "a genuinely
-            # different item got clicked" is whether the SELECTOR
-            # independently agrees AND whether the observed category is
-            # even one of the real categories this search's own results
-            # offered. If a wrong click had landed on some OTHER real
-            # candidate, ITS category would appear in `candidates`; pure
-            # OCR noise on the right row does not. One fresh independent
-            # re-read is still attempted first (in case this specific
-            # instance's noise is transient after all), but the
-            # corroboration check -- not the retry's outcome alone -- is
-            # what ultimately justifies trusting the UIA-proven
-            # selection over a category read that never once confirmed
-            # ANY real alternative. Selector must independently agree in
-            # BOTH reads; only the category may be excused. Falls
-            # through to the ordinary cancel/stop if the observed
-            # category matches a real candidate from this same search
-            # (genuine evidence of a possible different item) -- that
-            # case fails closed exactly as before, no exception.
-            selector_agrees = str(populated.selector or "").strip().upper() == str(top.dropdown.selector or "").strip().upper()
-            candidate_categories = {str(c.dropdown.category or "").strip().upper() for c in candidates}
-            observed_category_is_a_real_candidate = str(populated.category or "").strip().upper() in candidate_categories
-            if selector_agrees and not observed_category_is_a_real_candidate:
-                populated_retry = adapter.read_populated_fields()
-                retry_selector_agrees = str(populated_retry.selector or "").strip().upper() == str(top.dropdown.selector or "").strip().upper()
-                retry_category_is_a_real_candidate = str(populated_retry.category or "").strip().upper() in candidate_categories
-                if retry_selector_agrees and not retry_category_is_a_real_candidate:
-                    _record_lifecycle(
-                        adapter, "CATEGORY_OCR_UNCERTAIN_TRUSTED_UIA_SELECTION",
-                        expected=f"{top.dropdown.category}/{top.dropdown.selector}",
-                        observed_first=f"{populated.category}/{populated.selector}",
-                        observed_retry=f"{populated_retry.category}/{populated_retry.selector}",
-                    )
-                    populated = populated_retry
-                    match_result = None
-        if match_result is not None and match_result.match_state not in ("exact_match", "normalized_match"):
-            _cancel_pending_selection(adapter)
-            return _stop_existing(
-                outcome, STOP_REASON_FIELD_MISMATCH,
-                f"Populated fields ({populated.category}/{populated.selector}) differ from the selected "
-                f"candidate ({top.dropdown.category}/{top.dropdown.selector}): {match_result.reason}",
-            )
-    elif (populated.category, populated.selector) != (top.dropdown.category, top.dropdown.selector):
-        _cancel_pending_selection(adapter)
-        return _stop_existing(
-            outcome, STOP_REASON_FIELD_MISMATCH,
-            f"Populated fields ({populated.category}/{populated.selector}) differ from the selected "
-            f"candidate ({top.dropdown.category}/{top.dropdown.selector}).",
-        )
-
-    # Phase 5.6 Stage 4 (live-caught): the naive strict-equality check
-    # this replaced treated OCR garbage ("sa", "')_|'", etc.) from the
-    # freshly-populated Quick Entry unit field as equal-quality evidence
-    # to a real unit mismatch -- reproduced live, blocking an otherwise
-    # correct selection on unreadable OCR alone. `check_unit_
-    # compatibility()` (duck-typed, like verify_commit/snapshot_grid_
-    # identities -- only WindowsXactimateAdapter implements it today)
-    # applies the SAME evidence-aware synonym/OCR-confusion logic
-    # verify_commit()'s post-commit check already uses. Only a
-    # CONFIRMED incompatible unit (both readable AND genuinely
-    # different, e.g. EA vs LF) stops here pre-commit; an unreadable or
-    # missing observed unit is not treated as evidence of a mismatch --
-    # the commit proceeds and the more thorough post-commit verify_
-    # commit() (which polls/retries) makes the final call. Adapters
-    # without this method (e.g. FakeXactimateAdapter in tests) keep the
-    # original strict-equality behavior unchanged.
-    if item.source_unit and populated.unit:
-        if hasattr(adapter, "check_unit_compatibility"):
-            unit_result = adapter.check_unit_compatibility(item.source_unit, item.source_unit, populated.unit)
-            if unit_result.unit_match_state == "incompatible":
-                _cancel_pending_selection(adapter)
-                return _stop_existing(
-                    outcome, STOP_REASON_UNIT_MISMATCH,
-                    f"Populated unit ({populated.unit!r}) is incompatible with the source line item's unit "
-                    f"({item.source_unit!r}): {unit_result.unit_match_reason}",
-                )
-        elif item.source_unit.strip().upper() != populated.unit.strip().upper():
-            _cancel_pending_selection(adapter)
-            return _stop_existing(
-                outcome, STOP_REASON_UNIT_MISMATCH,
-                f"Populated unit ({populated.unit!r}) differs from the source line item's unit ({item.source_unit!r}).",
-            )
+    # The exact live UIA match in select_candidate(), combined with the
+    # positive physical delta above, is the pre-quantity instantiation
+    # proof.  Do not call read_populated_fields() here: its grid OCR may
+    # scroll/reset the whole right pane before quantity entry.  Preserve
+    # the UIA-proven identity on the outcome without claiming fields that
+    # were not independently observed.
+    outcome.populated_fields = PopulatedFields(
+        category=top.dropdown.category,
+        selector=top.dropdown.selector,
+        description=top.dropdown.description,
+        unit=None,
+        action=None,
+        item_number=top.dropdown.item_number,
+    )
 
     try:
         adapter.enter_quantity(item.quantity)
@@ -587,7 +489,7 @@ def execute_plan(
         outcome.verification = adapter.verify_commit(
             before_snapshot, top.dropdown.category, top.dropdown.selector, item.quantity,
             source_unit=item.source_unit, expected_xactimate_unit=item.source_unit,
-            populated_unit=populated.unit,
+            populated_unit=outcome.populated_fields.unit,
         )
         _record_lifecycle(adapter, "VERIFIED", trust_state=getattr(outcome.verification, "trust_state", None))
     return outcome

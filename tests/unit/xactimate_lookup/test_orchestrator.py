@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from estimate_extractor.xactimate_lookup import orchestrator, registry
 from estimate_extractor.xactimate_lookup.adapter import AdapterError, FakeXactimateAdapter
 from estimate_extractor.xactimate_lookup.models import (
@@ -100,6 +102,52 @@ def test_description_duplicate_fallback_wrong_cat_sel_fails_closed(tmp_path, phr
     assert outcome.physical_item_created is False
     assert "no exact match" in outcome.stop_detail
     assert not any(name == "enter_quantity" for name, _args, _kwargs in adapter.log.calls)
+
+
+def test_failed_focus_never_clears_or_types(tmp_path, phrase_rules, ranking_config):
+    item = _item()
+    conn = registry.create_database(tmp_path / "reg.db")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    adapter = FakeXactimateAdapter()
+    adapter.supports_live_execution = True
+
+    def _fail_focus():
+        adapter.log.record("focus_search")
+        raise AdapterError("search focus not verified")
+
+    adapter.focus_search = _fail_focus
+
+    with pytest.raises(AdapterError, match="search focus not verified"):
+        orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    names = [name for name, _args, _kwargs in adapter.log.calls]
+    assert "clear_search" not in names
+    assert "search_by_description" not in names
+
+
+def test_pending_item_proceeds_directly_to_quantity_without_populated_fields_read(
+    tmp_path, phrase_rules, ranking_config,
+):
+    item = _item()
+    conn = registry.create_database(tmp_path / "reg.db")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    selected = _dropdown(item.original_description, cat="RFG", sel="ARMVN")
+    adapter = _PendingAwareAdapter(
+        dropdown_script={plan.search_input: [selected]}, pending_results=(True,),
+    )
+
+    def _forbidden_read():
+        raise AssertionError("read_populated_fields must not run before quantity")
+
+    adapter.read_populated_fields = _forbidden_read
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.committed is True
+    names = [name for name, _args, _kwargs in adapter.log.calls]
+    assert "read_populated_fields" not in names
+    assert names.index("select_candidate") < names.index("pending_item_created") < names.index("enter_quantity")
 
 
 def test_description_no_pending_item_does_not_fallback_without_distinct_task_proof(
@@ -415,7 +463,7 @@ def test_verify_commit_not_called_when_adapter_does_not_support_it(tmp_path, phr
     assert outcome.to_dict()["verification_trust_state"] is None
 
 
-def test_field_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phrase_rules, ranking_config, monkeypatch):
+def test_removed_prequantity_ocr_mismatch_cannot_override_uia_and_pending_proof(tmp_path, phrase_rules, ranking_config, monkeypatch):
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item()
     plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
@@ -431,15 +479,8 @@ def test_field_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phra
     monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
-    assert outcome.decision == DECISION_REVIEW_REQUIRED
-    assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
-    assert outcome.committed is False
-    # Phase 5.3: select_candidate() already put a pending row in the
-    # grid -- it must be cancelled here, or a LATER unrelated
-    # commit_item() call (e.g. verify_group()'s own probe cycle) can
-    # silently persist it with default/wrong data, never having gone
-    # through this module's own commit path at all (live-reproduced).
-    assert cancel_calls == [1]
+    assert outcome.committed is True
+    assert cancel_calls == []
 
 
 def test_category_selector_match_duck_typed_check_prevents_a_false_cancellation(tmp_path, phrase_rules, ranking_config, monkeypatch):
@@ -473,7 +514,7 @@ def test_category_selector_match_duck_typed_check_prevents_a_false_cancellation(
     assert outcome.committed is True
 
 
-def test_category_selector_match_duck_typed_check_still_catches_a_real_mismatch(tmp_path, phrase_rules, ranking_config, monkeypatch):
+def test_removed_prequantity_category_check_is_not_called(tmp_path, phrase_rules, ranking_config, monkeypatch):
     """Counterpart: a genuinely different, unrelated selector must still
     stop and cancel even when check_category_selector_match() is
     available -- the tolerant comparison must never become a rubber
@@ -498,9 +539,9 @@ def test_category_selector_match_duck_typed_check_still_catches_a_real_mismatch(
     monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
-    assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
-    assert outcome.committed is False
-    assert cancel_calls == [1]
+    assert outcome.stop_reason is None
+    assert outcome.committed is True
+    assert cancel_calls == []
 
 
 def test_category_ocr_uncertain_but_corroborated_by_selector_and_absent_from_results(tmp_path, phrase_rules, ranking_config, monkeypatch):
@@ -540,7 +581,7 @@ def test_category_ocr_uncertain_but_corroborated_by_selector_and_absent_from_res
     assert cancel_calls == []
 
 
-def test_category_ocr_matching_a_real_alternate_candidate_still_fails_closed(tmp_path, phrase_rules, ranking_config, monkeypatch):
+def test_removed_prequantity_ocr_alternate_does_not_replace_uia_identity(tmp_path, phrase_rules, ranking_config, monkeypatch):
     """Counterpart: if the observed (wrong) category matches one of the
     OTHER real candidates this same search actually returned, that is
     genuine evidence a different item may have been affected -- the
@@ -569,12 +610,12 @@ def test_category_ocr_matching_a_real_alternate_candidate_still_fails_closed(tmp
     monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
-    assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
-    assert outcome.committed is False
-    assert cancel_calls == [1]
+    assert outcome.stop_reason is None
+    assert outcome.committed is True
+    assert cancel_calls == []
 
 
-def test_category_ocr_corroboration_requires_selector_to_also_agree(tmp_path, phrase_rules, ranking_config, monkeypatch):
+def test_removed_prequantity_ocr_selector_does_not_replace_uia_identity(tmp_path, phrase_rules, ranking_config, monkeypatch):
     """The corroboration override requires the SELECTOR to independently
     agree too -- if the selector is also wrong, this is ordinary
     evidence of a real mismatch, not category-only OCR noise."""
@@ -598,9 +639,9 @@ def test_category_ocr_corroboration_requires_selector_to_also_agree(tmp_path, ph
     monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
-    assert outcome.stop_reason == STOP_REASON_FIELD_MISMATCH
-    assert outcome.committed is False
-    assert cancel_calls == [1]
+    assert outcome.stop_reason is None
+    assert outcome.committed is True
+    assert cancel_calls == []
 
 
 def _trusted_plan(item, category, selector):
@@ -674,7 +715,7 @@ def test_force_auto_select_for_trusted_mapping_still_refuses_a_hard_conflict(tmp
     assert outcome.committed is False
 
 
-def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phrase_rules, ranking_config, monkeypatch):
+def test_removed_prequantity_unit_ocr_is_deferred_to_postcommit_verification(tmp_path, phrase_rules, ranking_config, monkeypatch):
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item(source_unit="SQ")
     plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
@@ -686,16 +727,9 @@ def test_unit_mismatch_after_selection_stops_and_does_not_commit(tmp_path, phras
     monkeypatch.setattr(adapter, "cancel_current_item", lambda **kwargs: cancel_calls.append(1), raising=False)
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
-    assert outcome.decision == DECISION_REVIEW_REQUIRED
-    assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
-    # outcome.committed is the authoritative "was anything actually
-    # committed" signal -- NOT whether commit_item() was ever called.
-    # Phase 5.4 added a save-after-cancel step (commit_item() persists
-    # the "nothing here" state so the project doesn't sit as "Unsaved
-    # changes" after a safe stop), which legitimately calls
-    # commit_item() without committing a line item.
-    assert outcome.committed is False
-    assert cancel_calls == [1]  # Phase 5.3: pending row must be cancelled, not left dangling
+    assert outcome.committed is True
+    assert outcome.populated_fields.unit is None
+    assert cancel_calls == []
 
 
 def test_cancel_pending_selection_retries_when_the_first_attempt_fails(tmp_path, phrase_rules, ranking_config, monkeypatch):
@@ -723,9 +757,7 @@ def test_cancel_pending_selection_retries_when_the_first_attempt_fails(tmp_path,
 
     monkeypatch.setattr(adapter, "cancel_current_item", _flaky_cancel, raising=False)
 
-    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
-
-    assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
+    orchestrator._cancel_pending_selection(adapter)
     assert len(attempts) == 2  # first attempt failed, second succeeded -- no residue left behind
 
 
@@ -747,8 +779,7 @@ def test_cancel_pending_selection_gives_up_after_bounded_retries_without_raising
     monkeypatch.setattr(adapter, "cancel_current_item", _always_fails, raising=False)
 
     # Must not raise -- a cleanup failure must never mask the original stop reason.
-    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
-    assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
+    orchestrator._cancel_pending_selection(adapter)
     assert len(attempts) == 3  # bounded -- never unbounded
 
 
@@ -765,8 +796,7 @@ def test_cancel_pending_selection_is_a_no_op_when_adapter_lacks_the_method(tmp_p
     adapter.supports_live_execution = True
     assert not hasattr(adapter, "cancel_current_item")
 
-    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
-    assert outcome.stop_reason == STOP_REASON_UNIT_MISMATCH
+    orchestrator._cancel_pending_selection(adapter)
 
 
 def test_matching_populated_unit_does_not_block_commit(tmp_path, phrase_rules, ranking_config):

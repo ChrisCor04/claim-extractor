@@ -30,6 +30,7 @@ from estimate_extractor.xactimate_lookup.windows_adapter import (
     QuantityVerificationResult,
     ReconciliationResult,
     RowOffscreenError,
+    SearchFocusError,
     StaleCandidateError,
     UnitVerificationResult,
     WindowsXactimateAdapter,
@@ -303,6 +304,97 @@ def test_select_candidate_without_prior_capture_raises():
     candidate = DropdownResult(raw_text="x", row_position=0, category="SFG", selector="GUTA")
     with pytest.raises(PopupNotFoundError):
         adapter.select_candidate(candidate)
+
+
+def test_focus_search_fails_closed_when_live_search_target_cannot_be_verified(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_search_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    with pytest.raises(SearchFocusError, match="positively locate"):
+        adapter.focus_search()
+
+    assert clicks == []
+
+
+def test_focus_search_fails_closed_when_keyboard_focus_is_not_verified(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_search_field", lambda image: (100, 40, 300, 65))
+    monkeypatch.setattr(adapter, "_search_focus_is_verified", lambda hwnd, field: False)
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    with pytest.raises(SearchFocusError, match="keyboard focus"):
+        adapter.focus_search()
+
+    assert clicks == [(101, 200, 52)]
+
+
+def test_reset_scroll_state_does_not_click_unverified_items_target(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: None)
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import ItemsTabVerificationError
+
+    with pytest.raises(ItemsTabVerificationError, match="positively locate"):
+        adapter._reset_scroll_state()
+
+    assert clicks == []
+
+
+def test_reset_scroll_state_requires_live_items_tab_and_search_pane(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    captures = iter(["before", "after"])
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: next(captures))
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
+    monkeypatch.setattr(adapter, "_locate_search_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import ItemsTabVerificationError
+
+    with pytest.raises(ItemsTabVerificationError, match="did not produce"):
+        adapter._reset_scroll_state()
+
+    assert clicks == [(101, 20, 15)]
+
+
+def test_select_candidate_rejects_wrong_live_uia_identity_before_click(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_dropdown_hwnd = 999
+    candidate = DropdownResult(raw_text="RFGARMVN wanted", row_position=0, category="RFG", selector="ARMVN")
+    wrong = _raw_row("RFGWRONG", "wrong", "$1.00", hwnd=999)
+
+    class _Win32:
+        @staticmethod
+        def IsWindow(hwnd):
+            return True
+
+    clicks = []
+    monkeypatch.setattr(adapter, "_win32gui", lambda: _Win32)
+    monkeypatch.setattr(adapter, "_read_dropdown_rows", lambda hwnd: [wrong])
+    monkeypatch.setattr(adapter, "_click_screen", lambda *args: clicks.append(args))
+
+    with pytest.raises(StaleCandidateError, match="no longer present"):
+        adapter.select_candidate(candidate)
+
+    assert clicks == []
 
 
 def test_get_adapter_diagnostics_reports_not_found_state():

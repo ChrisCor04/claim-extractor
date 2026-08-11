@@ -58,7 +58,6 @@ from estimate_extractor.xactimate_lookup.models import (
     LOOKUP_PATH_DESCRIPTION_SEARCH,
     LOOKUP_PATH_TRUSTED,
     DropdownResult,
-    PopulatedFields,
 )
 
 
@@ -664,17 +663,15 @@ def test_unmapped_task_ambiguous_ranking_is_still_a_safe_stop(tmp_path, phrase_r
     assert len(select_calls) == 1  # only task_mapped's unambiguous selection
 
 
-def test_observed_cat_sel_recorded_after_successful_unmapped_commit(tmp_path, phrase_rules, ranking_config):
-    """Requirement 11: observed CAT/SEL (and description/activity) are
+def test_uia_observed_cat_sel_recorded_after_successful_unmapped_commit(tmp_path, phrase_rules, ranking_config):
+    """Requirement 11: UIA-observed CAT/SEL and description are
     recorded on the task after a successful commit of an
     originally-unmapped row, and a proposal is written to the separate
-    observed_mappings.json file."""
+    observed_mappings.json file. Activity remains unknown because the
+    removed pre-quantity grid OCR was its only source."""
     plan = _plan_mapped_and_unmapped()
     script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script)
-    adapter.read_populated_fields = lambda: PopulatedFields(
-        category="RFG", selector="FELT15", description="Roofing felt - 15 lb.", unit="SQ", action="install", item_number=None
-    )
 
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
 
@@ -683,7 +680,7 @@ def test_observed_cat_sel_recorded_after_successful_unmapped_commit(tmp_path, ph
     assert task.observed_category == "RFG"
     assert task.observed_selector == "FELT15"
     assert task.observed_description == "Roofing felt - 15 lb."
-    assert task.observed_activity == "install"
+    assert task.observed_activity is None
     # the mapped task never gets these populated -- unchanged behavior
     assert result.task_by_id("task_mapped").observed_category is None
 

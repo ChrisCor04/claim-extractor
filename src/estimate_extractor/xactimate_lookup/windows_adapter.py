@@ -257,6 +257,16 @@ class PopupCaptureFailedError(AdapterError):
     be silently reported as if Xactimate found nothing."""
 
 
+class ItemsTabVerificationError(AdapterError):
+    """Raised before clicking when the live Items tab cannot be located,
+    or after clicking when the Items search pane cannot be observed."""
+
+
+class SearchFocusError(AdapterError):
+    """Raised when the live Search field or its keyboard focus cannot be
+    positively verified.  Callers must not clear or type after this."""
+
+
 class RowOffscreenError(AdapterError):
     """Phase 6.2 (live-caught): raised by enter_quantity() when the
     pending row's computed screen position still falls outside the
@@ -1390,6 +1400,142 @@ class WindowsXactimateAdapter(XactimateAdapter):
         top, left, width, height = matches[0]
         return (left, top, left + width, top + height)
 
+    def _locate_search_field(self, image) -> tuple[int, int, int, int] | None:
+        """Locate the current Search input from live OCR geometry.
+
+        Static Xactimate chrome has no UIA/MSAA descendants, so there is
+        no accessible Edit element to query.  The two visible ``Search``
+        labels provide a live structural locator instead: the section
+        heading followed by the Search button on the next row.  The input
+        must be the long bordered rectangle between them.  Both horizontal
+        borders are detected from the current pixels; calibrated search-box
+        coordinates are deliberately not consulted.
+        """
+        pytesseract = self._pytesseract()
+        from pytesseract import Output
+
+        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        words = []
+        for i, text in enumerate(data["text"]):
+            if re.sub(r"[^a-z]+", "", str(text).lower()) == "search":
+                words.append((data["left"][i], data["top"][i], data["width"][i], data["height"][i]))
+
+        gray = image.convert("L")
+
+        def dark_runs(y: int, x0: int, x1: int) -> list[tuple[int, int]]:
+            runs = []
+            start = None
+            for x in range(x0, x1):
+                dark = gray.getpixel((x, y)) < 245
+                if dark and start is None:
+                    start = x
+                elif not dark and start is not None:
+                    if x - start >= 120:
+                        runs.append((start, x))
+                    start = None
+            if start is not None and x1 - start >= 120:
+                runs.append((start, x1))
+            return runs
+
+        for hx, hy, hw, hh in sorted(words, key=lambda box: box[1]):
+            for bx, by, bw, bh in words:
+                if not (20 <= by - hy <= 90 and bx >= hx + 140):
+                    continue
+                x0 = max(0, hx - 16)
+                x1 = min(image.width, bx - 8)
+                y0 = max(0, by - 12)
+                y1 = min(image.height, by + bh + 12)
+                horizontal = []
+                for y in range(y0, y1):
+                    horizontal.extend((y, left, right) for left, right in dark_runs(y, x0, x1))
+                for top, left, right in horizontal:
+                    for bottom, left2, right2 in horizontal:
+                        height = bottom - top
+                        overlap = min(right, right2) - max(left, left2)
+                        if 14 <= height <= 32 and overlap >= 120:
+                            field_left = max(left, left2)
+                            field_right = min(right, right2)
+                            if field_right - field_left >= 120:
+                                return (field_left, top, field_right, bottom + 1)
+        return None
+
+    def _locate_items_tab(self, image) -> tuple[int, int, int, int] | None:
+        """Locate Items only when a neighboring tab proves tab context.
+
+        ``Items`` also appears in the page title (``Estimate Items``),
+        and OCR can miss any one narrow tab label.  Evaluate every Items
+        match and accept one only when Components, Supporting, or Summary
+        is horizontally aligned to its right on the same tab strip.
+        """
+        pytesseract = self._pytesseract()
+        from pytesseract import Output
+
+        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        items_boxes = []
+        neighbor_boxes = []
+        for i, text in enumerate(data["text"]):
+            clean = re.sub(r"[^a-z]+", "", str(text).lower())
+            box = (
+                data["left"][i], data["top"][i],
+                data["left"][i] + data["width"][i],
+                data["top"][i] + data["height"][i],
+            )
+            if clean == "items":
+                items_boxes.append(box)
+            elif clean in {"components", "supporting", "summary"}:
+                neighbor_boxes.append(box)
+
+        for items in items_boxes:
+            items_mid_y = (items[1] + items[3]) // 2
+            if items_mid_y > image.height // 3:
+                continue
+            for neighbor in neighbor_boxes:
+                neighbor_mid_y = (neighbor[1] + neighbor[3]) // 2
+                if items[0] < neighbor[0] and abs(items_mid_y - neighbor_mid_y) <= 12:
+                    return items
+        return None
+
+    def _search_focus_is_verified(self, hwnd: int, field: tuple[int, int, int, int]) -> bool:
+        """Require the OS caret to be inside the live-located Search field.
+
+        The WPF surface has one native HWND, so ``hwndFocus`` is expected
+        to be the main window.  ``rcCaret`` is converted from the caret
+        window's client coordinates to the main client before testing it.
+        Absence of caret evidence is uncertainty and therefore failure.
+        """
+        ctypes, wintypes = self._win32()
+        user32 = ctypes.windll.user32
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        if user32.GetForegroundWindow() != hwnd:
+            return False
+        thread_id = user32.GetWindowThreadProcessId(hwnd, None)
+        info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+        if not thread_id or not user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)):
+            return False
+        if info.hwndFocus != hwnd or not info.hwndCaret:
+            return False
+        caret_window = info.hwndCaret
+        point = wintypes.POINT(info.rcCaret.left, info.rcCaret.top)
+        if not user32.ClientToScreen(caret_window, ctypes.byref(point)):
+            return False
+        if not user32.ScreenToClient(hwnd, ctypes.byref(point)):
+            return False
+        left, top, right, bottom = field
+        return left <= point.x <= right and top <= point.y <= bottom
+
     def _anchor_offset(self, image) -> tuple[int, int] | None:
         """Locates the grid header's own "Cat" column label live and
         returns the (dx, dy) shift from its calibrated position in
@@ -1572,7 +1718,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return self._main_hwnd
 
     def _reset_scroll_state(self) -> None:
-        """Clicking the always-visible 'Items' tab (outside the
+        """Click the live-located Items tab and verify its Search pane.
+
+        Clicking the always-visible 'Items' tab (outside the
         scrollable content pane) re-selects the current tab and, per
         live testing, returns the content pane to its top scroll
         position -- the state _ANCHORS was calibrated against.
@@ -1593,9 +1741,20 @@ class WindowsXactimateAdapter(XactimateAdapter):
         behavior across every prior phase. See
         docs/xactimate-lookup.md Phase 4.7."""
         hwnd = self._ensure_main_window()
-        l, t, r, b = _ANCHORS["items_tab"]
+        before = self._capture_client_image(hwnd)
+        items = self._locate_items_tab(before)
+        if items is None:
+            raise ItemsTabVerificationError(
+                "Could not positively locate the Items tab with its neighboring tab context; refusing to click."
+            )
+        l, t, r, b = items
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
         time.sleep(0.3)
+        after = self._capture_client_image(hwnd)
+        if self._locate_search_field(after) is None:
+            raise ItemsTabVerificationError(
+                "Items tab click did not produce a positively located Search field; refusing to continue."
+            )
 
     def focus_search(self) -> None:
         """Live-caught (Phase 4.7): unlike the tab bar, the search box
@@ -1611,13 +1770,21 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if not self._force_foreground(hwnd):
             raise AdapterError("Could not bring Xactimate window to the foreground.")
         self._reset_scroll_state()
-        image, offset = self._capture_and_locate(hwnd)
-        if offset is None:
-            l, t, r, b = _ANCHORS["search_box"]
-        else:
-            l, t, r, b = self._shifted_anchor("search_box", offset)
+        image = self._capture_client_image(hwnd)
+        field = self._locate_search_field(image)
+        if field is None:
+            raise SearchFocusError(
+                "Could not positively locate the current Search field; refusing to click or type."
+            )
+        l, t, r, b = field
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
         time.sleep(0.2)
+        current = self._capture_client_image(hwnd)
+        current_field = self._locate_search_field(current)
+        if current_field is None or not self._search_focus_is_verified(hwnd, current_field):
+            raise SearchFocusError(
+                "Search field keyboard focus could not be positively verified after the click; refusing to clear or type."
+            )
 
     def clear_search(self) -> None:
         self._select_all_and_delete()
