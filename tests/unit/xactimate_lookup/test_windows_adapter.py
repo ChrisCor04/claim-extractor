@@ -306,7 +306,7 @@ def test_select_candidate_without_prior_capture_raises():
         adapter.select_candidate(candidate)
 
 
-def test_focus_search_fails_closed_when_live_search_target_cannot_be_verified(monkeypatch):
+def test_focus_search_has_no_fixed_coordinate_fallback_when_live_target_is_absent(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     clicks = []
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
@@ -340,11 +340,72 @@ def test_focus_search_fails_closed_when_keyboard_focus_is_not_verified(monkeypat
     assert clicks == [(101, 200, 52)]
 
 
+def test_search_field_readiness_poll_finds_later_rendered_field(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    captures = iter(["not-ready-1", "not-ready-2", "ready"])
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: next(captures))
+    monkeypatch.setattr(
+        adapter, "_locate_search_field",
+        lambda image: (100, 40, 300, 65) if image == "ready" else None,
+    )
+
+    assert adapter._wait_for_search_field(101, attempts=3) == (100, 40, 300, 65)
+
+
+def test_search_field_readiness_poll_permanent_absence_fails_closed(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    captures = []
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: captures.append(hwnd) or object())
+    monkeypatch.setattr(adapter, "_locate_search_field", lambda image: None)
+
+    assert adapter._wait_for_search_field(101, attempts=4) is None
+    assert captures == [101, 101, 101, 101]
+
+
+def test_search_locator_uses_breadcrumb_corroboration_when_focused_heading_is_absent(monkeypatch):
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 180), "white")
+    ImageDraw.Draw(image).rectangle((50, 80, 250, 102), outline=(100, 120, 140), width=1)
+    data = {
+        "text": ["Home", "Price", "Search"],
+        "left": [55, 105, 280],
+        "top": [58, 58, 85],
+        "width": [30, 30, 40],
+        "height": [10, 10, 10],
+    }
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(*args, **kwargs):
+            return data
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._locate_search_field(image) == (50, 80, 251, 103)
+
+
+def test_reset_scroll_state_does_not_click_when_items_search_is_already_ready(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "ready")
+    monkeypatch.setattr(adapter, "_locate_search_field", lambda image: (100, 40, 300, 65))
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (_ for _ in ()).throw(AssertionError("not needed")))
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    adapter._reset_scroll_state()
+
+    assert clicks == []
+
+
 def test_reset_scroll_state_does_not_click_unverified_items_target(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     clicks = []
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_search_field", lambda image: None)
     monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: None)
     monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
 
@@ -358,12 +419,12 @@ def test_reset_scroll_state_does_not_click_unverified_items_target(monkeypatch):
 
 def test_reset_scroll_state_requires_live_items_tab_and_search_pane(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    captures = iter(["before", "after"])
     clicks = []
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
-    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: next(captures))
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "before")
     monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
     monkeypatch.setattr(adapter, "_locate_search_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: None)
     monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
@@ -373,6 +434,31 @@ def test_reset_scroll_state_requires_live_items_tab_and_search_pane(monkeypatch)
         adapter._reset_scroll_state()
 
     assert clicks == [(101, 20, 15)]
+
+
+def test_valid_search_focus_permits_clear_and_query_typing(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    actions = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
+    monkeypatch.setattr(adapter, "_locate_search_field", lambda image: (100, 40, 300, 65))
+    monkeypatch.setattr(adapter, "_search_focus_is_verified", lambda hwnd, field: True)
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: actions.append(("click", args)))
+    monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: actions.append(("clear", ())))
+    monkeypatch.setattr(adapter, "_type_keybdevent", lambda text: actions.append(("type", (text,))))
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    adapter.focus_search()
+    adapter.clear_search()
+    adapter.search_by_description("Drip edge")
+
+    assert actions == [
+        ("click", (101, 200, 52)),
+        ("clear", ()),
+        ("type", ("Drip edge",)),
+    ]
 
 
 def test_select_candidate_rejects_wrong_live_uia_identity_before_click(monkeypatch):

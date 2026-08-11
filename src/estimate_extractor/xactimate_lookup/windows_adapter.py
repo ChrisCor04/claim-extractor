@@ -1404,20 +1404,30 @@ class WindowsXactimateAdapter(XactimateAdapter):
         """Locate the current Search input from live OCR geometry.
 
         Static Xactimate chrome has no UIA/MSAA descendants, so there is
-        no accessible Edit element to query.  The two visible ``Search``
-        labels provide a live structural locator instead: the section
-        heading followed by the Search button on the next row.  The input
-        must be the long bordered rectangle between them.  Both horizontal
-        borders are detected from the current pixels; calibrated search-box
-        coordinates are deliberately not consulted.
+        no accessible Edit element to query.  Live structural evidence
+        provides the locator instead: normally the section heading and
+        Search button; in the focused rendering where that heading drops
+        out of OCR, the Search button plus the Home/Price breadcrumb.  The
+        input must be the long bordered rectangle corroborated by either
+        relationship.  Both horizontal borders are detected from current
+        pixels; calibrated search-box coordinates are never consulted.
         """
         pytesseract = self._pytesseract()
         from pytesseract import Output
 
         data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
         words = []
+        word_boxes: dict[str, list[tuple[int, int, int, int]]] = {}
         for i, text in enumerate(data["text"]):
-            if re.sub(r"[^a-z]+", "", str(text).lower()) == "search":
+            clean = re.sub(r"[^a-z]+", "", str(text).lower())
+            box = (
+                data["left"][i], data["top"][i],
+                data["left"][i] + data["width"][i],
+                data["top"][i] + data["height"][i],
+            )
+            if clean:
+                word_boxes.setdefault(clean, []).append(box)
+            if clean == "search":
                 words.append((data["left"][i], data["top"][i], data["width"][i], data["height"][i]))
 
         gray = image.convert("L")
@@ -1437,26 +1447,55 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 runs.append((start, x1))
             return runs
 
+        relationships = []
         for hx, hy, hw, hh in sorted(words, key=lambda box: box[1]):
             for bx, by, bw, bh in words:
                 if not (20 <= by - hy <= 90 and bx >= hx + 140):
                     continue
-                x0 = max(0, hx - 16)
-                x1 = min(image.width, bx - 8)
-                y0 = max(0, by - 12)
-                y1 = min(image.height, by + bh + 12)
-                horizontal = []
-                for y in range(y0, y1):
-                    horizontal.extend((y, left, right) for left, right in dark_runs(y, x0, x1))
-                for top, left, right in horizontal:
-                    for bottom, left2, right2 in horizontal:
-                        height = bottom - top
-                        overlap = min(right, right2) - max(left, left2)
-                        if 14 <= height <= 32 and overlap >= 120:
-                            field_left = max(left, left2)
-                            field_right = min(right, right2)
-                            if field_right - field_left >= 120:
-                                return (field_left, top, field_right, bottom + 1)
+                relationships.append((hx - 16, (bx, by, bx + bw, by + bh)))
+
+        # Focused-state live evidence: clicking this WPF Search field can
+        # make OCR omit the section-heading "Search" while the Search
+        # button, Home/Price List breadcrumb, and input borders remain
+        # unchanged and readable.  Corroborate the button against BOTH
+        # breadcrumb words instead of requiring the transient heading.
+        for bx, by, bw, bh in words:
+            button = (bx, by, bx + bw, by + bh)
+            for home in word_boxes.get("home", []):
+                for price in word_boxes.get("price", []):
+                    home_mid_y = (home[1] + home[3]) // 2
+                    price_mid_y = (price[1] + price[3]) // 2
+                    if not (10 <= by - home[1] <= 50):
+                        continue
+                    if abs(home_mid_y - price_mid_y) > 12:
+                        continue
+                    if not (home[0] < price[0] < bx and bx - home[0] >= 140):
+                        continue
+                    relationships.append((min(home[0], price[0]) - 16, button))
+
+        seen_relationships = set()
+        for left_hint, button in relationships:
+            bx, by, br, bb = button
+            relationship_key = (left_hint, button)
+            if relationship_key in seen_relationships:
+                continue
+            seen_relationships.add(relationship_key)
+            x0 = max(0, left_hint)
+            x1 = min(image.width, bx - 8)
+            y0 = max(0, by - 12)
+            y1 = min(image.height, bb + 12)
+            horizontal = []
+            for y in range(y0, y1):
+                horizontal.extend((y, left, right) for left, right in dark_runs(y, x0, x1))
+            for top, left, right in horizontal:
+                for bottom, left2, right2 in horizontal:
+                    height = bottom - top
+                    overlap = min(right, right2) - max(left, left2)
+                    if 14 <= height <= 32 and overlap >= 120:
+                        field_left = max(left, left2)
+                        field_right = min(right, right2)
+                        if field_right - field_left >= 120:
+                            return (field_left, top, field_right, bottom + 1)
         return None
 
     def _locate_items_tab(self, image) -> tuple[int, int, int, int] | None:
@@ -1535,6 +1574,23 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return False
         left, top, right, bottom = field
         return left <= point.x <= right and top <= point.y <= bottom
+
+    def _wait_for_search_field(
+        self, hwnd: int, *, attempts: int = 4,
+    ) -> tuple[int, int, int, int] | None:
+        """Boundedly recapture until the live Search field is rendered.
+
+        This is feedback-driven readiness polling, not a blind delay: each
+        attempt captures a new frame and immediately stops on positive
+        OCR/geometry evidence.  OCR itself supplies the render interval,
+        so no unconditional sleep or fixed-coordinate fallback is used.
+        """
+        for _attempt in range(attempts):
+            image = self._capture_client_image(hwnd)
+            field = self._locate_search_field(image)
+            if field is not None:
+                return field
+        return None
 
     def _anchor_offset(self, image) -> tuple[int, int] | None:
         """Locates the grid header's own "Cat" column label live and
@@ -1742,6 +1798,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         docs/xactimate-lookup.md Phase 4.7."""
         hwnd = self._ensure_main_window()
         before = self._capture_client_image(hwnd)
+        # If the active Items pane already exposes a positively located
+        # Search field, it is already in the only state this reset exists
+        # to establish.  Do not churn the layout with a redundant tab
+        # click.
+        if self._locate_search_field(before) is not None:
+            return
         items = self._locate_items_tab(before)
         if items is None:
             raise ItemsTabVerificationError(
@@ -1749,11 +1811,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
             )
         l, t, r, b = items
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
-        time.sleep(0.3)
-        after = self._capture_client_image(hwnd)
-        if self._locate_search_field(after) is None:
+        if self._wait_for_search_field(hwnd) is None:
             raise ItemsTabVerificationError(
-                "Items tab click did not produce a positively located Search field; refusing to continue."
+                "Items tab click did not produce a positively located Search field within the bounded readiness poll; "
+                "refusing to continue."
             )
 
     def focus_search(self) -> None:
