@@ -90,9 +90,6 @@ from estimate_extractor.xactimate_lookup.models import (
     LookupPlan,
     MAPPING_STATUS_APPROVED,
     RecommendationInput,
-    STOP_REASON_EXTRACTION_FAILED,
-    STOP_REASON_NO_RESULTS,
-    STOP_REASON_UNEXPECTED_DIALOG,
 )
 from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, generate_search_phrase
 from estimate_extractor.xactimate_lookup.ranking import RankingConfig
@@ -470,189 +467,76 @@ def _find_verified_search_description(project_dir: Path, line_item_id: str) -> s
         return None
 
 
-#: Phase 5.5D Stage 7: the fixed, ordered attempt-type labels a began_
-#: unmapped task's search sequence can produce -- recorded on each
-#: ExecutionTask.search_attempts entry's "search_type" field.
-SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION = "verified_search_description"
+#: The only search type permitted for a began-unmapped production task.
+#: Historical alternative labels were removed when live evidence showed
+#: that retrying alternate text could instantiate the same task again.
 SEARCH_TYPE_EXACT_DESCRIPTION = "exact_description"
-SEARCH_TYPE_NORMALIZED_DESCRIPTION = "normalized_description"
-SEARCH_TYPE_COMPACT_GENERATED_PHRASE = "compact_generated_phrase"
-#: Phase 5.15 Pass 2: last-resort fallback for cleaning-intent rows
-#: whose component-specific search cannot reach Xactimate's own
-#: generic "Clean {V}"-style template catalog entries -- see
-#: _description_first_search_attempts()'s own comment for the live
-#: evidence and exact scope (action_search_terms resolves to "clean").
-SEARCH_TYPE_GENERIC_CLEANING_FALLBACK = "generic_cleaning_fallback"
-SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL = "trusted_observed_cat_sel"
-
-#: Decision/stop_reason combinations that mean "try the next attempt" --
-#: everything else means "stop here, this attempt produced a defensible
-#: result" (an AUTO_SELECT, or a REVIEW_REQUIRED for any reason OTHER
-#: than these two -- e.g. an ambiguous ranking IS defensible: a human
-#: should look at THAT candidate, not have the row silently re-searched
-#: with different text).
-_ADVANCE_STOP_REASONS = frozenset({STOP_REASON_NO_RESULTS, STOP_REASON_EXTRACTION_FAILED, STOP_REASON_UNEXPECTED_DIALOG})
-
 
 def _description_first_search_attempts(
     task: ExecutionTask, phrase_rules: PhraseRules, project_dir: Path,
 ) -> list[tuple[str, LookupPlan]]:
-    """Builds the bounded, ordered attempt sequence for a began_unmapped
-    task (Phase 5.5D Stage 7, extended Phase 5.7A): a previously
-    VERIFIED search description for this exact line item (if this row
-    was already executed and verified in an earlier run -- e.g. a
-    resume/retry), then the exact source description, normalized
-    description, the existing compact/generated phrase, then -- only if
-    a previous VERIFIED commit of this exact line item produced one --
-    a trusted CAT/SEL as the FINAL fallback. Never starts with CAT/SEL,
-    and a learned CAT/SEL NEVER substitutes for a description attempt
-    -- see docs/build-estimate.md Phase 5.7A: a live incident where
-    SFG/GUTA (the group-verification probe's own hardcoded disposable
-    test item, unrelated to any PDF row -- see WindowsXactimateAdapter.
-    _verify_group_once()) was mistaken for an unmapped row's search
-    input prompted tracing this whole sequence end-to-end; the trace
-    confirmed description-first ordering was already correct, and this
-    phase adds the verified-description-reuse attempt plus locks the
-    ordering down with explicit regression tests. Reuses generate_
-    search_phrase()/compute_normalized_description() exactly as they
-    already exist elsewhere in this codebase -- no global phrase-
-    generation or ranking change. Skips a candidate attempt whose text
-    is empty or exactly duplicates an earlier attempt's text (nothing
-    new to learn from re-running an identical search)."""
-    attempts: list[tuple[str, LookupPlan]] = []
-    seen_texts: set[str] = set()
+    """Build the sole lookup allowed for a began-unmapped task.
 
-    def _add(search_type: str, text: str | None, *, phrase_result=None) -> None:
-        if not text or not text.strip():
-            return
-        normalized_text = text.strip()
-        if normalized_text.lower() in seen_texts:
-            return
-        seen_texts.add(normalized_text.lower())
-        attempts.append((
-            search_type,
-            LookupPlan(
-                line_item_id=task.line_item_id, path=LOOKUP_PATH_DESCRIPTION_SEARCH,
-                item_signature="", search_input=normalized_text, phrase_result=phrase_result,
-            ),
-        ))
-
-    # Phase 5.7A: a DESCRIPTION, not a CAT/SEL shortcut -- reused only
-    # when a previous run of this EXACT row was independently verified.
-    # Still a description-search attempt like any other, ranked and
-    # safety-stopped identically; the only thing "learned" here is
-    # which wording to type first, never which candidate to pick.
-    _add(SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION, _find_verified_search_description(project_dir, task.line_item_id))
-
-    _add(SEARCH_TYPE_EXACT_DESCRIPTION, task.description)
-    _add(SEARCH_TYPE_NORMALIZED_DESCRIPTION, compute_normalized_description(
-        task.normalized_trade, task.normalized_component, task.normalized_material, task.normalized_action,
-    ))
-    phrase_result = generate_search_phrase(
-        task.description, task.normalized_component, task.normalized_material, task.normalized_action, phrase_rules,
-    )
-    _add(SEARCH_TYPE_COMPACT_GENERATED_PHRASE, phrase_result.phrase, phrase_result=phrase_result)
-
-    # Phase 5.15 Pass 2 (ground-truth-guided, live-verified against the
-    # completed Aranda reference estimate): a component-specific
-    # cleaning search (e.g. "Clean Fence") structurally cannot find
-    # Xactimate's own GENERIC "Clean {V}"-style template entries --
-    # every component-specific search above (exact/normalized/compact,
-    # all of which include the component word "fence") returns
-    # component-specific candidates whose descriptions genuinely never
-    # mention "clean" (wrong_action-capped), while a search for "clean"
-    # alone live-confirmed CLN/AV ("Clean {V}") as the top Xactimate
-    # result -- the reference's own actual answer for "Clean Fence".
-    # Scoped narrowly and evidence-based: ONLY when the resolved action
-    # search term is literally "clean" (the one case actually live-
-    # tested), tried only as a LAST-RESORT attempt after every
-    # component-specific attempt above has already failed to produce a
-    # defensible result -- never a replacement for searching the real
-    # source wording first. Not fence-specific: the same "clean" action
-    # term fires for any "Clean [component]" carrier row (wall, siding,
-    # floor, ...), matching score_dropdown_candidate()'s companion
-    # fix that stops a template candidate's missing component word
-    # from being scored as a hard conflict.
-    action_term = phrase_rules.action_search_terms.get(task.normalized_action or "")
-    if action_term == "clean":
-        _add(SEARCH_TYPE_GENERIC_CLEANING_FALLBACK, action_term)
-
-    # Phase 5.7A: CAT/SEL remains the LAST resort -- every description
-    # attempt above is tried and must fail (no_results/extraction-
-    # failed/unexpected-dialog) before this is ever reached. Learned
-    # CAT/SEL knowledge is candidate/result metadata, never a reason to
-    # skip searching by description first.
-    trusted = _find_trusted_observed_mapping(project_dir, task.line_item_id)
-    if trusted is not None:
-        category, selector = trusted
-        trusted_mapping = InternalMappingRecord(
-            mapping_id=f"observed_mapping:{task.line_item_id}",
-            item_signature="", source_description=task.description, search_phrase="",
-            category=category, selector=selector, xactimate_description=task.description,
-            unit=task.expected_unit, action=None, reviewer="",
-            approval_reason="Reused from a previous VERIFIED commit of this exact line item (Phase 5.5D Stage 7).",
-            status=MAPPING_STATUS_APPROVED,
-        )
-        attempts.append((
-            SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL,
-            LookupPlan(
-                line_item_id=task.line_item_id, path=LOOKUP_PATH_TRUSTED, item_signature="",
-                search_input=f"{category} {selector}", trusted_mapping=trusted_mapping,
-            ),
-        ))
-    return attempts
+    Production evidence showed that continuing with normalized,
+    generated, learned-description, or CAT/SEL alternatives after the
+    source description had already selected an item could instantiate
+    the same task repeatedly.  Search the complete source description
+    exactly once and let that attempt's normal safety result stand.
+    ``phrase_rules`` and ``project_dir`` remain in the signature for
+    caller compatibility; neither may alter the lookup text.
+    """
+    description = task.description.strip()
+    if not description:
+        return []
+    return [(
+        SEARCH_TYPE_EXACT_DESCRIPTION,
+        LookupPlan(
+            line_item_id=task.line_item_id,
+            path=LOOKUP_PATH_DESCRIPTION_SEARCH,
+            item_signature="",
+            search_input=description,
+        ),
+    )]
 
 
 def _run_description_first_task(
     task: ExecutionTask, item: RecommendationInput, adapter, ranking_config: RankingConfig,
     phrase_rules: PhraseRules, project_dir: Path, dry_run: bool,
 ):
-    """Phase 5.5D Stage 7: runs a began_unmapped task through the
-    bounded attempt sequence from _description_first_search_attempts(),
-    stopping at the FIRST attempt that produces a defensible result
-    (anything other than no-results/extraction-failure/unexpected-
-    dialog) -- reusing orchestrator.execute_plan() UNCHANGED for every
-    individual attempt, so ranking/safety-stop/commit/verify behavior
-    is identical to any other lookup. Records the full attempt trail on
-    `task.search_attempts` regardless of outcome. Returns the winning
-    (or final) LookupOutcome, and (actual_strategy, reason) exactly
-    like _task_to_lookup_plan() -- kept in that same 3-tuple shape so
-    the caller's existing task.actual_lookup_strategy/lookup_strategy_
-    reason assignment doesn't need special-casing."""
+    """Run the single complete-source-description lookup.
+
+    Ranking, safety-stop, commit, and verification remain delegated to
+    orchestrator.execute_plan() unchanged.  No alternate query is
+    permitted after this attempt, irrespective of its outcome.
+    """
     attempts = _description_first_search_attempts(task, phrase_rules, project_dir)
     if not attempts:
         raise UnsafeLookupRouting(
-            f"{task.task_id}: no search attempt could be built (empty description and no fallback) -- "
+            f"{task.task_id}: no search attempt could be built (empty full description) -- "
             f"refusing to guess."
         )
-
-    outcome = None
-    for attempt_number, (search_type, attempt_plan) in enumerate(attempts, start=1):
-        outcome = orchestrator.execute_plan(attempt_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
-        is_last_attempt = attempt_number == len(attempts)
-        should_advance = (
-            not is_last_attempt
-            and (outcome.decision == DECISION_NO_MATCH or outcome.stop_reason in _ADVANCE_STOP_REASONS)
+    if len(attempts) != 1:
+        raise UnsafeLookupRouting(
+            f"{task.task_id}: expected exactly one full-description search, got {len(attempts)} -- "
+            f"refusing alternate lookups."
         )
-        top = outcome.candidates[0] if outcome.candidates else None
-        task.search_attempts.append({
-            "attempt_number": attempt_number,
-            "search_type": search_type,
-            "search_text": attempt_plan.search_input,
-            "result_count": len(outcome.candidates),
-            "top_candidate_category": top.dropdown.category if top is not None else None,
-            "top_candidate_selector": top.dropdown.selector if top is not None else None,
-            "top_candidate_score": top.score if top is not None else None,
-            "decision": outcome.decision,
-            "stop_reason": outcome.stop_reason,
-            "advanced_to_next_attempt": should_advance,
-            "advance_reason": (
-                "no defensible candidate -- trying the next attempt" if should_advance
-                else ("final attempt in the sequence" if is_last_attempt else "defensible result found -- stopping here")
-            ),
-        })
-        if not should_advance:
-            break
+
+    search_type, attempt_plan = attempts[0]
+    outcome = orchestrator.execute_plan(attempt_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
+    top = outcome.candidates[0] if outcome.candidates else None
+    task.search_attempts.append({
+        "attempt_number": 1,
+        "search_type": search_type,
+        "search_text": attempt_plan.search_input,
+        "result_count": len(outcome.candidates),
+        "top_candidate_category": top.dropdown.category if top is not None else None,
+        "top_candidate_selector": top.dropdown.selector if top is not None else None,
+        "top_candidate_score": top.score if top is not None else None,
+        "decision": outcome.decision,
+        "stop_reason": outcome.stop_reason,
+        "advanced_to_next_attempt": False,
+        "advance_reason": "single full-description attempt; alternatives disabled",
+    })
 
     reason = (
         f"test_description_first: attempt {len(task.search_attempts)}/{len(attempts)} "
@@ -820,9 +704,9 @@ def run_execution_plan(
 
             item = _task_to_recommendation_input(task)
             try:
-                # Phase 5.5D Stage 7: a began_unmapped task runs through
-                # the bounded exact-description-first attempt sequence
-                # instead of a single generated-phrase search -- see
+                # A began_unmapped task gets exactly one complete-source-
+                # description search. No normalized/generated/learned or
+                # CAT/SEL alternative may follow it -- see
                 # _run_description_first_task()'s docstring. Every other
                 # (today, only review_approved) task is completely
                 # unchanged: one _task_to_lookup_plan() call, one

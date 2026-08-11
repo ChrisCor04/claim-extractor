@@ -40,11 +40,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
 )
 from estimate_extractor.xactimate_lookup.execution_runner import (
     OBSERVED_MAPPING_STATE,
-    SEARCH_TYPE_COMPACT_GENERATED_PHRASE,
     SEARCH_TYPE_EXACT_DESCRIPTION,
-    SEARCH_TYPE_NORMALIZED_DESCRIPTION,
-    SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL,
-    SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION,
     UnsafeLookupRouting,
     _description_first_search_attempts,
     _find_trusted_observed_mapping,
@@ -561,6 +557,7 @@ def test_project_lost_between_groups_is_a_hard_stop_for_the_whole_run(tmp_path, 
 # ---------------------------------------------------------------------
 
 _FELT_PHRASE = "roofing felt 15"  # what generate_search_phrase() produces for the description/context below (Phase 5.6: "15" now recognized as a size term, see phrase_generator.py's weight-unit pattern)
+_FELT_FULL_DESCRIPTION = "Roofing felt - 15 lb."
 
 
 def _unmapped_task(task_id, line_item_id, section_name, source_order, qty=33.66, unit="SQ"):
@@ -641,7 +638,7 @@ def test_unmapped_task_ambiguous_ranking_is_still_a_safe_stop(tmp_path, phrase_r
         # source (neither is the "15 lb" exact/near match Stage 5's
         # weight-unit size fix now correctly disambiguates) -- genuinely
         # ambiguous, tied fuzzy scores by construction.
-        _FELT_PHRASE: [
+        _FELT_FULL_DESCRIPTION: [
             DropdownResult(raw_text="Felt A", row_position=0, category="RFG", selector="FELTX", description="Roofing felt product Alpha", extraction_confidence=1.0),
             DropdownResult(raw_text="Felt B", row_position=1, category="RFG", selector="FELTY", description="Roofing felt product Omega", extraction_confidence=1.0),
         ],
@@ -670,7 +667,7 @@ def test_uia_observed_cat_sel_recorded_after_successful_unmapped_commit(tmp_path
     observed_mappings.json file. Activity remains unknown because the
     removed pre-quantity grid OCR was its only source."""
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script)
 
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
@@ -691,7 +688,7 @@ def test_uia_observed_cat_sel_recorded_after_successful_unmapped_commit(tmp_path
     proposal = proposals["line_unmapped"]
     assert proposal["observed_category"] == "RFG"
     assert proposal["observed_selector"] == "FELT15"
-    assert proposal["search_phrase"] == _FELT_PHRASE
+    assert proposal["search_phrase"] == _FELT_FULL_DESCRIPTION
     assert "line_mapped" not in proposals  # never written for the normal CAT/SEL path
 
 
@@ -699,7 +696,7 @@ def test_observed_mapping_proposal_uses_a_distinct_non_approved_state(tmp_path, 
     """Requirement 12: the observed proposal is never labeled
     human-approved -- it carries its own, clearly distinct state."""
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script)
 
     run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
@@ -723,7 +720,7 @@ def test_observed_mapping_proposal_verified_flag_false_for_any_non_verified_trus
     mismatch, a conflicting row, or an outright verification failure)
     must be recorded with verified=False, never eligible for reuse."""
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script, trust_state=trust_state)
 
     run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
@@ -740,7 +737,7 @@ def test_observed_mapping_proposal_verified_flag_true_only_for_verified_trust_st
     with verified=True, the one and only signal
     _find_trusted_observed_mapping() will ever trust."""
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script, trust_state="VERIFIED")
 
     run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
@@ -772,7 +769,7 @@ def test_commit_state_is_committed_for_every_trust_state_except_verification_fai
     from estimate_extractor.xactimate_lookup.execution_plan import TASK_COMMIT_STATE_COMMITTED
 
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script, trust_state=trust_state)
 
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
@@ -788,7 +785,7 @@ def test_commit_state_is_not_committed_when_verification_failed(tmp_path, phrase
     from estimate_extractor.xactimate_lookup.execution_plan import TASK_COMMIT_STATE_NOT_COMMITTED
 
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script, trust_state="VERIFICATION_FAILED")
 
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
@@ -848,7 +845,7 @@ def test_already_committed_task_is_never_re_executed_even_if_pending(tmp_path, p
     task.state = TASK_PENDING
     task.trust_state = "QUANTITY_MISMATCH"  # a prior real commit, low confidence
 
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script)
     search_calls = []
     original_search = adapter.search_by_description
@@ -944,11 +941,8 @@ def test_find_verified_search_description_refuses_unverified_and_missing_entries
     assert _find_verified_search_description(tmp_path, "line_never_seen") is None
 
 
-def test_unmapped_task_never_searches_cat_sel_first_even_with_a_verified_mapping(tmp_path, phrase_rules):
-    """Requirement 1: began_unmapped=True must not search CAT/SEL first
-    even when a previous run's VERIFIED CAT/SEL mapping exists for this
-    exact line item -- description attempts always come first; CAT/SEL
-    is the LAST attempt in the sequence, never the first."""
+def test_unmapped_task_uses_only_full_description_even_with_a_verified_mapping(tmp_path, phrase_rules):
+    """Learned CAT/SEL data must never add an alternate task lookup."""
     path = _observed_mappings_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -966,21 +960,14 @@ def test_unmapped_task_never_searches_cat_sel_first_even_with_a_verified_mapping
 
     attempts = _description_first_search_attempts(task, phrase_rules, tmp_path)
 
-    assert attempts[0][0] != SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL
+    assert len(attempts) == 1
     assert attempts[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
     assert attempts[0][1].search_input == 'R&R Gutter - aluminum - up to 5"'
     assert attempts[0][1].path == "description_search"
-    # CAT/SEL is present, but strictly last, and it's the only CAT/SEL entry
-    cat_sel_attempts = [a for a in attempts if a[0] == SEARCH_TYPE_TRUSTED_OBSERVED_CAT_SEL]
-    assert cat_sel_attempts == [attempts[-1]]
-    assert attempts[-1][1].path == "trusted_cat_sel"
 
 
-def test_verified_search_description_is_preferred_as_first_description_attempt(tmp_path, phrase_rules):
-    """Requirement 2: a learned verified_search_description is tried
-    FIRST (still as a description-search attempt, never CAT/SEL) --
-    ahead of the raw exact source description -- since it's already
-    proven to work for this exact row in a previous verified run."""
+def test_verified_search_description_never_replaces_full_source_description(tmp_path, phrase_rules):
+    """A prior search phrase is evidence, not authorization for another query."""
     path = _observed_mappings_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -998,19 +985,14 @@ def test_verified_search_description_is_preferred_as_first_description_attempt(t
 
     attempts = _description_first_search_attempts(task, phrase_rules, tmp_path)
 
-    assert attempts[0][0] == SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION
-    assert attempts[0][1].search_input == "Gutter / downspout - aluminum - up to 5\""
+    assert len(attempts) == 1
+    assert attempts[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
+    assert attempts[0][1].search_input == 'R&R Gutter - aluminum - up to 5"'
     assert attempts[0][1].path == "description_search"
-    # the raw exact description is still tried afterward (a real, distinct attempt)
-    assert any(a[0] == SEARCH_TYPE_EXACT_DESCRIPTION for a in attempts[1:])
 
 
-def test_cat_sel_fallback_cannot_occur_before_description_attempts(tmp_path, phrase_rules, ranking_config):
-    """Requirement 4, end-to-end: even when a verified CAT/SEL mapping
-    exists, run_execution_plan() must exhaust every description attempt
-    (no_results each time) before ever calling search_by_category_
-    selector -- and the CAT/SEL search must be the LAST adapter search
-    call made for this task, never the first."""
+def test_no_result_from_full_description_does_not_trigger_cat_sel_alternative(tmp_path, phrase_rules, ranking_config):
+    """A failed full-description lookup is final for that source task."""
     path = _observed_mappings_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -1024,9 +1006,6 @@ def test_cat_sel_fallback_cannot_occur_before_description_attempts(tmp_path, phr
         encoding="utf-8",
     )
     plan = _plan_mapped_and_unmapped()
-    # every description-search attempt for the unmapped task returns
-    # nothing; only the trusted CAT/SEL search (added by the adapter
-    # script below) returns a real result.
     script = {
         "RFG 3TAB": [_dropdown("RFG", "3TAB")],
         "RFG FELT15": [_felt_dropdown()],
@@ -1035,25 +1014,32 @@ def test_cat_sel_fallback_cannot_occur_before_description_attempts(tmp_path, phr
 
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
 
-    assert result.task_by_id("task_unmapped").state == TASK_COMPLETED
+    assert result.task_by_id("task_unmapped").state in (TASK_REVIEW_REQUIRED, TASK_FAILED)
     search_desc_calls = [c for c in adapter.log.calls if c[0] == "search_by_description"]
     search_cs_calls = [c for c in adapter.log.calls if c[0] == "search_by_category_selector"]
-    # every description attempt (exact, normalized, compact phrase --
-    # no learned description was available) was tried, all returning no
-    # results, BEFORE the one CAT/SEL search that finally succeeded for
-    # the unmapped task. ("RFG", "3TAB") is the OTHER (mapped/approved)
-    # task's own, unrelated, always-CAT/SEL search -- unaffected by
-    # this phase, expected to still happen.
-    assert len(search_desc_calls) >= 1
-    assert ("search_by_category_selector", ("RFG", "FELT15"), {}) in search_cs_calls
-    # every description search call happened strictly before the
-    # unmapped task's own CAT/SEL fallback call -- only search_by_
-    # description exists for the unmapped task, so this index comparison
-    # unambiguously proves the ordering for THIS task, not the other one.
-    all_calls = [c for c in adapter.log.calls if c[0] in ("search_by_description", "search_by_category_selector")]
-    felt15_index = all_calls.index(("search_by_category_selector", ("RFG", "FELT15"), {}))
-    desc_indices = [i for i, c in enumerate(all_calls) if c[0] == "search_by_description"]
-    assert desc_indices and all(i < felt15_index for i in desc_indices)
+    assert search_desc_calls == [("search_by_description", ("Roofing felt - 15 lb.",), {})]
+    assert search_cs_calls == [("search_by_category_selector", ("RFG", "3TAB"), {})]
+    assert result.task_by_id("task_unmapped").search_attempts[0]["advanced_to_next_attempt"] is False
+
+
+def test_full_description_failure_never_searches_an_alternative(tmp_path, phrase_rules, ranking_config):
+    """Regression: one failed interaction must not try alternate wording or add again."""
+    plan = _plan_mapped_and_unmapped()
+    adapter = _adapter_with_test_project(
+        dropdown_script={"RFG 3TAB": [_dropdown("RFG", "3TAB")]},
+        raise_unexpected_dialog_for={_FELT_FULL_DESCRIPTION},
+    )
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert [
+        call for call in adapter.log.calls if call[0] == "search_by_description"
+    ] == [("search_by_description", (_FELT_FULL_DESCRIPTION,), {})]
+    assert len(task.search_attempts) == 1
+    assert task.search_attempts[0]["search_type"] == SEARCH_TYPE_EXACT_DESCRIPTION
+    assert task.search_attempts[0]["advanced_to_next_attempt"] is False
+    assert ("search_by_category_selector", ("RFG", "FELT15"), {}) not in adapter.log.calls
 
 
 def test_review_approved_task_still_uses_trusted_cat_sel_directly(phrase_rules):
@@ -1071,20 +1057,8 @@ def test_review_approved_task_still_uses_trusted_cat_sel_directly(phrase_rules):
     assert actual_strategy == LOOKUP_PATH_TRUSTED
 
 
-def test_gutter_and_downspout_produce_distinct_tasks_that_may_share_a_verified_description(tmp_path, phrase_rules):
-    """Requirement 6: two textually different source rows (gutter,
-    downspout) generate their own distinct search-attempt sequences
-    (never merged into one task), but -- once a verified run has
-    established a shared Xactimate-catalog description for one of
-    them -- a LATER run of the OTHER exact row can still only reuse a
-    verified_search_description recorded under ITS OWN line_item_id
-    (Phase 5.7A does not invent cross-row signature matching, which
-    would risk pulling in an unrelated item's description); each
-    family independently converges on the same real catalog wording
-    via its own exact-description attempt, as confirmed live (both
-    line_0001 and line_0032's attempt 1 -- their own raw source
-    descriptions -- separately AUTO_SELECT the same SFG/GUTA "Gutter /
-    downspout" catalog entry)."""
+def test_gutter_and_downspout_each_keep_their_own_full_description(tmp_path, phrase_rules):
+    """Distinct source rows remain distinct even when evidence shares a catalog description."""
     gutter = _unmapped_task("task_line_0001", "line_0001", "Exterior", 0, qty=200.0, unit="LF")
     gutter.description = 'R&R Gutter - aluminum - up to 5"'
     downspout = _unmapped_task("task_line_0032", "line_0032", "Rear Elevation", 1, qty=24.0, unit="LF")
@@ -1114,11 +1088,10 @@ def test_gutter_and_downspout_produce_distinct_tasks_that_may_share_a_verified_d
     gutter_attempts_2 = _description_first_search_attempts(gutter, phrase_rules, tmp_path)
     downspout_attempts_2 = _description_first_search_attempts(downspout, phrase_rules, tmp_path)
 
-    # line_0001's own future runs now prefer its learned description first
-    assert gutter_attempts_2[0][0] == SEARCH_TYPE_VERIFIED_SEARCH_DESCRIPTION
-    assert gutter_attempts_2[0][1].search_input == "Gutter / downspout - aluminum - up to 5\""
-    # line_0032 is a DIFFERENT line_item_id -- it is never given line_0001's
-    # learned description; it still starts from its own raw description
+    assert len(gutter_attempts_2) == 1
+    assert gutter_attempts_2[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
+    assert gutter_attempts_2[0][1].search_input == 'R&R Gutter - aluminum - up to 5"'
+    assert len(downspout_attempts_2) == 1
     assert downspout_attempts_2[0][0] == SEARCH_TYPE_EXACT_DESCRIPTION
     assert downspout_attempts_2[0][1].search_input == 'R&R Downspout - aluminum - up to 5"'
     assert _find_trusted_observed_mapping(tmp_path, "line_never_seen") is None
@@ -1137,7 +1110,7 @@ def test_observed_mapping_proposal_never_touches_review_service_state(tmp_path, 
     before = review_state_path.read_text(encoding="utf-8")
 
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script)
 
     run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
@@ -1154,7 +1127,7 @@ def test_test_only_task_refused_when_live_project_is_not_exactly_test(tmp_path, 
     whole run -- only this one task is refused; a normal CAT/SEL task
     in the same run is unaffected."""
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = GroupAwareFakeAdapter(dropdown_script=script)
     adapter.supports_live_execution = True
     adapter.expected_project_name = "some-production-claim"  # NOT "TEST"
@@ -1231,7 +1204,7 @@ def test_requested_and_actual_lookup_strategies_are_reported(tmp_path, phrase_ru
     persisted task -- the exact audit trail that would have caught the
     live "None None" CAT/SEL incident."""
     plan = _plan_mapped_and_unmapped()
-    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_PHRASE: [_felt_dropdown()]}
+    script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script)
 
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
