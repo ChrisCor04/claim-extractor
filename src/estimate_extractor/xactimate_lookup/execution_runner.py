@@ -60,6 +60,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     RUN_STATE_IN_PROGRESS,
     RUN_STATE_PAUSED,
     STOP_REASON_GROUP_VERIFICATION_FAILURE,
+    STOP_REASON_GROUP_SETUP_BLOCKED,
     STOP_REASON_NORMAL_COMPLETION,
     STOP_REASON_PROJECT_LEVEL_HARD_STOP,
     STOP_REASON_PROJECT_VERIFICATION_FAILURE,
@@ -741,6 +742,7 @@ def run_execution_plan(
                 group.error = detail
                 for task in pending_tasks:
                     task.state = TASK_REVIEW_REQUIRED
+                    task.stop_reason = STOP_REASON_GROUP_SETUP_BLOCKED
                     task.stop_detail = f"Group not verified: {detail}"
                     task.completed_at = utc_now_iso()
                 save_execution_plan(plan, project_dir)

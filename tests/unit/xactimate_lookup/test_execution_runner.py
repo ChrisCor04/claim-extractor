@@ -32,6 +32,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     RUN_STATE_COMPLETED,
     RUN_STATE_PAUSED,
     STOP_REASON_NORMAL_COMPLETION,
+    STOP_REASON_GROUP_SETUP_BLOCKED,
     STOP_REASON_PROTECTED_ROW_REFUSAL,
     TASK_COMPLETED,
     TASK_FAILED,
@@ -294,6 +295,9 @@ def test_group_verification_failure_marks_only_that_groups_tasks_review_required
     fence_tasks = [t for t in result.tasks if t.section_name == "Fence"]
     assert all(t.state == TASK_COMPLETED for t in roof_tasks)
     assert all(t.state == TASK_REVIEW_REQUIRED for t in fence_tasks)
+    assert all(t.stop_reason == STOP_REASON_GROUP_SETUP_BLOCKED for t in fence_tasks)
+    assert all(t.attempts == 0 for t in fence_tasks)
+    assert all(not t.search_attempts for t in fence_tasks)
     assert result.group_by_id("Fence").state == GROUP_FAILED
     assert result.group_by_id("Dwelling Roof").state == GROUP_COMPLETED
     # never silently used whatever group happened to be active -- Fence's

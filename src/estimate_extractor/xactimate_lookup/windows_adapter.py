@@ -1550,6 +1550,64 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     return items
         return None
 
+    def _locate_components_tab(self, image) -> tuple[int, int, int, int] | None:
+        """Locate Components only within the verified Estimate Items tab strip."""
+        pytesseract = self._pytesseract()
+        from pytesseract import Output
+
+        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        components_boxes = []
+        neighbor_boxes = []
+        for i, text in enumerate(data["text"]):
+            clean = re.sub(r"[^a-z]+", "", str(text).lower())
+            box = (
+                data["left"][i], data["top"][i],
+                data["left"][i] + data["width"][i],
+                data["top"][i] + data["height"][i],
+            )
+            if clean == "components":
+                components_boxes.append(box)
+            elif clean in {"items", "supporting", "summary"}:
+                neighbor_boxes.append(box)
+        for components in components_boxes:
+            mid_y = (components[1] + components[3]) // 2
+            if mid_y > image.height // 3:
+                continue
+            if any(abs(mid_y - (n[1] + n[3]) // 2) <= 12 for n in neighbor_boxes):
+                return components
+        return None
+
+    @staticmethod
+    def _tab_is_active(image, tab: tuple[int, int, int, int]) -> bool:
+        """Confirm a freshly located tab from its live cyan underline.
+
+        The tab labels themselves are always visible, active or not. Xactimate's
+        selected tab has a two-pixel cyan underline immediately below the label;
+        requiring a substantial run of those pixels proves pane state without a
+        fixed coordinate or a pane label that can also occur on another tab.
+        """
+        l, _t, r, b = tab
+        rgb = image.convert("RGB")
+        cyan_pixels = 0
+        for y in range(b, min(image.height, b + 12)):
+            for x in range(max(0, l - 8), min(image.width, r + 8)):
+                red, green, blue = rgb.getpixel((x, y))
+                if red < 80 and green > 110 and blue > 140 and green - red > 60 and blue - red > 80:
+                    cyan_pixels += 1
+        return cyan_pixels >= max(12, int((r - l) * 0.6))
+
+    def _items_search_pane_field(self, image) -> tuple[int, int, int, int] | None:
+        """Return Search only when the freshly located Items tab is active."""
+        items = self._locate_items_tab(image)
+        if items is None or not self._tab_is_active(image, items):
+            return None
+        return self._locate_search_field(image)
+
+    def _components_pane_is_verified(self, image) -> bool:
+        """Require a freshly located Components tab with its active underline."""
+        components = self._locate_components_tab(image)
+        return components is not None and self._tab_is_active(image, components)
+
     def _search_focus_is_verified(self, hwnd: int, field: tuple[int, int, int, int]) -> bool:
         """Require the OS caret to be inside the live-located Search field.
 
@@ -1603,7 +1661,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         """
         for _attempt in range(attempts):
             image = self._capture_client_image(hwnd)
-            field = self._locate_search_field(image)
+            field = self._items_search_pane_field(image)
             if field is not None:
                 return field
         return None
@@ -1818,7 +1876,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # Search field, it is already in the only state this reset exists
         # to establish.  Do not churn the layout with a redundant tab
         # click.
-        if self._locate_search_field(before) is not None:
+        if self._items_search_pane_field(before) is not None:
             return
         items = self._locate_items_tab(before)
         if items is None:
@@ -1848,7 +1906,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             raise AdapterError("Could not bring Xactimate window to the foreground.")
         self._reset_scroll_state()
         image = self._capture_client_image(hwnd)
-        field = self._locate_search_field(image)
+        field = self._items_search_pane_field(image)
         if field is None:
             raise SearchFocusError(
                 "Could not positively locate the current Search field; refusing to click or type."
@@ -1857,7 +1915,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
         time.sleep(0.2)
         current = self._capture_client_image(hwnd)
-        current_field = self._locate_search_field(current)
+        current_field = self._items_search_pane_field(current)
         if current_field is None or not self._search_focus_is_verified(hwnd, current_field):
             raise SearchFocusError(
                 "Search field keyboard focus could not be positively verified after the click; refusing to clear or type."
@@ -5209,10 +5267,24 @@ class WindowsXactimateAdapter(XactimateAdapter):
         _assert_group_transition_settled()."""
         self._assert_group_transition_settled(next_group="<new group being created>")
         hwnd = self._ensure_main_window()
-        l, t, r, b = _ANCHORS["components_tab"]
+        image = self._capture_client_image(hwnd)
+        components = self._locate_components_tab(image)
+        if components is None:
+            raise ItemsTabVerificationError(
+                "Could not positively locate Components in the Estimate Items tab strip; refusing reset click."
+            )
+        l, t, r, b = components
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
-        time.sleep(0.5)
-        self._reset_scroll_state()  # clicks back to the Items tab
+        components_verified = False
+        for _attempt in range(4):
+            if self._components_pane_is_verified(self._capture_client_image(hwnd)):
+                components_verified = True
+                break
+        if not components_verified:
+            raise ItemsTabVerificationError(
+                "Components tab click did not produce a positively verified Components pane."
+            )
+        self._reset_scroll_state()
 
     #: Live-measured (Phase 5.5C Stage 7): a SELECTED row's highlight
     #: draws a thin (~2px-tall) border across the entire row width,
@@ -5809,6 +5881,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if not self.verify_application() or not self.verify_project():
                 return False
             hwnd = self._ensure_main_window()
+            # Group creation deliberately visits Components to clear
+            # creation stickiness. Never inherit that pane: establish
+            # Items/Search before any probe baseline, focus, or typing.
+            self._reset_scroll_state()
             self._scroll_group_tree_to_top(hwnd)
             rows = self.snapshot_group_names()
             # Phase 5.7: ambiguity (more than one matching row) must
@@ -5973,6 +6049,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
             # is Stage 4's "DO NOT CHANGE GROUP CONTEXT" hard stop.
             skip_cleanup = True
             raise
+        except ItemsTabVerificationError:
+            # Pane identity failed before probe typing. There is no
+            # trustworthy Items grid to inspect or clean, so do not run
+            # cleanup against whatever pane happens to be visible.
+            skip_cleanup = True
+            raise
         except Exception:
             # Phase 5.9 (live-caught): a failed probe attempt --
             # commonly an UnexpectedDialogError this method couldn't
@@ -6064,6 +6146,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
                                     f"_verify_group_once({group_name!r}): pre-existing rows changed during probe "
                                     f"cleanup -- before={baseline_identities!r} after={after_identities!r}."
                                 )
+                    # A successful verification cycle must hand control
+                    # back in the same positively established Items pane.
+                    self._reset_scroll_state()
                 except ProtectedCommittedRowError:
                     # Phase 5.5D: never swallowed -- this means cleaning
                     # up the disposable probe would have deleted a row
@@ -6078,6 +6163,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     # diagnosable group-verification failure reason is
                     # the whole point; silently continuing is exactly
                     # what let garbage SFG/GUTA rows accumulate.
+                    raise
+                except ItemsTabVerificationError:
                     raise
                 except Exception:
                     pass
