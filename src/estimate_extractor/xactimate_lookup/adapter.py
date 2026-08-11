@@ -154,6 +154,22 @@ class XactimateAdapter(ABC):
         Orchestrator.py calls this after any AdapterError and before
         surfacing the stop to the caller."""
 
+    def set_physical_item_created_callback(self, callback) -> None:
+        """Install the runner's immediate physical-row checkpoint hook.
+
+        Candidate activation happens before quantity entry and commit.  A
+        process interruption in that interval must not leave a persisted
+        plan claiming that no physical item exists.  The runner installs a
+        callback for the current task; adapters need no plan knowledge.
+        """
+        self._physical_item_created_callback = callback
+
+    def record_physical_item_created(self) -> None:
+        """Persist the current task's physical-created checkpoint, if set."""
+        callback = getattr(self, "_physical_item_created_callback", None)
+        if callback is not None:
+            callback()
+
 
 @dataclass(slots=True)
 class AdapterCallLog:

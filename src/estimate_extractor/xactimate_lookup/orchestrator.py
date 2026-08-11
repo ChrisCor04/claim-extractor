@@ -426,6 +426,11 @@ def execute_plan(
                 "CAT/SEL instantiation fallback was unavailable or also created nothing."
             )
         outcome.physical_item_created = True
+        # Persist the physical-created checkpoint before quantity entry.
+        # This is deliberately separate from the eventual outcome apply:
+        # a crash or later failure must not make a resume instantiate the
+        # same task a second time.
+        adapter.record_physical_item_created()
         _record_lifecycle(adapter, "CANDIDATE_SELECTED", category=top.dropdown.category, selector=top.dropdown.selector)
     except UnexpectedDialogError as exc:
         adapter.recover()

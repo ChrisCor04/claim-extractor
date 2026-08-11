@@ -510,6 +510,16 @@ class GroupRowSnapshot:
     unit_text: str | None
 
 
+@dataclass(slots=True, frozen=True)
+class ActivationRowSnapshot:
+    """Read-only identity evidence for one physical activation row."""
+
+    category: str | None
+    selector: str | None
+    description: str | None
+    activity: str | None
+
+
 @dataclass(slots=True)
 class EstimateBaseline:
     """Phase 5.4: a full structural + financial snapshot of the
@@ -2969,24 +2979,37 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return self._is_intentional_duplicate(candidate)
 
     def pending_item_created(self, before_snapshot, timeout_s: float = 8.0) -> bool:
-        """Positively detect candidate activation via a row-count delta.
+        """Positively detect one newly-created logical item.
 
-        This is intentionally smaller than commit verification: before
-        quantity entry we only need to know whether one new physical row
-        exists. Polling absorbs the render delay already observed by
-        ``enter_quantity()``. The same bounded viewport-edge identity
-        probe is used for both baseline and current reads, so a
-        pre-existing trailing row cannot masquerade as the delta.
+        Xactimate may instantiate one logical R&R item as either one
+        physical row or an adjacent remove/add pair.  A two-row delta is
+        accepted only when both appended rows have the same CAT/SEL and
+        compatible descriptions, and every readable activity cell agrees
+        with the expected ``-`` then ``+`` ordering.  Arbitrary two-row
+        growth still fails closed.
         """
         expected = len(before_snapshot)
         start = time.time()
         while True:
-            current = self.snapshot_grid_identities_for_activation()
-            if len(current) == expected + 1:
-                return True
-            if len(current) > expected + 1:
+            rows = self._snapshot_activation_rows()
+            current = [(row.category, row.selector) for row in rows]
+            if current[:expected] != list(before_snapshot):
                 raise AdapterError(
-                    "Candidate activation changed the grid by more than one row; refusing to guess "
+                    "Candidate activation changed the pre-existing grid rows; refusing to infer a pending item."
+                )
+            delta = rows[expected:]
+            if len(delta) == 1:
+                return True
+            if len(delta) == 2:
+                if self._is_logical_rr_pair(delta[0], delta[1]):
+                    return True
+                raise AdapterError(
+                    "Candidate activation added two physical rows that were not a corroborated adjacent "
+                    f"R&R -/+ pair (before={expected}, after={len(current)})."
+                )
+            if len(delta) > 2:
+                raise AdapterError(
+                    "Candidate activation changed the grid by more than one logical item; refusing to guess "
                     f"which item was created (before={expected}, after={len(current)})."
                 )
             if self._unexpected_dialog_present():
@@ -2996,6 +3019,33 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if time.time() - start >= timeout_s:
                 return False
             time.sleep(0.25)
+
+    @staticmethod
+    def _normalized_pair_text(value: str | None) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", str(value or "").lower()))
+
+    @classmethod
+    def _is_logical_rr_pair(cls, remove_row: ActivationRowSnapshot, add_row: ActivationRowSnapshot) -> bool:
+        remove_identity = (
+            cls._normalized_pair_text(remove_row.category),
+            cls._normalized_pair_text(remove_row.selector),
+        )
+        add_identity = (
+            cls._normalized_pair_text(add_row.category),
+            cls._normalized_pair_text(add_row.selector),
+        )
+        if not all(remove_identity) or remove_identity != add_identity:
+            return False
+
+        remove_description = cls._normalized_pair_text(remove_row.description)
+        add_description = cls._normalized_pair_text(add_row.description)
+        if not remove_description or remove_description != add_description:
+            return False
+
+        activities = [str(remove_row.activity or "").strip(), str(add_row.activity or "").strip()]
+        # Blank means OCR supplied no activity evidence.  Any readable
+        # value must agree with its expected side of the R&R pair.
+        return all(not observed or observed == expected for observed, expected in zip(activities, ("-", "+")))
 
     def _dismiss_stray_results_popup(self) -> bool:
         """Phase 5.8A (live-caught, defense-in-depth). orchestrator.
@@ -3456,21 +3506,65 @@ class WindowsXactimateAdapter(XactimateAdapter):
         performs no scrolling and therefore cannot strand the
         following search on a displaced Price List screen.
         """
-        identities = self.snapshot_grid_identities()
+        return [(row.category, row.selector) for row in self._snapshot_activation_rows()]
+
+    def _snapshot_activation_rows(self) -> list[ActivationRowSnapshot]:
+        """Capture physical rows plus pair evidence without scrolling."""
         hwnd = self._ensure_main_window()
-        image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+        image, offset = self._capture_and_locate(hwnd)
         if offset is None:
-            return identities
+            return []
+        geom = self._last_row_geometry(image, offset)
+        row_count = geom[0] if geom is not None else 0
         row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        rows = [
+            self._read_activation_row_at(image, offset, row_1_top + index * _GRID_ROW_HEIGHT)
+            for index in range(row_count)
+        ]
         for _probe in range(2):
-            next_row_top = row_1_top + len(identities) * _GRID_ROW_HEIGHT
+            next_row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
             if next_row_top < 0 or next_row_top + _GRID_ROW_HEIGHT > image.height:
                 break
-            trailing = self._read_category_selector_at(image, offset, next_row_top)
-            if not all(str(value or "").strip() for value in trailing):
+            trailing = self._read_activation_row_at(image, offset, next_row_top)
+            if not all(str(value or "").strip() for value in (trailing.category, trailing.selector)):
                 break
-            identities.append(trailing)
-        return identities
+            rows.append(trailing)
+        return rows
+
+    def _read_activation_row_at(self, image, offset: tuple[int, int], row_top: int) -> ActivationRowSnapshot:
+        category, selector = self._read_category_selector_at(image, offset, row_top)
+        return ActivationRowSnapshot(
+            category=category,
+            selector=selector,
+            description=self._read_description_at(image, offset, row_top),
+            activity=self._read_activation_activity_at(image, offset, row_top),
+        )
+
+    def _read_activation_activity_at(self, image, offset: tuple[int, int], row_top: int) -> str | None:
+        """Read an R&R activity glyph without including the right gridline.
+
+        On the live Roof pair, the ordinary full activity-column crop
+        rendered visible ``-``/``+`` glyphs as ``_``/``__`` because the
+        gridline dominated OCR.  The glyph itself sits across the
+        selector/activity boundary (an already-documented Xactimate
+        rendering quirk), so this activation-only crop straddles that
+        boundary and corroborates two OCR segmentation modes.  It does
+        not alter the shared grid columns used by quantity/commit logic.
+        """
+        activity_left, _activity_right = _GRID_COLUMNS["activity"]
+        dx = offset[0]
+        crop = image.crop((
+            activity_left - 14 + dx,
+            row_top,
+            activity_left + 12 + dx,
+            row_top + _GRID_ROW_HEIGHT,
+        ))
+        crop = crop.resize((crop.width * 4, crop.height * 4))
+        reads = [self._ocr_text(crop, psm=psm).strip() for psm in (6, 7)]
+        for expected in ("-", "+"):
+            if expected in reads:
+                return expected
+        return next((read for read in reads if read), None)
 
     def _read_description_at(self, image, offset: tuple[int, int], row_top: int) -> str | None:
         """Lighter-weight description-only read at an ARBITRARY

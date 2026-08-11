@@ -828,13 +828,23 @@ def run_execution_plan(
                 # unchanged: one _task_to_lookup_plan() call, one
                 # orchestrator.execute_plan() call, exactly as before
                 # this phase.
-                if task.lookup_strategy == LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST:
-                    outcome, actual_strategy, reason = _run_description_first_task(
-                        task, item, adapter, ranking_config, phrase_rules, project_dir, dry_run,
-                    )
-                else:
-                    lookup_plan, actual_strategy, reason = _task_to_lookup_plan(task, phrase_rules)
-                    outcome = orchestrator.execute_plan(lookup_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
+                def _checkpoint_physical_item_created() -> None:
+                    task.commit_state = TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+                    save_execution_plan(plan, project_dir)
+
+                adapter.set_physical_item_created_callback(
+                    None if dry_run else _checkpoint_physical_item_created
+                )
+                try:
+                    if task.lookup_strategy == LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST:
+                        outcome, actual_strategy, reason = _run_description_first_task(
+                            task, item, adapter, ranking_config, phrase_rules, project_dir, dry_run,
+                        )
+                    else:
+                        lookup_plan, actual_strategy, reason = _task_to_lookup_plan(task, phrase_rules)
+                        outcome = orchestrator.execute_plan(lookup_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run)
+                finally:
+                    adapter.set_physical_item_created_callback(None)
 
                 task.actual_lookup_strategy = actual_strategy
                 task.lookup_strategy_reason = reason

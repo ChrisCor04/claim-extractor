@@ -18,9 +18,10 @@ import time
 
 import pytest
 
-from estimate_extractor.xactimate_lookup.adapter import UnexpectedDialogError
+from estimate_extractor.xactimate_lookup.adapter import AdapterError, UnexpectedDialogError
 from estimate_extractor.xactimate_lookup.models import DropdownResult
 from estimate_extractor.xactimate_lookup.windows_adapter import (
+    ActivationRowSnapshot,
     CommitVerification,
     EstimateBaseline,
     GroupRowSnapshot,
@@ -2006,23 +2007,106 @@ def test_intentional_duplicate_blocked_for_a_different_group(monkeypatch):
 
 def test_activation_baseline_adds_one_readable_viewport_edge_row_without_scrolling(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    initial = [("RFG", str(i)) for i in range(15)]
-    monkeypatch.setattr(adapter, "snapshot_grid_identities", lambda: list(initial))
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     image = type("Image", (), {"height": 500})()
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: (image, (0, 0)))
     monkeypatch.setattr(adapter, "_shifted_anchor", lambda name, offset: (0, 100, 0, 0))
+    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (15, 100 + 14 * 25))
     reads = []
     monkeypatch.setattr(
-        adapter, "_read_category_selector_at",
-        lambda image, offset, row_top: reads.append(row_top) or ("RFG", "STEEP"),
+        adapter, "_read_activation_row_at",
+        lambda image, offset, row_top: reads.append(row_top) or ActivationRowSnapshot(
+            "RFG", "STEEP", "Steep charge", "-"
+        ),
     )
 
     baseline = adapter.snapshot_grid_identities_for_activation()
 
     assert len(baseline) == 16
     assert baseline[-1] == ("RFG", "STEEP")
-    assert reads == [100 + 15 * 25]
+    assert reads == [100 + index * 25 for index in range(16)]
+
+
+def _activation_row(cat="RFG", sel="STEEP", desc="Steep charge", activity="-"):
+    return ActivationRowSnapshot(cat, sel, desc, activity)
+
+
+def test_pending_detector_accepts_one_new_physical_row(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row()])
+
+    assert adapter.pending_item_created([], timeout_s=0) is True
+
+
+def test_pending_detector_counts_valid_remove_add_pair_as_one_logical_item(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    pair = [_activation_row(activity="-"), _activation_row(activity="+")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: pair)
+
+    assert adapter.pending_item_created([], timeout_s=0) is True
+
+
+def test_pending_detector_accepts_new_pair_after_existing_rows(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    existing = _activation_row(cat="SFG", sel="GUTA", desc="Gutter", activity="+")
+    pair = [_activation_row(activity="-"), _activation_row(activity="+")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [existing, *pair])
+
+    assert adapter.pending_item_created([("SFG", "GUTA")], timeout_s=0) is True
+
+
+def test_pending_detector_rejects_two_unrelated_new_rows(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_activation_row(), _activation_row(cat="SFG", sel="GUTA", desc="Gutter", activity="+")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: rows)
+
+    with pytest.raises(AdapterError, match="not a corroborated adjacent R&R"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        _activation_row(desc="Different description", activity="+"),
+        _activation_row(activity="-"),
+    ],
+)
+def test_pending_detector_rejects_invalid_same_identity_pair(monkeypatch, second):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row(), second])
+
+    with pytest.raises(AdapterError, match="not a corroborated adjacent R&R"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+@pytest.mark.parametrize(
+    "ocr_reads, expected",
+    [
+        (["", "-"], "-"),
+        (["+", "*_"], "+"),
+        (["_", "__"], "_"),
+    ],
+)
+def test_activation_activity_requires_a_recognized_glyph_when_ocr_is_readable(
+    monkeypatch, ocr_reads, expected,
+):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    class _Crop:
+        width = 26
+        height = 25
+
+        def resize(self, _size):
+            return self
+
+    class _Image:
+        def crop(self, _box):
+            return _Crop()
+
+    reads = iter(ocr_reads)
+    monkeypatch.setattr(adapter, "_ocr_text", lambda crop, psm: next(reads))
+
+    assert adapter._read_activation_activity_at(_Image(), (0, 0), 100) == expected
 
 
 def test_commit_item_dismisses_a_duplicate_item_dialog(monkeypatch):

@@ -817,6 +817,12 @@ def test_physical_created_unconfirmed_is_not_blindly_retryable(tmp_path, phrase_
     adapter.pending_item_created = lambda before: True
 
     def fail_after_creation(_quantity):
+        # The checkpoint is both in memory and on disk before quantity
+        # processing begins, rather than only being inferred later from
+        # the returned outcome.
+        assert task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+        persisted = load_execution_plan(tmp_path)
+        assert persisted.task_by_id(task.task_id).commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
         raise AdapterError("simulated failure after the physical row appeared")
 
     adapter.enter_quantity = fail_after_creation
