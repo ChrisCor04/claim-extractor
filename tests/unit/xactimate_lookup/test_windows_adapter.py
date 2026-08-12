@@ -5761,3 +5761,281 @@ def test_read_populated_fields_resets_scroll_state_only_when_scrolled(monkeypatc
     monkeypatch.setattr(adapter, "_read_populated_fields_once", lambda: (fake_fields, True))
     adapter.read_populated_fields()
     assert calls["reset"] == 1
+
+
+# ---------------------------------------------------------------------
+# _count_grid_rows() / _last_row_geometry(): row-count primitive
+# replaced. Live audit (2026-08-12) of a real General Conditions grid
+# with 6 populated rows found _count_grid_rows()'s old '#'-column OCR
+# reading blank gridline space -- landing on "<" or "" -- even though
+# every OTHER column (Cat, Sel, Description, Quantity), shifted by the
+# exact same anchor offset, still read correctly at the same row
+# positions. That undercount (0) cascaded through _last_row_geometry()
+# (-> None) into every downstream caller: enter_quantity()'s row
+# targeting, commit verification, the pre/post-activation row-count
+# baseline the R&R multiset-delta safety logic depends on, and
+# group-verification probe cleanup. The new implementation counts rows
+# from their own content (category/selector, description, quantity+
+# unit) at the already-independently-correct row_1_top/_GRID_ROW_HEIGHT
+# positions, and never reads the '#' column at all.
+# ---------------------------------------------------------------------
+
+
+def _wire_row_content(monkeypatch, adapter, rows, *, image_height=None):
+    """Wires _read_category_selector_at/_read_description_at/
+    _read_quantity_at/_read_unit_at/_read_activation_activity_at to
+    return controlled content at each row position, keyed by row index
+    (0-based) against `rows` -- a list where each element is a dict with
+    any of category/selector/description/quantity/unit/activity, or
+    None for an explicitly blank row position. Deliberately never wires
+    anything related to the '#'/row-number column -- every test using
+    this helper proves the row-count primitive under test does not read
+    it at all. Returns (image, offset) -- a _FakeImage tall enough to
+    hold every given row (plus margin) unless `image_height` overrides
+    it, and offset=(0, 0)."""
+    offset = (0, 0)
+    row_1_top = adapter._shifted_anchor("grid_row_1", offset)[1]
+    by_row_top = {row_1_top + i * _GRID_ROW_HEIGHT: (rows[i] or {}) for i in range(len(rows))}
+
+    def _cat_sel(image, offset, row_top):
+        data = by_row_top.get(row_top, {})
+        return data.get("category"), data.get("selector")
+
+    def _desc(image, offset, row_top):
+        return by_row_top.get(row_top, {}).get("description")
+
+    def _qty(image, offset, row_top, **kwargs):
+        return by_row_top.get(row_top, {}).get("quantity")
+
+    def _unit(image, offset, row_top):
+        unit = by_row_top.get(row_top, {}).get("unit")
+        return unit, unit
+
+    def _activity(image, offset, row_top):
+        return by_row_top.get(row_top, {}).get("activity")
+
+    monkeypatch.setattr(adapter, "_read_category_selector_at", _cat_sel)
+    monkeypatch.setattr(adapter, "_read_description_at", _desc)
+    monkeypatch.setattr(adapter, "_read_quantity_at", _qty)
+    monkeypatch.setattr(adapter, "_read_unit_at", _unit)
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", _activity)
+
+    if image_height is None:
+        image_height = row_1_top + (len(rows) + 4) * _GRID_ROW_HEIGHT
+    image = _FakeImage(height=image_height)
+    return image, offset
+
+
+def test_count_grid_rows_counts_six_populated_rows_with_broken_number_column(monkeypatch):
+    """Ground truth from the live General Conditions audit: 6 real
+    rows, '#' column unreadable. Nothing here wires that column at all
+    -- the count comes purely from row content."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary Repairs - per hour", "quantity": 6.0, "unit": "HR"},
+        {"category": "POL", "selector": "LAB", "description": "Swimming Pool Installer - per hour to clean", "quantity": 7.5, "unit": "HR"},
+        {"category": "POL", "selector": "PUMP>", "description": "Swimming pool pump, 2 hp", "quantity": 1.0, "unit": "EA"},
+        {"category": "DMO", "selector": "DUMP<", "description": "Dumpster load - Approx. 12 yards, 1-3 tons", "quantity": 1.0, "unit": "EA"},
+        {"category": "WDR", "selector": "SCRN", "description": "Window screen, 10 - 16 SF", "quantity": 5.0, "unit": "EA"},
+        {"category": "WDR", "selector": "SCRN<", "description": "Window screen, 1 - 9 SF", "quantity": 7.0, "unit": "EA"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+
+    assert adapter._count_grid_rows(image, offset) == 6
+    row_1_top = adapter._shifted_anchor("grid_row_1", offset)[1]
+    assert adapter._last_row_geometry(image, offset) == (6, row_1_top + 5 * _GRID_ROW_HEIGHT)
+
+
+def test_count_grid_rows_unaffected_by_row_number_column_drift(monkeypatch):
+    """A different row count than the 6-row fixture above, still with
+    the '#' column never wired -- its position (drifted or not) plays
+    no role at all in the new algorithm."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "RFG", "selector": "240", "description": "3 tab - 25 yr. composition shingles", "quantity": 30.19, "unit": "SQ"},
+        {"category": "RFG", "selector": "FELT15", "description": "Roofing felt - 15 lb.", "quantity": 30.19, "unit": "SQ"},
+        {"category": "RFG", "selector": "VENTT", "description": "R&R Roof vent - turtle type", "quantity": 1.0, "unit": "EA"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+
+    assert adapter._count_grid_rows(image, offset) == 3
+
+
+def test_count_grid_rows_counts_row_via_description_when_cat_sel_garbled(monkeypatch):
+    """Requirement: a row with noisy Cat/Sel OCR but a real, readable
+    description still counts -- one working signal is enough. Mirrors
+    the live #74 DMO/DUMP< row, whose selector OCR'd as a bare ')'."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary Repairs - per hour", "quantity": 6.0, "unit": "HR"},
+        {"category": "D", "selector": ")", "description": "Dumpster load - Approx. 12 yards, 1-3 tons", "quantity": 1.0, "unit": "EA"},
+        {"category": "WDR", "selector": "SCRN", "description": "Window screen, 10 - 16 SF", "quantity": 5.0, "unit": "EA"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+
+    assert adapter._count_grid_rows(image, offset) == 3
+
+
+def test_count_grid_rows_stops_at_first_stable_empty_run(monkeypatch):
+    """One blank 'new entry' row after the last real item is normal and
+    must not be counted; two consecutive blanks is the confirmed stop --
+    content beyond that (simulated here as a row that WOULD read
+    populated) must never be reached or counted."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary Repairs - per hour", "quantity": 6.0, "unit": "HR"},
+        {"category": "POL", "selector": "LAB", "description": "Swimming Pool Installer", "quantity": 7.5, "unit": "HR"},
+        None,  # the one always-present blank "new entry" row
+        None,  # second consecutive blank -- confirms the stop
+        {"category": "RFG", "selector": "240", "description": "must never be reached", "quantity": 1.0, "unit": "EA"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+
+    assert adapter._count_grid_rows(image, offset) == 2
+
+
+def test_count_grid_rows_tolerates_single_isolated_misread_between_real_rows(monkeypatch):
+    """A single unreadable position sandwiched between real rows is
+    treated as one field-level misread, not the end of the grid -- the
+    count still extends through it once a later position reads
+    populated again."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "WDR", "selector": "SCRN", "description": "Window screen, 10 - 16 SF", "quantity": 5.0, "unit": "EA"},
+        None,  # single spurious miss on what is really row 2 of 3
+        {"category": "WDR", "selector": "SCRN<", "description": "Window screen, 1 - 9 SF", "quantity": 7.0, "unit": "EA"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+
+    assert adapter._count_grid_rows(image, offset) == 3
+
+
+def test_count_grid_rows_returns_zero_for_truly_empty_grid(monkeypatch):
+    """Fail-closed contract preserved: a genuinely empty grid still
+    counts 0, and _last_row_geometry() still returns None -- exactly
+    the same downstream signal a real 'grid not located' case produces,
+    just no longer produced merely because the '#' column is unreadable
+    on a NON-empty grid."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image, offset = _wire_row_content(monkeypatch, adapter, [None, None, None])
+
+    assert adapter._count_grid_rows(image, offset) == 0
+    assert adapter._last_row_geometry(image, offset) is None
+
+
+def test_count_grid_rows_excludes_a_clipped_partial_last_row(monkeypatch):
+    """A row position that does not fully fit in the captured image
+    must never be read or counted, even if it would otherwise look
+    populated -- reuses _row_is_visible()'s own existing margin
+    unchanged."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary Repairs - per hour", "quantity": 6.0, "unit": "HR"},
+        {"category": "POL", "selector": "LAB", "description": "Swimming Pool Installer", "quantity": 7.5, "unit": "HR"},
+        # A 3rd row that WOULD read populated, but sits clipped at the
+        # viewport edge.
+        {"category": "RFG", "selector": "240", "description": "clipped, must not be counted", "quantity": 1.0, "unit": "EA"},
+    ]
+    row_1_top = adapter._shifted_anchor("grid_row_1", (0, 0))[1]
+    # _row_is_visible() requires the target row PLUS a full extra row of
+    # margin below it -- so row index 1 needs height >= row_top(1) + 2 *
+    # ROW_HEIGHT, while row index 2 must fall short of that same bar
+    # applied to itself. This band satisfies "row 1 visible, row 2 not".
+    clipped_height = row_1_top + 1 * _GRID_ROW_HEIGHT + 2 * _GRID_ROW_HEIGHT + 5
+    image, offset = _wire_row_content(monkeypatch, adapter, rows, image_height=clipped_height)
+
+    assert adapter._count_grid_rows(image, offset) == 2
+
+
+def test_downstream_snapshots_return_all_six_rows_when_number_column_unreadable(monkeypatch):
+    """capture_estimate_baseline()/verify_commit()/the activation-delta
+    pipeline all read through _snapshot_grid_rows_detailed(),
+    _snapshot_commit_rows(), and _snapshot_activation_rows() -- fixing
+    only the shared _count_grid_rows()/_last_row_geometry() primitive
+    must fix all three without changing any of them directly."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary Repairs - per hour", "quantity": 6.0, "unit": "HR"},
+        {"category": "POL", "selector": "LAB", "description": "Swimming Pool Installer", "quantity": 7.5, "unit": "HR"},
+        {"category": "POL", "selector": "PUMP>", "description": "Swimming pool pump, 2 hp", "quantity": 1.0, "unit": "EA"},
+        {"category": "DMO", "selector": "DUMP<", "description": "Dumpster load", "quantity": 1.0, "unit": "EA"},
+        {"category": "WDR", "selector": "SCRN", "description": "Window screen, 10 - 16 SF", "quantity": 5.0, "unit": "EA"},
+        {"category": "WDR", "selector": "SCRN<", "description": "Window screen, 1 - 9 SF", "quantity": 7.0, "unit": "EA"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (image, offset))
+
+    detailed = adapter._snapshot_grid_rows_detailed()
+    commit_rows = adapter._snapshot_commit_rows()
+    activation = adapter._snapshot_activation_rows()
+
+    assert len(detailed) == 6
+    assert len(commit_rows) == 6
+    assert len(activation) == 6
+    assert [r.category for r in activation] == ["TMP", "POL", "POL", "DMO", "WDR", "WDR"]
+
+
+def test_last_row_geometry_targets_correct_index_for_quantity_entry(monkeypatch):
+    """enter_quantity() locates the row to type into from
+    _last_row_geometry()'s (row_count, last_row_top) -- for the 6-row
+    General Conditions fixture the target must be row index 5 (the 6th,
+    last row), not an undercounted earlier one."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary Repairs - per hour", "quantity": 6.0, "unit": "HR"},
+        {"category": "POL", "selector": "LAB", "description": "Swimming Pool Installer", "quantity": 7.5, "unit": "HR"},
+        {"category": "POL", "selector": "PUMP>", "description": "Swimming pool pump, 2 hp", "quantity": 1.0, "unit": "EA"},
+        {"category": "DMO", "selector": "DUMP<", "description": "Dumpster load", "quantity": 1.0, "unit": "EA"},
+        {"category": "WDR", "selector": "SCRN", "description": "Window screen, 10 - 16 SF", "quantity": 5.0, "unit": "EA"},
+        {"category": "WDR", "selector": "SCRN<", "description": "Window screen, 1 - 9 SF", "quantity": 7.0, "unit": "EA"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+
+    row_count, last_row_top = adapter._last_row_geometry(image, offset)
+    row_1_top = adapter._shifted_anchor("grid_row_1", offset)[1]
+
+    assert row_count == 6
+    assert last_row_top == row_1_top + 5 * _GRID_ROW_HEIGHT
+    # The row actually sitting at that targeted position really is the
+    # last (6th) wired row, not row 5 or an out-of-bounds position.
+    assert adapter._read_category_selector_at(image, offset, last_row_top) == ("WDR", "SCRN<")
+    assert adapter._read_quantity_at(image, offset, last_row_top) == 7.0
+
+
+def test_activation_delta_correct_with_row_number_ocr_unavailable(monkeypatch):
+    """End-to-end: the R&R before/after multiset-delta safety logic
+    (pending_item_created(), which drives every physical_state_uncertain
+    / task_local_row_reconciliation decision) must still work correctly
+    when the '#' column is never readable -- driven entirely by the new
+    content-based _count_grid_rows()/_last_row_geometry(), through the
+    real (unmocked) _snapshot_activation_rows()."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+
+    before_content = [
+        {"category": "RFG", "selector": "240", "description": "3 tab shingles", "activity": None},
+        {"category": "RFG", "selector": "FELT15", "description": "Roofing felt", "activity": None},
+        {"category": "RFG", "selector": "VENTT", "description": "Roof vent", "activity": None},
+    ]
+    after_content = before_content + [
+        {"category": "RFG", "selector": "STEEP", "description": "Steep charge", "activity": "+"},
+    ]
+
+    adapter._last_activation_baseline_rows = [
+        ActivationRowSnapshot(r["category"], r["selector"], r["description"], r["activity"])
+        for r in before_content
+    ]
+    before_snapshot = [(r["category"], r["selector"]) for r in before_content]
+
+    image, offset = _wire_row_content(monkeypatch, adapter, after_content)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (image, offset))
+
+    # The primitive itself sees the new 4th row -- proves the delta
+    # logic below is being fed a real, correct count, not a mock.
+    assert adapter._count_grid_rows(image, offset) == 4
+
+    assert adapter.pending_item_created(before_snapshot, timeout_s=0) is True
+    assert adapter._pending_quantity_target.activity == "+"
+    assert adapter._pending_quantity_target.after_index == 3
+    assert adapter._pending_quantity_target.physical_row_delta == 1

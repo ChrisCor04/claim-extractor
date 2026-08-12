@@ -1824,99 +1824,119 @@ class WindowsXactimateAdapter(XactimateAdapter):
         dx, dy = offset
         return (l + dx, t + dy, r + dx, b + dy)
 
+    #: Minimum alphanumeric-character count (after stripping gridline/OCR
+    #: noise punctuation) for an OCR'd token to count as real content
+    #: rather than a stray artifact -- see `_is_meaningful_ocr_text()`.
+    _MEANINGFUL_TEXT_MIN_LEN = {
+        "category": 2, "selector": 2, "description": 3, "unit": 1,
+    }
+
+    @staticmethod
+    def _is_meaningful_ocr_text(value: str | None, min_len: int) -> bool:
+        """True when `value`, after stripping everything but letters/
+        digits, still has at least `min_len` characters left. Filters
+        out exactly the kind of single-character gridline-bleed noise
+        (a stray "<", "|", ".") that a real row never produces but a
+        genuinely blank cell does -- the same class of artifact
+        `_count_grid_rows()`'s old '#'-column reader had to work around
+        (see its historical docstring, kept below), applied here as a
+        generic per-field content check instead of column-specific
+        digit parsing."""
+        if not value:
+            return False
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", value)
+        return len(cleaned) >= min_len
+
+    def _row_has_content(self, image, offset: tuple[int, int], row_top: int) -> bool:
+        """True when the row at `row_top` shows plausible physical-item
+        content by ANY one of three independent signals -- category+
+        selector, description, or quantity+unit together -- so a single
+        noisy/misread field (e.g. a garbled selector) never hides a row
+        whose description or quantity still reads fine. Category+
+        selector is checked first since it is the cheapest (no extra
+        crop needed) and correct for the overwhelming majority of real
+        rows, so most rows never pay for the extra description/quantity
+        reads at all."""
+        category, selector = self._read_category_selector_at(image, offset, row_top)
+        if self._is_meaningful_ocr_text(category, self._MEANINGFUL_TEXT_MIN_LEN["category"]) and \
+                self._is_meaningful_ocr_text(selector, self._MEANINGFUL_TEXT_MIN_LEN["selector"]):
+            return True
+        description = self._read_description_at(image, offset, row_top)
+        if self._is_meaningful_ocr_text(description, self._MEANINGFUL_TEXT_MIN_LEN["description"]):
+            return True
+        quantity = self._read_quantity_at(image, offset, row_top)
+        if quantity is not None:
+            raw_unit, _normalized_unit = self._read_unit_at(image, offset, row_top)
+            if self._is_meaningful_ocr_text(raw_unit, self._MEANINGFUL_TEXT_MIN_LEN["unit"]):
+                return True
+        return False
+
+    #: Generous ceiling on how many row positions `_count_grid_rows()`
+    #: will ever probe -- large enough for every group size observed to
+    #: date (the historical '#'-column reader's own largest calibrated
+    #: crop covered 24 rows; see the combos this replaced), while still
+    #: bounding worst-case OCR cost to a fixed, small number of reads
+    #: rather than scanning indefinitely.
+    _MAX_ROW_SCAN = 40
+
     def _count_grid_rows(self, image, offset: tuple[int, int]) -> int:
-        """OCR's the '#' column beneath the grid header, counting
-        distinct rows with numeric content -- used for before/after
-        item-count mutation checks and to locate the most-recently-added
-        row (assumed appended last, matching every row addition observed
-        live).
+        """Counts populated grid rows from the rows' OWN content --
+        category/selector, description, and quantity/unit, all already
+        independently read (and relied upon) elsewhere in this file --
+        rather than OCR'ing the '#' (row-number) column.
 
-        Serious, repeatedly-live-caught bug fixed here (see
-        docs/xactimate-lookup.md Phase 4.4): the same column-gridline
-        OCR bleed found elsewhere in this adapter (a stray "|" character)
-        also affects the '#' column, producing text like "406 |" for a
-        real, single-digit-only row number. The original `line.strip().
-        isdigit()` check rejected any line with that trailing artifact
-        outright, undercounting a real row as 0 -- which made
-        cancel_current_item() silently return early ("nothing to
-        clean up") on a grid that was NOT actually empty, reporting
-        success without ever attempting a delete. This was caught only
-        by repeatedly observing a "cleaned up" adapter call followed by
-        the row still being visibly present on screen. Fixed by
-        extracting the leading digit run from each line instead of
-        requiring the whole line to be clean digits.
+        Replaced (see docs/xactimate-lookup.md "row-count primitive
+        replaced"): a live audit found the '#' column crop -- computed
+        the same way every other grid column is, by shifting its
+        calibrated `_GRID_COLUMNS["number"]` x-range by the anchor
+        offset derived from the grid header's "Cat" label -- landing on
+        blank space/gridline in a live session where every OTHER column
+        (Cat, Sel, Description, Quantity), shifted by that exact same
+        offset, still read correctly. The '#' column's real on-screen
+        position relative to the "Cat" anchor had drifted independently
+        of the rest of the grid; the old implementation's only failure
+        path for "can't read the row-number column" was to return 0,
+        which cascaded into `_last_row_geometry()` returning None and
+        every caller (enter_quantity's row targeting, commit
+        verification, the pre/post-activation row-count baseline the
+        R&R multiset-delta safety logic depends on, group-verification
+        probe cleanup, ...) silently treating a populated grid as
+        empty.
 
-        Second, more serious bug (Phase 4.5): at 4+ rows, `--psm 6`
-        (a "uniform block of text" assumption) misreads this narrow
-        (~32px-wide) numeric column badly and non-randomly -- e.g. a
-        real, clearly-legible "422" consistently read as "a2" or "ry",
-        silently undercounting the grid by one or more rows. This
-        directly caused a live wrong-row mutation: `enter_quantity()`
-        computed the "last row" position from an undercounted total
-        and entered a quantity into an existing, already-correct row
-        instead of the newly-selected one, silently overwriting its
-        value. `--psm 11` ("sparse text, no layout assumed") plus a 2x
-        upscale reads every row correctly in the same live state where
-        `--psm 6` failed -- swept scale 1x/2x/4x x five PSM modes
-        before finding this combination.
-
-        Third bug (Phase 4.6): the root cause behind both the Phase 4.5
-        fix AND its own failure mode turned out to be the SAME thing --
-        the crop height (a fixed, generous 400px band to accommodate
-        an unknown row count) is mostly blank whenever fewer than ~15
-        rows are present, and Tesseract's layout analysis is sensitive
-        to that blank-space ratio in ways that flip which PSM mode
-        works: `--psm 6` misreads a real "444" as "ast" on the full
-        400px-tall crop, but reads it correctly on the same crop
-        cropped down to just its top 100px; `--psm 11` reads a
-        single row fine on the full crop but returns nothing on a
-        2-row crop where the second row is legible to the eye.
-        Neither a single PSM mode nor a single crop height is reliable
-        across every row count. Fixed by trying multiple (crop height,
-        PSM) combinations and taking the MAXIMUM row count found
-        (not the first non-empty one): undercounting is the dangerous
-        direction here (Phase 4.5's wrong-row mutation), while
-        overcounting fails safe (a later step won't find a row that
-        isn't really there and will raise, rather than silently
-        acting on the wrong one). See docs/xactimate-lookup.md Phase
-        4.6."""
-        header = self._shifted_anchor("grid_header", offset)
-        col_l, col_r = _GRID_COLUMNS["number"]
-        dx, dy = offset
-        col_l, col_r = col_l + dx, col_r + dx
-        import re
-
-        def rows_at(crop_height, psm, scale):
-            crop = image.crop((col_l, header[3], col_r, header[3] + crop_height))
-            crop = crop.resize((crop.width * scale, crop.height * scale))
-            text = self._ocr_text(crop, psm=psm)
-            return [line for line in text.splitlines() if re.match(r"^\s*\d+", line)]
-
-        # Live-caught (Phase 4.6): even (crop_height, psm) alone isn't
-        # enough -- the specific misread of one row's digits also
-        # varies by upscale factor, non-deterministically producing
-        # different non-digit-leading garbage at 2x vs. 3x on
-        # otherwise-identical crops. Scale is swept alongside crop
-        # height and PSM for the same reason: take the max valid count
-        # across everything tried rather than trust any single
-        # combination.
-        # Phase 6.2 (live-caught): the original 400px ceiling here is
-        # exactly 16 rows (400 / _GRID_ROW_HEIGHT) -- a second, INDEPENDENT
-        # cap from the scroll-into-view fix in enter_quantity(): even
-        # after scrolling genuinely brings a 17th+ row into the visible
-        # client area, this method's own crop never extended far enough
-        # to include it, live-reproduced as a hard ceiling of 16
-        # regardless of scroll position (the crop is anchored to, and
-        # moves WITH, the header -- scrolling shifts what's captured,
-        # never how MUCH). Added two larger-crop combos rather than
-        # raising the existing ones in place, preserving every
-        # previously-tuned (height, psm, scale) combination exactly as
-        # calibrated; max() below already takes the largest count found
-        # across all combos, so this can only ever increase, never
-        # decrease, an otherwise-correct read.
-        combos = [(100, 6, 2), (100, 6, 3), (400, 11, 2), (400, 6, 2), (600, 11, 2), (600, 6, 2)]
-        counts = [len(rows_at(h, psm, scale)) for h, psm, scale in combos]
-        return max(counts)
+        Walks row positions from `grid_row_1` downward in fixed
+        `_GRID_ROW_HEIGHT` steps -- geometry already proven correct
+        independently of the '#' column, since every other column reads
+        correctly at these exact same positions -- and asks
+        `_row_has_content()` whether each one looks populated. Stops at
+        the first STABLE run of two consecutive empty positions after
+        at least one populated row (one blank position alone is treated
+        as a plausible single-field misread on an otherwise-real row,
+        not the end of the grid -- the scan continues, and a later
+        populated position still extends the count through it). Two
+        empty positions in a row -- or two at the very top -- is treated
+        as the genuine end of content: this both matches the one always-
+        present blank "new entry" row Xactimate leaves under the last
+        real item, and fails closed (returns 0, exactly like "grid not
+        located" did before) rather than guessing when nothing readable
+        exists. A row position that doesn't fully fit within the
+        captured image (`_row_is_visible()`) is never read or counted,
+        so a clipped partial row at the bottom of the viewport is
+        correctly excluded rather than counted from a partial read."""
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        last_populated_index = -1
+        consecutive_empty = 0
+        for index in range(self._MAX_ROW_SCAN):
+            row_top = row_1_top + index * _GRID_ROW_HEIGHT
+            if not self._row_is_visible(image, row_top):
+                break
+            if self._row_has_content(image, offset, row_top):
+                last_populated_index = index
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+        return last_populated_index + 1
 
     # ------------------------------------------------------------------
     # XactimateAdapter contract
