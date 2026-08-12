@@ -392,6 +392,70 @@ def test_decision_diagnostics_present_on_auto_select(tmp_path, phrase_rules, ran
     assert diag.top_has_hard_conflict is False
 
 
+# ---------------------------------------------------------------------
+# Phase 5.19 (live-caught, odom-insurance-v2 Rows 7/11/18): execute_plan()
+# computes preferred_categories from the source item's trade/component
+# via selector_recommendation's own data-calibrated hints (see
+# orchestrator._category_hint_rules()/hinted_categories()) and threads
+# it into classify_decision_with_diagnostics() so a cross-category exact
+# tie can be resolved end to end, not just at the ranking-unit level.
+# ---------------------------------------------------------------------
+
+
+def test_execute_plan_resolves_cross_category_tie_row7_shape(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(
+        original_description="Digital satellite system - Detach & reset",
+        trade="electrical", component="satellite_system", material=None, action="detach_and_reset",
+    )
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    els = _dropdown("Digital satellite system - Detach & reset", cat="ELS", sel="DISHRS", pos=0)
+    rfg = _dropdown("Digital satellite system - Detach & reset", cat="RFG", sel="DISHRS", pos=1)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [els, rfg]})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.decision == DECISION_AUTO_SELECT
+    assert outcome.selected.dropdown.category == "ELS"
+    assert outcome.selected.dropdown.selector == "DISHRS"
+    assert outcome.decision_diagnostics.gate == "exact_tie_resolved_by_context"
+    assert outcome.decision_diagnostics.tie_resolution.resolved is True
+
+
+def test_execute_plan_resolves_cross_category_tie_regardless_of_candidate_order(tmp_path, phrase_rules, ranking_config):
+    """Same Row 7 shape with the dropdown rows returned in the opposite
+    order -- the winner must be picked by context, never by position."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(
+        original_description="Digital satellite system - Detach & reset",
+        trade="electrical", component="satellite_system", material=None, action="detach_and_reset",
+    )
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    els = _dropdown("Digital satellite system - Detach & reset", cat="ELS", sel="DISHRS", pos=0)
+    rfg = _dropdown("Digital satellite system - Detach & reset", cat="RFG", sel="DISHRS", pos=1)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [rfg, els]})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.decision == DECISION_AUTO_SELECT
+    assert outcome.selected.dropdown.category == "ELS"
+    assert outcome.selected.dropdown.selector == "DISHRS"
+
+
+def test_execute_plan_leaves_cross_category_tie_unresolved_without_trade_signal_row11_shape(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(
+        original_description="Step flashing", trade="unknown", component="unknown", material=None, action="unknown",
+    )
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    rfg = _dropdown("Step flashing", cat="RFG", sel="STEP", pos=0)
+    sdg = _dropdown("Step flashing", cat="SDG", sel="STEP", pos=1)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [rfg, sdg]})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.decision == DECISION_REVIEW_REQUIRED
+    assert outcome.decision_diagnostics.tie_resolution.resolved is False
+    assert outcome.decision_diagnostics.tie_resolution.reason == "no_category_hint_available"
+
+
 def test_decision_diagnostics_still_reflects_original_auto_select_on_invalid_quantity_stop(tmp_path, phrase_rules, ranking_config):
     """`decision` on the returned outcome flips to REVIEW_REQUIRED for
     the quantity guard, but decision_diagnostics must still explain the

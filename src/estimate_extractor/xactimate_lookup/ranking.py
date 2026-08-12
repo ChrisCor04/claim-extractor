@@ -693,6 +693,128 @@ def _below_floor_semantic_dominance(candidates: list[RankedCandidate], config: R
 
 
 @dataclass(slots=True, frozen=True)
+class TieResolution:
+    """The record of one attempt to resolve a cross-category EXACT tie
+    using pre-existing source context -- see _resolve_cross_category_
+    tie()'s own docstring for the full rule. Always built once an exact
+    score tie is detected (`tie_detected=True`), whether or not it was
+    actually resolved, so a persisted search attempt can show its work:
+    what was tied, what context was consulted, and exactly why a
+    candidate was or was not preferred.
+
+    `reason` is one of: "not_textually_equivalent",
+    "three_or_more_way_tie", "same_category_tie",
+    "no_category_hint_available", "both_candidates_match_hint",
+    "neither_candidate_matches_hint", "context_matched_one_candidate"."""
+
+    tie_detected: bool
+    reason: str
+    category_a: str | None
+    selector_a: str | None
+    category_b: str | None
+    selector_b: str | None
+    preferred_categories: tuple[str, ...]
+    resolved: bool
+    resolved_category: str | None
+    resolved_selector: str | None
+
+    def to_dict(self) -> dict:
+        return {
+            "tie_detected": self.tie_detected,
+            "reason": self.reason,
+            "category_a": self.category_a,
+            "selector_a": self.selector_a,
+            "category_b": self.category_b,
+            "selector_b": self.selector_b,
+            "preferred_categories": list(self.preferred_categories),
+            "resolved": self.resolved,
+            "resolved_category": self.resolved_category,
+            "resolved_selector": self.resolved_selector,
+        }
+
+
+def _resolve_cross_category_tie(
+    candidates: list[RankedCandidate], top: RankedCandidate, second: RankedCandidate,
+    preferred_categories: tuple[str, ...],
+) -> TieResolution | None:
+    """A narrow, generalized tie-break for the specific shape live-caught
+    across Rows 7/11/18 of the odom-insurance-v2 benchmark: two
+    candidates in DIFFERENT Xactimate categories with textually
+    identical descriptions score an exact tie (e.g. "Digital satellite
+    system - Detach & reset" exists verbatim in both ELS and RFG;
+    "Step flashing" in both RFG and SDG; "House wrap" in both INS and
+    SDG) -- classify_decision_with_diagnostics()'s ordinary margin gate
+    can never distinguish these on text alone, and must not: an
+    arbitrary pick by candidate order would fabricate false confidence.
+
+    Returns None (not applicable -- caller attaches no tie_resolution
+    at all) when the two candidates aren't an exact score tie in the
+    first place; this keeps every ordinary REVIEW_REQUIRED case (a
+    near-miss margin like Rows 27/35, or any non-tied ambiguity)
+    completely untouched. Once a tie IS detected, always returns a
+    TieResolution explaining the outcome, resolved or not.
+
+    `preferred_categories` is the caller's own pre-computed positive
+    context -- e.g. the source item's trade/component mapped through
+    selector_recommendation's existing, data-calibrated trade_category_
+    hints/component_category_hints (see candidate_generation.
+    hinted_categories()) -- never derived here, and never a new
+    category-preference table: this function only ever asks "does
+    already-established mapping evidence single out one of the two
+    tied categories?" It resolves ONLY when that context implicates
+    exactly one of the two tied candidates' categories -- never when
+    it's silent (no hint), implicates both (conflicting/non-
+    discriminating), or implicates neither. It never lowers
+    auto_select_margin or touches the text/ranking score; it only
+    chooses which of two ALREADY-equal-scoring candidates to select."""
+    if top.score != second.score:
+        return None
+
+    category_a, selector_a = top.dropdown.category, top.dropdown.selector
+    category_b, selector_b = second.dropdown.category, second.dropdown.selector
+    base = dict(
+        tie_detected=True, category_a=category_a, selector_a=selector_a,
+        category_b=category_b, selector_b=selector_b, preferred_categories=preferred_categories,
+        resolved=False, resolved_category=None, resolved_selector=None,
+    )
+
+    text_a = normalize_description(top.dropdown.description or top.dropdown.raw_text or "")
+    text_b = normalize_description(second.dropdown.description or second.dropdown.raw_text or "")
+    if text_a != text_b:
+        return TieResolution(reason="not_textually_equivalent", **base)
+
+    # A third candidate tied at the same score means this isn't a clean
+    # pairwise ambiguity -- no defensible single winner to pick.
+    if len(candidates) > 2 and candidates[2].score == top.score:
+        return TieResolution(reason="three_or_more_way_tie", **base)
+
+    if category_a == category_b:
+        # Same-category "tie" (e.g. two duplicate catalog rows) is a
+        # different problem than the cross-category ambiguity this
+        # function exists for -- a trade/component hint could never
+        # discriminate between two rows in the SAME category anyway.
+        return TieResolution(reason="same_category_tie", **base)
+
+    if not preferred_categories:
+        return TieResolution(reason="no_category_hint_available", **base)
+
+    a_in = category_a in preferred_categories
+    b_in = category_b in preferred_categories
+    if a_in and b_in:
+        return TieResolution(reason="both_candidates_match_hint", **base)
+    if not a_in and not b_in:
+        return TieResolution(reason="neither_candidate_matches_hint", **base)
+
+    winner_category, winner_selector = (category_a, selector_a) if a_in else (category_b, selector_b)
+    return TieResolution(
+        reason="context_matched_one_candidate", resolved=True,
+        resolved_category=winner_category, resolved_selector=winner_selector,
+        tie_detected=True, category_a=category_a, selector_a=selector_a,
+        category_b=category_b, selector_b=selector_b, preferred_categories=preferred_categories,
+    )
+
+
+@dataclass(slots=True, frozen=True)
 class DecisionDiagnostics:
     """Every value classify_decision() actually consulted to reach its
     outcome, plus which exact branch ("gate") produced it -- built by
@@ -706,7 +828,17 @@ class DecisionDiagnostics:
     `gate` is one of: "no_candidates", "below_review_required_min",
     "below_auto_select_min", "below_floor_semantic_dominance_override",
     "hard_conflict", "low_extraction_confidence", "insufficient_margin",
-    "insufficient_margin_exact_top_override", "clear_margin"."""
+    "insufficient_margin_exact_top_override",
+    "exact_tie_resolved_by_context", "clear_margin".
+
+    `selected_candidate` is the actual RankedCandidate the caller should
+    treat as chosen whenever `decision == DECISION_AUTO_SELECT` -- None
+    otherwise. Exists because it is normally (but, since the cross-
+    category tie resolution below, no longer ALWAYS) `candidates[0]`;
+    callers must not assume position. Deliberately excluded from
+    to_dict() -- it's a live object reference for immediate in-process
+    use, not persisted data (top_category/top_selector/top_score below
+    already capture the winner's identity for persistence)."""
 
     decision: str
     gate: str
@@ -723,6 +855,8 @@ class DecisionDiagnostics:
     auto_select_min: float
     auto_select_margin: float
     min_extraction_confidence: float
+    tie_resolution: TieResolution | None = None
+    selected_candidate: RankedCandidate | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -741,22 +875,35 @@ class DecisionDiagnostics:
             "auto_select_min": self.auto_select_min,
             "auto_select_margin": self.auto_select_margin,
             "min_extraction_confidence": self.min_extraction_confidence,
+            "tie_resolution": self.tie_resolution.to_dict() if self.tie_resolution is not None else None,
         }
 
 
-def classify_decision_with_diagnostics(candidates: list[RankedCandidate], config: RankingConfig) -> DecisionDiagnostics:
+def classify_decision_with_diagnostics(
+    candidates: list[RankedCandidate], config: RankingConfig, *, preferred_categories: tuple[str, ...] = (),
+) -> DecisionDiagnostics:
     """The actual decision logic -- classify_decision() is a thin
     wrapper returning only `.decision`, so every existing caller's
     signature/behavior is completely unchanged. Never automatically
     returns AUTO_SELECT for an empty or single weak result -- see build
-    spec 'Do not automatically choose the first dropdown result.'."""
+    spec 'Do not automatically choose the first dropdown result.'.
+
+    `preferred_categories`: pre-existing, positive category evidence for
+    THIS item -- e.g. the source line item's trade/component mapped
+    through selector_recommendation's own data-calibrated trade/
+    component category hints (see candidate_generation.hinted_
+    categories()). Computed entirely by the caller; this function never
+    derives it and never assumes any category is globally preferred.
+    Defaults to empty, which makes _resolve_cross_category_tie() below
+    a pure no-op -- every existing caller that doesn't pass this is
+    completely unaffected."""
     thresholds = dict(
         auto_select_min=config.auto_select_min,
         auto_select_margin=config.auto_select_margin,
         min_extraction_confidence=config.min_extraction_confidence,
     )
 
-    def _build(decision: str, gate: str, *, top=None, second=None, margin=None) -> DecisionDiagnostics:
+    def _build(decision: str, gate: str, *, top=None, second=None, margin=None, tie_resolution=None) -> DecisionDiagnostics:
         return DecisionDiagnostics(
             decision=decision, gate=gate,
             top_category=top.dropdown.category if top is not None else None,
@@ -769,6 +916,8 @@ def classify_decision_with_diagnostics(candidates: list[RankedCandidate], config
             second_selector=second.dropdown.selector if second is not None else None,
             second_score=second.score if second is not None else None,
             margin=margin,
+            tie_resolution=tie_resolution,
+            selected_candidate=top if decision == DECISION_AUTO_SELECT else None,
             **thresholds,
         )
 
@@ -825,7 +974,29 @@ def classify_decision_with_diagnostics(candidates: list[RankedCandidate], config
         exact_top = top.score >= _EXACT_MATCH_SCORE_THRESHOLD
         exact_tie = second_score >= _EXACT_MATCH_SCORE_THRESHOLD
         if not (exact_top and not exact_tie):
-            return _build(DECISION_REVIEW_REQUIRED, "insufficient_margin", top=top, second=second, margin=margin)
+            # Phase 5.19 (live-caught, odom-insurance-v2 Rows 7/11/18):
+            # the comment above already identifies this exact shape --
+            # "two identically-worded candidates in different real
+            # categories" -- as one the margin override deliberately
+            # never resolves. _resolve_cross_category_tie() is a
+            # SEPARATE, narrower mechanism that only ever fires for a
+            # genuine score tie, and only when the caller's own
+            # pre-existing positive context implicates exactly one of
+            # the two tied categories -- see its docstring. Returns
+            # None (not an exact tie at all -- e.g. Rows 27/35's near-
+            # miss margins) or a TieResolution that did not resolve
+            # (no/conflicting context) for every case that isn't this
+            # narrow shape, leaving REVIEW_REQUIRED exactly as before.
+            tie = None
+            if second is not None:
+                tie = _resolve_cross_category_tie(candidates, top, second, preferred_categories)
+            if tie is not None and tie.resolved:
+                winner, loser = (top, second) if tie.resolved_category == top.dropdown.category else (second, top)
+                return _build(
+                    DECISION_AUTO_SELECT, "exact_tie_resolved_by_context",
+                    top=winner, second=loser, margin=margin, tie_resolution=tie,
+                )
+            return _build(DECISION_REVIEW_REQUIRED, "insufficient_margin", top=top, second=second, margin=margin, tie_resolution=tie)
         return _build(DECISION_AUTO_SELECT, "insufficient_margin_exact_top_override", top=top, second=second, margin=margin)
 
     return _build(DECISION_AUTO_SELECT, "clear_margin", top=top, second=second, margin=margin)

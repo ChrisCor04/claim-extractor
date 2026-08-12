@@ -805,6 +805,265 @@ def test_diagnostics_to_dict_serializes_all_fields(ranking_config):
     assert d["auto_select_min"] == ranking_config.auto_select_min
     assert d["auto_select_margin"] == ranking_config.auto_select_margin
     assert d["min_extraction_confidence"] == ranking_config.min_extraction_confidence
+    assert d["tie_resolution"] is None
+
+
+# ---------------------------------------------------------------------
+# Phase 5.19 (live-caught, odom-insurance-v2 Rows 7/11/18): a cross-
+# category EXACT tie between otherwise textually-identical candidates
+# (e.g. "Digital satellite system - Detach & reset" scoring identically
+# in both ELS and RFG) can never be resolved by text/margin alone --
+# _resolve_cross_category_tie() only ever breaks it using the caller's
+# own PRE-EXISTING positive category evidence (`preferred_categories`,
+# in production sourced from selector_recommendation's own data-
+# calibrated trade/component category hints -- see orchestrator.py).
+# Every test below drives classify_decision_with_diagnostics() directly
+# with a synthetic preferred_categories tuple, matching this file's own
+# established convention (_ranked()) for isolating one branch.
+# ---------------------------------------------------------------------
+
+
+_SATELLITE_DESC = "Digital satellite system - Detach & reset"
+_STEP_DESC = "Step flashing"
+_WRAP_DESC = "House wrap (air/moisture barrier)"
+
+
+def test_exact_tie_resolved_by_strong_context_row7_shape(ranking_config):
+    """Row 7: trade='electrical' hints ('ELE', 'ELS') -- ELS is the tied
+    candidate that evidence supports; RFG is not. Must AUTO_SELECT ELS,
+    not merely stay REVIEW_REQUIRED, and must not distort either
+    candidate's own text/ranking score."""
+    els = _ranked(1.0, cat="ELS", sel="DISHRS", desc=_SATELLITE_DESC, pos=0)
+    rfg = _ranked(1.0, cat="RFG", sel="DISHRS", desc=_SATELLITE_DESC, pos=1)
+    diag = ranking.classify_decision_with_diagnostics([els, rfg], ranking_config, preferred_categories=("ELE", "ELS"))
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_context"
+    assert diag.top_category == "ELS"
+    assert diag.top_selector == "DISHRS"
+    assert diag.top_score == 1.0  # score itself is untouched by resolution
+    assert diag.selected_candidate is els
+    assert diag.second_category == "RFG"  # the losing candidate, recorded for audit
+    tr = diag.tie_resolution
+    assert tr is not None
+    assert tr.tie_detected is True
+    assert tr.resolved is True
+    assert tr.resolved_category == "ELS"
+    assert tr.resolved_selector == "DISHRS"
+    assert tr.reason == "context_matched_one_candidate"
+    assert tr.preferred_categories == ("ELE", "ELS")
+    assert ranking.classify_decision([els, rfg], ranking_config) == DECISION_REVIEW_REQUIRED  # no preferred_categories -> unresolved
+
+
+def test_exact_tie_resolved_by_strong_context_row18_shape(ranking_config):
+    """Row 18: trade='siding' hints ('SDG',) -- SDG is preferred over INS."""
+    ins = _ranked(1.0, cat="INS", sel="HWRAP", desc=_WRAP_DESC, pos=0)
+    sdg = _ranked(1.0, cat="SDG", sel="HWRAP", desc=_WRAP_DESC, pos=1)
+    diag = ranking.classify_decision_with_diagnostics([ins, sdg], ranking_config, preferred_categories=("SDG",))
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_context"
+    assert diag.top_category == "SDG"
+    assert diag.selected_candidate is sdg
+
+
+def test_exact_tie_without_category_evidence_stays_review_required_row11_shape(ranking_config):
+    """Row 11: trade='unknown' yields no hint at all -- there is no
+    defensible signal to prefer RFG or SDG, so the tie must be left
+    exactly as REVIEW_REQUIRED, same as before this change existed."""
+    rfg = _ranked(1.0, cat="RFG", sel="STEP", desc=_STEP_DESC, pos=0)
+    sdg = _ranked(1.0, cat="SDG", sel="STEP", desc=_STEP_DESC, pos=1)
+    diag = ranking.classify_decision_with_diagnostics([rfg, sdg], ranking_config, preferred_categories=())
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "insufficient_margin"
+    tr = diag.tie_resolution
+    assert tr is not None
+    assert tr.tie_detected is True
+    assert tr.resolved is False
+    assert tr.resolved_category is None
+    assert tr.reason == "no_category_hint_available"
+
+
+def test_exact_tie_with_conflicting_category_evidence_stays_review_required(ranking_config):
+    """Both tied categories appear in the hint list -- the context does
+    not discriminate between them, so this must be treated the same as
+    no evidence at all: stay REVIEW_REQUIRED, never guess."""
+    rfg = _ranked(1.0, cat="RFG", sel="STEP", desc=_STEP_DESC, pos=0)
+    sdg = _ranked(1.0, cat="SDG", sel="STEP", desc=_STEP_DESC, pos=1)
+    diag = ranking.classify_decision_with_diagnostics([rfg, sdg], ranking_config, preferred_categories=("RFG", "SDG"))
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    tr = diag.tie_resolution
+    assert tr.resolved is False
+    assert tr.reason == "both_candidates_match_hint"
+
+
+def test_exact_tie_evidence_matching_neither_candidate_stays_review_required(ranking_config):
+    """The hint list is non-empty but names a category that is neither
+    of the two tied candidates -- also not defensible evidence for
+    either one specifically."""
+    rfg = _ranked(1.0, cat="RFG", sel="STEP", desc=_STEP_DESC, pos=0)
+    sdg = _ranked(1.0, cat="SDG", sel="STEP", desc=_STEP_DESC, pos=1)
+    diag = ranking.classify_decision_with_diagnostics([rfg, sdg], ranking_config, preferred_categories=("ELS",))
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    tr = diag.tie_resolution
+    assert tr.resolved is False
+    assert tr.reason == "neither_candidate_matches_hint"
+
+
+def test_exact_tie_resolution_unaffected_by_candidate_order(ranking_config):
+    """Candidate order reversal must not change which candidate wins --
+    the winner is chosen by which category the context supports, never
+    by list position."""
+    ins = _ranked(1.0, cat="INS", sel="HWRAP", desc=_WRAP_DESC, pos=0)
+    sdg = _ranked(1.0, cat="SDG", sel="HWRAP", desc=_WRAP_DESC, pos=1)
+    forward = ranking.classify_decision_with_diagnostics([ins, sdg], ranking_config, preferred_categories=("SDG",))
+    reversed_ = ranking.classify_decision_with_diagnostics([sdg, ins], ranking_config, preferred_categories=("SDG",))
+    assert forward.decision == reversed_.decision == DECISION_AUTO_SELECT
+    assert forward.top_category == reversed_.top_category == "SDG"
+    assert forward.top_selector == reversed_.top_selector == "HWRAP"
+    assert forward.selected_candidate is sdg
+    assert reversed_.selected_candidate is sdg
+
+
+def test_ordinary_clear_margin_case_unaffected_by_preferred_categories(ranking_config):
+    """A normal, non-tied AUTO_SELECT must behave identically whether or
+    not preferred_categories is supplied -- tie resolution never even
+    attempts to run outside the exact-tie branch."""
+    top = _ranked(1.0, cat="RFG", sel="X")
+    second = _ranked(0.5, cat="SDG", sel="Y")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config, preferred_categories=("SDG",))
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "clear_margin"
+    assert diag.tie_resolution is None
+    assert diag.selected_candidate is top
+
+
+def test_near_tie_row27_shape_is_not_treated_as_an_exact_tie(ranking_config):
+    """Row 27 shape: top 0.9006 vs second 0.8485 -- a real margin gap,
+    not a bitwise score tie. Tie resolution must never fire here, even
+    when preferred_categories would otherwise discriminate."""
+    top = _ranked(0.9006, cat="FCC", sel="PAD-")
+    second = _ranked(0.8485, cat="FCT", sel="B-")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config, preferred_categories=("FCC", "FCT"))
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "insufficient_margin"
+    assert diag.tie_resolution is None
+
+
+def test_near_tie_row35_shape_is_not_treated_as_an_exact_tie(ranking_config):
+    """Row 35 shape: top 0.9379 vs second 0.9306 -- thinnest near-miss
+    margin in the benchmark, still not an exact tie."""
+    top = _ranked(0.9379, cat="WDW", sel="MN")
+    second = _ranked(0.9306, cat="WDV", sel="MN")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config, preferred_categories=("WDW", "WDV"))
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "insufficient_margin"
+    assert diag.tie_resolution is None
+
+
+def test_score_limited_row6_shape_never_reaches_tie_resolution(ranking_config):
+    """Row 6 shape: top score (0.6996) itself is below auto_select_min
+    -- the margin/tie branch is never even reached, regardless of any
+    preferred_categories passed in."""
+    top = _ranked(0.6996, cat="RFG", sel="VENTRS")
+    second = _ranked(0.6658, cat="RFG", sel="RIDGTRS")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config, preferred_categories=("RFG",))
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "below_auto_select_min"
+    assert diag.tie_resolution is None
+
+
+def test_score_limited_row28_shape_never_reaches_tie_resolution(ranking_config):
+    """Row 28/31 shape: top score (0.45) is below review_required_min
+    entirely -- NO_MATCH via the very first gate, tie resolution never
+    attempted."""
+    top = _ranked(0.45, cat="SDG", sel="SHTR", conflict_reasons=["wrong_component: ['window'] not found in candidate description"])
+    second = _ranked(0.45, cat="SDG", sel="SHTR<")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config, preferred_categories=("SDG",))
+    assert diag.decision == DECISION_NO_MATCH
+    assert diag.gate == "below_review_required_min"
+    assert diag.tie_resolution is None
+
+
+def test_same_category_tie_is_not_resolved():
+    """Two candidates tied in the SAME category (e.g. duplicate catalog
+    rows) is a different problem than cross-category ambiguity -- a
+    trade/component hint could never discriminate between them anyway,
+    and this function must not try."""
+    config = ranking.load_ranking_config()
+    a = _ranked(1.0, cat="RFG", sel="A", desc="Drip edge", pos=0)
+    b = _ranked(1.0, cat="RFG", sel="B", desc="Drip edge", pos=1)
+    diag = ranking.classify_decision_with_diagnostics([a, b], config, preferred_categories=("RFG",))
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    tr = diag.tie_resolution
+    assert tr.resolved is False
+    assert tr.reason == "same_category_tie"
+
+
+def test_score_tie_without_textual_equivalence_is_not_resolved():
+    """A numeric score tie alone is not sufficient -- this mechanism is
+    scoped to genuinely textually-equivalent candidates (the live-caught
+    shape), not any two candidates that happen to sum to the same
+    weighted score for unrelated reasons."""
+    config = ranking.load_ranking_config()
+    a = _ranked(1.0, cat="ELS", sel="A", desc="Digital satellite system", pos=0)
+    b = _ranked(1.0, cat="RFG", sel="B", desc="Something completely different", pos=1)
+    diag = ranking.classify_decision_with_diagnostics([a, b], config, preferred_categories=("ELS",))
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    tr = diag.tie_resolution
+    assert tr.resolved is False
+    assert tr.reason == "not_textually_equivalent"
+
+
+def test_three_way_tie_is_not_resolved():
+    """A third candidate tied at the exact same score means this isn't a
+    clean pairwise ambiguity -- no defensible single winner, even when
+    the top two would otherwise resolve cleanly."""
+    config = ranking.load_ranking_config()
+    a = _ranked(1.0, cat="ELS", sel="A", desc=_SATELLITE_DESC, pos=0)
+    b = _ranked(1.0, cat="RFG", sel="B", desc=_SATELLITE_DESC, pos=1)
+    c = _ranked(1.0, cat="HVC", sel="C", desc=_SATELLITE_DESC, pos=2)
+    diag = ranking.classify_decision_with_diagnostics([a, b, c], config, preferred_categories=("ELS",))
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    tr = diag.tie_resolution
+    assert tr.resolved is False
+    assert tr.reason == "three_or_more_way_tie"
+
+
+def test_classify_decision_plain_wrapper_reflects_tie_resolution_when_passed_through():
+    """classify_decision() itself never received preferred_categories in
+    this codebase's real call sites (only classify_decision_with_
+    diagnostics() does, from orchestrator.py) -- confirms it still
+    delegates correctly if a caller does pass one."""
+    config = ranking.load_ranking_config()
+    els = _ranked(1.0, cat="ELS", sel="DISHRS", desc=_SATELLITE_DESC, pos=0)
+    rfg = _ranked(1.0, cat="RFG", sel="DISHRS", desc=_SATELLITE_DESC, pos=1)
+    assert ranking.classify_decision([els, rfg], config) == DECISION_REVIEW_REQUIRED
+    diag = ranking.classify_decision_with_diagnostics([els, rfg], config, preferred_categories=("ELS",))
+    assert diag.decision == DECISION_AUTO_SELECT
+
+
+def test_selected_candidate_is_none_for_review_required_and_no_match(ranking_config):
+    d1 = ranking.classify_decision_with_diagnostics([], ranking_config)
+    assert d1.selected_candidate is None
+    top = _ranked(0.6)
+    second = _ranked(0.5)
+    d2 = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert d2.decision == DECISION_REVIEW_REQUIRED
+    assert d2.selected_candidate is None
+
+
+def test_tie_resolution_to_dict_serializes_all_fields(ranking_config):
+    els = _ranked(1.0, cat="ELS", sel="DISHRS", desc=_SATELLITE_DESC, pos=0)
+    rfg = _ranked(1.0, cat="RFG", sel="DISHRS", desc=_SATELLITE_DESC, pos=1)
+    diag = ranking.classify_decision_with_diagnostics([els, rfg], ranking_config, preferred_categories=("ELS",))
+    d = diag.to_dict()["tie_resolution"]
+    assert d["tie_detected"] is True
+    assert d["resolved"] is True
+    assert d["category_a"] == "ELS"
+    assert d["category_b"] == "RFG"
+    assert d["preferred_categories"] == ["ELS"]
+    assert d["resolved_category"] == "ELS"
+    assert d["resolved_selector"] == "DISHRS"
+    assert d["reason"] == "context_matched_one_candidate"
 
 
 def test_below_floor_dominance_real_0016_shape_correctly_refuses_to_fire():

@@ -16,8 +16,10 @@ itself.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
 
+from estimate_extractor.selector_recommendation.candidate_generation import hinted_categories, load_recommendation_rules
 from estimate_extractor.xactimate_lookup import registry, signature as signature_mod
 from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
@@ -61,6 +63,19 @@ from estimate_extractor.xactimate_lookup.ranking import (
     classify_decision_with_diagnostics,
     rank_dropdown_results,
 )
+
+
+@functools.lru_cache(maxsize=1)
+def _category_hint_rules():
+    """Loads selector_recommendation's own data-calibrated trade/
+    component -> Xactimate category hints (config/selector_
+    recommendation_rules.yaml) -- see that config's own comment: these
+    were sampled from the real selector catalog, not guessed from
+    naming conventions. Reused as-is (never duplicated) as the positive
+    context for ranking.py's cross-category exact-tie resolution;
+    cached since the file never changes mid-process and this is read on
+    every ranked search attempt."""
+    return load_recommendation_rules()
 
 
 def _verified_catalog_trusted_mapping(item: RecommendationInput, verified_records: list, item_signature: str) -> InternalMappingRecord | None:
@@ -332,7 +347,8 @@ def execute_plan(
         unit=item.source_unit, size_key=size_key, grade_key=grade_key, dropdowns=dropdowns,
         rules=phrase_rules, config=ranking_config, prior_verified_mapping=(plan.path == LOOKUP_PATH_TRUSTED),
     )
-    decision_diagnostics = classify_decision_with_diagnostics(candidates, ranking_config)
+    preferred_categories = tuple(hinted_categories(item, _category_hint_rules()))
+    decision_diagnostics = classify_decision_with_diagnostics(candidates, ranking_config, preferred_categories=preferred_categories)
     decision = decision_diagnostics.decision
     _record_lifecycle(adapter, "DECISION_MADE", decision=decision, gate=decision_diagnostics.gate)
 
@@ -371,8 +387,15 @@ def execute_plan(
             candidates=candidates, selected=top, decision_diagnostics=decision_diagnostics,
         )
 
-    # DECISION_AUTO_SELECT
-    top = candidates[0]
+    # DECISION_AUTO_SELECT. `selected_candidate` is None whenever this
+    # AUTO_SELECT came from the trusted-mapping override above (which
+    # already validated candidates[0] itself) rather than from ranking
+    # directly -- candidates[0] is the correct fallback there. When
+    # ranking decided it directly, selected_candidate is normally also
+    # candidates[0], EXCEPT for a cross-category exact-tie resolution
+    # (see ranking.classify_decision_with_diagnostics()), which may
+    # have picked candidates[1] instead -- never assume position here.
+    top = decision_diagnostics.selected_candidate if decision_diagnostics.selected_candidate is not None else candidates[0]
 
     if item.quantity is None or item.quantity <= 0:
         return _stop(
