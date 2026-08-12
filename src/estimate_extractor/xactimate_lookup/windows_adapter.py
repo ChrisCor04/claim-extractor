@@ -537,8 +537,10 @@ class PendingQuantityTarget:
     """Logical identity retained from the proven activation delta.
 
     ``after_index`` and ``activity_ordinal`` are corroborating position
-    evidence from the same after-snapshot; every later use still
-    re-reads and verifies the row identity before clicking or reading.
+    evidence from the same after-snapshot. Identity is re-read and
+    verified immediately before quantity entry; after that binding is
+    established, confirmation stays on the exact edited row/cell while
+    separately proving the grid geometry did not materially change.
     """
 
     identity: tuple[str, str, str]
@@ -2893,9 +2895,42 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 self._reset_scroll_state()
             return
 
+        # Identity is load-bearing only BEFORE the write. Bind the exact
+        # identity-verified row to its current grid index and quantity-cell
+        # geometry now; confirmation below must read this same structural
+        # row, never reconstruct identity from repaint-sensitive CAT/SEL/
+        # description/activity OCR and never substitute the last row.
+        geometry_before = self._last_row_geometry(image, offset)
+        if geometry_before is None:
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the identity-verified target disappeared before its quantity cell could be edited."
+            )
+        row_count_before, _last_row_top = geometry_before
+        row_1_top_before = self._shifted_anchor("grid_row_1", offset)[1]
+        row_delta = row_top - row_1_top_before
+        if row_delta < 0 or row_delta % _GRID_ROW_HEIGHT != 0:
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the identity-verified target does not align to a stable grid row; refusing to edit."
+            )
+        row_index = row_delta // _GRID_ROW_HEIGHT
+        if row_index >= row_count_before:
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the identity-verified target is outside the current grid row count; refusing to edit."
+            )
+
         col_l, col_r = _GRID_COLUMNS["quantity"]
         qx = (col_l + col_r) // 2 + offset[0]
         qy = row_top + _GRID_ROW_HEIGHT // 2
+        image_width = getattr(image, "width", None)
+        image_height = getattr(image, "height", None)
+        if (
+            qx < 0 or qy < 0
+            or (image_width is not None and qx >= image_width)
+            or (image_height is not None and qy >= image_height)
+        ):
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the identity-verified quantity cell is outside the captured grid viewport."
+            )
         self._click_client(hwnd, qx, qy)
         time.sleep(0.2)
         self._select_all_and_delete()
@@ -2904,19 +2939,69 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._press_key(0x09)  # Tab commits the cell edit; never Enter.
         time.sleep(1.0)
 
-        # Re-capture geometry and re-resolve the SAME logical
-        # identity/activity occurrence.  Never read the last/bottom row
-        # as a proxy for the row just edited.
-        _image, _offset, _row_top, _ordinal, observed, confirm_scrolled = self._locate_pending_quantity_row(
-            hwnd, confirmation_ordinal=ordinal,
-        )
-        scrolled = scrolled or confirm_scrolled
-        if observed is None or abs(observed - quantity) > 0.01:
+        # Confirm from the SAME row/cell context. CAT/SEL/description/
+        # activity OCR is deliberately not repeated here: it already
+        # established the binding above, while Tab repaint is proven noisy.
+        # Structural drift is checked independently before every read.
+        observed = None
+        for confirmation_attempt in range(3):
+            after, after_offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+            if after_offset is None or self._items_search_pane_field(after) is None:
+                raise QuantityNotConfirmedError(
+                    "enter_quantity(): focus/navigation left the expected Items/Search grid during quantity editing."
+                )
+            if self._find_dropdown_window() is not None or self._unexpected_dialog_present():
+                raise QuantityNotConfirmedError(
+                    "enter_quantity(): a dialog or dropdown appeared during quantity editing."
+                )
+            if after_offset != offset:
+                raise QuantityNotConfirmedError(
+                    "enter_quantity(): the grid anchor materially changed during quantity editing."
+                )
+
+            geometry_after = self._last_row_geometry(after, after_offset)
+            if geometry_after is None:
+                raise QuantityNotConfirmedError(
+                    "enter_quantity(): the edited target row disappeared during quantity editing."
+                )
+            row_count_after, _last_after_top = geometry_after
+            if row_count_after != row_count_before:
+                raise QuantityNotConfirmedError(
+                    "enter_quantity(): the grid row count changed unexpectedly during quantity editing "
+                    f"({row_count_before} -> {row_count_after})."
+                )
+
+            row_1_top_after = self._shifted_anchor("grid_row_1", after_offset)[1]
+            edited_row_top = row_1_top_after + row_index * _GRID_ROW_HEIGHT
+            if (
+                row_index >= row_count_after
+                or edited_row_top < 0
+                or edited_row_top + _GRID_ROW_HEIGHT > after.height
+            ):
+                raise QuantityNotConfirmedError(
+                    "enter_quantity(): the edited target row disappeared from the expected grid geometry."
+                )
+
+            observed = self._read_quantity_at(after, after_offset, edited_row_top)
+            if observed is None:
+                observed = self._read_quantity_at(
+                    after, after_offset, edited_row_top, min_votes=1, enhance_contrast=True,
+                )
+            if observed is not None and abs(observed - quantity) <= 0.01:
+                break
+            if observed is not None and abs(observed) > 0.01:
+                raise QuantityNotConfirmedError(
+                    f"enter_quantity({quantity:g}): same-cell read-back was {observed:g}; "
+                    "refusing to commit a different non-zero quantity."
+                )
+            if confirmation_attempt < 2:
+                time.sleep(0.25)
+        else:
             target = self._pending_quantity_target
             raise QuantityNotConfirmedError(
-                f"enter_quantity({quantity:g}): read back {observed!r} from retained target "
-                f"identity={target.identity if target else None}, activity={target.activity if target else None}, "
-                f"occurrence={ordinal}; refusing to commit an unconfirmed quantity."
+                f"enter_quantity({quantity:g}): same-cell read-back never confirmed the expected value "
+                f"(last read={observed!r}, retained identity={target.identity if target else None}, "
+                f"activity={target.activity if target else None}, occurrence={ordinal})."
             )
 
         if scrolled:

@@ -4571,8 +4571,9 @@ class _FakeImage:
     only ever reads `.height` off it (via _row_is_visible()) and passes
     it opaquely to mocked crop/read methods."""
 
-    def __init__(self, height=1023):
+    def __init__(self, height=1023, width=1920):
         self.height = height
+        self.width = width
 
 
 def _mock_enter_quantity(
@@ -4601,6 +4602,12 @@ def _mock_enter_quantity(
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=1, delay_s=0: (_FakeImage(image_height), (0, 0)))
     monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (state["row_count"], state["row_top"]))
+    monkeypatch.setattr(
+        adapter, "_shifted_anchor",
+        lambda name, offset: (0, state["row_top"] - adapter._pending_quantity_target.after_index * _GRID_ROW_HEIGHT, 0, 0),
+    )
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: (10, 10, 20, 20))
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: None)
     monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
     monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: None)
     monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
@@ -4628,6 +4635,13 @@ def _mock_enter_quantity(
         return [(target.after_index, state["row_top"], observed)]
 
     monkeypatch.setattr(adapter, "_quantity_target_candidates", fake_candidates)
+    monkeypatch.setattr(
+        adapter, "_read_quantity_at",
+        lambda image, offset, row_top, **kwargs: (
+            typed.get("value", 0.0) + confirmed_qty_offset
+            if state["tabbed"] else existing_qty_at_target
+        ),
+    )
     return state, calls
 
 
@@ -4853,7 +4867,10 @@ def test_enter_quantity_resets_scroll_state_after_scrolling(monkeypatch):
     assert calls["reset_scroll"] == 1
 
 
-def _wire_identity_quantity_flow(monkeypatch, adapter, rows, quantities_before, expected):
+def _wire_identity_quantity_flow(
+    monkeypatch, adapter, rows, quantities_before, expected, *,
+    rows_after=None, confirmed_quantity=..., row_count_after=None, target_disappears=False,
+):
     """Exercise the real identity resolver with synthetic grid rows."""
     image = _FakeImage(height=600)
     row_1_top = 100
@@ -4862,19 +4879,28 @@ def _wire_identity_quantity_flow(monkeypatch, adapter, rows, quantities_before, 
     clicks = []
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: (image, (0, 0)))
-    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (len(rows), row_1_top + (len(rows) - 1) * 25))
+    def geometry(image, offset):
+        if state["typed"] and target_disappears:
+            return None
+        count = row_count_after if state["typed"] and row_count_after is not None else len(rows)
+        return (count, row_1_top + (count - 1) * 25) if count else None
+
+    monkeypatch.setattr(adapter, "_last_row_geometry", geometry)
     monkeypatch.setattr(adapter, "_shifted_anchor", lambda name, offset: (0, row_1_top, 0, 0))
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: (10, 10, 20, 20))
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: None)
     monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
 
     def read_row(image, offset, row_top):
         index = (row_top - row_1_top) // 25
-        return rows[index] if 0 <= index < len(rows) else ActivationRowSnapshot(None, None, None, None)
+        active_rows = rows_after if state["typed"] and rows_after is not None else rows
+        return active_rows[index] if 0 <= index < len(active_rows) else ActivationRowSnapshot(None, None, None, None)
 
     def read_quantity(image, offset, row_top, **kwargs):
         index = (row_top - row_1_top) // 25
         reads.append(index)
         if state["typed"] and index == state.get("clicked_index"):
-            return expected
+            return expected if confirmed_quantity is ... else confirmed_quantity
         return quantities_before[index]
 
     monkeypatch.setattr(adapter, "_read_activation_row_at", read_row)
@@ -4888,6 +4914,107 @@ def _wire_identity_quantity_flow(monkeypatch, adapter, rows, quantities_before, 
     monkeypatch.setattr(adapter, "_scroll_grid_body", lambda *args, **kwargs: None)
     monkeypatch.setattr(time, "sleep", lambda *_: None)
     return state, reads, clicks
+
+
+def test_same_cell_quantity_confirmation_ignores_noisy_post_edit_cat_ocr(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None)]
+    after = [ActivationRowSnapshot("zs", "GUTA", "Aluminum gutter", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "guta", "aluminum gutter"), None, 0, 1)
+    state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, before, [0.0], 200.0, rows_after=after,
+    )
+
+    adapter.enter_quantity(200.0)
+
+    assert state["clicked_index"] == 0
+    assert reads == [0, 0]
+
+
+def test_same_cell_quantity_confirmation_ignores_noisy_post_edit_description(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None)]
+    after = [ActivationRowSnapshot("SFG", "GUTA", "unreadable repaint noise", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "guta", "aluminum gutter"), None, 0, 1)
+    _wire_identity_quantity_flow(monkeypatch, adapter, before, [0.0], 200.0, rows_after=after)
+
+    adapter.enter_quantity(200.0)
+
+
+def test_same_cell_quantity_confirmation_rejects_different_nonzero_readback(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
+    _wire_identity_quantity_flow(
+        monkeypatch, adapter, rows, [0.0], 1.0, confirmed_quantity=7.0,
+    )
+
+    with pytest.raises(QuantityNotConfirmedError, match="different non-zero quantity"):
+        adapter.enter_quantity(1.0)
+
+
+def test_same_cell_quantity_confirmation_rejects_row_count_change(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
+    _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 1.0, row_count_after=2)
+
+    with pytest.raises(QuantityNotConfirmedError, match="row count changed unexpectedly"):
+        adapter.enter_quantity(1.0)
+
+
+def test_same_cell_quantity_confirmation_rejects_disappeared_target(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
+    _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 1.0, target_disappears=True)
+
+    with pytest.raises(QuantityNotConfirmedError, match="target row disappeared"):
+        adapter.enter_quantity(1.0)
+
+
+def test_previous_unrelated_quantity_cannot_satisfy_same_cell_confirmation(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None),
+        ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None),
+    ]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 1, 1)
+    _state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, rows, [1.0, 0.0], 1.0, confirmed_quantity=0.0,
+    )
+
+    with pytest.raises(QuantityNotConfirmedError, match="never confirmed"):
+        adapter.enter_quantity(1.0)
+    assert set(reads) == {1}
+
+
+def test_prepopulated_exact_quantity_remains_write_free_with_same_cell_model(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
+    state, reads, clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [1.0], 1.0)
+
+    adapter.enter_quantity(1.0)
+
+    assert state["typed"] is False
+    assert reads == [0]
+    assert clicks == []
+
+
+def test_rr_plus_row_uses_prebound_same_cell_after_noisy_repaint(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [_activation_row(activity="-"), _activation_row(activity="+")]
+    after = [_activation_row(activity="-"), ActivationRowSnapshot("??", "STEEP", "noise", "o")]
+    adapter._pending_quantity_target = PendingQuantityTarget(("rfg", "steep", "steep charge"), "+", 1, 1)
+    state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, before, [0.0, 0.0], 33.66, rows_after=after,
+    )
+
+    adapter.enter_quantity(33.66)
+
+    assert state["clicked_index"] == 1
+    assert set(reads) == {1}
 
 
 def test_quantity_identity_prior_200_new_gsg_reads_one_never_prior_row(monkeypatch):
