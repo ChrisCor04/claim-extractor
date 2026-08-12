@@ -53,6 +53,24 @@ class PhysicalStateUncertainError(AdapterError):
     """
 
 
+class TaskLocalRowReconciliationError(AdapterError):
+    """Raised after candidate activation when the resulting row-count/R&R
+    multiset delta doesn't match a recognized pattern for THIS task's own
+    commit, but nothing about the activation implicates the group's
+    navigation state or the application/project itself -- e.g. an extra,
+    unexplained row appeared alongside the intended one and the adapter
+    can't safely guess which is which.
+
+    Deliberately NOT a ``PhysicalStateUncertainError``: that type is a
+    project-level hard stop (later tasks must not run against an
+    unexplained grid), which is too broad a blast radius for uncertainty
+    that is local to one row's own reconciliation. The execution runner
+    marks only the current task REVIEW_REQUIRED and continues with the
+    next task in the same group -- see execution_runner.py's stop-
+    severity hierarchy (TASK_LOCAL_REVIEW / GROUP_REVIEW_REQUIRED /
+    PROJECT_LEVEL_HARD_STOP)."""
+
+
 class UnexpectedDialogError(AdapterError):
     """Raised when the adapter detects a dialog/prompt it did not expect
     (a license warning, an unsaved-changes prompt, a crash reporter,

@@ -66,6 +66,7 @@ from estimate_extractor.xactimate_lookup.adapter import (
     PhysicalStateUncertainError,
     ProtectedCommittedRowError,
     QuantityConfirmationError,
+    TaskLocalRowReconciliationError,
     UnexpectedDialogError,
     XactimateAdapter,
 )
@@ -3364,7 +3365,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 if target is not None and target.allow_initial_quantity_overwrite:
                     self._pending_quantity_target = target
                     return True
-                raise PhysicalStateUncertainError(
+                # Task-local, not project-level: exactly one new row landed
+                # from this task's own activation, but it doesn't match a
+                # recognized single-row/R&R-+ shape -- reconciliation
+                # ambiguity confined to this one commit, not evidence the
+                # grid/group/app is unsafe for later tasks. See
+                # TaskLocalRowReconciliationError's docstring.
+                raise TaskLocalRowReconciliationError(
                     "Candidate activation added one physical row, but the logical multiset delta was not "
                     "one safe ordinary row or quantity-bearing R&R + row."
                 )
@@ -3373,7 +3380,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 if target is not None and self._is_one_logical_rr_multiset_delta(baseline_rows, rows):
                     self._pending_quantity_target = target
                     return True
-                raise PhysicalStateUncertainError(
+                # Task-local, not project-level: this task's own activation
+                # added two rows but they don't reconcile as one corroborated
+                # R&R -/+ pair -- ambiguity about which new row is THIS
+                # task's item, not evidence anything outside this task is
+                # unsafe. See TaskLocalRowReconciliationError's docstring.
+                raise TaskLocalRowReconciliationError(
                     "Candidate activation added two physical rows, but the logical multiset delta was not "
                     f"exactly one R&R -/+ item (before={expected}, after={len(rows)})."
                 )

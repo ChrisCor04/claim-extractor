@@ -18,6 +18,7 @@ from estimate_extractor.xactimate_lookup.adapter import (
     PhysicalStateUncertainError,
     ProtectedCommittedRowError,
     QuantityConfirmationError,
+    TaskLocalRowReconciliationError,
     UnexpectedDialogError,
 )
 from estimate_extractor.xactimate_lookup.execution_plan import (
@@ -68,6 +69,7 @@ from estimate_extractor.xactimate_lookup.models import (
     DropdownResult,
     STOP_REASON_EXTRACTION_FAILED,
     STOP_REASON_QUANTITY_CONFIRMATION_FAILED,
+    STOP_REASON_TASK_LOCAL_ROW_RECONCILIATION,
 )
 
 
@@ -239,6 +241,44 @@ def test_physical_state_uncertain_activation_stops_following_tasks(
     assert second.state == TASK_PENDING and second.attempts == 0
     assert third.state == TASK_PENDING and third.attempts == 0
     assert len([call for call in adapter.log.calls if call[0] == "select_candidate"]) == 1
+
+
+def test_task_local_row_reconciliation_marks_only_that_task_and_continues(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """Policy correction: a row-count/R&R multiset delta mismatch local
+    to one task's own candidate activation (e.g. 'added two physical
+    rows, but the logical multiset delta was not exactly one R&R -/+
+    item') must NOT hard-stop the whole run -- only that task is marked
+    REVIEW_REQUIRED, and the run continues with the next task in the
+    same group, then the next group. Contrast with the genuinely
+    project-level PhysicalStateUncertainError case immediately above,
+    which still (correctly) hard-stops everything."""
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    def reconciliation_uncertain(_before):
+        raise TaskLocalRowReconciliationError(
+            "Candidate activation added two physical rows, but the logical multiset delta was not "
+            "exactly one R&R -/+ item (before=2, after=4)."
+        )
+
+    adapter.pending_item_created = reconciliation_uncertain
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    first, second, third = result.tasks
+    assert first.state == TASK_REVIEW_REQUIRED
+    assert first.commit_state == "not_committed"
+    assert first.physical_state_uncertain is False
+    assert first.stop_reason == STOP_REASON_TASK_LOCAL_ROW_RECONCILIATION
+    # The whole point of the fix: sibling task in the SAME group, and the
+    # task in the NEXT group, were both still attempted -- neither is
+    # left untouched PENDING the way a project-level hard stop leaves them.
+    assert second.state == TASK_REVIEW_REQUIRED and second.attempts == 1
+    assert third.state == TASK_REVIEW_REQUIRED and third.attempts == 1
+    assert result.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP
+    assert len([call for call in adapter.log.calls if call[0] == "select_candidate"]) == 3
 
 
 def test_resumed_physical_unconfirmed_checkpoint_stops_before_any_task_or_later_group(

@@ -24,6 +24,7 @@ from estimate_extractor.xactimate_lookup.adapter import (
     PhysicalStateUncertainError,
     ProtectedCommittedRowError,
     QuantityConfirmationError,
+    TaskLocalRowReconciliationError,
     UnexpectedDialogError,
     XactimateAdapter,
 )
@@ -43,6 +44,7 @@ from estimate_extractor.xactimate_lookup.models import (
     STOP_REASON_NO_RESULTS,
     STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
     STOP_REASON_QUANTITY_CONFIRMATION_FAILED,
+    STOP_REASON_TASK_LOCAL_ROW_RECONCILIATION,
     STOP_REASON_UNEXPECTED_DIALOG,
     STOP_REASON_UNIT_MISMATCH,
     STOP_REASON_UNIT_QUANTITY_INVALID,
@@ -406,6 +408,20 @@ def execute_plan(
         outcome.physical_state_uncertain = True
         outcome.decision = DECISION_REVIEW_REQUIRED
         outcome.stop_reason = STOP_REASON_PHYSICAL_STATE_UNCERTAIN
+        outcome.stop_detail = str(exc)
+        return outcome
+    except TaskLocalRowReconciliationError as exc:
+        # Deliberately does NOT set outcome.physical_state_uncertain --
+        # this is row-count/R&R reconciliation uncertainty local to this
+        # task's own commit, not evidence the grid is unsafe for later
+        # tasks/groups. execution_runner.py's hard-stop gates all key off
+        # physical_state_uncertain, so leaving it False here is what lets
+        # the run mark only this task REVIEW_REQUIRED and continue with
+        # the next task in the same group (see TaskLocalRowReconciliation
+        # Error's docstring / the stop-severity hierarchy).
+        adapter.recover()
+        outcome.decision = DECISION_REVIEW_REQUIRED
+        outcome.stop_reason = STOP_REASON_TASK_LOCAL_ROW_RECONCILIATION
         outcome.stop_detail = str(exc)
         return outcome
     except AdapterError as exc:

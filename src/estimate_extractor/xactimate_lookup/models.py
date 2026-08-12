@@ -44,6 +44,13 @@ STOP_REASON_UNIT_MISMATCH = "unit_mismatch"
 STOP_REASON_UNSUPPORTED_ADAPTER = "unsupported_adapter"
 STOP_REASON_UNEXPECTED_DIALOG = "unexpected_dialog"
 STOP_REASON_PHYSICAL_STATE_UNCERTAIN = "physical_state_uncertain"
+#: A row-count/R&R multiset delta mismatch local to the current task's
+#: own candidate activation -- distinct from STOP_REASON_PHYSICAL_STATE_
+#: UNCERTAIN, which is a project-level hard stop. This stop reason marks
+#: only the one task REVIEW_REQUIRED; the run continues with the next
+#: task in the same group (see execution_runner.py's stop-severity
+#: hierarchy).
+STOP_REASON_TASK_LOCAL_ROW_RECONCILIATION = "task_local_row_reconciliation"
 
 
 def utc_now_iso() -> str:
