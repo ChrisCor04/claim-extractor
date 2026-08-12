@@ -2752,14 +2752,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
         hwnd: int,
         *,
         confirmation_ordinal: int | None = None,
+        expected_quantity: float | None = None,
     ):
         """Locate the task's retained logical row, never the bottom row.
 
-        Before entry, an identical R&R duplicate is disambiguated by
-        requiring exactly one matching ``+`` row to remain blank/zero.
-        After entry, the same identity/activity occurrence is re-read
-        at freshly captured geometry.  Every coordinate is therefore
-        current and identity-verified before use.
+        Before entry, an identical R&R duplicate is normally
+        disambiguated by requiring exactly one matching ``+`` row to
+        remain blank/zero. If the retained activity occurrence already
+        holds the expected quantity, that occurrence is accepted
+        without a write. After entry, the same identity/activity
+        occurrence is re-read at freshly captured geometry. Every
+        coordinate is therefore current and identity-verified before
+        use.
         """
         target = self._pending_quantity_target
         if target is None:
@@ -2790,9 +2794,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     _index, row_top, observed = matches[0]
                     if observed is None or abs(observed) <= 0.01:
                         return image, offset, row_top, 1, observed, scrolled
+                    if expected_quantity is not None and abs(observed - expected_quantity) <= 0.01:
+                        return image, offset, row_top, 1, observed, scrolled
                     raise QuantityNotConfirmedError(
-                        "enter_quantity(): the only identity-matched pending target already has a non-zero quantity; "
-                        "refusing to overwrite it."
+                        "enter_quantity(): the only identity-matched pending target already has a different non-zero "
+                        f"quantity ({observed:g}, expected {expected_quantity!r}); refusing to overwrite it."
                     )
                 elif len(matches) > 1:
                     blank = [entry for entry in matches if entry[2] is None or abs(entry[2]) <= 0.01]
@@ -2800,6 +2806,23 @@ class WindowsXactimateAdapter(XactimateAdapter):
                         chosen = blank[0]
                         ordinal = matches.index(chosen) + 1
                         return image, offset, chosen[1], ordinal, chosen[2], scrolled
+                    if target.activity in ("-", "+") and 1 <= target.activity_ordinal <= len(matches):
+                        chosen = matches[target.activity_ordinal - 1]
+                        observed = chosen[2]
+                        if (
+                            expected_quantity is not None
+                            and observed is not None
+                            and abs(observed - expected_quantity) <= 0.01
+                        ):
+                            return (
+                                image, offset, chosen[1], target.activity_ordinal, observed, scrolled,
+                            )
+                        if observed is not None and abs(observed) > 0.01:
+                            raise QuantityNotConfirmedError(
+                                "enter_quantity(): the retained R&R activity occurrence already has a different "
+                                f"non-zero quantity ({observed:g}, expected {expected_quantity!r}); refusing to "
+                                "overwrite it."
+                            )
                     raise QuantityNotConfirmedError(
                         "enter_quantity(): identical target rows could not be uniquely resolved to one blank pending row."
                     )
@@ -2820,7 +2843,21 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def enter_quantity(self, quantity: float) -> None:
         hwnd = self._ensure_main_window()
-        image, offset, row_top, ordinal, _before_quantity, scrolled = self._locate_pending_quantity_row(hwnd)
+        image, offset, row_top, ordinal, before_quantity, scrolled = self._locate_pending_quantity_row(
+            hwnd, expected_quantity=quantity,
+        )
+
+        # Some Xactimate items instantiate with a real default quantity
+        # (live: SFG/GSG appears as 1 EA). Identity has already been
+        # established by the retained CAT/SEL + normalized-description
+        # target (and activity occurrence for R&R) before this value is
+        # considered. An exact quantity match therefore needs no edit;
+        # avoiding the write also avoids disturbing an already-correct
+        # cell. A different non-zero value was rejected above.
+        if before_quantity is not None and abs(before_quantity - quantity) <= 0.01:
+            if scrolled:
+                self._reset_scroll_state()
+            return
 
         col_l, col_r = _GRID_COLUMNS["quantity"]
         qx = (col_l + col_r) // 2 + offset[0]

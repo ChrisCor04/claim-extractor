@@ -4397,8 +4397,108 @@ def test_enter_quantity_refuses_to_overwrite_identity_matched_populated_row(monk
         monkeypatch, adapter, row_count=16, row_top=600, image_height=1023,
         existing_qty_at_target=9.0,  # the computed row is already populated
     )
-    with pytest.raises(QuantityNotConfirmedError, match="already has a non-zero quantity"):
+    with pytest.raises(QuantityNotConfirmedError, match="different non-zero quantity"):
         adapter.enter_quantity(1.0)
+
+
+@pytest.mark.parametrize("existing", [None, 0.0])
+def test_enter_quantity_writes_blank_or_zero_retained_target(monkeypatch, existing):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=600,
+        existing_qty_at_target=existing,
+    )
+
+    adapter.enter_quantity(1.0)
+
+    assert state["tabbed"] is True
+
+
+def test_enter_quantity_accepts_equal_existing_quantity_without_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=600,
+        existing_qty_at_target=1.0,
+    )
+
+    adapter.enter_quantity(1.0)
+
+    assert state["tabbed"] is False
+
+
+def test_enter_quantity_does_not_accept_expected_quantity_on_unrelated_row(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None),
+        ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None),
+    ]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 1, 1)
+    state, reads, _clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [1.0, 0.0], 1.0)
+
+    adapter.enter_quantity(1.0)
+
+    assert state["clicked_index"] == 1
+    assert set(reads) == {1}
+
+
+def test_existing_guta_200_and_retained_gsg_1_accepts_gsg_without_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None),
+        ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None),
+    ]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 1, 1)
+    state, reads, clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [200.0, 1.0], 1.0)
+
+    adapter.enter_quantity(1.0)
+
+    assert state["typed"] is False
+    assert set(reads) == {1}
+    assert clicks == []
+
+
+def test_rr_plus_row_with_expected_quantity_is_accepted_without_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_activation_row(activity="-"), _activation_row(activity="+")]
+    adapter._pending_quantity_target = PendingQuantityTarget(("rfg", "steep", "steep charge"), "+", 1, 1)
+    state, reads, clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0, 33.66], 33.66)
+
+    adapter.enter_quantity(33.66)
+
+    assert state["typed"] is False
+    assert set(reads) == {1}
+    assert clicks == []
+
+
+def test_retained_rr_plus_occurrence_with_expected_quantity_is_accepted_without_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        _activation_row(activity="-"), _activation_row(activity="-"),
+        _activation_row(activity="+"), _activation_row(activity="+"),
+    ]
+    adapter._pending_quantity_target = PendingQuantityTarget(("rfg", "steep", "steep charge"), "+", 3, 2)
+    state, reads, clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0, 33.66, 35.67], 35.67,
+    )
+
+    adapter.enter_quantity(35.67)
+
+    assert state["typed"] is False
+    assert set(reads) == {2, 3}
+    assert clicks == []
+
+
+def test_mismatching_nonzero_retained_target_still_fails_before_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=600,
+        existing_qty_at_target=2.0,
+    )
+
+    with pytest.raises(QuantityNotConfirmedError, match="different non-zero quantity"):
+        adapter.enter_quantity(1.0)
+
+    assert state["tabbed"] is False
 
 
 def test_enter_quantity_resets_scroll_state_after_scrolling(monkeypatch):
