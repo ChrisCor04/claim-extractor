@@ -61,7 +61,7 @@ class _PendingAwareAdapter(FakeXactimateAdapter):
         return self.duplicate_allowed
 
 
-def test_description_duplicate_without_pending_item_uses_exact_cat_sel_only_for_instantiation(
+def test_description_selection_zero_delta_stops_after_one_click(
     tmp_path, phrase_rules, ranking_config,
 ):
     item = _item()
@@ -76,18 +76,17 @@ def test_description_duplicate_without_pending_item_uses_exact_cat_sel_only_for_
 
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
 
-    assert outcome.committed is True
-    assert outcome.selected.dropdown.category == "RFG"
-    assert outcome.selected.dropdown.selector == "ARMVN"
+    assert outcome.committed is False
+    assert outcome.physical_state_uncertain is True
+    assert outcome.stop_reason == "physical_state_uncertain"
     names = [name for name, _args, _kwargs in adapter.log.calls]
     assert names.count("search_by_description") == 1
-    assert names.count("search_by_category_selector") == 1
-    assert names.count("select_candidate") == 2
-    assert names.index("search_by_description") < names.index("allows_intentional_duplicate")
-    assert names.index("allows_intentional_duplicate") < names.index("search_by_category_selector")
+    assert names.count("search_by_category_selector") == 0
+    assert names.count("select_candidate") == 1
+    assert "allows_intentional_duplicate" not in names
 
 
-def test_description_duplicate_fallback_wrong_cat_sel_fails_closed(tmp_path, phrase_rules, ranking_config):
+def test_description_zero_delta_never_searches_cat_sel_fallback(tmp_path, phrase_rules, ranking_config):
     item = _item()
     conn = registry.create_database(tmp_path / "reg.db")
     plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
@@ -100,7 +99,10 @@ def test_description_duplicate_fallback_wrong_cat_sel_fails_closed(tmp_path, phr
 
     assert outcome.committed is False
     assert outcome.physical_item_created is False
-    assert "no exact match" in outcome.stop_detail
+    assert outcome.physical_state_uncertain is True
+    assert "zero new physical rows" in outcome.stop_detail
+    assert len([name for name, _args, _kwargs in adapter.log.calls if name == "select_candidate"]) == 1
+    assert not any(name == "search_by_category_selector" for name, _args, _kwargs in adapter.log.calls)
     assert not any(name == "enter_quantity" for name, _args, _kwargs in adapter.log.calls)
 
 

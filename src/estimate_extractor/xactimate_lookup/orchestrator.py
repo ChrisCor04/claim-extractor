@@ -214,55 +214,15 @@ def _activate_description_selected_candidate(
     candidate,
     before_snapshot,
 ) -> bool:
-    """Activate the description-ranked candidate and prove a pending
-    row exists.  Some Xactimate builds silently ignore a duplicate item
-    clicked from description results, while exact CAT/SEL search opens
-    the intentional-duplicate flow.  Description remains the sole
-    decision/ranking path; CAT/SEL is used only to instantiate that
-    already-chosen identity, and only after the first activation was
-    positively observed to create nothing.
-
-    Adapters without the two narrow hooks retain their prior behavior.
-    The Windows adapter implements both and fails closed unless its
-    existing distinct-task duplicate ledger authorizes the fallback.
-    """
+    """Click the selected result exactly once and prove its physical delta."""
     adapter.select_candidate(candidate)
     if not hasattr(adapter, "pending_item_created"):
         return True
-    if adapter.pending_item_created(before_snapshot):
-        return True
-
-    allowed = (
-        plan.path == LOOKUP_PATH_DESCRIPTION_SEARCH
-        and hasattr(adapter, "allows_intentional_duplicate")
-        and adapter.allows_intentional_duplicate(candidate)
-    )
-    if not allowed:
-        return False
-
-    _record_lifecycle(
-        adapter, "DESCRIPTION_SELECTION_CREATED_NO_PENDING_ITEM",
-        category=candidate.category, selector=candidate.selector,
-    )
-    adapter.focus_search()
-    adapter.clear_search()
-    adapter.search_by_category_selector(candidate.category, candidate.selector)
-    raw = adapter.capture_dropdown()
-    exact_results = [
-        result for result in adapter.parse_dropdown(raw)
-        if (result.category, result.selector) == (candidate.category, candidate.selector)
-    ]
-    if not exact_results:
-        raise AdapterError(
-            "CAT/SEL instantiation fallback returned no exact match for the "
-            f"description-selected candidate {candidate.category}/{candidate.selector}."
+    if not adapter.pending_item_created(before_snapshot):
+        raise PhysicalStateUncertainError(
+            "Selected candidate created zero new physical rows; one-click activation failed closed."
         )
-    adapter.select_candidate(exact_results[0])
-    _record_lifecycle(
-        adapter, "CAT_SEL_INSTANTIATION_FALLBACK_SELECTED",
-        category=candidate.category, selector=candidate.selector,
-    )
-    return bool(adapter.pending_item_created(before_snapshot))
+    return True
 
 
 def _stop_existing(outcome: LookupOutcome, reason: str, detail: str) -> LookupOutcome:

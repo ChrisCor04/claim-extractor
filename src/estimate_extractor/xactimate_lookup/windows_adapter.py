@@ -557,6 +557,9 @@ class PendingQuantityTarget:
     #: that narrow case Xactimate's nonzero default is editable source data,
     #: not identity evidence. R&R targets never set this flag.
     allow_initial_quantity_overwrite: bool = False
+    #: Rich pre-click snapshot retained for causal ordinary-row binding.
+    #: Empty for legacy/R&R targets, which keep their established logic.
+    activation_baseline_rows: tuple[ActivationRowSnapshot, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -2744,6 +2747,32 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return []
         row_count, _last_row_top = geom
         row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        if target.allow_initial_quantity_overwrite:
+            rows = [
+                self._read_activation_row_at(image, offset, row_1_top + index * _GRID_ROW_HEIGHT)
+                for index in range(row_count)
+            ]
+            for _probe in range(2):
+                row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
+                if row_top < 0 or row_top + _GRID_ROW_HEIGHT > image.height:
+                    break
+                trailing = self._read_activation_row_at(image, offset, row_top)
+                if not all(str(value or "").strip() for value in (trailing.category, trailing.selector)):
+                    break
+                rows.append(trailing)
+            target_index = self._unique_clean_ordinary_delta_index(
+                list(target.activation_baseline_rows), rows,
+            )
+            if target_index is None:
+                return []
+            row_top = row_1_top + target_index * _GRID_ROW_HEIGHT
+            observed = self._read_quantity_at(image, offset, row_top)
+            if observed is None:
+                observed = self._read_quantity_at(
+                    image, offset, row_top, min_votes=1, enhance_contrast=True,
+                )
+            return [(target_index, row_top, observed)]
+
         matches = []
         # Retain the activation snapshot's two-row undercount guard.
         for index in range(row_count + 2):
@@ -3291,21 +3320,19 @@ class WindowsXactimateAdapter(XactimateAdapter):
             rows = self._snapshot_activation_rows()
             physical_delta = len(rows) - expected
             if physical_delta == 1:
-                target = self._ordinary_single_row_target_from_selected_candidate(baseline_rows, rows)
-                if target is not None and target.allow_initial_quantity_overwrite:
-                    self._pending_quantity_target = target
-                    return True
                 legacy_target = self._pending_quantity_target_from_delta(baseline_rows, rows)
                 if (
                     legacy_target is not None
                     and self._is_one_safe_single_row_delta(baseline_rows, rows)
                     and (self._last_selected is None or legacy_target.activity == "+")
                 ):
-                    # Compatibility for non-production unit fakes that do
-                    # not perform a selection, plus the separately-proven
-                    # one-row R&R representation. A real selected ordinary
-                    # candidate must pass the identity-first path above.
+                    # Preserve the separately-proven one-row R&R form and
+                    # compatibility for non-production fakes.
                     self._pending_quantity_target = legacy_target
+                    return True
+                target = self._ordinary_single_row_target_from_selected_candidate(baseline_rows, rows)
+                if target is not None and target.allow_initial_quantity_overwrite:
+                    self._pending_quantity_target = target
                     return True
                 raise PhysicalStateUncertainError(
                     "Candidate activation added one physical row, but the logical multiset delta was not "
@@ -3329,12 +3356,19 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 raise PhysicalStateUncertainError(
                     "Candidate activation removed physical rows; refusing to infer a pending item."
                 )
+            if physical_delta == 0 and not self._baseline_rows_accounted(baseline_rows, rows):
+                raise PhysicalStateUncertainError(
+                    "Candidate activation left the row count unchanged but a prior physical row disappeared or "
+                    "mutated beyond structural reconciliation."
+                )
             if self._unexpected_dialog_present():
                 raise PhysicalStateUncertainError(
                     "An unexpected dialog appeared while confirming pending-item creation."
                 )
             if time.time() - start >= timeout_s:
-                return False
+                raise PhysicalStateUncertainError(
+                    "Candidate selection created zero new physical rows within the activation window."
+                )
             time.sleep(0.25)
 
     @classmethod
@@ -3432,50 +3466,14 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         Quantity is neither accepted nor inspected by this method.
         """
-        from collections import Counter
-
         selected = self._last_selected
         if selected is None or len(after_rows) != len(before_rows) + 1:
             return None
-        expected_identity = (
-            self._normalized_pair_text(selected.category),
-            self._normalized_pair_text(selected.selector),
-            self._normalized_pair_text(selected.description),
-        )
-        if not all(expected_identity):
+        if not all((selected.category, selected.selector)):
             return None
 
-        plausible: list[int] = []
-        for index, row in enumerate(after_rows):
-            if self._activity_token(row) in ("-", "+"):
-                continue
-            code_match = check_category_selector_match(
-                selected.category, selected.selector, row.category, row.selector,
-            )
-            observed_identity = self._activation_identity(row)
-            if (
-                code_match.match_state in ("exact_match", "normalized_match")
-                and self._ordinary_activation_identity_matches(observed_identity, expected_identity)
-            ):
-                plausible.append(index)
-        if len(plausible) != 1:
-            return None
-
-        target_index = plausible[0]
-
-        def structural_key(row: ActivationRowSnapshot):
-            token = self._activity_token(row)
-            return (
-                self._normalized_pair_text(row.category),
-                self._normalized_pair_text(row.selector),
-                token if token in ("-", "+") else None,
-            )
-
-        before_structure = Counter(structural_key(row) for row in before_rows)
-        after_structure = Counter(
-            structural_key(row) for index, row in enumerate(after_rows) if index != target_index
-        )
-        if before_structure != after_structure:
+        target_index = self._unique_clean_ordinary_delta_index(before_rows, after_rows)
+        if target_index is None:
             return None
 
         return PendingQuantityTarget(
@@ -3485,7 +3483,107 @@ class WindowsXactimateAdapter(XactimateAdapter):
             activity_ordinal=1,
             physical_row_delta=1,
             allow_initial_quantity_overwrite=True,
+            activation_baseline_rows=tuple(before_rows),
         )
+
+    @classmethod
+    def _unique_clean_ordinary_delta_index(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> int | None:
+        """Return the sole post-click row not explainable by the baseline.
+
+        Search-result UIA identity and the single click establish intent.
+        OCR only proves continuity of the pre-existing physical rows; the
+        unmatched row's own OCR is never used as authoritative identity.
+        """
+        if len(after_rows) != len(before_rows) + 1:
+            return None
+        candidates = [
+            index for index in range(len(after_rows))
+            if cls._baseline_rows_accounted(
+                before_rows, [row for row_index, row in enumerate(after_rows) if row_index != index],
+            )
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    @classmethod
+    def _baseline_rows_accounted(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> bool:
+        if len(before_rows) != len(after_rows):
+            return False
+        edges = [
+            [index for index, after in enumerate(after_rows) if cls._activation_rows_correspond(before, after)]
+            for before in before_rows
+        ]
+        if any(not row_edges for row_edges in edges):
+            return False
+        matched_before: dict[int, int] = {}
+
+        def assign(before_index: int, seen: set[int]) -> bool:
+            for after_index in edges[before_index]:
+                if after_index in seen:
+                    continue
+                seen.add(after_index)
+                if after_index not in matched_before or assign(matched_before[after_index], seen):
+                    matched_before[after_index] = before_index
+                    return True
+            return False
+
+        return all(assign(index, set()) for index in sorted(range(len(edges)), key=lambda i: len(edges[i])))
+
+    @classmethod
+    def _activation_rows_correspond(
+        cls, before: ActivationRowSnapshot, after: ActivationRowSnapshot,
+    ) -> bool:
+        before_activity = cls._activity_token(before)
+        after_activity = cls._activity_token(after)
+        if before_activity in ("-", "+") and after_activity in ("-", "+") and before_activity != after_activity:
+            return False
+        category_close = cls._normalized_text_is_close(before.category, after.category, max_edits=1)
+        selector_close = cls._normalized_text_is_close(before.selector, after.selector, max_edits=1)
+        description_close = cls._normalized_text_is_close(
+            before.description, after.description, allow_long_prefix=True,
+        )
+        return description_close and (category_close or selector_close)
+
+    @classmethod
+    def _normalized_text_is_close(
+        cls, left: str | None, right: str | None, *, max_edits: int | None = None,
+        allow_long_prefix: bool = False,
+    ) -> bool:
+        left_text = cls._normalized_pair_text(left).replace(" ", "")
+        right_text = cls._normalized_pair_text(right).replace(" ", "")
+        if not left_text or not right_text:
+            return False
+        if left_text == right_text:
+            return True
+        shorter, longer = sorted((left_text, right_text), key=len)
+        if allow_long_prefix and len(shorter) >= 20 and longer.startswith(shorter):
+            return len(shorter) / len(longer) >= 0.65
+        budget = max_edits
+        if budget is None:
+            length = max(len(left_text), len(right_text))
+            budget = 1 if length <= 20 else 2 if length <= 50 else 3
+        if abs(len(left_text) - len(right_text)) > budget:
+            return False
+        previous = list(range(len(right_text) + 1))
+        for left_index, left_char in enumerate(left_text, start=1):
+            current = [left_index]
+            for right_index, right_char in enumerate(right_text, start=1):
+                current.append(min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1] + (left_char != right_char),
+                ))
+            if min(current) > budget:
+                return False
+            previous = current
+        return previous[-1] <= budget
 
     @classmethod
     def _ordinary_activation_identity_matches(
@@ -3511,24 +3609,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if not observed_description or not expected_description:
             return False
 
-        max_length = max(len(observed_description), len(expected_description))
-        max_edits = 1 if max_length <= 20 else 2 if max_length <= 50 else 3
-        if abs(len(observed_description) - len(expected_description)) > max_edits:
-            return False
-
-        previous = list(range(len(expected_description) + 1))
-        for observed_index, observed_char in enumerate(observed_description, start=1):
-            current = [observed_index]
-            for expected_index, expected_char in enumerate(expected_description, start=1):
-                current.append(min(
-                    current[-1] + 1,
-                    previous[expected_index] + 1,
-                    previous[expected_index - 1] + (observed_char != expected_char),
-                ))
-            if min(current) > max_edits:
-                return False
-            previous = current
-        return previous[-1] <= max_edits
+        return cls._normalized_text_is_close(observed_description, expected_description)
 
     @classmethod
     def _rows_by_activation_identity(

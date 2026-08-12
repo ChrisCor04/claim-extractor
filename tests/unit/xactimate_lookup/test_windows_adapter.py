@@ -2997,26 +2997,81 @@ def test_selected_ordinary_row_fails_closed_when_multiple_rows_are_plausible(mon
         adapter.pending_item_created([("RFG", "GCR300")], timeout_s=0)
 
 
-def test_selected_ordinary_row_fails_closed_for_wrong_cat_sel(monkeypatch):
+def test_selected_ordinary_row_binds_despite_noisy_post_click_cat_sel(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected = _selected_ordinary()
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
         ActivationRowSnapshot("RFG", "GCR301", "Gable cornice return laminated", None),
     ])
 
-    with pytest.raises(AdapterError, match="not one safe ordinary row"):
-        adapter.pending_item_created([], timeout_s=0)
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.after_index == 0
+    assert adapter._pending_quantity_target.allow_initial_quantity_overwrite is True
 
 
-def test_selected_ordinary_row_fails_closed_for_material_description_conflict(monkeypatch):
+def test_selected_ordinary_row_binds_when_unique_delta_description_is_only_corroborating(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected = _selected_ordinary()
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
         ActivationRowSnapshot("RFG", "GCR300", "Gable cornice return metal", None),
     ])
 
-    with pytest.raises(AdapterError, match="not one safe ordinary row"):
-        adapter.pending_item_created([], timeout_s=0)
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.after_index == 0
+
+
+def test_live_ridgcs_truncated_description_binds_from_unique_clean_delta(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [ActivationRowSnapshot("RFC", "GCR300", "Gable cornice return laminated", "7 &")]
+    after = [
+        ActivationRowSnapshot("RFG", "RIDGCS", "Hip Ridge cap Standard profile composit", ">> &"),
+        ActivationRowSnapshot("RFG", "GCR300", "Gable cornice return laminated", "7 &"),
+    ]
+    adapter._last_selected = _selected_ordinary(
+        cat="RFG", sel="RIDGCS",
+        desc="Hip / Ridge cap - Standard profile - composition shingles",
+    )
+    adapter._last_activation_baseline_rows = before
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    assert adapter.pending_item_created([("RFC", "GCR300")], timeout_s=0) is True
+    assert adapter._pending_quantity_target.after_index == 0
+    assert adapter._pending_quantity_target.activation_baseline_rows == tuple(before)
+
+
+def test_unique_ordinary_delta_unreadable_activity_is_non_authoritative(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected = _selected_ordinary()
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot(None, None, None, "???"),
+    ])
+
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.activity is None
+
+
+def test_zero_new_rows_is_physical_state_uncertain(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [ActivationRowSnapshot("SFG", "GUTA", "Gutter", None)]
+    adapter._last_selected = _selected_ordinary()
+    adapter._last_activation_baseline_rows = before
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: before)
+
+    with pytest.raises(AdapterError, match="zero new physical rows"):
+        adapter.pending_item_created([("SFG", "GUTA")], timeout_s=0)
+
+
+def test_prior_row_disappearance_is_physical_state_uncertain(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [ActivationRowSnapshot("SFG", "GUTA", "Gutter", None)]
+    adapter._last_selected = _selected_ordinary()
+    adapter._last_activation_baseline_rows = before
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot("SFG", "GSG", "Splash guard", None),
+    ])
+
+    with pytest.raises(AdapterError, match="prior physical row disappeared"):
+        adapter.pending_item_created([("SFG", "GUTA")], timeout_s=0)
 
 
 def test_selected_ordinary_row_fails_closed_for_unrelated_baseline_mutation(monkeypatch):
