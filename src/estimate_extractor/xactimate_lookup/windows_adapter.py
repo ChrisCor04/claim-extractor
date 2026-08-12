@@ -2752,12 +2752,34 @@ class WindowsXactimateAdapter(XactimateAdapter):
         spaces. This is not fuzzy matching and cannot turn a different
         character sequence into a match.
         """
-        return (
-            observed[0] == expected[0]
-            and observed[1] == expected[1]
-            and bool(observed[2])
-            and observed[2].replace(" ", "") == expected[2].replace(" ", "")
-        )
+        if observed[0] != expected[0] or observed[1] != expected[1]:
+            return False
+        observed_description = observed[2]
+        expected_description = expected[2]
+        if not observed_description or not expected_description:
+            return False
+        if observed_description.replace(" ", "") == expected_description.replace(" ", ""):
+            return True
+
+        # Live-caught on SFG/GUTA after quantity Tab: the description
+        # crop is deliberately wide enough for long item descriptions,
+        # and the selected-row repaint exposed the first two letters of
+        # the adjacent Coverage cell ("Dwelling") as a separate final
+        # OCR token: ``... up to 5`` became ``... up to 5 dy``. Initial
+        # targeting had already positively matched the retained row and
+        # written 200; confirmation then rejected that same CAT/SEL row
+        # and misleadingly exhausted the scroll budget. Tolerate only
+        # one trailing token of at most two characters, on either read,
+        # after the remaining normalized description is exact. This is
+        # not fuzzy matching and cannot erase a real mid-description or
+        # longer suffix difference.
+        observed_tokens = observed_description.split()
+        expected_tokens = expected_description.split()
+        if len(observed_tokens) == len(expected_tokens) + 1 and len(observed_tokens[-1]) <= 2:
+            return "".join(observed_tokens[:-1]) == "".join(expected_tokens)
+        if len(expected_tokens) == len(observed_tokens) + 1 and len(expected_tokens[-1]) <= 2:
+            return "".join(expected_tokens[:-1]) == "".join(observed_tokens)
+        return False
 
     def _locate_pending_quantity_row(
         self,

@@ -4731,6 +4731,50 @@ def test_quantity_confirmation_reidentifies_moved_single_row_after_ocr_repaint(m
     assert set(reads) == {0}
 
 
+def test_quantity_confirmation_accepts_two_letter_trailing_coverage_bleed(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        ActivationRowSnapshot(
+            "SFG", "GUTA", 'Gutter / downspout - aluminum - up to 5" Dy', "o",
+        ),
+    ]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("sfg", "guta", "gutter downspout aluminum up to 5"), None, 0, 1,
+    )
+    _state, reads, _clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [200.0], 200.0)
+
+    _image, _offset, row_top, ordinal, observed, _scrolled = adapter._locate_pending_quantity_row(
+        123, confirmation_ordinal=1,
+    )
+
+    assert row_top == 100
+    assert ordinal == 1
+    assert observed == 200.0
+    assert reads == [0]
+
+
+@pytest.mark.parametrize(
+    "observed_description",
+    [
+        "Gutter downspout steel up to 5",
+        "Gutter downspout aluminum up to 6",
+        "Gutter downspout aluminum up to 5 dwelling",
+    ],
+)
+def test_quantity_identity_rejects_genuine_description_difference(observed_description):
+    assert WindowsXactimateAdapter._quantity_identity_matches(
+        ("sfg", "guta", observed_description),
+        ("sfg", "guta", "gutter downspout aluminum up to 5"),
+    ) is False
+
+
+def test_quantity_identity_trailing_bleed_still_requires_exact_cat_sel():
+    assert WindowsXactimateAdapter._quantity_identity_matches(
+        ("sfg", "gsg", "gutter downspout aluminum up to 5 dy"),
+        ("sfg", "guta", "gutter downspout aluminum up to 5"),
+    ) is False
+
+
 def test_quantity_confirmation_fails_closed_for_ambiguous_ordinary_duplicates(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     rows = [
