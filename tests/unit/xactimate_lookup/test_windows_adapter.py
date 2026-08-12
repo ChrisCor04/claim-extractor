@@ -2865,7 +2865,7 @@ def _selected_ordinary(cat="RFG", sel="GCR300", desc="Gable cornice return - lam
 
 @pytest.mark.parametrize(
     "initial_quantity, expect_write",
-    [(None, True), (0.0, True), (4.0, False), (1.0, True)],
+    [(None, True), (0.0, True), (4.0, True), (1.0, True)],
 )
 def test_selected_unique_ordinary_row_binds_regardless_of_initial_quantity(
     monkeypatch, initial_quantity, expect_write,
@@ -2892,6 +2892,7 @@ def test_selected_unique_ordinary_row_binds_regardless_of_initial_quantity(
     assert adapter._pending_quantity_target.after_index == 2
     assert adapter._pending_quantity_target.activity is None
     assert adapter._pending_quantity_target.allow_initial_quantity_overwrite is True
+    assert adapter._pending_quantity_target.write_source_quantity_once is True
 
     state, reads, _clicks = _wire_identity_quantity_flow(
         monkeypatch, adapter, after, [0.0, 0.0, initial_quantity], 4.0,
@@ -4904,6 +4905,7 @@ def _mock_enter_quantity(
     existing_qty_at_target=0.0,
     scroll_effect=None,
     confirmed_qty_offset=0.0,
+    freshly_created=False,
 ):
     """Wires up every internal dependency enter_quantity() touches.
     `scroll_effect`, if given, is called each time _scroll_grid_body()
@@ -4919,6 +4921,7 @@ def _mock_enter_quantity(
         activity=None,
         after_index=max(row_count - 1, 0),
         activity_ordinal=1,
+        write_source_quantity_once=freshly_created,
     )
 
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
@@ -5103,6 +5106,23 @@ def test_enter_quantity_accepts_equal_existing_quantity_without_write(monkeypatc
     adapter.enter_quantity(1.0)
 
     assert state["tabbed"] is False
+
+
+@pytest.mark.parametrize("initial_ocr", [0.0, 1.0, 8.0])
+def test_freshly_bound_item_always_receives_source_quantity_once(monkeypatch, initial_ocr):
+    """Initial quantity OCR is never an admission gate after a clean
+    current-task activation delta has already bound the new row."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=600,
+        existing_qty_at_target=initial_ocr,
+        freshly_created=True,
+    )
+
+    adapter.enter_quantity(244.0)
+
+    assert state["tabbed"] is True
+    assert adapter.last_quantity_confirmation.expected == 244.0
 
 
 def test_enter_quantity_does_not_accept_expected_quantity_on_unrelated_row(monkeypatch):
@@ -5583,6 +5603,28 @@ def test_quantity_identity_targets_blank_plus_in_regrouped_duplicate_rr(monkeypa
     assert target is not None
     adapter._pending_quantity_target = target
     state, reads, _clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0, 0.0, 33.66, 0.0], 35.67)
+
+    adapter.enter_quantity(35.67)
+
+    assert state["clicked_index"] == 3
+    assert 2 in reads and 3 in reads
+
+
+def test_fresh_rr_delta_writes_only_retained_new_plus_despite_initial_ocr(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [_activation_row(activity="-"), _activation_row(activity="+")]
+    rows = [
+        _activation_row(activity="-"), _activation_row(activity="-"),
+        _activation_row(activity="+"), _activation_row(activity="+"),
+    ]
+    target = adapter._pending_quantity_target_from_delta(before, rows)
+    assert target is not None
+    assert target.activity_ordinal == 2
+    assert target.write_source_quantity_once is True
+    adapter._pending_quantity_target = target
+    state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0, 33.66, 8.0], 35.67,
+    )
 
     adapter.enter_quantity(35.67)
 

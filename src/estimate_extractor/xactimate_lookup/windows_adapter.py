@@ -555,8 +555,15 @@ class PendingQuantityTarget:
     #: True only for a uniquely selected ordinary row whose identity and
     #: activation delta were already proven independently of quantity. In
     #: that narrow case Xactimate's nonzero default is editable source data,
-    #: not identity evidence. R&R targets never set this flag.
+    #: not identity evidence. This flag controls causal ordinary-row
+    #: relocation only; R&R targets retain their activity/occurrence logic.
     allow_initial_quantity_overwrite: bool = False
+    #: True only for the fresh logical item created by the current candidate
+    #: click and positively bound through its activation delta. Once that
+    #: binding exists, the source quantity is written exactly once without
+    #: consulting repaint-sensitive initial quantity OCR. This does not apply
+    #: to arbitrary pre-existing/legacy targets.
+    write_source_quantity_once: bool = False
     #: Rich pre-click snapshot retained for causal ordinary-row binding.
     #: Empty for legacy/R&R targets, which keep their established logic.
     activation_baseline_rows: tuple[ActivationRowSnapshot, ...] = ()
@@ -2885,6 +2892,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
                         )
                 elif len(matches) == 1:
                     _index, row_top, observed = matches[0]
+                    if target.write_source_quantity_once:
+                        return image, offset, row_top, 1, observed, scrolled
                     if observed is None or abs(observed) <= 0.01:
                         return image, offset, row_top, 1, observed, scrolled
                     if expected_quantity is not None and abs(observed - expected_quantity) <= 0.01:
@@ -2896,6 +2905,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
                         f"quantity ({observed:g}, expected {expected_quantity!r}); refusing to overwrite it."
                     )
                 elif len(matches) > 1:
+                    if (
+                        target.write_source_quantity_once
+                        and target.activity in ("-", "+")
+                        and 1 <= target.activity_ordinal <= len(matches)
+                    ):
+                        chosen = matches[target.activity_ordinal - 1]
+                        return (
+                            image, offset, chosen[1], target.activity_ordinal, chosen[2], scrolled,
+                        )
                     blank = [entry for entry in matches if entry[2] is None or abs(entry[2]) <= 0.01]
                     if len(blank) == 1:
                         chosen = blank[0]
@@ -2945,16 +2963,28 @@ class WindowsXactimateAdapter(XactimateAdapter):
             hwnd, expected_quantity=quantity,
         )
 
+        # Pre-existing/legacy retained targets may already contain the exact
+        # requested quantity and can remain untouched. A freshly activated
+        # logical item is different: its identity and quantity-bearing row
+        # were already bound through the causal click delta, so write the
+        # source quantity exactly once without making initial quantity OCR
+        # load-bearing.
+        #
         # Some Xactimate items instantiate with a real default quantity
         # (live: SFG/GSG appears as 1 EA). Identity has already been
         # established by the retained CAT/SEL + normalized-description
         # target (and activity occurrence for R&R) before this value is
         # considered. An exact quantity match therefore needs no edit;
         # avoiding the write also avoids disturbing an already-correct
-        # cell. A different non-zero value is overwritten only for a
-        # uniquely activation-bound ordinary row; R&R and every legacy/
-        # ambiguous target retain the fail-closed rule above.
-        if before_quantity is not None and abs(before_quantity - quantity) <= 0.01:
+        # cell. A fresh, uniquely activation-bound ordinary or R&R target
+        # receives the source value; every legacy/pre-existing or ambiguous
+        # target retains the fail-closed rule above.
+        target = self._pending_quantity_target
+        if (
+            not (target and target.write_source_quantity_once)
+            and before_quantity is not None
+            and abs(before_quantity - quantity) <= 0.01
+        ):
             self.last_quantity_confirmation = QuantityEntryConfirmation(
                 expected=quantity, observed=before_quantity, confidence="CONFIRMED",
                 review_required=False, reason="Exact expected quantity was already populated; no write performed.",
@@ -3447,6 +3477,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             after_index=matching_indices[-1],
             activity_ordinal=len(matching_indices),
             physical_row_delta=2 if is_rr else 1,
+            write_source_quantity_once=True,
         )
 
     def _ordinary_single_row_target_from_selected_candidate(
@@ -3483,6 +3514,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             activity_ordinal=1,
             physical_row_delta=1,
             allow_initial_quantity_overwrite=True,
+            write_source_quantity_once=True,
             activation_baseline_rows=tuple(before_rows),
         )
 
