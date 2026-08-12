@@ -404,6 +404,7 @@ class _VerifyingFakeAdapter(FakeXactimateAdapter):
 class _FakeCommitVerification:
     def __init__(self, trust_state):
         self.trust_state = trust_state
+        self.reason = "post-commit verification passed"
 
 
 def test_verify_commit_called_on_live_commit_when_adapter_supports_it(tmp_path, phrase_rules, ranking_config):
@@ -428,6 +429,40 @@ def test_verify_commit_called_on_live_commit_when_adapter_supports_it(tmp_path, 
     assert source_unit == item.source_unit
     assert outcome.verification is verification
     assert outcome.to_dict()["verification_trust_state"] == "VERIFIED"
+
+
+def test_stable_postwrite_ocr_disagreement_commits_once_and_routes_to_review(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    verification = _FakeCommitVerification("VERIFIED")
+    adapter = _VerifyingFakeAdapter(dropdown_script={plan.search_input: [d]}, verification_result=verification)
+    adapter.supports_live_execution = True
+
+    class _Advisory:
+        review_required = True
+        reason = "Stable same-cell OCR read 66 instead of 33.66; write preserved."
+
+    original_enter_quantity = adapter.enter_quantity
+
+    def enter_quantity_once(quantity):
+        original_enter_quantity(quantity)
+        adapter.last_quantity_confirmation = _Advisory()
+
+    adapter.enter_quantity = enter_quantity_once
+
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.committed is True
+    assert outcome.physical_item_created is True
+    assert outcome.stop_reason is None
+    assert outcome.verification.trust_state == "QUANTITY_MISMATCH"
+    assert outcome.verification.reason == _Advisory.reason
+    names = [name for name, _args, _kwargs in adapter.log.calls]
+    assert names.count("enter_quantity") == 1
+    assert names.count("commit_item") == 1
 
 
 def test_verify_commit_not_called_on_dry_run(tmp_path, phrase_rules, ranking_config):

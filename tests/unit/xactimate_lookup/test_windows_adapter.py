@@ -1525,6 +1525,86 @@ def test_verify_commit_accepts_valid_rr_pair_after_unchanged_existing_rows(monke
     assert result.row_index == 2
 
 
+def test_verify_commit_uses_retained_rr_pair_when_postcommit_cat_sel_ocr_repaints(monkeypatch):
+    """Live 0004: the exact UIA-selected 300S pair stayed physically
+    correct, while later grid OCR independently read RFG/RFC and 3008.
+    The activation-bound pair remains one logical item; ordinary rows do
+    not use this fallback.
+    """
+    baseline = [
+        CommitRowSnapshot("RFC", "ARMV>", "Tear off laminated shingles", None, 66.0, "SQ"),
+    ]
+    after_rows = [
+        CommitRowSnapshot("RFG", "ARMV>", "Tear off laminated shingles", "-", 66.0, "SQ"),
+        CommitRowSnapshot("RFG", "3008", "Laminated comp shingle without felt", None, 0.0, "SQ"),
+        CommitRowSnapshot("RFC", "3008", "Laminated comp shingle without felt", "+", 35.33, "SQ"),
+    ]
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[],
+        unit_reads=[("SQ", "SQ")],
+        quantity_reads=[35.33],
+        commit_row_sequence=[after_rows],
+        baseline_rows=baseline,
+    )
+    adapter._last_selected = DropdownResult(
+        raw_text="RFG 300S", row_position=0, category="RFG", selector="300S",
+    )
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("rfg", "3008", "laminated comp shingle without felt"), "+", 2, 1,
+        physical_row_delta=2,
+    )
+    monkeypatch.setattr(adapter, "_read_category_selector_for_verify_commit", lambda *_args: (None, None))
+
+    result = adapter.verify_commit(
+        [("RFC", "ARMV>")], "RFG", "300S", 35.33,
+        source_unit="SQ", expected_xactimate_unit="SQ",
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.row_index == 2
+    assert result.preexisting_rows_unchanged is True
+    assert result.samples[0]["retained_rr_activation_binding"] is True
+    assert result.samples[0]["logical_rr_pair"] is True
+
+
+def test_verify_commit_uses_retained_single_plus_when_existing_cat_ocr_repaints(monkeypatch):
+    """Live 0005 shape: a uniquely activated, quantity-bearing ``+``
+    row is a complete one-row R&R representation, even when unrelated
+    baseline CAT OCR changes between captures.
+    """
+    baseline = [CommitRowSnapshot("RFC", "ARMV>", "Tear off", "-", 66.0, "SQ")]
+    after_rows = [
+        CommitRowSnapshot("RFG", "ARMV>", "Tear off", "-", 66.0, "SQ"),
+        CommitRowSnapshot("RFG", "FELT15", "Roofing felt 15 lb", "+", 33.66, "SQ"),
+    ]
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[],
+        unit_reads=[("SQ", "SQ")],
+        quantity_reads=[33.66],
+        commit_row_sequence=[after_rows],
+        baseline_rows=baseline,
+    )
+    adapter._last_selected = DropdownResult(
+        raw_text="RFG FELT15", row_position=0, category="RFG", selector="FELT15",
+    )
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("rfg", "felt15", "roofing felt 15 lb"), "+", 1, 1,
+        physical_row_delta=1,
+    )
+    monkeypatch.setattr(adapter, "_read_category_selector_for_verify_commit", lambda *_args: (None, None))
+
+    result = adapter.verify_commit(
+        [("RFC", "ARMV>")], "RFG", "FELT15", 33.66,
+        source_unit="SQ", expected_xactimate_unit="SQ",
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.row_index == 1
+    assert result.samples[0]["retained_rr_activation_binding"] is True
+
+
 def test_verify_commit_preexisting_rows_changed_is_conflicting_row(monkeypatch):
     """Regression test (Phase 4.8): even when the row count increases
     by exactly 1, if the pre-existing rows no longer match the
@@ -2763,6 +2843,17 @@ def test_pending_detector_counts_valid_remove_add_pair_as_one_logical_item(monke
     assert adapter.pending_item_created([], timeout_s=0) is True
     assert adapter._pending_quantity_target.activity == "+"
     assert adapter._pending_quantity_target.after_index == 1
+    assert adapter._pending_quantity_target.physical_row_delta == 2
+
+
+def test_pending_detector_accepts_one_quantity_bearing_plus_row_as_rr_item(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row(activity="+")])
+
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.activity == "+"
+    assert adapter._pending_quantity_target.after_index == 0
+    assert adapter._pending_quantity_target.physical_row_delta == 1
 
 
 def test_pending_detector_accepts_new_pair_after_existing_rows(monkeypatch):
@@ -2815,12 +2906,11 @@ def test_pending_detector_accepts_activity_grouped_duplicate_rr_delta(monkeypatc
     assert adapter._pending_quantity_target.activity_ordinal == 2
 
 
-@pytest.mark.parametrize("activity", ["-", "+"])
-def test_pending_detector_rejects_lone_rr_activity(monkeypatch, activity):
+def test_pending_detector_rejects_lone_quantityless_remove_activity(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row(activity=activity)])
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [_activation_row(activity="-")])
 
-    with pytest.raises(AdapterError, match="not one ordinary non-R&R row"):
+    with pytest.raises(AdapterError, match="not one safe ordinary row or quantity-bearing R&R \\+ row"):
         adapter.pending_item_created([], timeout_s=0)
 
 
@@ -4720,12 +4810,16 @@ def test_enter_quantity_confirms_quantity_before_returning(monkeypatch):
         monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
     )
     adapter.enter_quantity(33.66)  # must not raise -- read-back mock echoes the typed value
+    assert adapter.last_quantity_confirmation.confidence == "CONFIRMED"
 
 
-def test_enter_quantity_raises_when_confirmation_mismatches(monkeypatch):
-    """Item 6: a read-back that disagrees with the typed value must
-    hard-block -- this is the actual safety net that catches a
-    targeting failure enter_quantity()'s other checks might miss."""
+def test_enter_quantity_records_review_when_stable_confirmation_mismatches(monkeypatch):
+    """A stable same-cell OCR disagreement is advisory after the write.
+
+    Target identity and geometry were proven independently before entry;
+    this signal must neither rewrite nor classify the real row as an
+    unconfirmed physical creation.
+    """
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected_row_count_before = None
 
@@ -4733,8 +4827,11 @@ def test_enter_quantity_raises_when_confirmation_mismatches(monkeypatch):
         monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
         confirmed_qty_offset=-33.66,  # read-back always comes back as 0
     )
-    with pytest.raises(QuantityNotConfirmedError):
-        adapter.enter_quantity(33.66)
+    adapter.enter_quantity(33.66)
+
+    assert adapter.last_quantity_confirmation.confidence == "LOW_CONFIDENCE"
+    assert adapter.last_quantity_confirmation.review_required is True
+    assert adapter.last_quantity_confirmation.observed == 0.0
 
 
 def test_enter_quantity_refuses_to_overwrite_identity_matched_populated_row(monkeypatch):
@@ -4941,7 +5038,7 @@ def test_same_cell_quantity_confirmation_ignores_noisy_post_edit_description(mon
     adapter.enter_quantity(200.0)
 
 
-def test_same_cell_quantity_confirmation_rejects_different_nonzero_readback(monkeypatch):
+def test_stable_same_cell_quantity_ocr_disagreement_is_advisory(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
     adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
@@ -4949,8 +5046,58 @@ def test_same_cell_quantity_confirmation_rejects_different_nonzero_readback(monk
         monkeypatch, adapter, rows, [0.0], 1.0, confirmed_quantity=7.0,
     )
 
-    with pytest.raises(QuantityNotConfirmedError, match="different non-zero quantity"):
-        adapter.enter_quantity(1.0)
+    adapter.enter_quantity(1.0)
+
+    assert adapter.last_quantity_confirmation.confidence == "LOW_CONFIDENCE"
+    assert adapter.last_quantity_confirmation.review_required is True
+    assert adapter.last_quantity_confirmation.observed == 7.0
+
+
+def test_stable_same_cell_quantity_66_for_expected_33_66_is_advisory(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("RFG", "ARMV>", "Remove laminated shingle roofing", "-")]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("rfg", "armv", "remove laminated shingle roofing"), "-", 0, 1,
+    )
+    state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, rows, [0.0], 33.66, confirmed_quantity=66.0,
+    )
+
+    adapter.enter_quantity(33.66)
+
+    assert state["typed"] is True
+    assert reads == [0, 0]
+    assert adapter.last_quantity_confirmation.observed == 66.0
+    assert adapter.last_quantity_confirmation.review_required is True
+
+
+def test_blank_stable_same_cell_readback_is_advisory(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "guta", "aluminum gutter"), None, 0, 1)
+    _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 200.0, confirmed_quantity=None)
+
+    adapter.enter_quantity(200.0)
+
+    assert adapter.last_quantity_confirmation.observed is None
+    assert adapter.last_quantity_confirmation.review_required is True
+
+
+def test_malformed_stable_same_cell_readback_is_advisory_without_extra_ocr_pass(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "guta", "aluminum gutter"), None, 0, 1)
+    _state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, rows, [0.0], 200.0, confirmed_quantity=None,
+    )
+
+    adapter.enter_quantity(200.0)
+
+    # One pre-write quantity read and exactly one post-write read. A
+    # malformed OCR crop parses as None and does not trigger an enhanced
+    # pass, relocation, or rewrite.
+    assert reads == [0, 0]
+    assert adapter.last_quantity_confirmation.confidence == "LOW_CONFIDENCE"
 
 
 def test_same_cell_quantity_confirmation_rejects_row_count_change(monkeypatch):
@@ -4984,9 +5131,10 @@ def test_previous_unrelated_quantity_cannot_satisfy_same_cell_confirmation(monke
         monkeypatch, adapter, rows, [1.0, 0.0], 1.0, confirmed_quantity=0.0,
     )
 
-    with pytest.raises(QuantityNotConfirmedError, match="never confirmed"):
-        adapter.enter_quantity(1.0)
+    adapter.enter_quantity(1.0)
     assert set(reads) == {1}
+    assert adapter.last_quantity_confirmation.observed == 0.0
+    assert adapter.last_quantity_confirmation.review_required is True
 
 
 def test_prepopulated_exact_quantity_remains_write_free_with_same_cell_model(monkeypatch):
@@ -5000,6 +5148,43 @@ def test_prepopulated_exact_quantity_remains_write_free_with_same_cell_model(mon
     assert state["typed"] is False
     assert reads == [0]
     assert clicks == []
+    assert adapter.last_quantity_confirmation.confidence == "CONFIRMED"
+    assert adapter.last_quantity_confirmation.review_required is False
+
+
+def test_prewrite_different_nonzero_quantity_still_fails_closed_without_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
+    state, _reads, clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [7.0], 1.0)
+
+    with pytest.raises(QuantityNotConfirmedError, match="different non-zero"):
+        adapter.enter_quantity(1.0)
+
+    assert state["typed"] is False
+    assert clicks == []
+
+
+def test_dialog_after_quantity_write_remains_a_hard_stop(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
+    state, _reads, _clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 1.0)
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: state["typed"])
+
+    with pytest.raises(QuantityNotConfirmedError, match="dialog or dropdown"):
+        adapter.enter_quantity(1.0)
+
+
+def test_navigation_away_after_quantity_write_remains_a_hard_stop(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
+    state, _reads, _clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 1.0)
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None if state["typed"] else (1, 1, 1, 1))
+
+    with pytest.raises(QuantityNotConfirmedError, match="focus/navigation"):
+        adapter.enter_quantity(1.0)
 
 
 def test_rr_plus_row_uses_prebound_same_cell_after_noisy_repaint(monkeypatch):
@@ -5015,6 +5200,7 @@ def test_rr_plus_row_uses_prebound_same_cell_after_noisy_repaint(monkeypatch):
 
     assert state["clicked_index"] == 1
     assert set(reads) == {1}
+    assert adapter.last_quantity_confirmation.review_required is False
 
 
 def test_quantity_identity_prior_200_new_gsg_reads_one_never_prior_row(monkeypatch):

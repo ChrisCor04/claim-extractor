@@ -547,6 +547,27 @@ class PendingQuantityTarget:
     activity: str | None
     after_index: int
     activity_ordinal: int
+    #: One quantity-bearing ``+`` row may be either the complete physical
+    #: representation or one half of an Xactimate-generated ``-/+`` pair.
+    #: Recorded when activation is positively reconciled, before entry.
+    physical_row_delta: int = 1
+
+
+@dataclass(slots=True, frozen=True)
+class QuantityEntryConfirmation:
+    """Result of the single same-cell read immediately after entry.
+
+    Identity is deliberately absent: it was proven before the write and
+    retained by :class:`PendingQuantityTarget`.  A low-confidence OCR read
+    is advisory only when the bound row/cell and surrounding grid structure
+    remain stable; callers still route the completed commit to review.
+    """
+
+    expected: float
+    observed: float | None
+    confidence: str  # "CONFIRMED" | "LOW_CONFIDENCE"
+    review_required: bool
+    reason: str
 
 
 @dataclass(slots=True)
@@ -903,6 +924,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_activation_baseline_rows: list[ActivationRowSnapshot] | None = None
         self._last_commit_baseline_rows: list[CommitRowSnapshot] | None = None
         self._pending_quantity_target: PendingQuantityTarget | None = None
+        self.last_quantity_confirmation: QuantityEntryConfirmation | None = None
         self._current_query: str | None = None
         #: Phase 5.8: monotonic timestamp of the most recent
         #: search_by_description()/search_by_category_selector() call
@@ -2878,6 +2900,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         )
 
     def enter_quantity(self, quantity: float) -> None:
+        # Per-task state: never let an advisory from an earlier item leak
+        # into the current item's post-commit outcome.
+        self.last_quantity_confirmation = None
         hwnd = self._ensure_main_window()
         image, offset, row_top, ordinal, before_quantity, scrolled = self._locate_pending_quantity_row(
             hwnd, expected_quantity=quantity,
@@ -2891,6 +2916,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # avoiding the write also avoids disturbing an already-correct
         # cell. A different non-zero value was rejected above.
         if before_quantity is not None and abs(before_quantity - quantity) <= 0.01:
+            self.last_quantity_confirmation = QuantityEntryConfirmation(
+                expected=quantity, observed=before_quantity, confidence="CONFIRMED",
+                review_required=False, reason="Exact expected quantity was already populated; no write performed.",
+            )
             if scrolled:
                 self._reset_scroll_state()
             return
@@ -2942,66 +2971,61 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # Confirm from the SAME row/cell context. CAT/SEL/description/
         # activity OCR is deliberately not repeated here: it already
         # established the binding above, while Tab repaint is proven noisy.
-        # Structural drift is checked independently before every read.
-        observed = None
-        for confirmation_attempt in range(3):
-            after, after_offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
-            if after_offset is None or self._items_search_pane_field(after) is None:
-                raise QuantityNotConfirmedError(
-                    "enter_quantity(): focus/navigation left the expected Items/Search grid during quantity editing."
-                )
-            if self._find_dropdown_window() is not None or self._unexpected_dialog_present():
-                raise QuantityNotConfirmedError(
-                    "enter_quantity(): a dialog or dropdown appeared during quantity editing."
-                )
-            if after_offset != offset:
-                raise QuantityNotConfirmedError(
-                    "enter_quantity(): the grid anchor materially changed during quantity editing."
-                )
-
-            geometry_after = self._last_row_geometry(after, after_offset)
-            if geometry_after is None:
-                raise QuantityNotConfirmedError(
-                    "enter_quantity(): the edited target row disappeared during quantity editing."
-                )
-            row_count_after, _last_after_top = geometry_after
-            if row_count_after != row_count_before:
-                raise QuantityNotConfirmedError(
-                    "enter_quantity(): the grid row count changed unexpectedly during quantity editing "
-                    f"({row_count_before} -> {row_count_after})."
-                )
-
-            row_1_top_after = self._shifted_anchor("grid_row_1", after_offset)[1]
-            edited_row_top = row_1_top_after + row_index * _GRID_ROW_HEIGHT
-            if (
-                row_index >= row_count_after
-                or edited_row_top < 0
-                or edited_row_top + _GRID_ROW_HEIGHT > after.height
-            ):
-                raise QuantityNotConfirmedError(
-                    "enter_quantity(): the edited target row disappeared from the expected grid geometry."
-                )
-
-            observed = self._read_quantity_at(after, after_offset, edited_row_top)
-            if observed is None:
-                observed = self._read_quantity_at(
-                    after, after_offset, edited_row_top, min_votes=1, enhance_contrast=True,
-                )
-            if observed is not None and abs(observed - quantity) <= 0.01:
-                break
-            if observed is not None and abs(observed) > 0.01:
-                raise QuantityNotConfirmedError(
-                    f"enter_quantity({quantity:g}): same-cell read-back was {observed:g}; "
-                    "refusing to commit a different non-zero quantity."
-                )
-            if confirmation_attempt < 2:
-                time.sleep(0.25)
-        else:
-            target = self._pending_quantity_target
+        # Structural drift is checked once before one ordinary same-cell
+        # OCR read.  OCR disagreement alone cannot choose another row,
+        # cause another write, or turn a physically created item into an
+        # unconfirmed failure.
+        after, after_offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+        if after_offset is None or self._items_search_pane_field(after) is None:
             raise QuantityNotConfirmedError(
-                f"enter_quantity({quantity:g}): same-cell read-back never confirmed the expected value "
-                f"(last read={observed!r}, retained identity={target.identity if target else None}, "
-                f"activity={target.activity if target else None}, occurrence={ordinal})."
+                "enter_quantity(): focus/navigation left the expected Items/Search grid during quantity editing."
+            )
+        if self._find_dropdown_window() is not None or self._unexpected_dialog_present():
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): a dialog or dropdown appeared during quantity editing."
+            )
+        if after_offset != offset:
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the grid anchor materially changed during quantity editing."
+            )
+
+        geometry_after = self._last_row_geometry(after, after_offset)
+        if geometry_after is None:
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the edited target row disappeared during quantity editing."
+            )
+        row_count_after, _last_after_top = geometry_after
+        if row_count_after != row_count_before:
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the grid row count changed unexpectedly during quantity editing "
+                f"({row_count_before} -> {row_count_after})."
+            )
+
+        row_1_top_after = self._shifted_anchor("grid_row_1", after_offset)[1]
+        edited_row_top = row_1_top_after + row_index * _GRID_ROW_HEIGHT
+        if (
+            row_index >= row_count_after
+            or edited_row_top < 0
+            or edited_row_top + _GRID_ROW_HEIGHT > after.height
+        ):
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the edited target row disappeared from the expected grid geometry."
+            )
+
+        observed = self._read_quantity_at(after, after_offset, edited_row_top)
+        if observed is not None and abs(observed - quantity) <= 0.01:
+            self.last_quantity_confirmation = QuantityEntryConfirmation(
+                expected=quantity, observed=observed, confidence="CONFIRMED",
+                review_required=False, reason="Same-cell quantity read-back matched the expected value.",
+            )
+        else:
+            self.last_quantity_confirmation = QuantityEntryConfirmation(
+                expected=quantity, observed=observed, confidence="LOW_CONFIDENCE",
+                review_required=True,
+                reason=(
+                    f"Stable same-cell post-write OCR read {observed!r} instead of {quantity:g}; "
+                    "the entered expected quantity was preserved without rewriting."
+                ),
             )
 
         if scrolled:
@@ -3263,7 +3287,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     return True
                 raise AdapterError(
                     "Candidate activation added one physical row, but the logical multiset delta was not "
-                    "one ordinary non-R&R row."
+                    "one safe ordinary row or quantity-bearing R&R + row."
                 )
             if physical_delta == 2:
                 target = self._pending_quantity_target_from_delta(baseline_rows, rows)
@@ -3364,6 +3388,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             activity=activity,
             after_index=matching_indices[-1],
             activity_ordinal=len(matching_indices),
+            physical_row_delta=2 if is_rr else 1,
         )
 
     @classmethod
@@ -3479,15 +3504,17 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     return False
                 continue
             changed += 1
-            # The sole unexplained row may be an ordinary item, but a
-            # lone readable R&R activity is explicitly incomplete.
+            # The sole unexplained row may be ordinary or Xactimate's
+            # complete one-row representation of a quantity-bearing R&R
+            # ``+`` item. A lone ``-`` row is never quantity-bearing and
+            # remains incomplete/fail-closed.
             possible_new = [
                 token for token, count in remaining.items()
                 for _ in range(count)
             ]
             if len(possible_new) != before_unknown + 1:
                 return False
-            if before_unknown == 0 and possible_new[0] in ("-", "+"):
+            if before_unknown == 0 and possible_new[0] == "-":
                 return False
         return changed == 1
 
@@ -4027,6 +4054,83 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 new_indices.append(index)
         return not any(remaining.values()), new_indices
 
+    def _retained_rr_commit_delta_indices(
+        self,
+        after_rows: list[CommitRowSnapshot],
+        *,
+        row_count_before: int,
+        category: str,
+        selector: str,
+    ) -> list[int]:
+        """Recover only a previously proven R&R activation binding.
+
+        Activation already reconciled the full pre-selection multiset and
+        retained the quantity-bearing ``+`` occurrence before any write.
+        A later grid repaint can independently corrupt companion CAT/SEL OCR
+        (live: ``RFG/RFC`` and ``300S/3008``) or blank the ``-`` glyph. That
+        repaint must not turn the same bound R&R item into a new identity
+        problem after commit. Ordinary rows never enter this path.
+
+        The exact UIA-selected CAT/SEL, retained normalized description,
+        activity occurrence, expected one-row/two-row form, and final row
+        count must all agree. No quantity is used to choose the row.
+        """
+        target = self._pending_quantity_target
+        selected = self._last_selected
+        if (
+            target is None
+            or target.activity != "+"
+            or target.physical_row_delta not in (1, 2)
+            or selected is None
+            or self._normalized_pair_text(selected.category) != self._normalized_pair_text(category)
+            or self._normalized_pair_text(selected.selector) != self._normalized_pair_text(selector)
+            or len(after_rows) != row_count_before + target.physical_row_delta
+        ):
+            return []
+
+        expected_description = target.identity[2]
+        same_description = [
+            index for index, row in enumerate(after_rows)
+            if self._activation_identity(ActivationRowSnapshot(
+                row.category, row.selector, row.description, row.activity,
+            ))[2] == expected_description
+        ]
+        plus_indices = [
+            index for index in same_description
+            if self._activity_token(ActivationRowSnapshot(
+                after_rows[index].category, after_rows[index].selector,
+                after_rows[index].description, after_rows[index].activity,
+            )) == "+"
+        ]
+        ordinal_index = target.activity_ordinal - 1
+        if ordinal_index < 0 or ordinal_index >= len(plus_indices):
+            return []
+        plus_index = plus_indices[ordinal_index]
+        if target.physical_row_delta == 1:
+            return [plus_index]
+
+        # Prefer a readable ``-`` occurrence. If its glyph alone was lost
+        # in the post-commit repaint, the corresponding same-description,
+        # non-``+`` occurrence is the already-proven companion.
+        remove_indices = [
+            index for index in same_description
+            if self._activity_token(ActivationRowSnapshot(
+                after_rows[index].category, after_rows[index].selector,
+                after_rows[index].description, after_rows[index].activity,
+            )) == "-"
+        ]
+        if ordinal_index >= len(remove_indices):
+            remove_indices = [
+                index for index in same_description
+                if index != plus_index and self._activity_token(ActivationRowSnapshot(
+                    after_rows[index].category, after_rows[index].selector,
+                    after_rows[index].description, after_rows[index].activity,
+                )) != "+"
+            ]
+        if ordinal_index >= len(remove_indices):
+            return []
+        return [remove_indices[ordinal_index], plus_index]
+
     def snapshot_grid_identities_for_activation(self) -> list[tuple[str | None, str | None]]:
         """Capture the activation baseline without changing viewport.
 
@@ -4324,6 +4428,26 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     baseline_rows, after_rows,
                 )
 
+            retained_rr_indices = []
+            retained_rr_binding = False
+            if delta in (1, 2):
+                retained_rr_indices = self._retained_rr_commit_delta_indices(
+                    after_rows,
+                    row_count_before=row_count_before,
+                    category=category,
+                    selector=selector,
+                )
+                retained_rr_binding = len(retained_rr_indices) == delta
+                if retained_rr_binding:
+                    # This is not a fresh identity reconstruction: the full
+                    # multiset and exact selected CAT/SEL were proven at
+                    # activation, and quantity entry retained that binding.
+                    # Only the expected final row count and bound R&R
+                    # description/activity occurrence are rechecked here.
+                    preexisting_unchanged = True
+                    new_indices = retained_rr_indices
+                    sample["retained_rr_activation_binding"] = True
+
             if delta == 2 and preexisting_unchanged and len(new_indices) == 2:
                 activation_delta = [ActivationRowSnapshot(
                     after_rows[index].category,
@@ -4332,7 +4456,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     after_rows[index].activity,
                 ) for index in new_indices]
                 activation_delta.sort(key=lambda row: 0 if self._activity_token(row) == "-" else 1)
-                logical_rr_pair = self._is_logical_rr_pair(activation_delta[0], activation_delta[1])
+                logical_rr_pair = (
+                    self._is_logical_rr_pair(activation_delta[0], activation_delta[1])
+                    or retained_rr_binding
+                )
                 sample["rr_pair_evidence"] = [
                     {
                         "category": row.category,
@@ -4470,9 +4597,16 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     trust_state = "VERIFIED"
                     reason = (
                         ("one corroborated R&R -/+ logical item added" if logical_rr_pair
-                         else "exactly one physical row added")
-                        + " by order-independent logical multiset delta, pre-existing rows unchanged, "
-                        "quantity matched, unit compatible, and category/selector OCR "
+                         else (
+                             "one retained quantity-bearing R&R + row added"
+                             if retained_rr_binding else "exactly one physical row added"
+                         ))
+                        + (
+                            " by the retained activation-time R&R binding, expected row count remained stable, "
+                            if retained_rr_binding
+                            else " by order-independent logical multiset delta, pre-existing rows unchanged, "
+                        )
+                        + "quantity matched, unit compatible, and category/selector OCR "
                         + ("agrees" if cat_sel_agrees else "was unreadable (not treated as a conflict)")
                     )
 

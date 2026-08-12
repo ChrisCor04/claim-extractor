@@ -504,5 +504,16 @@ def execute_plan(
             source_unit=item.source_unit, expected_xactimate_unit=item.source_unit,
             populated_unit=outcome.populated_fields.unit,
         )
+        quantity_confirmation = getattr(adapter, "last_quantity_confirmation", None)
+        if (
+            getattr(quantity_confirmation, "review_required", False)
+            and getattr(outcome.verification, "trust_state", None) == "VERIFIED"
+        ):
+            # The structural multiset verifier remains unchanged.  This
+            # merely preserves the earlier stable-cell OCR uncertainty in
+            # the closest existing durable state: committed + review_required.
+            outcome.verification.trust_state = "QUANTITY_MISMATCH"
+            if hasattr(outcome.verification, "reason"):
+                outcome.verification.reason = quantity_confirmation.reason
         _record_lifecycle(adapter, "VERIFIED", trust_state=getattr(outcome.verification, "trust_state", None))
     return outcome
