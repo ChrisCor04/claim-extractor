@@ -2200,12 +2200,8 @@ def test_verify_group_never_raises_on_unexpected_error(monkeypatch):
     assert adapter.verify_group("Dwelling Roof") is False
 
 
-def test_verify_group_caches_a_positive_result_for_this_session(monkeypatch):
-    """Phase 5.7B: once a group has been positively verified via a real
-    probe, a later call for the SAME name must return the cached True
-    WITHOUT running another probe -- the visually confusing, mutating
-    disposable SFG/GUTA commit only needs to happen once per group per
-    live adapter instance."""
+def test_verify_group_cache_never_bypasses_fresh_selection_evidence(monkeypatch):
+    """A session cache records success but never replaces current UI proof."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     probe_calls = []
     monkeypatch.setattr(adapter, "_verify_group_once", lambda name: probe_calls.append(name) or True)
@@ -2213,16 +2209,15 @@ def test_verify_group_caches_a_positive_result_for_this_session(monkeypatch):
     assert adapter.verify_group("Dwelling Roof") is True
     assert adapter.verify_group("Dwelling Roof") is True
     assert adapter.verify_group("dwelling roof") is True  # case-insensitive cache key
-    assert probe_calls == ["Dwelling Roof"]  # probed exactly once, not three times
+    assert probe_calls == ["Dwelling Roof", "Dwelling Roof", "dwelling roof"]
 
     # a DIFFERENT group is never served from another group's cache entry
     assert adapter.verify_group("Fence") is True
-    assert probe_calls == ["Dwelling Roof", "Fence"]
+    assert probe_calls == ["Dwelling Roof", "Dwelling Roof", "dwelling roof", "Fence"]
 
 
 def test_verify_group_use_cache_false_forces_a_fresh_probe(monkeypatch):
-    """use_cache=False (diagnostics/tests needing real-time ground
-    truth) must bypass the cache even for an already-verified group."""
+    """Forced verification remains a fresh read under the non-destructive path."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     probe_calls = []
     monkeypatch.setattr(adapter, "_verify_group_once", lambda name: probe_calls.append(name) or True)
@@ -2239,93 +2234,287 @@ def test_verify_group_never_caches_a_negative_result(monkeypatch):
     import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
 
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    results = iter([False, False, True, True])  # verify_group() retries internally (2 attempts)
+    results = iter([False, True])
     monkeypatch.setattr(adapter, "_verify_group_once", lambda name: next(results))
     monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
 
-    assert adapter.verify_group("Dwelling Roof") is False  # both internal attempts failed
+    assert adapter.verify_group("Dwelling Roof") is False
     assert adapter.verify_group("Dwelling Roof") is True  # fresh attempt, not blocked by a cached False
 
 
+def _wire_group_verification_frame(
+    monkeypatch, adapter, *, rows=None, row_text="Exterior", selected=True,
+    items=True, search=True, grid=True,
+):
+    rows = rows or ["TEST", "Exterior"]
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (10, 10, 40, 20))
+    monkeypatch.setattr(adapter, "_snapshot_group_names_from_image", lambda image: list(rows))
+    monkeypatch.setattr(adapter, "_ocr_group_tree_row_text", lambda image, header, index: row_text)
+    monkeypatch.setattr(adapter, "_group_tree_row_has_selection_boundary", lambda image, header, index: selected)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (100, 10, 140, 25) if items else None)
+    monkeypatch.setattr(adapter, "_tab_is_active", lambda image, tab: bool(items))
+    monkeypatch.setattr(adapter, "_locate_search_field", lambda image: (100, 40, 300, 65) if search else None)
+    monkeypatch.setattr(adapter, "_anchor_offset", lambda image: (0, 0) if grid else None)
+
+
+def _wire_non_destructive_verify(monkeypatch, adapter, *, frame_results=(1, 1), dialog=False, dropdown=False):
+    captures = iter(["before", "repaint", "first", "second"])
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
+    monkeypatch.setattr(adapter, "verify_application", lambda: True)
+    monkeypatch.setattr(adapter, "verify_project", lambda: True)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: next(captures))
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (10, 10, 40, 20))
+    monkeypatch.setattr(adapter, "_snapshot_group_names_from_image", lambda image: ["TEST", "Exterior"])
+    monkeypatch.setattr(adapter, "_ocr_group_tree_row_text", lambda image, header, index: "Exterior")
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: None)
+    monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: None)
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: 999 if dropdown else None)
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: dialog)
+    results = iter(frame_results)
+    monkeypatch.setattr(adapter, "_group_verification_frame", lambda *args, **kwargs: next(results))
+
+
+def test_non_destructive_group_frame_accepts_complete_positive_evidence(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_group_verification_frame(monkeypatch, adapter)
+    assert adapter._group_verification_frame(object(), "Exterior") == 1
+
+
+def test_group_selection_boundary_uses_matching_relative_edges_not_fixed_rgb():
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (360, 180), "white")
+    header = (20, 20, 60, 30)
+    row_top = adapter._group_tree_row_crop_top(header[1], 1)
+    draw = ImageDraw.Draw(image)
+    # An arbitrary purple boundary proves the detector is not tied to the
+    # blue RGB observed in one preserved Xactimate screenshot.
+    draw.line((16, row_top, 254, row_top), fill=(133, 71, 181), width=1)
+    draw.line(
+        (16, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2,
+         254, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2),
+        fill=(133, 71, 181), width=1,
+    )
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 1) is True
+
+
+def test_group_selection_boundary_does_not_fabricate_selection_from_blank_row():
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (360, 180), "white")
+    assert adapter._group_tree_row_has_selection_boundary(image, (20, 20, 60, 30), 1) is False
+
+
+def test_group_selection_boundary_rejects_one_unmatched_horizontal_artifact():
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (360, 180), "white")
+    header = (20, 20, 60, 30)
+    row_top = adapter._group_tree_row_crop_top(header[1], 1)
+    ImageDraw.Draw(image).line((16, row_top, 254, row_top), fill=(30, 120, 190), width=1)
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 1) is False
+
+
+def _draw_partial_group_selection_boundary(image, adapter, header, row_index, *, indent_px):
+    """Draw a depth-shifted, non-full-width selection edge."""
+    from PIL import ImageDraw
+
+    row_top = adapter._group_tree_row_crop_top(header[1], row_index)
+    left = header[0] + indent_px
+    right = left + 95
+    draw = ImageDraw.Draw(image)
+    draw.line((left, row_top, right, row_top), fill=(104, 155, 213), width=1)
+    draw.line(
+        (left, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2,
+         right, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2),
+        fill=(104, 155, 213), width=1,
+    )
+
+
+@pytest.mark.parametrize("indent_px", [20, 40, 60])
+def test_group_selection_boundary_accepts_top_level_and_nested_depths(indent_px):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    _draw_partial_group_selection_boundary(image, adapter, header, 2, indent_px=indent_px)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is True
+
+
+def test_nested_selected_row_does_not_make_parent_selected():
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    _draw_partial_group_selection_boundary(image, adapter, header, 2, indent_px=60)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 1) is False
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is True
+
+
+def test_wrong_sibling_selection_does_not_verify_requested_row():
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    _draw_partial_group_selection_boundary(image, adapter, header, 3, indent_px=40)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 3) is True
+
+
+def test_group_selection_accepts_shorter_continuous_edge_after_dynamic_column_resize():
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    row_top = adapter._group_tree_row_crop_top(header[1], 2)
+    draw = ImageDraw.Draw(image)
+    # Live regression shape after the ninth group expanded the tree's
+    # internal column geometry: only a 58px top/bottom segment remained
+    # continuously common, despite the row being positively selected.
+    draw.line((28, row_top, 85, row_top), fill=(125, 162, 206), width=1)
+    draw.line(
+        (28, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2,
+         85, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2),
+        fill=(125, 162, 206), width=1,
+    )
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is True
+
+
+def test_group_selection_rejects_fragmented_chromatic_edge_artifacts():
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    row_top = adapter._group_tree_row_crop_top(header[1], 2)
+    draw = ImageDraw.Draw(image)
+    for start in range(28, 148, 20):
+        draw.line((start, row_top, start + 9, row_top), fill=(125, 162, 206), width=1)
+        draw.line(
+            (start, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2,
+             start + 9, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2),
+            fill=(125, 162, 206), width=1,
+        )
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
+
+
+def test_group_selection_rejects_non_overlapping_top_bottom_runs():
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    row_top = adapter._group_tree_row_crop_top(header[1], 2)
+    draw = ImageDraw.Draw(image)
+    draw.line((28, row_top, 85, row_top), fill=(125, 162, 206), width=1)
+    draw.line(
+        (100, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2,
+         157, row_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2),
+        fill=(125, 162, 206), width=1,
+    )
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
+
+
+def test_non_destructive_group_frame_rejects_duplicate_group_match(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_group_verification_frame(monkeypatch, adapter, rows=["TEST", "Exterior", "Exterior"])
+    assert adapter._group_verification_frame(object(), "Exterior") is None
+
+
+def test_non_destructive_group_frame_rejects_unreadable_requested_row(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_group_verification_frame(monkeypatch, adapter, row_text="")
+    assert adapter._group_verification_frame(object(), "Exterior") is None
+
+
+def test_non_destructive_group_frame_rejects_wrong_selected_row(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_group_verification_frame(monkeypatch, adapter, selected=False)
+    assert adapter._group_verification_frame(object(), "Exterior") is None
+
+
+def test_non_destructive_group_verify_rejects_selection_change_between_frames(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_non_destructive_verify(monkeypatch, adapter, frame_results=(1, None))
+    assert adapter._verify_group_once("Exterior") is False
+
+
+@pytest.mark.parametrize(
+    "items,search,grid",
+    [(False, True, True), (True, False, True), (True, True, False)],
+    ids=["items-inactive", "search-unavailable", "grid-unavailable"],
+)
+def test_non_destructive_group_frame_requires_items_search_and_grid(monkeypatch, items, search, grid):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_group_verification_frame(monkeypatch, adapter, items=items, search=search, grid=grid)
+    assert adapter._group_verification_frame(object(), "Exterior") is None
+
+
+@pytest.mark.parametrize("dialog,dropdown", [(True, False), (False, True)])
+def test_non_destructive_group_verify_rejects_dialog_or_dropdown(monkeypatch, dialog, dropdown):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_non_destructive_verify(monkeypatch, adapter, dialog=dialog, dropdown=dropdown)
+    assert adapter._verify_group_once("Exterior") is False
+
+
+def test_non_destructive_group_verify_performs_no_probe_search_commit_delete_or_cleanup(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_non_destructive_verify(monkeypatch, adapter)
+    forbidden = [
+        "focus_search", "clear_search", "search_by_category_selector", "search_by_description",
+        "select_candidate", "commit_item", "_click_delete_via_uia", "_cleanup_probe_item",
+    ]
+    for name in forbidden:
+        monkeypatch.setattr(
+            adapter, name,
+            lambda *args, _name=name, **kwargs: (_ for _ in ()).throw(AssertionError(_name)),
+        )
+    rows = []
+    assert adapter._verify_group_once("Exterior") is True
+    assert rows == []
+    assert adapter.probes_run_total == 0
+    assert adapter.probes_by_group == {}
+
+
+def test_fresh_newly_created_group_can_verify_non_destructively(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _wire_non_destructive_verify(monkeypatch, adapter)
+    assert adapter.verify_group("Exterior", use_cache=False) is True
+    assert "exterior" in adapter._verified_groups_this_session
+
+
 # ---------------------------------------------------------------------
-# Phase 5.10C Stage 4 (live-caught): a probe-observation/cleanup
-# timeout (ProbeCleanupFailedError) used to propagate straight out of
-# verify_group(), bypassing its own 2-attempt retry loop entirely --
-# reproduced live as the P510B-Bravo incident (one transient timeout
-# hard-failed the group on its first and only attempt).
+# Non-destructive group verification has no probe-cleanup retry path.
 # ---------------------------------------------------------------------
 
 
-def test_verify_group_retries_after_a_probe_cleanup_timeout(monkeypatch):
-    """A ProbeCleanupFailedError on attempt 1 must not escape -- the
-    2nd attempt this loop was always meant to provide must still run,
-    and succeed if the 2nd attempt's own probe is clean."""
-    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
-    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
+def test_non_destructive_verify_group_never_enters_legacy_probe_retry_path(monkeypatch):
+    """A failure is terminal for this read-only verification call.
 
+    There is no disposable row to resolve and therefore no cleanup-driven
+    second attempt that could mutate the estimate behind the caller's back.
+    """
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    attempts = iter([ProbeCleanupFailedError("timeout"), True])
+    calls = []
+    monkeypatch.setattr(adapter, "_verify_group_once", lambda name: calls.append("verify") or False)
+    monkeypatch.setattr(adapter, "_resolve_stray_probe_before_retry", lambda name: calls.append("resolve"))
 
-    def _fake_once(name):
-        outcome = next(attempts)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
-
-    monkeypatch.setattr(adapter, "_verify_group_once", _fake_once)
-    resolve_calls = []
-    monkeypatch.setattr(adapter, "_resolve_stray_probe_before_retry", lambda name: resolve_calls.append(name))
-    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
-
-    assert adapter.verify_group("Dwelling Roof") is True
-    assert resolve_calls == ["Dwelling Roof"]  # stray-probe resolution ran between attempts
-
-
-def test_verify_group_resolves_stray_probe_before_the_retry_attempt(monkeypatch):
-    """_resolve_stray_probe_before_retry() must run BEFORE the 2nd
-    _verify_group_once() call, never after -- otherwise the 2nd
-    attempt's own baseline capture could see a still-present leftover
-    row and silently treat it as pre-existing content."""
-    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
-    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
-
-    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    call_order = []
-
-    def _fake_once(name):
-        call_order.append("verify_group_once")
-        if call_order.count("verify_group_once") == 1:
-            raise ProbeCleanupFailedError("timeout")
-        return True
-
-    monkeypatch.setattr(adapter, "_verify_group_once", _fake_once)
-    monkeypatch.setattr(adapter, "_resolve_stray_probe_before_retry", lambda name: call_order.append("resolve"))
-    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
-
-    assert adapter.verify_group("Dwelling Roof") is True
-    assert call_order == ["verify_group_once", "resolve", "verify_group_once"]
-
-
-def test_verify_group_fails_closed_after_second_probe_cleanup_failure(monkeypatch):
-    """If the retry ALSO raises ProbeCleanupFailedError, it must
-    propagate (fail closed) -- never a silent 3rd attempt."""
-    import estimate_extractor.xactimate_lookup.windows_adapter as wa_mod
-    from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
-
-    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    call_count = {"n": 0}
-
-    def _fake_once(name):
-        call_count["n"] += 1
-        raise ProbeCleanupFailedError(f"timeout attempt {call_count['n']}")
-
-    monkeypatch.setattr(adapter, "_verify_group_once", _fake_once)
-    monkeypatch.setattr(adapter, "_resolve_stray_probe_before_retry", lambda name: None)
-    monkeypatch.setattr(wa_mod.time, "sleep", lambda s: None)
-
-    with pytest.raises(ProbeCleanupFailedError):
-        adapter.verify_group("Dwelling Roof")
-    assert call_count["n"] == 2  # exactly 2 attempts, never a 3rd
+    assert adapter.verify_group("Dwelling Roof") is False
+    assert calls == ["verify"]
 
 
 def test_verify_group_never_retries_on_protected_committed_row_error(monkeypatch):
@@ -3153,7 +3342,7 @@ def test_verify_group_once_probes_a_uniquely_nested_group_by_name(monkeypatch):
         lambda before: probe_order.append("pending_detected") or True,
     )
 
-    assert adapter._verify_group_once("Front Elevation") is True
+    assert adapter._verify_group_once_destructive_legacy("Front Elevation") is True
     assert items_resets == ["verified-items", "verified-items"]
     assert probed_index["index"] == 2  # the nested group's own row, found purely by name
     # Phase 5.8 Stage 8: a real probe run must be counted, per-group.
@@ -3189,7 +3378,7 @@ def test_verify_group_probe_focus_failure_prevents_all_query_typing(monkeypatch)
     monkeypatch.setattr(adapter, "_cleanup_probe_item", lambda count: None)
     monkeypatch.setattr(adapter, "recover", lambda: None)
 
-    assert adapter._verify_group_once("Exterior") is False
+    assert adapter._verify_group_once_destructive_legacy("Exterior") is False
     assert typed == []
     assert resets == ["items", "items"]
 
@@ -3340,7 +3529,7 @@ def test_verify_group_once_self_heals_duplicate_dialog_from_its_own_probe(monkey
 
     monkeypatch.setattr(adapter, "commit_item", _commit_item_tracked)
 
-    assert adapter._verify_group_once("Rear Elevation") is True
+    assert adapter._verify_group_once_destructive_legacy("Rear Elevation") is True
     assert select_calls == [1]  # select_candidate() itself is never retried
     # Called twice: once by this method's own opening Phase 5.7B self-
     # heal check (a no-op here, nothing open yet), once more to heal
@@ -3386,7 +3575,7 @@ def test_verify_group_once_reraises_when_duplicate_dialog_cannot_be_self_healed(
     recover_calls = []
     monkeypatch.setattr(adapter, "recover", lambda: recover_calls.append(1))
 
-    assert adapter._verify_group_once("Rear Elevation") is False  # caught by the outer except, never raises
+    assert adapter._verify_group_once_destructive_legacy("Rear Elevation") is False  # caught by the outer except, never raises
     assert recover_calls == [1]  # Phase 5.9: best-effort recovery before returning False
 
 
@@ -3432,7 +3621,7 @@ def test_verify_group_once_succeeds_when_subtotal_header_cannot_be_located(monke
     subtotal_calls = []
     monkeypatch.setattr(adapter, "_group_subtotal_pixel_count", lambda *a: subtotal_calls.append(1))
 
-    assert adapter._verify_group_once("Fencing") is True
+    assert adapter._verify_group_once_destructive_legacy("Fencing") is True
     assert subtotal_calls == []  # never even attempted -- header was None
     assert adapter.last_verify_group_subtotal_evidence == "UNAVAILABLE"
 
@@ -3472,7 +3661,7 @@ def test_verify_group_once_fails_when_probe_never_observed(monkeypatch):
     recover_calls = []
     monkeypatch.setattr(adapter, "recover", lambda: recover_calls.append(1))
 
-    assert adapter._verify_group_once("Fencing") is False
+    assert adapter._verify_group_once_destructive_legacy("Fencing") is False
     assert recover_calls == [1]
 
 
@@ -3520,7 +3709,7 @@ def test_verify_group_once_raises_if_pre_existing_rows_change_during_cleanup(mon
 
     from estimate_extractor.xactimate_lookup.windows_adapter import ProbeCleanupFailedError
     with pytest.raises(ProbeCleanupFailedError):
-        adapter._verify_group_once("Fencing")
+        adapter._verify_group_once_destructive_legacy("Fencing")
 
 
 def test_verify_group_once_tolerates_single_char_selector_noise_on_recheck(monkeypatch):
@@ -3574,15 +3763,10 @@ def test_verify_group_once_tolerates_single_char_selector_noise_on_recheck(monke
 
     monkeypatch.setattr(adapter, "snapshot_grid_identities", _misaligned_then_recovering_snapshot)
 
-    assert adapter._verify_group_once("Fencing") is True
+    assert adapter._verify_group_once_destructive_legacy("Fencing") is True
 
 
-def test_probe_counts_start_at_zero_and_only_increment_on_a_real_probe(monkeypatch):
-    """Phase 5.8 Stage 8: probes_run_total/probes_by_group must reflect
-    ONLY real disposable-probe runs -- a cached verify_group() hit
-    (Phase 5.7B) must never increment them, so a normal N-group run
-    shows at most N probes, never one per task or per repeated group
-    operation."""
+def test_non_destructive_group_verification_never_increments_probe_counts(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     assert adapter.probes_run_total == 0
     assert adapter.probes_by_group == {}
@@ -3591,25 +3775,19 @@ def test_probe_counts_start_at_zero_and_only_increment_on_a_real_probe(monkeypat
 
     def fake_verify_group_once(name):
         real_probe_calls.append(name)
-        adapter.probes_run_total += 1
-        adapter.probes_by_group[name] = adapter.probes_by_group.get(name, 0) + 1
         return True
 
     monkeypatch.setattr(adapter, "_verify_group_once", fake_verify_group_once)
 
-    # 3 groups, each verified multiple times (as a resumed/rechecked
-    # run might) -- only the FIRST verify_group() call per group must
-    # reach the real probe; every later call for the same name is
-    # served from cache.
     for _ in range(3):
         assert adapter.verify_group("Exterior") is True
     for _ in range(2):
         assert adapter.verify_group("Dwelling Roof") is True
     assert adapter.verify_group("Fence") is True
 
-    assert real_probe_calls == ["Exterior", "Dwelling Roof", "Fence"]  # exactly one real probe per group
-    assert adapter.probes_run_total == 3
-    assert adapter.probes_by_group == {"Exterior": 1, "Dwelling Roof": 1, "Fence": 1}
+    assert real_probe_calls == ["Exterior", "Exterior", "Exterior", "Dwelling Roof", "Dwelling Roof", "Fence"]
+    assert adapter.probes_run_total == 0
+    assert adapter.probes_by_group == {}
 
 
 def test_cleanup_probe_item_preserves_pre_existing_rows(monkeypatch):
@@ -3712,7 +3890,7 @@ def test_verify_group_once_fails_closed_when_grid_cannot_be_located(monkeypatch)
     monkeypatch.setattr(adapter, "_cleanup_probe_item", _fail_if_called("_cleanup_probe_item"))
     monkeypatch.setattr(adapter, "cancel_current_item", _fail_if_called("cancel_current_item"))
 
-    assert adapter._verify_group_once("Dwelling Roof") is False
+    assert adapter._verify_group_once_destructive_legacy("Dwelling Roof") is False
 
 
 # ---------------------------------------------------------------------

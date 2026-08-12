@@ -4953,6 +4953,17 @@ class WindowsXactimateAdapter(XactimateAdapter):
         garbage/blank (never matches a real group name)."""
         hwnd = self._ensure_main_window()
         image = self._capture_client_image(hwnd)
+        return self._snapshot_group_names_from_image(image, max_rows=max_rows)
+
+    def _snapshot_group_names_from_image(self, image, *, max_rows: int = 24) -> list[str]:
+        """Read group names and geometry from one immutable capture.
+
+        Group verification must correlate row identity, selection styling,
+        Items/Search readiness, and grid geometry on the same frame.  The
+        public snapshot method intentionally takes a fresh capture; this
+        helper prevents those independent facts from being accidentally
+        combined across different UI states.
+        """
         header = self._locate_group_tree_header(image)
         if header is None:
             return []
@@ -4978,6 +4989,67 @@ class WindowsXactimateAdapter(XactimateAdapter):
             # worse, so this is deliberately not "more is better").
             rows.append(self._ocr_group_tree_name_crop(crop))
         return rows
+
+    _GROUP_TREE_SELECTION_MIN_BACKGROUND_DISTANCE = 35
+    _GROUP_TREE_SELECTION_LINE_COLOR_TOLERANCE = 18
+    _GROUP_TREE_SELECTION_MIN_CHROMA = 45
+    _GROUP_TREE_SELECTION_MIN_OVERLAP_RUN = 32
+
+    def _group_tree_row_has_selection_boundary(
+        self, image, header_pos: tuple[int, int], row_index: int,
+    ) -> bool:
+        """Prove the row's live focus rectangle from relative pixel structure.
+
+        Xactimate draws a long matching top/bottom boundary around the selected
+        tree row.  Detection is intentionally color-agnostic: it derives edge
+        color candidates from this row, requires a substantial continuous
+        overlap of the same chromatic candidate on both edges, and requires
+        strong separation from the row interior.  The boundary can be split by
+        dynamic column geometry and its full-row coverage changes with nesting
+        depth and tree content, so it need not be the dominant color or occupy
+        a fixed percentage of the row.  A single average color, fixed RGB value,
+        fixed indentation, or absolute screen coordinate is never used.
+        """
+        from collections import Counter
+
+        left, top = header_pos[0], header_pos[1]
+        row_top = self._group_tree_row_crop_top(top, row_index)
+        row_left = max(0, left - 4)
+        row_right = min(image.width, left + self._GROUP_TREE_TEXT_WIDTH - 10)
+        if row_right - row_left < 80:
+            return False
+        rgb = image.convert("RGB")
+
+        top = Counter(rgb.getpixel((x, row_top)) for x in range(row_left, row_right))
+        interior = Counter(
+            rgb.getpixel((x, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT // 2))
+            for x in range(row_left, row_right)
+        )
+        interior_color = interior.most_common(1)[0][0]
+
+        def distance(a, b) -> int:
+            return sum(abs(int(x) - int(y)) for x, y in zip(a, b))
+
+        for top_color, _top_count in top.most_common():
+            if max(top_color) - min(top_color) < self._GROUP_TREE_SELECTION_MIN_CHROMA:
+                continue
+            if distance(top_color, interior_color) < self._GROUP_TREE_SELECTION_MIN_BACKGROUND_DISTANCE:
+                continue
+            overlap_run = 0
+            longest_overlap_run = 0
+            for x in range(row_left, row_right):
+                top_matches = distance(rgb.getpixel((x, row_top)), top_color) <= self._GROUP_TREE_SELECTION_LINE_COLOR_TOLERANCE
+                bottom_matches = distance(
+                    rgb.getpixel((x, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT - 2)), top_color,
+                ) <= self._GROUP_TREE_SELECTION_LINE_COLOR_TOLERANCE
+                if top_matches and bottom_matches:
+                    overlap_run += 1
+                    longest_overlap_run = max(longest_overlap_run, overlap_run)
+                else:
+                    overlap_run = 0
+            if longest_overlap_run >= self._GROUP_TREE_SELECTION_MIN_OVERLAP_RUN:
+                return True
+        return False
 
     #: Grand Total's own label+value block is FIXED left-sidebar chrome
     #: (not part of the scrollable grid content pane), live-measured at
@@ -6016,79 +6088,91 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return count
 
     def verify_group(self, group_name: str, *, use_cache: bool = True) -> bool:
-        """Not part of the abstract contract. Independently confirms
-        `group_name` is the group new items actually land in.
+        """Verify the selected group using only fresh, non-destructive UI evidence.
 
-        Live-caught (Phase 5.2 Stage 3): a group verified moments after
-        `ensure_group()` creates it can transiently fail this check even
-        though it genuinely is the active group -- the tree control can
-        still be settling from the creation/selection sequence (the
-        same class of timing issue `ensure_group()`'s own post-creation
-        check hit). A false NEGATIVE here is safe (it only routes tasks
-        to REVIEW_REQUIRED, never executes against an unconfirmed
-        group), but retrying once, from a completely fresh probe, before
-        giving up avoids unnecessarily blocking a genuinely-fine group.
-        Never masks a real negative: each attempt is a full independent
-        re-measurement, not a cached/assumed result, and this still
-        returns False, never raises, if every attempt fails.
-
-        Phase 5.7B: Stage 1/2 tested whether a non-mutating (pixel/
-        visual selection-highlight) check could replace the disposable
-        SFG/GUTA probe entirely. Live-measured across 15 alternating
-        switches over 5 real groups, cross-checked against this same
-        probe as ground truth: the highlight reliably identified 3 of 5
-        groups (Dwelling Roof, Front Elevation, Rear Elevation -- a
-        clear, confident darkening every time) but never confidently
-        detected the highlight at all for the other 2 (Exterior,
-        Fence), even though the probe confirmed them genuinely active
-        both times tested -- reconfirming, with fresh live evidence,
-        the original Phase 5.1 finding that the visual highlight does
-        not reliably track the active group for every row position.
-        The probe therefore remains necessary for a confident answer,
-        but IS now cached per adapter instance (`use_cache=True`,
-        the default): once a group has been positively verified THIS
-        session, a later call for the SAME name returns the cached
-        True immediately rather than re-probing -- exactly the
-        "already-verified, no context-loss" case
-        _ensure_select_verify_group() hits on a partial-resume within
-        the same live run. Pass use_cache=False to force a fresh probe
-        regardless (used by diagnostics that need real-time ground
-        truth, and by tests of the probe itself).
-
-        Phase 5.10C Stage 4 (live-caught): a probe-observation/cleanup
-        timeout inside _verify_group_once() raises ProbeCleanupFailedError
-        (Phase 5.9 Priority 2 -- never silently swallowed, by design),
-        but that exception used to propagate straight OUT of this
-        method entirely, bypassing the `for _attempt in range(2)` retry
-        loop below -- so a single transient observation timeout hard-
-        failed the group on its FIRST attempt, never getting the 2nd
-        attempt this loop was always meant to provide (confirmed live:
-        exactly the P510B-Bravo incident). A timeout is inconclusive,
-        not evidence of a real problem (ProtectedCommittedRowError and
-        GroupTransitionUnsafeError are NOT caught here -- both still
-        propagate immediately, since those DO mean something is
-        actually, concretely wrong). Before the retry, positively
-        resolves whatever the failed attempt might have left behind
-        (_resolve_stray_probe_before_retry()) so the next attempt's own
-        probe can never be confused with a leftover one -- if THAT
-        resolution itself cannot succeed, it propagates too, and this
-        method fails closed exactly as before (still at most 2 real
-        attempts, never more)."""
+        A cached success never substitutes for current selection evidence.  The
+        cache remains a record of session successes, but every call revalidates
+        the live row, selection boundary, pane, Search field, grid, and popup
+        state.  No catalog search, candidate selection, item commit, or cleanup
+        occurs here.
+        """
         normalized = group_name.strip().lower()
-        if use_cache and normalized in self._verified_groups_this_session:
-            return True
-        for attempt in range(2):
-            try:
-                if self._verify_group_once(group_name):
-                    self._verified_groups_this_session.add(normalized)
-                    return True
-            except ProbeCleanupFailedError:
-                if attempt == 0:
-                    self._resolve_stray_probe_before_retry(group_name)
-                else:
-                    raise
-            time.sleep(0.5)
-        return False
+        verified = self._verify_group_once(group_name)
+        if verified:
+            self._verified_groups_this_session.add(normalized)
+        else:
+            self._verified_groups_this_session.discard(normalized)
+        return verified
+
+    def _group_verification_frame(
+        self, image, group_name: str, *, expected_index: int | None = None,
+    ) -> int | None:
+        """Return the selected requested row only when one frame proves all geometry."""
+        header = self._locate_group_tree_header(image)
+        if header is None:
+            return None
+        rows = self._snapshot_group_names_from_image(image)
+        try:
+            target_index = self._find_unique_group_row(rows, group_name)
+        except AdapterError:
+            return None
+        if target_index is None or (expected_index is not None and target_index != expected_index):
+            return None
+        row_text = self._ocr_group_tree_row_text(image, header, target_index)
+        if not self._group_name_matches(row_text, group_name):
+            return None
+        if not self._group_tree_row_has_selection_boundary(image, header, target_index):
+            return None
+        if self._items_search_pane_field(image) is None:
+            return None
+        if self._anchor_offset(image) is None:
+            return None
+        return target_index
+
+    def _verify_group_once(self, group_name: str) -> bool:
+        """Select and corroborate one unique group across two fresh captures."""
+        try:
+            self._assert_group_transition_settled(next_group=group_name)
+            if not self.verify_application() or not self.verify_project():
+                return False
+            hwnd = self._ensure_main_window()
+            self._force_foreground(hwnd)
+            self._scroll_group_tree_to_top(hwnd)
+
+            before = self._capture_client_image(hwnd)
+            header = self._locate_group_tree_header(before)
+            if header is None:
+                return False
+            rows = self._snapshot_group_names_from_image(before)
+            target_index = self._find_unique_group_row(rows, group_name)
+            if target_index is None:
+                return False
+            if not self._group_name_matches(
+                self._ocr_group_tree_row_text(before, header, target_index), group_name,
+            ):
+                return False
+
+            self._click_client(hwnd, *self._group_tree_row_xy(header, target_index))
+            self._capture_client_image(hwnd)  # force selection repaint
+            self._reset_scroll_state()
+
+            first = self._capture_client_image(hwnd)
+            if self._find_dropdown_window() is not None or self._unexpected_dialog_present():
+                return False
+            first_index = self._group_verification_frame(first, group_name, expected_index=target_index)
+            if first_index is None:
+                return False
+
+            second = self._capture_client_image(hwnd)
+            if self._find_dropdown_window() is not None or self._unexpected_dialog_present():
+                return False
+            return self._group_verification_frame(
+                second, group_name, expected_index=first_index,
+            ) == first_index
+        except GroupTransitionUnsafeError:
+            raise
+        except Exception:
+            return False
 
     def _resolve_stray_probe_before_retry(self, group_name: str) -> None:
         """Phase 5.10C Stage 4: called by verify_group() between its
@@ -6116,7 +6200,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         protected_floor = self._protected_row_ledger.count_for_group(group_name)
         self._cleanup_probe_item(protected_floor)
 
-    def _verify_group_once(self, group_name: str) -> bool:
+    def _verify_group_once_destructive_legacy(self, group_name: str) -> bool:
         """One full probe-commit-and-check cycle. This DOES mutate the
         estimate transiently; it always cleans up before returning,
         including on failure. Returns False, never raises, on anything
