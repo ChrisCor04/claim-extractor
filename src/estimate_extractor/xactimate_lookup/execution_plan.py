@@ -618,12 +618,28 @@ def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset
     14 committed rows in a real run were in exactly this state). Now
     uses task_has_committed_row() -- not `state` alone -- to decide what
     "already finished, leave it alone" means, same `full_reset` escape
-    hatch as before for a genuine, deliberate start-over."""
+    hatch as before for a genuine, deliberate start-over.
+
+    Live-caught again: an already-TASK_PENDING task used to be a
+    complete no-op even under `full_reset=True`, on the theory that
+    "already pending" already means "clean". That's false whenever a
+    PRIOR call left it pending with stale execution-derived fields
+    still attached -- in particular `physical_state_uncertain`, which
+    the ORIGINAL full_reset fix above cleared only for a task
+    transitioning INTO pending, never for one already sitting there.
+    run_execution_plan()'s pre-loop guard checks that flag on every
+    PENDING task and hard-stops the whole run before task 1 if it's
+    still True, regardless of how it got there -- so a genuine full
+    reset must sanitize an already-pending task exactly like any other,
+    or "start completely over" silently doesn't. `reset_count` still
+    only counts actual state transitions (unchanged meaning/tests) --
+    an already-pending task is sanitized but not counted as "reset"."""
     reset_count = 0
     for task in plan.tasks:
         if not full_reset and (task.state == TASK_COMPLETED or task_has_committed_row(task)):
             continue
-        if task.state == TASK_PENDING:
+        already_pending = task.state == TASK_PENDING
+        if already_pending and not full_reset:
             continue
         task.state = TASK_PENDING
         task.stop_reason = None
@@ -656,7 +672,8 @@ def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset
             # actually in question. A genuine full reset must clear it
             # alongside commit_state, or it isn't actually a full reset.
             task.physical_state_uncertain = False
-        reset_count += 1
+        if not already_pending:
+            reset_count += 1
 
     for group in plan.groups:
         group_tasks = plan.tasks_in_group(group.group_id)

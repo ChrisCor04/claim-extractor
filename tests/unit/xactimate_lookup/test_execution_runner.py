@@ -333,6 +333,34 @@ def test_full_reset_clears_stale_physical_uncertain_so_preloop_guard_does_not_re
     assert adapter.ensure_group_calls != []
 
 
+def test_full_reset_sanitizes_an_already_pending_task_so_preloop_guard_does_not_refire(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """Second edge of the same live-caught bug: task_line_0002 persisted
+    with state ALREADY == pending (no transition needed) but physical_
+    state_uncertain still True from an earlier interrupted attempt --
+    reset_unfinished_tasks()'s own "already pending -> no-op" early-exit
+    used to mean full_reset=True never sanitized it either, so this
+    EXACT persisted shape kept re-triggering the pre-loop hard stop on
+    every subsequent "start over" attempt."""
+    plan = _plan_two_groups()
+    plan.tasks[0].state = TASK_PENDING  # already pending -- no state transition happens
+    plan.tasks[0].physical_state_uncertain = True
+
+    reset_unfinished_tasks(plan, tmp_path, full_reset=True)
+    assert plan.tasks[0].state == TASK_PENDING
+    assert plan.tasks[0].physical_state_uncertain is False
+
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP
+    assert result.tasks[0].attempts >= 1
+    assert adapter.ensure_group_calls != []
+
+
 def test_happy_path_all_groups_verified_all_tasks_completed(tmp_path, phrase_rules, ranking_config):
     plan = _plan_two_groups()
     adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))

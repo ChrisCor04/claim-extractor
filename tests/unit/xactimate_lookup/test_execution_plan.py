@@ -672,6 +672,126 @@ def test_reset_unfinished_tasks_leaves_physical_state_uncertain_when_not_full_re
 
 
 # ---------------------------------------------------------------------
+# Live-caught (second edge of the same bug): the fix above only cleared
+# physical_state_uncertain for a task TRANSITIONING into TASK_PENDING.
+# A task already sitting in TASK_PENDING (e.g. because an earlier,
+# pre-fix full_reset() call already flipped its state but left the flag
+# stale, or any other prior process left it pending with stale fields)
+# hit the function's own "already pending -> no-op" early-continue and
+# was never sanitized at all, even under full_reset=True. Proven live:
+# task_line_0002 persisted as exactly {state: pending, physical_state_
+# uncertain: true} and re-triggered the pre-loop hard stop on the very
+# next full-reset "start over" attempt.
+# ---------------------------------------------------------------------
+
+
+def test_full_reset_clears_stale_physical_state_uncertain_on_already_pending_task(tmp_path):
+    """The exact persisted shape live-caught in task_line_0002: state is
+    ALREADY pending (no transition happens), but physical_state_
+    uncertain is stale True from an earlier interrupted process."""
+    plan = _plan_with_mixed_states()
+    already_pending_but_stale = ExecutionTask(
+        task_id="t_already_pending_stale", line_item_id="line_already_pending_stale", source_order=4,
+        area_name=None, section_name="Roof", description="d", category=None, selector=None,
+        lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST, source_quantity=1.0, source_unit="SQ",
+        expected_unit="SQ", state=TASK_PENDING, began_unmapped=True,
+        physical_state_uncertain=True,
+    )
+    plan.tasks.append(already_pending_but_stale)
+    plan.groups[0].task_ids.append(already_pending_but_stale.task_id)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_unfinished_tasks(plan, project_dir, full_reset=True)
+
+    task = plan.task_by_id("t_already_pending_stale")
+    assert task.state == TASK_PENDING
+    assert task.physical_state_uncertain is False
+
+    reloaded = load_execution_plan(project_dir)
+    assert reloaded.task_by_id("t_already_pending_stale").physical_state_uncertain is False
+
+
+def test_full_reset_gives_already_pending_task_identical_cleanup_to_a_transitioning_one(tmp_path):
+    """An already-pending task must end up in EXACTLY the same clean
+    state as a non-pending task does after the same full_reset=True
+    call -- not just physical_state_uncertain, every execution-derived
+    field a full reset is supposed to wipe."""
+    plan = ExecutionPlan(plan_id="p1", project_slug="s", source_filename=None, created_at="now")
+
+    def _dirty_task(task_id, source_order, state):
+        return ExecutionTask(
+            task_id=task_id, line_item_id=f"line_{task_id}", source_order=source_order,
+            area_name=None, section_name="Roof", description="d", category=None, selector=None,
+            lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST, source_quantity=1.0, source_unit="SQ",
+            expected_unit="SQ", state=state, began_unmapped=True,
+            physical_state_uncertain=True, trust_state="QUANTITY_MISMATCH",
+            commit_state=TASK_COMMIT_STATE_COMMITTED, stop_reason="physical_state_uncertain",
+            stop_detail="d", error="e", actual_lookup_strategy="description_search",
+            lookup_strategy_reason="r", started_at="t1", completed_at="t2", recovery_outcome="recovered",
+            observed_category="RFG", observed_selector="240", observed_description="od",
+            observed_activity="+", observed_quantity=9.0, observed_unit="SQ", entered_quantity=9.0,
+        )
+
+    already_pending = _dirty_task("t_already_pending", 0, TASK_PENDING)
+    transitioning = _dirty_task("t_transitioning", 1, TASK_REVIEW_REQUIRED)
+    plan.tasks = [already_pending, transitioning]
+    from estimate_extractor.xactimate_lookup.execution_plan import GroupExecutionState
+    plan.groups = [GroupExecutionState(
+        group_id="Roof", area_name=None, section_name="Roof", xactimate_group_name="Roof",
+        group_name_reviewed=True, task_ids=["t_already_pending", "t_transitioning"],
+    )]
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_unfinished_tasks(plan, project_dir, full_reset=True)
+
+    fields_to_compare = (
+        "state", "physical_state_uncertain", "trust_state", "commit_state", "stop_reason", "stop_detail",
+        "error", "actual_lookup_strategy", "lookup_strategy_reason", "started_at", "completed_at",
+        "recovery_outcome", "observed_category", "observed_selector", "observed_description",
+        "observed_activity", "observed_quantity", "observed_unit", "entered_quantity",
+    )
+    already_pending_task = plan.task_by_id("t_already_pending")
+    transitioning_task = plan.task_by_id("t_transitioning")
+    for name in fields_to_compare:
+        assert getattr(already_pending_task, name) == getattr(transitioning_task, name), (
+            f"{name} differs: already-pending={getattr(already_pending_task, name)!r} vs "
+            f"transitioning={getattr(transitioning_task, name)!r}"
+        )
+    assert already_pending_task.state == TASK_PENDING
+    assert already_pending_task.physical_state_uncertain is False
+
+
+def test_reset_unfinished_tasks_leaves_already_pending_stale_task_untouched_when_not_full_reset(tmp_path):
+    """Non-full-reset semantics for THIS exact already-pending-plus-
+    stale-flag shape must remain unchanged: task_has_committed_row()
+    already treats physical_state_uncertain=True as unsafe-to-retry, so
+    even without the "already pending" early-continue, this task would
+    still be left alone by the first guard clause. Confirms the
+    refactor didn't disturb that."""
+    plan = _plan_with_mixed_states()
+    already_pending_but_stale = ExecutionTask(
+        task_id="t_already_pending_stale", line_item_id="line_already_pending_stale", source_order=4,
+        area_name=None, section_name="Roof", description="d", category=None, selector=None,
+        lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST, source_quantity=1.0, source_unit="SQ",
+        expected_unit="SQ", state=TASK_PENDING, began_unmapped=True,
+        physical_state_uncertain=True,
+    )
+    plan.tasks.append(already_pending_but_stale)
+    plan.groups[0].task_ids.append(already_pending_but_stale.task_id)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_count = reset_unfinished_tasks(plan, project_dir, full_reset=False)
+
+    task = plan.task_by_id("t_already_pending_stale")
+    assert reset_count == 2  # t_review and t_failed only, exactly as before this fix
+    assert task.state == TASK_PENDING
+    assert task.physical_state_uncertain is True  # untouched -- full_reset=True is required to clear this
+
+
+# ---------------------------------------------------------------------
 # Phase 5.9: save_execution_plan() refuses to silently shrink a plan.
 # ---------------------------------------------------------------------
 
