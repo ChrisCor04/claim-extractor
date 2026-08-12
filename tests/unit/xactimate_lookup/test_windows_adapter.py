@@ -1984,7 +1984,9 @@ def test_verify_commit_accepts_rr_activity_regrouping_as_multiset(monkeypatch):
 def test_verify_commit_times_out_when_row_count_never_changes(monkeypatch):
     """Regression test (Phase 4.8): if the row count never changes
     within budget, reports VERIFICATION_FAILED -- never an unbounded
-    wait, never a guess."""
+    wait, never a guess. No _pending_quantity_target is bound here
+    (defaults to None), so this also proves the retained-target
+    fallback added below is a no-op when there is no target at all."""
     adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
         row_sequence=[[]] * 20,
@@ -1992,6 +1994,188 @@ def test_verify_commit_times_out_when_row_count_never_changes(monkeypatch):
     result = adapter.verify_commit([], "SFG", "GUTA", 5.0, timeout_s=0.5)
     assert result.trust_state == "VERIFICATION_FAILED"
     assert result.row_index is None
+
+
+# ---------------------------------------------------------------------
+# Live-caught (Row 13, real run): verify_commit()'s row-count-delta
+# poll can time out at delta == 0 even though a real, correctly-
+# quantified row exists -- because commit_item() finalizes an already-
+# present row (created at activation, well before Ctrl+S) rather than
+# inserting a new one, so no further row-count growth is guaranteed at
+# commit. When a trustworthy _pending_quantity_target already exists
+# (bound during activation/quantity-entry), the timeout branch now
+# re-confirms that SAME already-identified row -- never a different
+# one -- via identity + activity (where known) + quantity + unit at its
+# known position, before falling back to the existing conservative
+# VERIFICATION_FAILED.
+# ---------------------------------------------------------------------
+
+
+def _row13_shaped_target(**overrides):
+    defaults = dict(
+        identity=("SFG", "GUTRS", "Gutter / downspout - Detach & reset"),
+        activity="+", after_index=0, activity_ordinal=1, physical_row_delta=1,
+    )
+    defaults.update(overrides)
+    return PendingQuantityTarget(**defaults)
+
+
+def test_verify_commit_retained_target_confirms_row13_shape(monkeypatch):
+    """Requirement 1: activation already created one row, quantity was
+    written, commit causes no further row-count growth (delta stays 0
+    through the whole timeout), but the exact bound target's identity/
+    activity/quantity persist at its known position -> VERIFIED."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTRS")]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[129.07],
+    )
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda image, offset, row_top: "+")
+    adapter._pending_quantity_target = _row13_shaped_target()
+
+    result = adapter.verify_commit(
+        [("SFG", "GUTRS")], "SFG", "GUTRS", 129.07,
+        source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.row_index == 0
+    assert result.quantity_matched is True
+    assert result.compatibility == "compatible"
+    assert "already positively bound during activation" in result.reason
+
+
+def test_verify_commit_retained_target_wrong_quantity_does_not_verify(monkeypatch):
+    """Requirement 2: same shape, but the re-read quantity at the known
+    position does not match what was supposedly written -> must NOT
+    verify; falls back to the existing conservative failure."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTRS")]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[999.0],
+    )
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda image, offset, row_top: "+")
+    adapter._pending_quantity_target = _row13_shaped_target()
+
+    result = adapter.verify_commit(
+        [("SFG", "GUTRS")], "SFG", "GUTRS", 129.07,
+        source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFICATION_FAILED"
+
+
+def test_verify_commit_retained_target_wrong_identity_does_not_verify(monkeypatch):
+    """Requirement 3: same shape, but the row now physically found at
+    the bound position reads a DIFFERENT category/selector -> must NOT
+    verify. This never searches for some other matching row -- it only
+    ever re-checks the one exact position it already knows."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("RFG", "DRIP")]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[129.07],
+    )
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda image, offset, row_top: "+")
+    adapter._pending_quantity_target = _row13_shaped_target()
+
+    result = adapter.verify_commit(
+        [("RFG", "DRIP")], "SFG", "GUTRS", 129.07,
+        source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFICATION_FAILED"
+
+
+def test_verify_commit_retained_target_disappeared_row_does_not_verify(monkeypatch):
+    """Requirement 4: the bound target's row can no longer be
+    positively read/identified at all (e.g. category/selector both
+    unreadable) -> must NOT verify."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[129.07],
+    )
+    monkeypatch.setattr(adapter, "_read_category_selector_for_verify_commit", lambda image, offset, row_top: (None, None))
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda image, offset, row_top: None)
+    adapter._pending_quantity_target = _row13_shaped_target()
+
+    result = adapter.verify_commit(
+        [], "SFG", "GUTRS", 129.07,
+        source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFICATION_FAILED"
+
+
+def test_verify_commit_retained_target_does_not_affect_ambiguous_multi_row_delta(monkeypatch):
+    """Requirement 5: the retained-target fallback only ever runs at
+    the delta == 0 timeout -- a genuinely ambiguous multi-row delta (2
+    new, unrelated rows) must still fail exactly as before, even with a
+    target bound. Existing ambiguity protection is completely
+    unchanged."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTRS"), ("RFG", "DRIP")]],
+    )
+    adapter._pending_quantity_target = _row13_shaped_target()
+
+    result = adapter.verify_commit(
+        [], "SFG", "GUTRS", 129.07,
+        source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "CONFLICTING_ROW"
+
+
+def test_verify_commit_retained_target_activity_mismatch_does_not_verify(monkeypatch):
+    """Requirement 6: genuine post-action uncertainty -- identity and
+    quantity both re-read correctly, but the activity at the known
+    position does not match what the target recorded ('-' instead of
+    the expected '+') -> must still fail closed, not be waved through
+    on identity/quantity alone."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("SFG", "GUTRS")]],
+        unit_reads=[("LF", "LF")],
+        quantity_reads=[129.07],
+    )
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda image, offset, row_top: "-")
+    adapter._pending_quantity_target = _row13_shaped_target()
+
+    result = adapter.verify_commit(
+        [("SFG", "GUTRS")], "SFG", "GUTRS", 129.07,
+        source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFICATION_FAILED"
+
+
+def test_verify_commit_retained_target_skips_rr_shaped_binding(monkeypatch):
+    """The fallback is deliberately scoped to ordinary single-row
+    bindings (physical_row_delta == 1) only -- an R&R-pair-shaped
+    target (physical_row_delta == 2) must never be corroborated here,
+    so R&R reconciliation logic is completely untouched by this fix."""
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch,
+        row_sequence=[[("RFG", "240S")]],
+        unit_reads=[("SQ", "SQ")],
+        quantity_reads=[33.33],
+    )
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda image, offset, row_top: "+")
+    adapter._pending_quantity_target = _row13_shaped_target(
+        identity=("RFG", "240S", "3 tab - comp shingle"), physical_row_delta=2,
+    )
+
+    result = adapter.verify_commit(
+        [("RFG", "240S")], "RFG", "240S", 33.33,
+        source_unit="SQ", expected_xactimate_unit="SQ", timeout_s=3.0,
+    )
+
+    assert result.trust_state == "VERIFICATION_FAILED"
 
 
 def test_verify_commit_quantity_mismatch_reported_distinctly(monkeypatch):

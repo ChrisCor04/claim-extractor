@@ -4983,12 +4983,125 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 )
 
             if elapsed >= timeout_s:
+                retained = self._verify_via_retained_pending_target(
+                    category=category, selector=selector, expected_quantity=expected_quantity,
+                    source_unit=source_unit, expected_xactimate_unit=expected_xactimate_unit,
+                    populated_unit=populated_unit, row_count_before=row_count_before,
+                    attempts=attempts, start=start, samples=samples,
+                )
+                if retained is not None:
+                    return retained
                 return fail(
                     "VERIFICATION_FAILED",
                     f"row count did not change within {timeout_s}s ({attempts} attempts) -- commit not detected",
                     row_count_after=row_count_after,
                 )
             time.sleep(0.1 if attempts < 5 else 0.4)
+
+    def _verify_via_retained_pending_target(
+        self,
+        *,
+        category: str,
+        selector: str,
+        expected_quantity: float,
+        source_unit: str | None,
+        expected_xactimate_unit: str | None,
+        populated_unit: str | None,
+        row_count_before: int,
+        attempts: int,
+        start: float,
+        samples: list[dict],
+    ) -> "CommitVerification | None":
+        """Last-resort corroboration for verify_commit()'s zero-row-
+        count-delta timeout, used ONLY there -- never in place of the
+        structural delta checks above, which still run first on every
+        poll and still fail exactly as strictly as before whenever a
+        real (nonzero) delta is observed.
+
+        verify_commit()'s own docstring already establishes that
+        commit_item() finalizes an already-present row rather than
+        inserting a new one -- the pending row is created at
+        activation, well before Ctrl+S. A zero row-count delta AT
+        COMMIT is therefore not evidence of failure by itself when a
+        trustworthy binding from that earlier activation still exists:
+        self._pending_quantity_target already positively identified
+        this exact row's identity/activity/position before quantity
+        was ever entered. This re-confirms that SAME already-proven
+        row -- it never searches for some other matching row, and it
+        is deliberately narrower than the normal structural path (which
+        can tolerate unreadable/non-contradicting OCR because it has a
+        structural delta backing it up): every check here must be
+        POSITIVELY read and POSITIVELY matching, or this returns None
+        and the caller falls through to the existing, unchanged
+        VERIFICATION_FAILED failure.
+
+        Deliberately restricted to physical_row_delta == 1 (an ordinary
+        single-row binding) -- an R&R -/+ pair binding is never
+        corroborated here, so R&R reconciliation behavior is completely
+        untouched by this method."""
+        target = self._pending_quantity_target
+        if target is None or target.physical_row_delta != 1:
+            return None
+        if target.identity[0] != category or target.identity[1] != selector:
+            return None
+
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+        if offset is None:
+            return None
+        row_top = self._shifted_anchor("grid_row_1", offset)[1] + target.after_index * _GRID_ROW_HEIGHT
+
+        cat_observed, sel_observed = self._read_category_selector_for_verify_commit(image, offset, row_top)
+        if cat_observed != category or sel_observed != selector:
+            return None
+
+        activity_observed = self._read_activation_activity_at(image, offset, row_top)
+        if target.activity is not None and activity_observed != target.activity:
+            return None
+
+        description_observed = self._read_description_at(image, offset, row_top)
+        quantity_observed = self._read_quantity_at(image, offset, row_top)
+        unit_raw, unit_normalized = self._read_unit_at(image, offset, row_top)
+        if quantity_observed is None or quantity_observed != expected_quantity:
+            return None
+
+        populated_unit_vocab = _resolve_observed_unit_vocab(populated_unit)
+        unit_source = "populated_field" if populated_unit_vocab is not None else "post_commit_ocr"
+        observed_unit_for_check = (
+            populated_unit if populated_unit_vocab is not None
+            else (unit_normalized or unit_raw)
+        )
+        unit_result = check_unit_compatibility(source_unit, expected_xactimate_unit, observed_unit_for_check)
+        if populated_unit_vocab is None and unit_normalized is not None:
+            unit_result.observed_xactimate_unit = unit_raw
+        compatibility = self._UNIT_STATE_TO_COMPATIBILITY.get(unit_result.unit_match_state, "review_required")
+        if compatibility == "hard_stop":
+            return None
+
+        samples.append({
+            "elapsed_s": round(time.time() - start, 3),
+            "retained_pending_target_corroboration": True,
+            "after_index": target.after_index,
+            "category_observed": cat_observed, "selector_observed": sel_observed,
+            "activity_observed": activity_observed, "quantity_observed": quantity_observed,
+            "unit_raw": unit_raw, "unit_normalized": unit_normalized, "unit_source": unit_source,
+        })
+        return CommitVerification(
+            trust_state="VERIFIED",
+            reason=(
+                "row count did not change at commit, but the identity/activity/quantity already positively bound "
+                "during activation was re-confirmed at its known position -- commit_item() finalizes an "
+                "already-present row rather than inserting a new one, so no further row-count growth was expected"
+            ),
+            row_count_before=row_count_before, row_count_after=row_count_before, row_index=target.after_index,
+            preexisting_rows_unchanged=True,
+            category_expected=category, selector_expected=selector,
+            category_observed=cat_observed, selector_observed=sel_observed, category_selector_ocr_agrees=True,
+            description_observed=description_observed,
+            quantity_expected=expected_quantity, quantity_observed=quantity_observed, quantity_matched=True,
+            unit=unit_result, compatibility=compatibility, compatibility_reason=unit_result.unit_match_reason,
+            attempts=attempts, elapsed_s=time.time() - start, samples=samples,
+        )
 
     def delete_existing_item(self, category: str, selector: str) -> None:
         """Not part of the abstract contract. Targeted deletion of a
