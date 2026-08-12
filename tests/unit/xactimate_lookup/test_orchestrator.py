@@ -321,6 +321,97 @@ def test_execute_plan_stops_on_invalid_quantity(tmp_path, phrase_rules, ranking_
     assert outcome.decision == DECISION_REVIEW_REQUIRED
 
 
+# ---------------------------------------------------------------------
+# Observability: execute_plan() attaches decision_diagnostics (built by
+# classify_decision_with_diagnostics() -- the SAME call that determines
+# `decision`) to the LookupOutcome, at every point after ranking ran.
+# ---------------------------------------------------------------------
+
+
+def test_decision_diagnostics_absent_when_dropdown_never_opened(tmp_path, phrase_rules, ranking_config):
+    """The empty-dropdowns early return in execute_plan() happens BEFORE
+    ranking ever runs -- no candidates exist to classify, so
+    decision_diagnostics must be None rather than fabricated."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    adapter = FakeXactimateAdapter(dropdown_script={})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.decision == DECISION_NO_MATCH
+    assert outcome.decision_diagnostics is None
+
+
+def test_decision_diagnostics_present_on_no_match_after_ranking(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(material="3-tab composition shingles")
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    unrelated = _dropdown("Tear off metal roofing panels", cat="RFG", sel="METAL", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [unrelated]})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.decision == DECISION_NO_MATCH
+    diag = outcome.decision_diagnostics
+    assert diag is not None
+    assert diag.decision == DECISION_NO_MATCH
+    assert diag.gate == "below_review_required_min"
+    assert diag.top_selector == "METAL"
+
+
+def test_decision_diagnostics_present_on_ambiguous_review_required(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(original_description="Drip edge", component=None, material=None, action=None)
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    a = _dropdown("Drip edge - copper", sel="DRIPC", pos=0)
+    b = _dropdown("Drip edge - PVC/TPO clad metal", sel="DRIPP", pos=1)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [a, b]})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.decision == DECISION_REVIEW_REQUIRED
+    diag = outcome.decision_diagnostics
+    assert diag is not None
+    assert diag.gate == "below_auto_select_min"
+    assert diag.top_selector == "DRIPC"
+    assert diag.second_selector == "DRIPP"
+    assert diag.top_score is not None and diag.top_score < ranking_config.auto_select_min
+
+
+def test_decision_diagnostics_present_on_auto_select(tmp_path, phrase_rules, ranking_config):
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item()
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.decision == DECISION_AUTO_SELECT
+    diag = outcome.decision_diagnostics
+    assert diag is not None
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.top_selector == d.selector
+    assert diag.top_has_hard_conflict is False
+
+
+def test_decision_diagnostics_still_reflects_original_auto_select_on_invalid_quantity_stop(tmp_path, phrase_rules, ranking_config):
+    """`decision` on the returned outcome flips to REVIEW_REQUIRED for
+    the quantity guard, but decision_diagnostics must still explain the
+    ranking decision that was actually made (AUTO_SELECT) -- it is not
+    re-derived for the quantity check, which classify_decision_with_
+    diagnostics() knows nothing about."""
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(quantity=None)
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    d = _dropdown("Tear off composition shingles - 3 tab (no haul off)", pos=0)
+    adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [d]})
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+    assert outcome.stop_reason == STOP_REASON_UNIT_QUANTITY_INVALID
+    assert outcome.decision == DECISION_REVIEW_REQUIRED
+    diag = outcome.decision_diagnostics
+    assert diag is not None
+    assert diag.decision == DECISION_AUTO_SELECT
+
+
 def test_dry_run_never_calls_select_or_commit_even_on_auto_select(tmp_path, phrase_rules, ranking_config):
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item()

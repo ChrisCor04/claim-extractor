@@ -1345,6 +1345,65 @@ def test_exact_description_hard_conflict_is_terminal(tmp_path, phrase_rules, ran
     assert task.search_attempts[0]["advanced_to_next_attempt"] is False
 
 
+# ---------------------------------------------------------------------
+# Observability: each recorded search_attempts entry carries a
+# "decision_diagnostics" dict (outcome.decision_diagnostics.to_dict(),
+# built by classify_decision_with_diagnostics() -- the same call that
+# determines "decision" above it), None only when ranking never ran.
+# ---------------------------------------------------------------------
+
+
+def test_search_attempt_decision_diagnostics_present_on_hard_conflict(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    conflict = DropdownResult(
+        raw_text="RFG FELT30", row_position=0, category="RFG", selector="FELT30",
+        description="Roofing felt - 30 lb.", extraction_confidence=1.0,
+    )
+    adapter = _adapter_with_test_project(dropdown_script={
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        _FELT_FULL_DESCRIPTION: [conflict],
+    })
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    diag = task.search_attempts[0]["decision_diagnostics"]
+    assert diag is not None
+    assert diag["decision"] == "REVIEW_REQUIRED"
+    # wrong_material caps the score well below auto_select_min, so the
+    # below_auto_select_min gate fires before the hard_conflict gate is
+    # ever reached -- top_has_hard_conflict/top_conflict_reasons below
+    # still independently record the conflict regardless of which gate
+    # produced the decision.
+    assert diag["gate"] == "below_auto_select_min"
+    assert diag["top_category"] == "RFG"
+    assert diag["top_selector"] == "FELT30"
+    assert diag["top_has_hard_conflict"] is True
+    assert any("wrong_size" in r for r in diag["top_conflict_reasons"])
+    assert diag["auto_select_min"] == ranking_config.auto_select_min
+    assert diag["auto_select_margin"] == ranking_config.auto_select_margin
+    assert diag["min_extraction_confidence"] == ranking_config.min_extraction_confidence
+
+
+def test_search_attempt_decision_diagnostics_present_on_auto_select(tmp_path, phrase_rules, ranking_config):
+    plan = _plan_mapped_and_unmapped()
+    adapter = _adapter_with_test_project(dropdown_script={
+        "RFG 3TAB": [_dropdown("RFG", "3TAB")],
+        _FELT_FULL_DESCRIPTION: [_felt_dropdown()],
+    })
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    task = result.task_by_id("task_unmapped")
+    assert task.state == TASK_COMPLETED
+    diag = task.search_attempts[-1]["decision_diagnostics"]
+    assert diag is not None
+    assert diag["decision"] == "AUTO_SELECT"
+    assert diag["top_category"] == "RFG"
+    assert diag["top_selector"] == "FELT15"
+    assert diag["top_has_hard_conflict"] is False
+
+
 def test_candidate_click_then_duplicate_dialog_is_terminal(tmp_path, phrase_rules, ranking_config):
     plan = _plan_mapped_and_unmapped()
     adapter = _adapter_with_test_project(dropdown_script={

@@ -14,8 +14,8 @@ def _dropdown(text, cat="RFG", sel="X", desc=None, pos=0, conf=0.95):
     return DropdownResult(raw_text=text, row_position=pos, category=cat, selector=sel, description=desc or text, extraction_confidence=conf)
 
 
-def _ranked(score, cat="RFG", sel="X", desc="d", pos=0, conflict_reasons=None):
-    return RankedCandidate(dropdown=_dropdown(desc, cat=cat, sel=sel, pos=pos), score=score, conflict_reasons=conflict_reasons or [])
+def _ranked(score, cat="RFG", sel="X", desc="d", pos=0, conflict_reasons=None, conf=0.95):
+    return RankedCandidate(dropdown=_dropdown(desc, cat=cat, sel=sel, pos=pos, conf=conf), score=score, conflict_reasons=conflict_reasons or [])
 
 
 def test_exact_strong_match_yields_auto_select(phrase_rules, ranking_config):
@@ -659,6 +659,152 @@ def test_below_floor_dominance_untouched_when_top_already_clears_the_ordinary_fl
     top = _below_floor_ranked(0.95)  # no action-match reason, no override needed
     runner_up = _below_floor_ranked(0.30, sel="Y")
     assert ranking.classify_decision([top, runner_up], config) == DECISION_AUTO_SELECT
+
+
+# ---------------------------------------------------------------------
+# Observability: classify_decision_with_diagnostics() persists the exact
+# values/gate classify_decision() itself consulted, without duplicating
+# any branch logic -- classify_decision() is now a pure `.decision`
+# delegate over this function (see ranking.py). Each test below proves
+# a distinct gate produces the right decision AND the right explanatory
+# fields, so a persisted search attempt can explain after the fact why
+# AUTO_SELECT did or did not happen.
+# ---------------------------------------------------------------------
+
+
+def test_diagnostics_score_below_auto_select_threshold(ranking_config):
+    top = _ranked(0.70, cat="RFG", sel="TOP")
+    second = _ranked(0.60, cat="RFG", sel="SECOND")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "below_auto_select_min"
+    assert diag.top_category == "RFG"
+    assert diag.top_selector == "TOP"
+    assert diag.top_score == 0.70
+    assert diag.second_category == "RFG"
+    assert diag.second_selector == "SECOND"
+    assert diag.second_score == 0.60
+    assert diag.margin == 0.10
+    assert diag.auto_select_min == ranking_config.auto_select_min
+    assert diag.auto_select_margin == ranking_config.auto_select_margin
+    assert diag.min_extraction_confidence == ranking_config.min_extraction_confidence
+    assert diag.top_has_hard_conflict is False
+    assert diag.top_conflict_reasons == ()
+    # classify_decision() must agree exactly -- it's a pure delegate.
+    assert ranking.classify_decision([top, second], ranking_config) == diag.decision
+
+
+def test_diagnostics_insufficient_margin(ranking_config):
+    top = _ranked(0.95, sel="TOP")
+    second = _ranked(0.90, sel="SECOND")
+    assert (top.score - second.score) < ranking_config.auto_select_margin
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "insufficient_margin"
+    assert diag.top_score == 0.95
+    assert diag.second_score == 0.90
+    assert diag.margin == 0.05
+    assert ranking.classify_decision([top, second], ranking_config) == diag.decision
+
+
+def test_diagnostics_extraction_confidence_below_minimum(ranking_config):
+    """The `low_extraction_confidence` gate sits AFTER the hard-conflict
+    gate in classify_decision_with_diagnostics() and is only reachable
+    when extraction_confidence is below the threshold WITHOUT already
+    being captured as a conflict_reason -- the real scorer (score_
+    dropdown_candidate) always converts a confidence deficit into a
+    hard conflict itself (see test_diagnostics_hard_conflict below), so
+    this exercises the gate directly via a synthetic candidate,
+    matching this file's existing convention for branches the full
+    scorer pipeline can't cleanly isolate (see the exact-match-override
+    and below-floor-dominance tests' own use of _ranked())."""
+    top = _ranked(0.95, sel="TOP", conf=0.5)
+    second = _ranked(0.5, sel="SECOND")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "low_extraction_confidence"
+    assert diag.top_extraction_confidence == 0.5
+    assert diag.min_extraction_confidence == ranking_config.min_extraction_confidence
+    assert ranking.classify_decision([top, second], ranking_config) == diag.decision
+
+
+def test_diagnostics_hard_conflict(ranking_config):
+    """Every real conflict_caps type (wrong_component/material/size/
+    action/grade_or_style) caps the score below auto_select_min, so a
+    real-scored hard conflict is always caught by the
+    below_review_required_min/below_auto_select_min gates first -- the
+    `hard_conflict` gate itself only fires for a top candidate whose
+    score already cleared auto_select_min (see
+    test_exact_top_with_hard_conflict_is_not_overridden above for the
+    same real, live-caught shape: a conflicting candidate can still
+    score 1.0)."""
+    top = _ranked(1.0, sel="TOP", conflict_reasons=["wrong_material: candidate states a different material"])
+    second = _ranked(0.5, sel="SECOND")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "hard_conflict"
+    assert diag.top_has_hard_conflict is True
+    assert any("wrong_material" in r for r in diag.top_conflict_reasons)
+    assert ranking.classify_decision([top, second], ranking_config) == diag.decision
+
+
+def test_diagnostics_genuine_auto_select(phrase_rules, ranking_config):
+    top = _dropdown("Stain - wood fence/gate", cat="PNT", sel="FENST", pos=0)
+    other = _dropdown("Paint - wood deck", cat="PNT", sel="OTHER", pos=1)
+    candidates = ranking.rank_dropdown_results(
+        original_description="Stain - wood fence/gate", trade="painting", component="fence", material="wood",
+        action="stain", unit="SF", size_key=None, grade_key=None, dropdowns=[top, other], rules=phrase_rules, config=ranking_config,
+    )
+    diag = ranking.classify_decision_with_diagnostics(candidates, ranking_config)
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "clear_margin"
+    assert diag.top_category == "PNT"
+    assert diag.top_selector == "FENST"
+    assert diag.top_has_hard_conflict is False
+    assert diag.margin is not None and diag.margin >= ranking_config.auto_select_margin
+    assert ranking.classify_decision(candidates, ranking_config) == diag.decision
+
+
+def test_diagnostics_no_match_below_review_threshold(phrase_rules, ranking_config):
+    d = _dropdown("Completely unrelated content about swimming pools", sel="POOL")
+    candidates = ranking.rank_dropdown_results(
+        original_description="Tear off composition shingles", trade="roofing", component="composition_shingles",
+        material=None, action="remove", unit="SQ", size_key=None, grade_key=None, dropdowns=[d], rules=phrase_rules, config=ranking_config,
+    )
+    diag = ranking.classify_decision_with_diagnostics(candidates, ranking_config)
+    assert diag.decision == DECISION_NO_MATCH
+    assert diag.gate == "below_review_required_min"
+    assert diag.top_score is not None and diag.top_score < ranking_config.review_required_min
+    assert ranking.classify_decision(candidates, ranking_config) == diag.decision
+
+
+def test_diagnostics_no_candidates_at_all(ranking_config):
+    diag = ranking.classify_decision_with_diagnostics([], ranking_config)
+    assert diag.decision == DECISION_NO_MATCH
+    assert diag.gate == "no_candidates"
+    assert diag.top_category is None
+    assert diag.top_score is None
+    assert diag.second_score is None
+    assert diag.margin is None
+
+
+def test_diagnostics_to_dict_serializes_all_fields(ranking_config):
+    top = _ranked(0.95, cat="RFG", sel="TOP")
+    second = _ranked(0.5, cat="RFG", sel="SECOND")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    d = diag.to_dict()
+    assert d["decision"] == DECISION_AUTO_SELECT
+    assert d["gate"] == "clear_margin"
+    assert d["top_category"] == "RFG"
+    assert d["top_selector"] == "TOP"
+    assert d["top_score"] == 0.95
+    assert d["second_category"] == "RFG"
+    assert d["second_selector"] == "SECOND"
+    assert d["second_score"] == 0.5
+    assert isinstance(d["top_conflict_reasons"], list)
+    assert d["auto_select_min"] == ranking_config.auto_select_min
+    assert d["auto_select_margin"] == ranking_config.auto_select_margin
+    assert d["min_extraction_confidence"] == ranking_config.min_extraction_confidence
 
 
 def test_below_floor_dominance_real_0016_shape_correctly_refuses_to_fire():

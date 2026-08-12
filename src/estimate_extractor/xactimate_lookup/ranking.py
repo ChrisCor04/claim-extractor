@@ -692,27 +692,106 @@ def _below_floor_semantic_dominance(candidates: list[RankedCandidate], config: R
     return True
 
 
-def classify_decision(candidates: list[RankedCandidate], config: RankingConfig) -> str:
-    """Never automatically returns AUTO_SELECT for an empty or single
-    weak result -- see build spec 'Do not automatically choose the first
-    dropdown result.'."""
+@dataclass(slots=True, frozen=True)
+class DecisionDiagnostics:
+    """Every value classify_decision() actually consulted to reach its
+    outcome, plus which exact branch ("gate") produced it -- built by
+    classify_decision_with_diagnostics(), which runs the SAME branches
+    classify_decision() itself delegates to, so this can never drift
+    from the real decision (see that function's own docstring). Exists
+    so a persisted search attempt can explain -- after the fact, without
+    re-running anything -- exactly why AUTO_SELECT did or did not
+    happen, without duplicating the decision logic anywhere else.
+
+    `gate` is one of: "no_candidates", "below_review_required_min",
+    "below_auto_select_min", "below_floor_semantic_dominance_override",
+    "hard_conflict", "low_extraction_confidence", "insufficient_margin",
+    "insufficient_margin_exact_top_override", "clear_margin"."""
+
+    decision: str
+    gate: str
+    top_category: str | None
+    top_selector: str | None
+    top_score: float | None
+    top_extraction_confidence: float | None
+    top_has_hard_conflict: bool | None
+    top_conflict_reasons: tuple[str, ...]
+    second_category: str | None
+    second_selector: str | None
+    second_score: float | None
+    margin: float | None
+    auto_select_min: float
+    auto_select_margin: float
+    min_extraction_confidence: float
+
+    def to_dict(self) -> dict:
+        return {
+            "decision": self.decision,
+            "gate": self.gate,
+            "top_category": self.top_category,
+            "top_selector": self.top_selector,
+            "top_score": self.top_score,
+            "top_extraction_confidence": self.top_extraction_confidence,
+            "top_has_hard_conflict": self.top_has_hard_conflict,
+            "top_conflict_reasons": list(self.top_conflict_reasons),
+            "second_category": self.second_category,
+            "second_selector": self.second_selector,
+            "second_score": self.second_score,
+            "margin": self.margin,
+            "auto_select_min": self.auto_select_min,
+            "auto_select_margin": self.auto_select_margin,
+            "min_extraction_confidence": self.min_extraction_confidence,
+        }
+
+
+def classify_decision_with_diagnostics(candidates: list[RankedCandidate], config: RankingConfig) -> DecisionDiagnostics:
+    """The actual decision logic -- classify_decision() is a thin
+    wrapper returning only `.decision`, so every existing caller's
+    signature/behavior is completely unchanged. Never automatically
+    returns AUTO_SELECT for an empty or single weak result -- see build
+    spec 'Do not automatically choose the first dropdown result.'."""
+    thresholds = dict(
+        auto_select_min=config.auto_select_min,
+        auto_select_margin=config.auto_select_margin,
+        min_extraction_confidence=config.min_extraction_confidence,
+    )
+
+    def _build(decision: str, gate: str, *, top=None, second=None, margin=None) -> DecisionDiagnostics:
+        return DecisionDiagnostics(
+            decision=decision, gate=gate,
+            top_category=top.dropdown.category if top is not None else None,
+            top_selector=top.dropdown.selector if top is not None else None,
+            top_score=top.score if top is not None else None,
+            top_extraction_confidence=top.dropdown.extraction_confidence if top is not None else None,
+            top_has_hard_conflict=top.has_hard_conflict if top is not None else None,
+            top_conflict_reasons=tuple(top.conflict_reasons) if top is not None else (),
+            second_category=second.dropdown.category if second is not None else None,
+            second_selector=second.dropdown.selector if second is not None else None,
+            second_score=second.score if second is not None else None,
+            margin=margin,
+            **thresholds,
+        )
+
     if not candidates:
-        return DECISION_NO_MATCH
+        return _build(DECISION_NO_MATCH, "no_candidates")
 
     top = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+    second_score = second.score if second is not None else 0.0
+    margin = round(top.score - second_score, 4)
+
     if top.score < config.review_required_min:
-        return DECISION_NO_MATCH
+        return _build(DECISION_NO_MATCH, "below_review_required_min", top=top, second=second, margin=margin)
 
     if top.score < config.auto_select_min:
         if _below_floor_semantic_dominance(candidates, config):
-            return DECISION_AUTO_SELECT
-        return DECISION_REVIEW_REQUIRED
+            return _build(DECISION_AUTO_SELECT, "below_floor_semantic_dominance_override", top=top, second=second, margin=margin)
+        return _build(DECISION_REVIEW_REQUIRED, "below_auto_select_min", top=top, second=second, margin=margin)
     if top.has_hard_conflict:
-        return DECISION_REVIEW_REQUIRED
+        return _build(DECISION_REVIEW_REQUIRED, "hard_conflict", top=top, second=second, margin=margin)
     if top.dropdown.extraction_confidence < config.min_extraction_confidence:
-        return DECISION_REVIEW_REQUIRED
+        return _build(DECISION_REVIEW_REQUIRED, "low_extraction_confidence", top=top, second=second, margin=margin)
 
-    second_score = candidates[1].score if len(candidates) > 1 else 0.0
     if (top.score - second_score) < config.auto_select_margin:
         # Phase 5.15 Pass 2 (live-caught against ground truth):
         # margin alone was refusing candidates that are, semantically,
@@ -746,6 +825,17 @@ def classify_decision(candidates: list[RankedCandidate], config: RankingConfig) 
         exact_top = top.score >= _EXACT_MATCH_SCORE_THRESHOLD
         exact_tie = second_score >= _EXACT_MATCH_SCORE_THRESHOLD
         if not (exact_top and not exact_tie):
-            return DECISION_REVIEW_REQUIRED
+            return _build(DECISION_REVIEW_REQUIRED, "insufficient_margin", top=top, second=second, margin=margin)
+        return _build(DECISION_AUTO_SELECT, "insufficient_margin_exact_top_override", top=top, second=second, margin=margin)
 
-    return DECISION_AUTO_SELECT
+    return _build(DECISION_AUTO_SELECT, "clear_margin", top=top, second=second, margin=margin)
+
+
+def classify_decision(candidates: list[RankedCandidate], config: RankingConfig) -> str:
+    """Never automatically returns AUTO_SELECT for an empty or single
+    weak result -- see build spec 'Do not automatically choose the first
+    dropdown result.' Thin wrapper over classify_decision_with_
+    diagnostics() -- see that function for the actual branch-by-branch
+    logic; this preserves the exact original signature/return value for
+    every existing caller, unchanged."""
+    return classify_decision_with_diagnostics(candidates, config).decision

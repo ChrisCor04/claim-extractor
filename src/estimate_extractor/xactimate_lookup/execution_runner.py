@@ -641,6 +641,7 @@ def _run_description_first_task(
             advance_reason = "final retrieval attempt"
 
         top = outcome.candidates[0] if outcome.candidates else None
+        diagnostics = outcome.decision_diagnostics
         task.search_attempts.append({
             "attempt_number": attempt_number,
             "search_type": search_type,
@@ -653,6 +654,14 @@ def _run_description_first_task(
             "stop_reason": outcome.stop_reason,
             "advanced_to_next_attempt": should_advance,
             "advance_reason": advance_reason,
+            # classify_decision_with_diagnostics()'s own record of every
+            # value it consulted (top/second candidate, score, margin,
+            # extraction confidence, hard-conflict/conflict reasons, the
+            # applicable thresholds) and which exact branch ("gate")
+            # produced `decision` above -- None only when ranking was
+            # never reached (e.g. an empty dropdown popup). See
+            # DecisionDiagnostics in ranking.py.
+            "decision_diagnostics": diagnostics.to_dict() if hasattr(diagnostics, "to_dict") else None,
         })
         if not should_advance:
             break

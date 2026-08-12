@@ -56,7 +56,11 @@ from estimate_extractor.xactimate_lookup.models import (
     RecommendationInput,
 )
 from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, generate_search_phrase
-from estimate_extractor.xactimate_lookup.ranking import RankingConfig, classify_decision, rank_dropdown_results
+from estimate_extractor.xactimate_lookup.ranking import (
+    RankingConfig,
+    classify_decision_with_diagnostics,
+    rank_dropdown_results,
+)
 
 
 def _verified_catalog_trusted_mapping(item: RecommendationInput, verified_records: list, item_signature: str) -> InternalMappingRecord | None:
@@ -132,10 +136,13 @@ def build_lookup_plan(
     )
 
 
-def _stop(line_item_id: str, plan: LookupPlan, decision: str, reason: str, detail: str, candidates=None, selected=None) -> LookupOutcome:
+def _stop(
+    line_item_id: str, plan: LookupPlan, decision: str, reason: str, detail: str, candidates=None, selected=None,
+    decision_diagnostics=None,
+) -> LookupOutcome:
     return LookupOutcome(
         line_item_id=line_item_id, decision=decision, plan=plan, candidates=candidates or [], selected=selected,
-        stop_reason=reason, stop_detail=detail,
+        stop_reason=reason, stop_detail=detail, decision_diagnostics=decision_diagnostics,
     )
 
 
@@ -325,8 +332,9 @@ def execute_plan(
         unit=item.source_unit, size_key=size_key, grade_key=grade_key, dropdowns=dropdowns,
         rules=phrase_rules, config=ranking_config, prior_verified_mapping=(plan.path == LOOKUP_PATH_TRUSTED),
     )
-    decision = classify_decision(candidates, ranking_config)
-    _record_lifecycle(adapter, "DECISION_MADE", decision=decision)
+    decision_diagnostics = classify_decision_with_diagnostics(candidates, ranking_config)
+    decision = decision_diagnostics.decision
+    _record_lifecycle(adapter, "DECISION_MADE", decision=decision, gate=decision_diagnostics.gate)
 
     if (
         force_auto_select_for_trusted_mapping
@@ -342,26 +350,41 @@ def execute_plan(
 
     if decision == DECISION_NO_MATCH:
         adapter.recover()  # Phase 5.8A: same popup-left-open fix as above
-        return _stop(item.line_item_id, plan, DECISION_NO_MATCH, STOP_REASON_NO_RESULTS, "No candidate scored above the review-required threshold.", candidates=candidates)
+        return _stop(
+            item.line_item_id, plan, DECISION_NO_MATCH, STOP_REASON_NO_RESULTS,
+            "No candidate scored above the review-required threshold.", candidates=candidates,
+            decision_diagnostics=decision_diagnostics,
+        )
 
     if decision == DECISION_REVIEW_REQUIRED:
         top = candidates[0]
         adapter.recover()  # Phase 5.8A: same popup-left-open fix as above
         if top.has_hard_conflict:
-            return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_HARD_CONFLICT, "; ".join(top.conflict_reasons), candidates=candidates, selected=top)
+            return _stop(
+                item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_HARD_CONFLICT,
+                "; ".join(top.conflict_reasons), candidates=candidates, selected=top,
+                decision_diagnostics=decision_diagnostics,
+            )
         return _stop(
             item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_AMBIGUOUS,
             "Top candidate lacks a clear margin, sufficient score, or reliable extraction confidence.",
-            candidates=candidates, selected=top,
+            candidates=candidates, selected=top, decision_diagnostics=decision_diagnostics,
         )
 
     # DECISION_AUTO_SELECT
     top = candidates[0]
 
     if item.quantity is None or item.quantity <= 0:
-        return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_QUANTITY_INVALID, f"Invalid quantity for commit: {item.quantity!r}.", candidates=candidates, selected=top)
+        return _stop(
+            item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNIT_QUANTITY_INVALID,
+            f"Invalid quantity for commit: {item.quantity!r}.", candidates=candidates, selected=top,
+            decision_diagnostics=decision_diagnostics,
+        )
 
-    outcome = LookupOutcome(line_item_id=item.line_item_id, decision=decision, plan=plan, candidates=candidates, selected=top)
+    outcome = LookupOutcome(
+        line_item_id=item.line_item_id, decision=decision, plan=plan, candidates=candidates, selected=top,
+        decision_diagnostics=decision_diagnostics,
+    )
 
     if dry_run:
         outcome.stop_detail = "dry_run: plan only, adapter selection/commit not executed."

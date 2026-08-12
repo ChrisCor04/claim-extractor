@@ -284,6 +284,19 @@ class LookupOutcome:
     #: nothing about execute_plan()'s own decision logic reads this
     #: field.
     populated_fields: PopulatedFields | None = None
+    #: ranking.DecisionDiagnostics from the SAME classify_decision_
+    #: with_diagnostics() call that produced `decision` -- every value
+    #: consulted (top/second candidate, score, margin, extraction
+    #: confidence, hard-conflict/conflict reasons, the applicable
+    #: thresholds) plus which exact branch ("gate") fired, so a
+    #: persisted search attempt can explain after the fact why
+    #: AUTO_SELECT did or did not happen, without re-running anything.
+    #: Deliberately untyped here (duck-typed via `.to_dict()`), same
+    #: convention as `verification` above -- xactimate_lookup's models
+    #: module stays independent of the ranking module's own types.
+    #: None only when classify_decision_with_diagnostics() was never
+    #: reached (e.g. the dropdown popup itself never appeared).
+    decision_diagnostics: object | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -309,4 +322,9 @@ class LookupOutcome:
             "committed": self.committed,
             "physical_state_uncertain": self.physical_state_uncertain,
             "verification_trust_state": getattr(self.verification, "trust_state", None),
+            "decision_diagnostics": (
+                self.decision_diagnostics.to_dict()
+                if hasattr(self.decision_diagnostics, "to_dict")
+                else None
+            ),
         }
