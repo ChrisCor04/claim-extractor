@@ -2712,9 +2712,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
             identity = self._activation_identity(row)
             if index >= row_count and not all(identity[:2]):
                 break
-            if identity != target.identity:
+            if not self._quantity_identity_matches(identity, target.identity):
                 continue
-            if target.activity is not None and self._activity_token(row) != target.activity:
+            # Only real R&R activity glyphs are stable identity evidence.
+            # Ordinary single rows can yield arbitrary OCR from this
+            # visually empty column (live: "&" before entry, "o" after
+            # Tab); never make that noise load-bearing.
+            if target.activity in ("-", "+") and self._activity_token(row) != target.activity:
                 continue
             observed = self._read_quantity_at(image, offset, row_top)
             if observed is None:
@@ -2723,6 +2727,25 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 )
             matches.append((index, row_top, observed))
         return matches
+
+    @staticmethod
+    def _quantity_identity_matches(
+        observed: tuple[str, str, str], expected: tuple[str, str, str],
+    ) -> bool:
+        """Exact logical identity with spacing-insensitive description.
+
+        CAT and SEL remain exact. Description OCR can split or join one
+        word across highlight/Tab repaint (live: ``up to``/``upto``), so
+        compare the already alphanumeric-normalized streams without
+        spaces. This is not fuzzy matching and cannot turn a different
+        character sequence into a match.
+        """
+        return (
+            observed[0] == expected[0]
+            and observed[1] == expected[1]
+            and bool(observed[2])
+            and observed[2].replace(" ", "") == expected[2].replace(" ", "")
+        )
 
     def _locate_pending_quantity_row(
         self,
@@ -2752,9 +2775,17 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if offset is not None:
                 matches = self._quantity_target_candidates(image, offset, target)
                 if confirmation_ordinal is not None:
-                    if 1 <= confirmation_ordinal <= len(matches):
+                    if len(matches) == 1:
+                        _index, row_top, observed = matches[0]
+                        return image, offset, row_top, 1, observed, scrolled
+                    if target.activity in ("-", "+") and 1 <= confirmation_ordinal <= len(matches):
                         _index, row_top, observed = matches[confirmation_ordinal - 1]
                         return image, offset, row_top, confirmation_ordinal, observed, scrolled
+                    if len(matches) > 1:
+                        raise QuantityNotConfirmedError(
+                            "enter_quantity(): multiple ordinary rows match the retained CAT/SEL/description "
+                            "during confirmation; refusing to resolve them by stale row index or quantity."
+                        )
                 elif len(matches) == 1:
                     _index, row_top, observed = matches[0]
                     if observed is None or abs(observed) <= 0.01:
@@ -3159,7 +3190,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     return None
             if len(remaining) != 1:
                 return None
-            activity = remaining[0]
+            # A non-R&R row's visually empty activity cell commonly
+            # produces changing OCR garbage. Retain activity only when
+            # it is a real +/- glyph; ordinary rows are identified by
+            # their validated CAT/SEL/description delta instead.
+            activity = remaining[0] if remaining[0] in ("-", "+") else None
 
         matching_indices = [
             index for index, row in enumerate(after_rows)

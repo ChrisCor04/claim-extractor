@@ -4470,6 +4470,54 @@ def test_quantity_identity_prior_200_new_gsg_reads_one_never_prior_row(monkeypat
     assert clicks == [100 + 25 + 12]
 
 
+def test_quantity_confirmation_reidentifies_moved_single_row_after_ocr_repaint(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    # The target was originally row 1 with joined-word description OCR
+    # and garbage from an empty activity cell. After Tab it is row 0,
+    # the word is split, and activity OCR changes. CAT/SEL and the exact
+    # alphanumeric description stream still uniquely identify it.
+    rows = [
+        ActivationRowSnapshot("SFG", "GUTA", "Gutter / downspout - aluminum - up to 5 Dy", "o"),
+        ActivationRowSnapshot("SFG", "DS", "Downspout", None),
+    ]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("sfg", "guta", "gutter downspout aluminum upto 5 dy"), "&", 1, 1,
+    )
+    _state, reads, _clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [200.0, 40.0], 200.0)
+
+    _image, _offset, row_top, ordinal, observed, _scrolled = adapter._locate_pending_quantity_row(
+        123, confirmation_ordinal=1,
+    )
+
+    assert row_top == 100
+    assert ordinal == 1
+    assert observed == 200.0
+    assert set(reads) == {0}
+
+
+def test_quantity_confirmation_fails_closed_for_ambiguous_ordinary_duplicates(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        ActivationRowSnapshot("SFG", "GUTA", "Gutter aluminum", None),
+        ActivationRowSnapshot("SFG", "GUTA", "Gutter aluminum", None),
+    ]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "guta", "gutter aluminum"), None, 1, 2)
+    _wire_identity_quantity_flow(monkeypatch, adapter, rows, [200.0, 200.0], 200.0)
+
+    with pytest.raises(QuantityNotConfirmedError, match="multiple ordinary rows"):
+        adapter._locate_pending_quantity_row(123, confirmation_ordinal=2)
+
+
+def test_pending_single_row_target_discards_non_rr_activity_ocr_noise():
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    target = adapter._pending_quantity_target_from_delta(
+        [], [ActivationRowSnapshot("SFG", "GUTA", "Gutter aluminum", "&")],
+    )
+
+    assert target is not None
+    assert target.activity is None
+
+
 def test_quantity_identity_survives_multiple_existing_rows(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     rows = [
