@@ -46,6 +46,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TASK_SKIPPED,
     is_plan_stale,
     load_execution_plan,
+    reset_unfinished_tasks,
     save_execution_plan,
 )
 from estimate_extractor.xactimate_lookup.execution_runner import (
@@ -297,6 +298,39 @@ def test_resumed_physical_unconfirmed_checkpoint_stops_before_any_task_or_later_
     assert not any(call[0] in ("search_by_description", "search_by_category_selector") for call in adapter.log.calls)
     assert adapter.ensure_group_calls == []
     assert "Fence" not in adapter.select_group_calls
+
+
+def test_full_reset_clears_stale_physical_uncertain_so_preloop_guard_does_not_refire(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """Live-caught regression: reset_unfinished_tasks(full_reset=True)
+    reset task state back to PENDING but left physical_state_uncertain
+    stale from a PRIOR run -- the resumed_physical pre-loop guard above
+    treats that identically to a real physical-item-created-unconfirmed
+    checkpoint and hard-stops the whole run before task 1 ever runs,
+    even on a plan that was just deliberately reset to start over (e.g.
+    after the live estimate was manually cleared, so the grid state that
+    originally set the flag no longer even exists). A genuine full reset
+    must clear it, or "start over" doesn't actually start over."""
+    plan = _plan_two_groups()
+    plan.tasks[0].state = TASK_REVIEW_REQUIRED
+    plan.tasks[0].physical_state_uncertain = True
+    plan.tasks[0].stop_reason = "physical_state_uncertain"
+
+    reset_unfinished_tasks(plan, tmp_path, full_reset=True)
+    assert plan.tasks[0].state == TASK_PENDING
+    assert plan.tasks[0].physical_state_uncertain is False
+
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    # The pre-loop guard must NOT fire -- the run actually proceeds and
+    # attempts task 0, rather than hard-stopping before touching anything.
+    assert result.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP
+    assert result.tasks[0].attempts >= 1
+    assert adapter.ensure_group_calls != []
 
 
 def test_happy_path_all_groups_verified_all_tasks_completed(tmp_path, phrase_rules, ranking_config):

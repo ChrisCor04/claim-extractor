@@ -644,6 +644,18 @@ def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset
             task.observed_quantity = None
             task.observed_unit = None
             task.entered_quantity = None
+            # Live-caught: physical_state_uncertain is the OTHER field
+            # (besides commit_state, already cleared above) run_
+            # execution_plan()'s pre-loop/per-task resume guards check to
+            # hard-stop the whole run before touching anything -- a task
+            # reset to PENDING with this still True from a PRIOR run (the
+            # grid state that made it True may no longer even exist, e.g.
+            # after the live estimate was manually cleared) immediately
+            # re-triggers that same hard stop before task 1 ever runs,
+            # even though nothing about the current physical state is
+            # actually in question. A genuine full reset must clear it
+            # alongside commit_state, or it isn't actually a full reset.
+            task.physical_state_uncertain = False
         reset_count += 1
 
     for group in plan.groups:

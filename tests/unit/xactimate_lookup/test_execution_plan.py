@@ -605,6 +605,73 @@ def test_reset_unfinished_tasks_full_reset_still_resets_committed_but_unverified
 
 
 # ---------------------------------------------------------------------
+# Live-caught: reset_unfinished_tasks(full_reset=True) reset `state`
+# back to PENDING but left `physical_state_uncertain` stale from the
+# prior run -- run_execution_plan()'s own pre-loop/per-task resume
+# guards check exactly that flag (alongside commit_state, which WAS
+# already cleared) and hard-stop the whole run before task 1 ever
+# starts, even on a plan that was just "genuinely started over".
+# ---------------------------------------------------------------------
+
+
+def test_full_reset_clears_stale_physical_state_uncertain(tmp_path):
+    plan = _plan_with_mixed_states()
+    stale_physical = ExecutionTask(
+        task_id="t_stale_physical", line_item_id="line_stale_physical", source_order=4,
+        area_name=None, section_name="Roof", description="d", category=None, selector=None,
+        lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST, source_quantity=1.0, source_unit="SQ",
+        expected_unit="SQ", state=TASK_REVIEW_REQUIRED, began_unmapped=True,
+        physical_state_uncertain=True, stop_reason="physical_state_uncertain",
+        started_at="t1", completed_at="t2",
+    )
+    plan.tasks.append(stale_physical)
+    plan.groups[0].task_ids.append(stale_physical.task_id)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_unfinished_tasks(plan, project_dir, full_reset=True)
+
+    task = plan.task_by_id("t_stale_physical")
+    assert task.state == TASK_PENDING
+    assert task.physical_state_uncertain is False
+    assert task.stop_reason is None
+
+    reloaded = load_execution_plan(project_dir)
+    assert reloaded.task_by_id("t_stale_physical").physical_state_uncertain is False  # persisted correctly
+
+
+def test_reset_unfinished_tasks_leaves_physical_state_uncertain_when_not_full_reset(tmp_path):
+    """The distinction is intentional and scoped to full_reset=True only
+    (per the fix's own scope): task_has_committed_row() already treats
+    physical_state_uncertain=True as "unsafe to retry" (see its own
+    docstring), so a plain "Reset unfinished" pass leaves such a task
+    completely untouched -- same as any other committed-evidence task --
+    rather than silently resetting it. That existing protection must
+    keep working exactly as before; this fix only changes what happens
+    once full_reset=True deliberately overrides it."""
+    plan = _plan_with_mixed_states()
+    stale_physical = ExecutionTask(
+        task_id="t_stale_physical", line_item_id="line_stale_physical", source_order=4,
+        area_name=None, section_name="Roof", description="d", category=None, selector=None,
+        lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST, source_quantity=1.0, source_unit="SQ",
+        expected_unit="SQ", state=TASK_REVIEW_REQUIRED, began_unmapped=True,
+        physical_state_uncertain=True, stop_reason="physical_state_uncertain",
+        started_at="t1", completed_at="t2",
+    )
+    plan.tasks.append(stale_physical)
+    plan.groups[0].task_ids.append(stale_physical.task_id)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    reset_count = reset_unfinished_tasks(plan, project_dir, full_reset=False)
+
+    task = plan.task_by_id("t_stale_physical")
+    assert reset_count == 2  # t_review and t_failed only -- NOT t_stale_physical
+    assert task.state == TASK_REVIEW_REQUIRED  # left completely untouched, unchanged from before this fix
+    assert task.physical_state_uncertain is True
+
+
+# ---------------------------------------------------------------------
 # Phase 5.9: save_execution_plan() refuses to silently shrink a plan.
 # ---------------------------------------------------------------------
 
