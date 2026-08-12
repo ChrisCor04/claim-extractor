@@ -22,6 +22,7 @@ from estimate_extractor.xactimate_lookup.adapter import AdapterError, Unexpected
 from estimate_extractor.xactimate_lookup.models import DropdownResult
 from estimate_extractor.xactimate_lookup.windows_adapter import (
     ActivationRowSnapshot,
+    CommitRowSnapshot,
     CommitVerification,
     EstimateBaseline,
     GroupRowSnapshot,
@@ -1204,7 +1205,10 @@ def test_quantity_match_does_not_override_unit_conflict():
     assert verification.trust_state == "UNIT_MISMATCH"
 
 
-def _adapter_with_fake_commit_grid(monkeypatch, row_sequence, unit_reads=None, quantity_reads=None):
+def _adapter_with_fake_commit_grid(
+    monkeypatch, row_sequence, unit_reads=None, quantity_reads=None,
+    commit_row_sequence=None, baseline_rows=None,
+):
     """Builds a WindowsXactimateAdapter with every internal dependency
     `verify_commit()` touches (via `snapshot_grid_identities()` and its
     own follow-up reads at the structurally-identified row)
@@ -1222,7 +1226,19 @@ def _adapter_with_fake_commit_grid(monkeypatch, row_sequence, unit_reads=None, q
     monkeypatch.setattr(adapter, "_shifted_anchor", lambda name, offset: (0, 0, 0, 0))
 
     grids = iter(row_sequence)
+    rich_grids = iter(commit_row_sequence) if commit_row_sequence is not None else None
     state = {"grid": []}
+    adapter._last_commit_baseline_rows = list(baseline_rows or [])
+
+    def snapshot_commit_rows():
+        if rich_grids is not None:
+            rich = next(rich_grids, [])
+            state["grid"] = [(row.category, row.selector) for row in rich]
+            return list(rich)
+        state["grid"] = next(grids, state["grid"])
+        return [CommitRowSnapshot(cat, sel, "desc", None, 0.0, "EA") for cat, sel in state["grid"]]
+
+    monkeypatch.setattr(adapter, "_snapshot_commit_rows", snapshot_commit_rows)
 
     def last_row_geometry(image, offset):
         state["grid"] = next(grids, state["grid"])
@@ -1458,16 +1474,17 @@ def test_verify_commit_two_unrelated_rows_remain_conflicting(monkeypatch):
 
 
 def test_verify_commit_accepts_valid_rr_pair_as_one_logical_item(monkeypatch):
+    rr_rows = [
+        CommitRowSnapshot("RFG", "STEEP", "Steep charge", "-", 0.0, "SQ"),
+        CommitRowSnapshot("RFG", "STEEP", "Steep charge", "+", 33.66, "SQ"),
+    ]
     adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
         row_sequence=[[("RFG", "STEEP"), ("RFG", "STEEP")]],
         unit_reads=[("SQ", "SQ")],
         quantity_reads=[33.66],
+        commit_row_sequence=[rr_rows],
     )
-    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
-        _activation_row(activity="-"),
-        _activation_row(activity="+"),
-    ])
 
     result = adapter.verify_commit(
         [], "RFG", "STEEP", 33.66,
@@ -1484,17 +1501,19 @@ def test_verify_commit_accepts_valid_rr_pair_as_one_logical_item(monkeypatch):
 
 def test_verify_commit_accepts_valid_rr_pair_after_unchanged_existing_rows(monkeypatch):
     before = [("SFG", "GUTA")]
+    baseline = [CommitRowSnapshot("SFG", "GUTA", "Gutter", None, 200.0, "LF")]
+    after_rows = [
+        baseline[0],
+        CommitRowSnapshot("RFG", "STEEP", "Steep charge", "-", 0.0, "SQ"),
+        CommitRowSnapshot("RFG", "STEEP", "Steep charge", "+", 35.67, "SQ"),
+    ]
     adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
         row_sequence=[[*before, ("RFG", "STEEP"), ("RFG", "STEEP")]],
         unit_reads=[("SQ", "SQ")],
         quantity_reads=[35.67],
+        commit_row_sequence=[after_rows], baseline_rows=baseline,
     )
-    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
-        _activation_row(cat="SFG", sel="GUTA", desc="Gutter", activity="+"),
-        _activation_row(activity="-"),
-        _activation_row(activity="+"),
-    ])
 
     result = adapter.verify_commit(
         before, "RFG", "STEEP", 35.67,
@@ -1515,10 +1534,123 @@ def test_verify_commit_preexisting_rows_changed_is_conflicting_row(monkeypatch):
     adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
         row_sequence=[[("PLM", "OTHER"), ("SFG", "GUTA")]],
+        baseline_rows=[CommitRowSnapshot("PLM", "TLT", "Toilet", None, 1.0, "EA")],
     )
     result = adapter.verify_commit([("PLM", "TLT")], "SFG", "GUTA", 5.0, timeout_s=3.0)
     assert result.trust_state == "CONFLICTING_ROW"
     assert result.preexisting_rows_unchanged is False
+
+
+def test_verify_commit_accepts_new_row_inserted_above_unchanged_existing_row(monkeypatch):
+    old = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 200.0, "LF")
+    new = CommitRowSnapshot("SFG", "GSG", "Gutter splash guard", None, 1.0, "EA")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[old], commit_row_sequence=[[new, old]],
+        quantity_reads=[1.0], unit_reads=[("EA", "EA")],
+    )
+
+    result = adapter.verify_commit(
+        [("SFG", "GUTA")], "SFG", "GSG", 1.0,
+        source_unit="EA", expected_xactimate_unit="EA",
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.row_index == 0
+    assert result.preexisting_rows_unchanged is True
+
+
+def test_verify_commit_accepts_ordinary_baseline_reordering(monkeypatch):
+    first = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 200.0, "LF")
+    second = CommitRowSnapshot("SFG", "DS", "Downspout", None, 40.0, "LF")
+    new = CommitRowSnapshot("SFG", "GSG", "Gutter splash guard", None, 1.0, "EA")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[first, second],
+        commit_row_sequence=[[new, second, first]], quantity_reads=[1.0], unit_reads=[("EA", "EA")],
+    )
+
+    result = adapter.verify_commit(
+        [("SFG", "GUTA"), ("SFG", "DS")], "SFG", "GSG", 1.0,
+        source_unit="EA", expected_xactimate_unit="EA",
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.row_index == 0
+
+
+def test_verify_commit_rejects_changed_baseline_quantity(monkeypatch):
+    old = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 200.0, "LF")
+    changed = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 199.0, "LF")
+    new = CommitRowSnapshot("SFG", "GSG", "Gutter splash guard", None, 1.0, "EA")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[old], commit_row_sequence=[[new, changed]],
+    )
+
+    result = adapter.verify_commit([("SFG", "GUTA")], "SFG", "GSG", 1.0)
+
+    assert result.trust_state == "CONFLICTING_ROW"
+
+
+def test_verify_commit_rejects_missing_baseline_row(monkeypatch):
+    old = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 200.0, "LF")
+    replacement = CommitRowSnapshot("SFG", "GSG", "Gutter splash guard", None, 1.0, "EA")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[old],
+        commit_row_sequence=[[replacement], [replacement], [replacement]],
+    )
+
+    result = adapter.verify_commit([("SFG", "GUTA")], "SFG", "GSG", 1.0, timeout_s=0.1)
+
+    assert result.trust_state != "VERIFIED"
+
+
+def test_verify_commit_rejects_two_unexpected_new_logical_items(monkeypatch):
+    old = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 200.0, "LF")
+    new = CommitRowSnapshot("SFG", "GSG", "Gutter splash guard", None, 1.0, "EA")
+    extra = CommitRowSnapshot("SFG", "DS", "Downspout", None, 40.0, "LF")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[old], commit_row_sequence=[[new, old, extra]],
+    )
+
+    result = adapter.verify_commit([("SFG", "GUTA")], "SFG", "GSG", 1.0)
+
+    assert result.trust_state == "CONFLICTING_ROW"
+
+
+def test_verify_commit_rejects_baseline_duplicate_multiplicity_loss(monkeypatch):
+    duplicate = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 200.0, "LF")
+    new = CommitRowSnapshot("SFG", "GSG", "Gutter splash guard", None, 1.0, "EA")
+    extra = CommitRowSnapshot("SFG", "DS", "Downspout", None, 40.0, "LF")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[duplicate, duplicate],
+        commit_row_sequence=[[new, duplicate, extra]],
+    )
+
+    result = adapter.verify_commit(
+        [("SFG", "GUTA"), ("SFG", "GUTA")], "SFG", "GSG", 1.0,
+    )
+
+    assert result.trust_state == "CONFLICTING_ROW"
+
+
+def test_verify_commit_accepts_rr_activity_regrouping_as_multiset(monkeypatch):
+    old_remove = CommitRowSnapshot("RFG", "STEEP", "Steep charge", "-", 0.0, "SQ")
+    old_add = CommitRowSnapshot("RFG", "STEEP", "Steep charge", "+", 33.66, "SQ")
+    new_remove = CommitRowSnapshot("RFG", "STEEP", "Steep charge", "-", 0.0, "SQ")
+    new_add = CommitRowSnapshot("RFG", "STEEP", "Steep charge", "+", 35.67, "SQ")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[old_remove, old_add],
+        commit_row_sequence=[[old_remove, new_remove, old_add, new_add]],
+        quantity_reads=[35.67], unit_reads=[("SQ", "SQ")],
+    )
+
+    result = adapter.verify_commit(
+        [("RFG", "STEEP"), ("RFG", "STEEP")], "RFG", "STEEP", 35.67,
+        source_unit="SQ", expected_xactimate_unit="SQ",
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.row_index == 3
+    assert result.samples[0]["logical_rr_pair"] is True
 
 
 def test_verify_commit_times_out_when_row_count_never_changes(monkeypatch):
@@ -2400,6 +2532,10 @@ def test_activation_baseline_adds_one_readable_viewport_edge_row_without_scrolli
             "RFG", "STEEP", "Steep charge", "-"
         ),
     )
+    monkeypatch.setattr(adapter, "_snapshot_commit_rows", lambda: [
+        CommitRowSnapshot("RFG", "STEEP", "Steep charge", "-", 0.0, "SQ")
+        for _ in range(16)
+    ])
 
     baseline = adapter.snapshot_grid_identities_for_activation()
 

@@ -446,10 +446,9 @@ class UnitVerificationResult:
 @dataclass(slots=True)
 class CommitVerification:
     """Phase 4.8: the full result of `verify_commit()` -- identifies
-    the committed row STRUCTURALLY (row-count delta from a
-    before-commit snapshot, plus the deterministic "insertions always
-    append at the end" behavior observed throughout this project),
-    never by searching OCR text across every row (Phase 4.7's
+    the committed row STRUCTURALLY (a rich, order-independent logical
+    multiset delta from a before-commit snapshot), never by searching
+    OCR text across every row (Phase 4.7's
     `verify_committed_row()`/`CommittedRowVerification`, retired --
     see docs/xactimate-lookup.md Phase 4.7 and 4.8). WHAT was intended
     is already certain before this ever runs (`select_candidate()`
@@ -519,6 +518,18 @@ class ActivationRowSnapshot:
     selector: str | None
     description: str | None
     activity: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class CommitRowSnapshot:
+    """Order-independent post-commit evidence for one physical row."""
+
+    category: str | None
+    selector: str | None
+    description: str | None
+    activity: str | None
+    quantity: float | None
+    unit: str | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -888,6 +899,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # by activity (-,-,+,+), so pending detection must compare a
         # logical multiset rather than assume the old rows stay a prefix.
         self._last_activation_baseline_rows: list[ActivationRowSnapshot] | None = None
+        self._last_commit_baseline_rows: list[CommitRowSnapshot] | None = None
         self._pending_quantity_target: PendingQuantityTarget | None = None
         self._current_query: str | None = None
         #: Phase 5.8: monotonic timestamp of the most recent
@@ -3846,6 +3858,68 @@ class WindowsXactimateAdapter(XactimateAdapter):
             for i in range(row_count)
         ]
 
+    def _snapshot_commit_rows(self, row_top_nudge: int = 0) -> list[CommitRowSnapshot]:
+        """Capture identity plus protected quantity/unit for each row."""
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd)
+        if offset is None:
+            return []
+        geom = self._last_row_geometry(image, offset)
+        if geom is None:
+            return []
+        row_count, _ = geom
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1] + row_top_nudge
+        rows = []
+        for index in range(row_count):
+            row_top = row_1_top + index * _GRID_ROW_HEIGHT
+            activation = self._read_activation_row_at(image, offset, row_top)
+            _unit_raw, unit = self._read_unit_at(image, offset, row_top)
+            rows.append(CommitRowSnapshot(
+                category=activation.category,
+                selector=activation.selector,
+                description=activation.description,
+                activity=activation.activity,
+                quantity=self._read_quantity_at(image, offset, row_top),
+                unit=unit,
+            ))
+        return rows
+
+    @classmethod
+    def _commit_row_multiset_key(cls, row: CommitRowSnapshot):
+        """Return a strict protected-row key, or None when unreadable."""
+        identity = cls._activation_identity(ActivationRowSnapshot(
+            row.category, row.selector, row.description, row.activity,
+        ))
+        if not all(identity) or row.quantity is None or not row.unit:
+            return None
+        activity = cls._activity_token(ActivationRowSnapshot(
+            row.category, row.selector, row.description, row.activity,
+        ))
+        return (*identity, activity if activity in ("-", "+") else None, round(float(row.quantity), 4), row.unit)
+
+    @classmethod
+    def _order_independent_commit_delta(
+        cls,
+        before_rows: list[CommitRowSnapshot],
+        after_rows: list[CommitRowSnapshot],
+    ) -> tuple[bool, list[int]]:
+        """Consume every protected baseline row and return new indices."""
+        remaining: dict[tuple, int] = {}
+        for row in before_rows:
+            key = cls._commit_row_multiset_key(row)
+            if key is None:
+                return False, []
+            remaining[key] = remaining.get(key, 0) + 1
+
+        new_indices = []
+        for index, row in enumerate(after_rows):
+            key = cls._commit_row_multiset_key(row)
+            if key is not None and remaining.get(key, 0) > 0:
+                remaining[key] -= 1
+            else:
+                new_indices.append(index)
+        return not any(remaining.values()), new_indices
+
     def snapshot_grid_identities_for_activation(self) -> list[tuple[str | None, str | None]]:
         """Capture the activation baseline without changing viewport.
 
@@ -3861,7 +3935,14 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._pending_quantity_target = None
         rows = self._snapshot_activation_rows()
         self._last_activation_baseline_rows = list(rows)
-        return [(row.category, row.selector) for row in rows]
+        identities = [(row.category, row.selector) for row in rows]
+        commit_rows = self._snapshot_commit_rows()
+        self._last_commit_baseline_rows = (
+            commit_rows
+            if [(row.category, row.selector) for row in commit_rows] == identities
+            else None
+        )
+        return identities
 
     def _snapshot_activation_rows(self, *, require_located: bool = False) -> list[ActivationRowSnapshot]:
         """Capture physical rows plus pair evidence without scrolling."""
@@ -4011,17 +4092,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         1. Poll (bounded by `timeout_s`) until the grid's row count
            differs from `len(before_snapshot)`.
-        2. `delta == 1` identifies one appended physical row. A
-           `delta == 2` is also one logical item only when the two
-           appended rows pass the same strict adjacent R&R-pair proof
-           used by pending-item detection (same CAT/SEL, compatible
-           description, readable activities agreeing with ``-/+``).
-           The quantity-bearing add row is then deterministically the
-           last row. No text search across unrelated rows is used.
-        3. The first `len(before_snapshot)` rows after commit must
-           equal `before_snapshot` exactly (`preexisting_rows_
-           unchanged`). If not, the state is not trustworthy even
-           though the count delta looks right.
+        2. Consume the rich pre-selection baseline (logical identity,
+           activity, quantity, and unit) from the post-commit rows as
+           an order-independent multiset. Every protected baseline row
+           must still exist with the same protected values.
+        3. The unconsumed delta must be exactly one expected ordinary
+           row, or one corroborated R&R -/+ pair. Its live row index is
+           taken from that delta, never presumed to be last.
         4. A delta other than one physical row or one corroborated R&R
            pair, or changed pre-existing rows ->
            `trust_state="CONFLICTING_ROW"` (refuses to guess which
@@ -4085,6 +4162,22 @@ class WindowsXactimateAdapter(XactimateAdapter):
         samples: list[dict] = []
         attempts = 0
         row_count_before = len(before_snapshot)
+        baseline_rows = list(self._last_commit_baseline_rows or [])
+        baseline_identities = [(row.category, row.selector) for row in baseline_rows]
+        supplied_identities = list(before_snapshot)
+        baseline_identity_multiset_matches = len(baseline_identities) == len(supplied_identities)
+        for identity in baseline_identities:
+            if identity in supplied_identities:
+                supplied_identities.remove(identity)
+            else:
+                baseline_identity_multiset_matches = False
+                break
+        baseline_identity_multiset_matches = baseline_identity_multiset_matches and not supplied_identities
+        if row_count_before and (
+            len(baseline_rows) != row_count_before
+            or not baseline_identity_multiset_matches
+        ):
+            baseline_rows = []
 
         def fail(
             trust_state: str, reason: str, row_count_after: int | None = None,
@@ -4108,23 +4201,31 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if self._unexpected_dialog_present():
                 return fail("VERIFICATION_FAILED", "an unexpected dialog appeared while verifying the commit")
 
-            after = self.snapshot_grid_identities()
+            after_rows = self._snapshot_commit_rows()
+            after = [(row.category, row.selector) for row in after_rows]
             row_count_after = len(after)
             delta = row_count_after - row_count_before
             sample: dict = {"elapsed_s": round(elapsed, 3), "row_count_after": row_count_after, "delta": delta}
             samples.append(sample)
 
             logical_rr_pair = False
-            if delta == 2:
-                activation_rows = self._snapshot_activation_rows()
-                activation_identities = [(row.category, row.selector) for row in activation_rows]
-                activation_delta = activation_rows[row_count_before:]
-                logical_rr_pair = (
-                    len(activation_rows) == row_count_after
-                    and activation_identities[:row_count_before] == before_snapshot
-                    and len(activation_delta) == 2
-                    and self._is_logical_rr_pair(activation_delta[0], activation_delta[1])
+            new_indices: list[int] = []
+            baseline_available = row_count_before == 0 or bool(baseline_rows)
+            preexisting_unchanged = False
+            if delta in (1, 2) and baseline_available:
+                preexisting_unchanged, new_indices = self._order_independent_commit_delta(
+                    baseline_rows, after_rows,
                 )
+
+            if delta == 2 and preexisting_unchanged and len(new_indices) == 2:
+                activation_delta = [ActivationRowSnapshot(
+                    after_rows[index].category,
+                    after_rows[index].selector,
+                    after_rows[index].description,
+                    after_rows[index].activity,
+                ) for index in new_indices]
+                activation_delta.sort(key=lambda row: 0 if self._activity_token(row) == "-" else 1)
+                logical_rr_pair = self._is_logical_rr_pair(activation_delta[0], activation_delta[1])
                 sample["rr_pair_evidence"] = [
                     {
                         "category": row.category,
@@ -4138,27 +4239,39 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 if not logical_rr_pair:
                     return fail(
                         "CONFLICTING_ROW",
-                        "row count increased by 2, but the appended rows were not a corroborated "
-                        "adjacent R&R -/+ pair -- refusing to guess which row is the committed item",
+                        "row count increased by 2, but the order-independent logical delta was not exactly one "
+                        "corroborated R&R -/+ pair -- refusing to guess which row is the committed item",
                         row_count_after=row_count_after,
-                        preexisting_rows_unchanged=(
-                            activation_identities[:row_count_before] == before_snapshot
-                            if len(activation_rows) >= row_count_before else False
-                        ),
+                        preexisting_rows_unchanged=preexisting_unchanged,
                     )
 
             if delta == 1 or logical_rr_pair:
-                preexisting_unchanged = after[:row_count_before] == before_snapshot
-                if not preexisting_unchanged:
+                if not preexisting_unchanged or len(new_indices) != delta:
                     return fail(
                         "CONFLICTING_ROW",
-                        f"row count increased by exactly 1 but the first {row_count_before} rows no longer match "
-                        f"the pre-commit snapshot -- refusing to trust which row is the committed one",
+                        "the order-independent post-commit multiset does not contain every protected baseline row "
+                        "unchanged plus exactly one expected logical delta",
                         row_count_after=row_count_after,
                         preexisting_rows_unchanged=False,
                     )
 
-                row_index = row_count_after - 1
+                if logical_rr_pair:
+                    plus_indices = [
+                        index for index in new_indices
+                        if self._activity_token(ActivationRowSnapshot(
+                            after_rows[index].category, after_rows[index].selector,
+                            after_rows[index].description, after_rows[index].activity,
+                        )) == "+"
+                    ]
+                    if len(plus_indices) != 1:
+                        return fail(
+                            "CONFLICTING_ROW", "the new R&R logical delta has no unique quantity-bearing + row",
+                            row_count_after=row_count_after, preexisting_rows_unchanged=True,
+                        )
+                    row_index = plus_indices[0]
+                else:
+                    row_index = new_indices[0]
+
                 hwnd = self._ensure_main_window()
                 image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
                 if offset is None:
@@ -4249,9 +4362,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 else:
                     trust_state = "VERIFIED"
                     reason = (
-                        ("one corroborated R&R -/+ logical item appended" if logical_rr_pair
-                         else "exactly one physical row appended")
-                        + " at the deterministic last position, pre-existing rows unchanged, "
+                        ("one corroborated R&R -/+ logical item added" if logical_rr_pair
+                         else "exactly one physical row added")
+                        + " by order-independent logical multiset delta, pre-existing rows unchanged, "
                         "quantity matched, unit compatible, and category/selector OCR "
                         + ("agrees" if cat_sel_agrees else "was unreadable (not treated as a conflict)")
                     )
