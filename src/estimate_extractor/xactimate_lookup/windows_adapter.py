@@ -1439,10 +1439,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         Static Xactimate chrome has no UIA/MSAA descendants, so there is
         no accessible Edit element to query.  Live structural evidence
         provides the locator instead: normally the section heading and
-        Search button; in the focused rendering where that heading drops
-        out of OCR, the Search button plus the Home/Price breadcrumb.  The
-        input must be the long bordered rectangle corroborated by either
-        relationship.  Both horizontal borders are detected from current
+        Search button; in focused rendering where that heading drops out
+        of OCR, the Search button plus either the ``Home > Price List``
+        breadcrumb or the lower ``Price List Searches`` heading. The input
+        must be the long bordered rectangle corroborated by one of those
+        relationships. Both horizontal borders are detected from current
         pixels; calibrated search-box coordinates are never consulted.
         """
         pytesseract = self._pytesseract()
@@ -1495,6 +1496,30 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # as if it shared Home's breadcrumb row (it does not).
         for bx, by, bw, bh in words:
             button = (bx, by, bx + bw, by + bh)
+            # Live-caught focused state: the section-heading "Search"
+            # and the lower "Price List Searches" heading can both be
+            # absent from OCR while the actual breadcrumb remains
+            # readable as Home > Price List. Corroborate that same-row
+            # breadcrumb with the Search button below/right; the active
+            # Items underline is independently required by
+            # _items_search_pane_field().
+            for home in word_boxes.get("home", []):
+                for price in word_boxes.get("price", []):
+                    for list_box in word_boxes.get("list", []):
+                        breadcrumb_mid_y = (home[1] + home[3]) // 2
+                        if not (10 <= by - home[1] <= 50):
+                            continue
+                        if not (
+                            abs(breadcrumb_mid_y - (price[1] + price[3]) // 2) <= 8
+                            and abs(breadcrumb_mid_y - (list_box[1] + list_box[3]) // 2) <= 8
+                        ):
+                            continue
+                        if not (home[0] < price[0] < list_box[0] < bx):
+                            continue
+                        if bx - home[0] < 140:
+                            continue
+                        relationships.append((home[0] - 16, button))
+
             for home in word_boxes.get("home", []):
                 for price in word_boxes.get("price", []):
                     for list_box in word_boxes.get("list", []):
@@ -1904,6 +1929,17 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # click.
         if self._items_search_pane_field(before) is not None:
             return
+        # The active-pane decision must not hinge on one OCR frame. A
+        # transient miss here previously converted an already-healthy
+        # Items/Search pane into a needless Items click; that click can
+        # itself repaint/destabilize the pane. Reuse the same bounded,
+        # evidence-driven readiness poll used after a necessary click.
+        # There is no sleep, cached rectangle, or coordinate fallback.
+        if self._wait_for_search_field(hwnd) is not None:
+            return
+        # The bounded poll captured newer frames. Locate the click target
+        # again from a fresh image rather than using the stale first one.
+        before = self._capture_client_image(hwnd)
         items = self._locate_items_tab(before)
         if items is None:
             raise ItemsTabVerificationError(

@@ -430,6 +430,30 @@ def test_search_locator_uses_breadcrumb_corroboration_when_focused_heading_is_ab
     assert adapter._locate_search_field(image) == (50, 80, 251, 103)
 
 
+def test_search_locator_uses_home_price_list_breadcrumb_when_focused_headings_are_absent(monkeypatch):
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 210), "white")
+    ImageDraw.Draw(image).rectangle((50, 80, 250, 102), outline=(100, 120, 140), width=1)
+    data = {
+        "text": ["Home", "Price", "List", "Search"],
+        "left": [55, 95, 130, 280],
+        "top": [58, 58, 58, 85],
+        "width": [30, 30, 20, 40],
+        "height": [10, 10, 10, 10],
+    }
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(*args, **kwargs):
+            return data
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._locate_search_field(image) == (50, 80, 251, 103)
+
+
 def test_search_locator_focused_fallback_requires_full_price_list_heading(monkeypatch):
     from PIL import Image, ImageDraw
 
@@ -468,12 +492,27 @@ def test_reset_scroll_state_does_not_click_when_items_search_is_already_ready(mo
     assert clicks == []
 
 
+def test_reset_scroll_state_is_idempotent_when_items_search_remains_ready(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "ready")
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: (100, 40, 300, 65))
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    adapter._reset_scroll_state()
+    adapter._reset_scroll_state()
+
+    assert clicks == []
+
+
 def test_reset_scroll_state_does_not_click_unverified_items_target(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     clicks = []
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
     monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: None)
     monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: None)
     monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
 
@@ -492,7 +531,8 @@ def test_reset_scroll_state_requires_live_items_tab_and_search_pane(monkeypatch)
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "before")
     monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
     monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
-    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: None)
+    readiness = iter([None, None])
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
     monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
@@ -502,6 +542,24 @@ def test_reset_scroll_state_requires_live_items_tab_and_search_pane(monkeypatch)
         adapter._reset_scroll_state()
 
     assert clicks == [(101, 20, 15)]
+
+
+def test_reset_scroll_state_clicks_inactive_items_then_accepts_later_bounded_capture(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    captures = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: captures.append(hwnd) or "inactive")
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
+    readiness = iter([None, (100, 40, 300, 65)])
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    adapter._reset_scroll_state()
+
+    assert clicks == [(101, 20, 15)]
+    assert captures == [101, 101]
 
 
 def test_components_search_like_control_is_not_accepted_as_items_search(monkeypatch):
@@ -533,7 +591,8 @@ def test_components_active_state_is_restored_to_verified_items_before_search(mon
         lambda image: (100, 40, 300, 65) if image == "items" else None,
     )
     monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
-    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: (100, 40, 300, 65))
+    readiness = iter([None, (100, 40, 300, 65)])
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
 
     def click(hwnd, x, y):
         clicks.append((hwnd, x, y))
