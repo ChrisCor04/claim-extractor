@@ -1828,6 +1828,8 @@ def test_select_group_raises_when_group_not_found(monkeypatch):
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
     monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
     monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Utility Room"])
@@ -1839,6 +1841,8 @@ def test_select_group_raises_when_group_not_found(monkeypatch):
 def test_select_group_raises_when_application_unverified(monkeypatch):
     from estimate_extractor.xactimate_lookup.adapter import AdapterError
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "verify_application", lambda: False)
 
     with pytest.raises(AdapterError, match="could not verify"):
@@ -1847,6 +1851,8 @@ def test_select_group_raises_when_application_unverified(monkeypatch):
 
 def test_ensure_group_is_a_no_op_when_group_already_exists(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "verify_application", lambda: True)
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
@@ -1889,6 +1895,8 @@ def _mock_ensure_group_scaffolding(monkeypatch, adapter, *, before_rows, after_r
     pixel-indent ancestry check are stubbed to no-ops/pass here; tests
     that specifically target those behaviors override them."""
     calls = {"snapshot": 0}
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
 
     def fake_snapshot():
         calls["snapshot"] += 1
@@ -2011,6 +2019,8 @@ def test_ensure_group_resets_stickiness_before_creating_but_not_for_a_noop():
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     reset_calls = []
     adapter._reset_group_creation_stickiness = lambda: reset_calls.append(1)
+    adapter._handle_duplicate_item_dialog = lambda: False
+    adapter._assert_group_transition_settled = lambda **kwargs: None
     adapter.verify_application = lambda: True
     adapter.verify_project = lambda: True
     adapter._ensure_main_window = lambda: 123
@@ -3041,6 +3051,8 @@ def test_ensure_group_raises_on_ambiguous_existing_name(monkeypatch):
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
     monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Fence", "Fence"])
 
@@ -3093,6 +3105,8 @@ def _mock_ensure_group_create_path(monkeypatch, adapter, *, found_on_attempt):
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
     monkeypatch.setattr(adapter, "_reset_group_creation_stickiness", lambda: None)
     monkeypatch.setattr(adapter, "snapshot_group_names", fake_snapshot)
@@ -3188,6 +3202,8 @@ def test_ensure_group_existing_group_behavior_is_unaffected_by_the_widened_budge
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
     monkeypatch.setattr(adapter, "snapshot_group_names", lambda: ["TEST", "Roof"])
     sleep_calls = []
@@ -3207,6 +3223,8 @@ def test_select_group_raises_on_ambiguous_name(monkeypatch):
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
     monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
@@ -3239,6 +3257,8 @@ def test_select_group_succeeds_on_a_uniquely_nested_group(monkeypatch):
     monkeypatch.setattr(adapter, "verify_project", lambda: True)
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
     monkeypatch.setattr(adapter, "_force_foreground", lambda hwnd: True)
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "_scroll_group_tree_to_top", lambda hwnd: None)
     monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: object())
     monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 0, 0))
@@ -3263,6 +3283,8 @@ def _stateful_probe_lifecycle_mocks(monkeypatch, adapter, *, baseline_row_count=
     _wait_for_probe_visible() and the pre/post cleanup identity
     reconciliation see a self-consistent grid throughout."""
     state = {"row_count": baseline_row_count}
+    monkeypatch.setattr(adapter, "_handle_duplicate_item_dialog", lambda: False)
+    monkeypatch.setattr(adapter, "_assert_group_transition_settled", lambda **kwargs: None)
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (object(), (0, 0)))
     monkeypatch.setattr(adapter, "_count_grid_rows", lambda image, offset: state["row_count"])
     monkeypatch.setattr(adapter, "_read_category_selector_at", lambda image, offset, row_top: ("SFG", "GUTA"))
