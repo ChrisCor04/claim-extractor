@@ -43,6 +43,16 @@ class QuantityConfirmationError(AdapterError):
     instead of misclassifying it as dropdown extraction."""
 
 
+class PhysicalStateUncertainError(AdapterError):
+    """Raised after a UI action changed the grid but the resulting
+    physical state cannot be uniquely reconciled with the intended task.
+
+    Unlike advisory OCR uncertainty, this is a project-level hard stop:
+    later tasks must not operate on a grid whose physical contents are
+    unexplained.
+    """
+
+
 class UnexpectedDialogError(AdapterError):
     """Raised when the adapter detects a dialog/prompt it did not expect
     (a license warning, an unsaved-changes prompt, a crash reporter,

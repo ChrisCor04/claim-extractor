@@ -15,6 +15,7 @@ import pytest
 from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
     FakeXactimateAdapter,
+    PhysicalStateUncertainError,
     ProtectedCommittedRowError,
     QuantityConfirmationError,
     UnexpectedDialogError,
@@ -215,6 +216,31 @@ def test_physical_unconfirmed_quantity_failure_hard_stops_entire_run(
     assert len(search_calls) == 1
 
 
+def test_physical_state_uncertain_activation_stops_following_tasks(
+    tmp_path, phrase_rules, ranking_config,
+):
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    def uncertain_activation(_before):
+        raise PhysicalStateUncertainError("one unexplained physical row appeared")
+
+    adapter.pending_item_created = uncertain_activation
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    first, second, third = result.tasks
+    assert first.state == TASK_REVIEW_REQUIRED
+    assert first.commit_state == "not_committed"
+    assert first.physical_state_uncertain is True
+    assert first.stop_reason == "physical_state_uncertain"
+    assert result.run_state == RUN_STATE_PAUSED
+    assert result.stop_reason_category == STOP_REASON_PROJECT_LEVEL_HARD_STOP
+    assert second.state == TASK_PENDING and second.attempts == 0
+    assert third.state == TASK_PENDING and third.attempts == 0
+    assert len([call for call in adapter.log.calls if call[0] == "select_candidate"]) == 1
+
+
 def test_resumed_physical_unconfirmed_checkpoint_stops_before_any_task_or_later_group(
     tmp_path, phrase_rules, ranking_config,
 ):
@@ -382,6 +408,11 @@ def test_non_verified_trust_state_is_review_required_not_completed(tmp_path, phr
 
     assert all(t.state == TASK_REVIEW_REQUIRED for t in result.tasks)
     assert all(t.trust_state == "UNIT_MISMATCH" for t in result.tasks)
+    assert len([call for call in adapter.log.calls if call[0] == "commit_item"]) == len(result.tasks)
+    queue = json.loads(
+        (tmp_path / "execution" / "reports" / "review_queue.json").read_text(encoding="utf-8")
+    )["items"]
+    assert [item["task_id"] for item in queue] == [task.task_id for task in result.tasks]
 
 
 def test_committed_without_verification_support_is_review_required_never_completed(tmp_path, phrase_rules, ranking_config):
@@ -785,6 +816,12 @@ def test_observed_mapping_proposal_verified_flag_false_for_any_non_verified_trus
     mismatch, a conflicting row, or an outright verification failure)
     must be recorded with verified=False, never eligible for reuse."""
     plan = _plan_mapped_and_unmapped()
+    if trust_state == "VERIFICATION_FAILED":
+        # Structural failure hard-stops the run, so make the unmapped task
+        # the first/only task to verify its own proposal is still persisted.
+        unmapped = plan.task_by_id("task_unmapped")
+        plan.tasks = [unmapped]
+        plan.groups[0].task_ids = [unmapped.task_id]
     script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script, trust_state=trust_state)
 
@@ -842,20 +879,26 @@ def test_commit_state_is_committed_for_every_trust_state_except_verification_fai
     assert result.task_by_id("task_unmapped").commit_state == TASK_COMMIT_STATE_COMMITTED
 
 
-def test_commit_state_is_not_committed_when_verification_failed(tmp_path, phrase_rules, ranking_config):
-    """VERIFICATION_FAILED specifically means the row count never moved
-    off its pre-commit baseline within the polling window -- nothing
-    actually landed, despite commit_item() having been called. Must be
-    the one trust_state that does NOT count as committed."""
-    from estimate_extractor.xactimate_lookup.execution_plan import TASK_COMMIT_STATE_NOT_COMMITTED
+def test_verification_failed_preserves_physical_checkpoint_and_stops(tmp_path, phrase_rules, ranking_config):
+    """A proven activation followed by zero commit delta is divergent.
 
+    The runner must retain the physical-created checkpoint and stop before
+    the following task instead of pretending the prior physical row vanished.
+    """
     plan = _plan_mapped_and_unmapped()
     script = {"RFG 3TAB": [_dropdown("RFG", "3TAB")], _FELT_FULL_DESCRIPTION: [_felt_dropdown()]}
     adapter = _adapter_with_test_project(dropdown_script=script, trust_state="VERIFICATION_FAILED")
 
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
 
-    assert result.task_by_id("task_unmapped").commit_state == TASK_COMMIT_STATE_NOT_COMMITTED
+    mapped = result.task_by_id("task_mapped")
+    unmapped = result.task_by_id("task_unmapped")
+    assert mapped.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+    assert mapped.physical_state_uncertain is True
+    assert mapped.state == TASK_REVIEW_REQUIRED
+    assert unmapped.state == TASK_PENDING and unmapped.attempts == 0
+    assert result.run_state == RUN_STATE_PAUSED
+    assert result.stop_reason_category == STOP_REASON_PROJECT_LEVEL_HARD_STOP
 
 
 def test_commit_state_is_not_committed_when_nothing_ever_committed(tmp_path, phrase_rules, ranking_config):
@@ -1173,6 +1216,9 @@ def test_candidate_click_then_duplicate_dialog_is_terminal(tmp_path, phrase_rule
 
     task = result.task_by_id("task_unmapped")
     assert task.stop_reason == "unexpected_dialog"
+    assert task.physical_state_uncertain is True
+    assert result.run_state == RUN_STATE_PAUSED
+    assert result.stop_reason_category == STOP_REASON_PROJECT_LEVEL_HARD_STOP
     assert len(task.search_attempts) == 1
     assert task.search_attempts[0]["advanced_to_next_attempt"] is False
 

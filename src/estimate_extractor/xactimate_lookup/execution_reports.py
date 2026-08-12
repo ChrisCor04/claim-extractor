@@ -17,9 +17,11 @@ from pathlib import Path
 from estimate_extractor.xactimate_lookup.execution_plan import (
     ExecutionPlan,
     ExecutionTask,
+    TASK_COMMIT_STATE_COMMITTED,
     TASK_FAILED,
     TASK_REVIEW_REQUIRED,
     TASK_SKIPPED,
+    task_has_committed_row,
 )
 
 TASK_CSV_COLUMNS = [
@@ -48,8 +50,14 @@ TASK_CSV_COLUMNS = [
     "observed_category",
     "observed_selector",
     "observed_description",
+    "selected_category",
+    "selected_selector",
+    "selected_description",
     "state",
     "trust_state",
+    "commit_state",
+    "review_reason",
+    "physical_state_uncertain",
     "stop_reason",
     "stop_detail",
     "evidence_path",
@@ -106,8 +114,14 @@ def _task_row(task: ExecutionTask) -> dict:
         "observed_category": task.observed_category,
         "observed_selector": task.observed_selector,
         "observed_description": task.observed_description,
+        "selected_category": task.selected_category,
+        "selected_selector": task.selected_selector,
+        "selected_description": task.selected_description,
         "state": task.state,
         "trust_state": task.trust_state,
+        "commit_state": task.commit_state,
+        "review_reason": task.review_reason,
+        "physical_state_uncertain": task.physical_state_uncertain,
         "stop_reason": task.stop_reason,
         "stop_detail": task.stop_detail,
         "evidence_path": task.evidence_path,
@@ -168,6 +182,55 @@ def write_unresolved_row_summary(plan: ExecutionPlan, path: Path, pretty: bool =
     path.write_text(_dump(data, pretty), encoding="utf-8")
 
 
+def build_review_queue(plan: ExecutionPlan) -> list[dict]:
+    """Return committed tasks that need human inspection, in source order.
+
+    A review-only ranking/no-match outcome is not a completed physical item
+    and therefore does not belong in this post-run queue. Conversely, every
+    committed non-VERIFIED task remains queued without blocking later work.
+    """
+    group_names = {
+        group.group_id: group.xactimate_group_name or group.section_name or group.group_id
+        for group in plan.groups
+    }
+    return [
+        {
+            "task_id": task.task_id,
+            "source_description": task.description,
+            "group": group_names.get(task.section_name or "", task.section_name),
+            "selected_category": task.selected_category or task.observed_category or task.category,
+            "selected_selector": task.selected_selector or task.observed_selector or task.selector,
+            "expected_quantity": task.source_quantity,
+            "expected_unit": task.expected_unit or task.source_unit,
+            "observed_quantity": task.observed_quantity,
+            "observed_unit": task.observed_unit,
+            "review_reason": task.review_reason or task.stop_detail or task.trust_state,
+            "trust_state": task.trust_state,
+            "evidence_path": task.evidence_path,
+        }
+        for task in sorted(plan.tasks, key=lambda item: item.source_order)
+        if (
+            task.state == TASK_REVIEW_REQUIRED
+            and not task.physical_state_uncertain
+            and (
+                task.commit_state == TASK_COMMIT_STATE_COMMITTED
+                or (task.commit_state is None and task_has_committed_row(task))
+            )
+        )
+    ]
+
+
+def write_review_queue(plan: ExecutionPlan, path: Path, pretty: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "plan_id": plan.plan_id,
+        "project_slug": plan.project_slug,
+        "generated_at": plan.updated_at,
+        "items": build_review_queue(plan),
+    }
+    path.write_text(_dump(data, pretty), encoding="utf-8")
+
+
 def write_structured_audit(plan: ExecutionPlan, path: Path, pretty: bool = True) -> None:
     """One audit entry per task, grouped by Xactimate group, in source
     order -- what was searched, what was selected, what was verified,
@@ -206,5 +269,6 @@ def write_all_execution_reports(plan: ExecutionPlan, project_dir: Path, pretty: 
     write_execution_report_json(plan, reports_dir / "execution_report.json", pretty)
     write_execution_report_csv(plan, reports_dir / "execution_report.csv")
     write_unresolved_row_summary(plan, reports_dir / "unresolved_row_summary.json", pretty)
+    write_review_queue(plan, reports_dir / "review_queue.json", pretty)
     write_structured_audit(plan, reports_dir / "structured_audit.json", pretty)
     return reports_dir

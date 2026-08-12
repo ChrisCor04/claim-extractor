@@ -17,9 +17,11 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TASK_SKIPPED,
 )
 from estimate_extractor.xactimate_lookup.execution_reports import (
+    build_review_queue,
     write_all_execution_reports,
     write_execution_report_csv,
     write_execution_report_json,
+    write_review_queue,
     write_structured_audit,
     write_unresolved_row_summary,
 )
@@ -112,4 +114,47 @@ def test_write_all_execution_reports_writes_every_file(tmp_path):
     assert (reports_dir / "execution_report.json").exists()
     assert (reports_dir / "execution_report.csv").exists()
     assert (reports_dir / "unresolved_row_summary.json").exists()
+    assert (reports_dir / "review_queue.json").exists()
     assert (reports_dir / "structured_audit.json").exists()
+
+
+def test_review_queue_accumulates_only_committed_review_tasks(tmp_path):
+    plan = _plan()
+    first = plan.task_by_id("t2")
+    first.selected_category = "RFG"
+    first.selected_selector = "GCR300"
+    first.review_reason = "quantity OCR was partial"
+    first.evidence_path = "evidence/t2.png"
+    second = _task(
+        "t5", "line_0005", "Dwelling Roof", 4, TASK_REVIEW_REQUIRED,
+        trust_state="QUANTITY_MISMATCH", commit_state="committed",
+        selected_category="RFG", selected_selector="FELT15",
+        review_reason="quantity OCR was blank", evidence_path="evidence/t5.png",
+    )
+    noncommitted = _task(
+        "t6", "line_0006", "Dwelling Roof", 5, TASK_REVIEW_REQUIRED,
+        trust_state=None, commit_state="not_committed", stop_detail="ambiguous before write",
+    )
+    plan.tasks.extend([second, noncommitted])
+    plan.groups[0].task_ids.extend(["t5", "t6"])
+
+    queue = build_review_queue(plan)
+    assert [item["task_id"] for item in queue] == ["t2", "t5"]
+    assert queue[0] == {
+        "task_id": "t2",
+        "source_description": "A description",
+        "group": "Dwelling Roof",
+        "selected_category": "RFG",
+        "selected_selector": "GCR300",
+        "expected_quantity": 5.0,
+        "expected_unit": "LF",
+        "observed_quantity": None,
+        "observed_unit": None,
+        "review_reason": "quantity OCR was partial",
+        "trust_state": "UNIT_MISMATCH",
+        "evidence_path": "evidence/t2.png",
+    }
+
+    path = tmp_path / "review_queue.json"
+    write_review_queue(plan, path)
+    assert [item["task_id"] for item in json.loads(path.read_text(encoding="utf-8"))["items"]] == ["t2", "t5"]

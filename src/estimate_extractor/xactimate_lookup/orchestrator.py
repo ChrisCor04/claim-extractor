@@ -21,6 +21,7 @@ import sqlite3
 from estimate_extractor.xactimate_lookup import registry, signature as signature_mod
 from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
+    PhysicalStateUncertainError,
     ProtectedCommittedRowError,
     QuantityConfirmationError,
     UnexpectedDialogError,
@@ -40,6 +41,7 @@ from estimate_extractor.xactimate_lookup.models import (
     STOP_REASON_FIELD_MISMATCH,
     STOP_REASON_HARD_CONFLICT,
     STOP_REASON_NO_RESULTS,
+    STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
     STOP_REASON_QUANTITY_CONFIRMATION_FAILED,
     STOP_REASON_UNEXPECTED_DIALOG,
     STOP_REASON_UNIT_MISMATCH,
@@ -435,9 +437,15 @@ def execute_plan(
         adapter.record_physical_item_created()
         _record_lifecycle(adapter, "CANDIDATE_SELECTED", category=top.dropdown.category, selector=top.dropdown.selector)
     except UnexpectedDialogError as exc:
-        adapter.recover()
+        outcome.physical_state_uncertain = True
         outcome.decision = DECISION_REVIEW_REQUIRED
         outcome.stop_reason = STOP_REASON_UNEXPECTED_DIALOG
+        outcome.stop_detail = str(exc)
+        return outcome
+    except PhysicalStateUncertainError as exc:
+        outcome.physical_state_uncertain = True
+        outcome.decision = DECISION_REVIEW_REQUIRED
+        outcome.stop_reason = STOP_REASON_PHYSICAL_STATE_UNCERTAIN
         outcome.stop_detail = str(exc)
         return outcome
     except AdapterError as exc:

@@ -63,6 +63,7 @@ from pathlib import Path
 
 from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
+    PhysicalStateUncertainError,
     ProtectedCommittedRowError,
     QuantityConfirmationError,
     UnexpectedDialogError,
@@ -551,6 +552,11 @@ class PendingQuantityTarget:
     #: representation or one half of an Xactimate-generated ``-/+`` pair.
     #: Recorded when activation is positively reconciled, before entry.
     physical_row_delta: int = 1
+    #: True only for a uniquely selected ordinary row whose identity and
+    #: activation delta were already proven independently of quantity. In
+    #: that narrow case Xactimate's nonzero default is editable source data,
+    #: not identity evidence. R&R targets never set this flag.
+    allow_initial_quantity_overwrite: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -2854,6 +2860,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
                         return image, offset, row_top, 1, observed, scrolled
                     if expected_quantity is not None and abs(observed - expected_quantity) <= 0.01:
                         return image, offset, row_top, 1, observed, scrolled
+                    if target.activity is None and target.allow_initial_quantity_overwrite:
+                        return image, offset, row_top, 1, observed, scrolled
                     raise QuantityNotConfirmedError(
                         "enter_quantity(): the only identity-matched pending target already has a different non-zero "
                         f"quantity ({observed:g}, expected {expected_quantity!r}); refusing to overwrite it."
@@ -2914,7 +2922,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # target (and activity occurrence for R&R) before this value is
         # considered. An exact quantity match therefore needs no edit;
         # avoiding the write also avoids disturbing an already-correct
-        # cell. A different non-zero value was rejected above.
+        # cell. A different non-zero value is overwritten only for a
+        # uniquely activation-bound ordinary row; R&R and every legacy/
+        # ambiguous target retain the fail-closed rule above.
         if before_quantity is not None and abs(before_quantity - quantity) <= 0.01:
             self.last_quantity_confirmation = QuantityEntryConfirmation(
                 expected=quantity, observed=before_quantity, confidence="CONFIRMED",
@@ -3268,12 +3278,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if baseline_rows is None:
             baseline_rows = [] if expected == 0 else None
         if baseline_rows is None or len(baseline_rows) != expected:
-            raise AdapterError(
+            raise PhysicalStateUncertainError(
                 "Pending-item detection has no matching rich activation baseline; refusing to infer a row delta."
             )
         baseline_identities = [(row.category, row.selector) for row in baseline_rows]
         if baseline_identities != list(before_snapshot):
-            raise AdapterError(
+            raise PhysicalStateUncertainError(
                 "Pending-item detection's rich baseline does not match the supplied physical-row baseline."
             )
         start = time.time()
@@ -3281,11 +3291,23 @@ class WindowsXactimateAdapter(XactimateAdapter):
             rows = self._snapshot_activation_rows()
             physical_delta = len(rows) - expected
             if physical_delta == 1:
-                target = self._pending_quantity_target_from_delta(baseline_rows, rows)
-                if target is not None and self._is_one_safe_single_row_delta(baseline_rows, rows):
+                target = self._ordinary_single_row_target_from_selected_candidate(baseline_rows, rows)
+                if target is not None and target.allow_initial_quantity_overwrite:
                     self._pending_quantity_target = target
                     return True
-                raise AdapterError(
+                legacy_target = self._pending_quantity_target_from_delta(baseline_rows, rows)
+                if (
+                    legacy_target is not None
+                    and self._is_one_safe_single_row_delta(baseline_rows, rows)
+                    and (self._last_selected is None or legacy_target.activity == "+")
+                ):
+                    # Compatibility for non-production unit fakes that do
+                    # not perform a selection, plus the separately-proven
+                    # one-row R&R representation. A real selected ordinary
+                    # candidate must pass the identity-first path above.
+                    self._pending_quantity_target = legacy_target
+                    return True
+                raise PhysicalStateUncertainError(
                     "Candidate activation added one physical row, but the logical multiset delta was not "
                     "one safe ordinary row or quantity-bearing R&R + row."
                 )
@@ -3294,19 +3316,21 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 if target is not None and self._is_one_logical_rr_multiset_delta(baseline_rows, rows):
                     self._pending_quantity_target = target
                     return True
-                raise AdapterError(
+                raise PhysicalStateUncertainError(
                     "Candidate activation added two physical rows, but the logical multiset delta was not "
                     f"exactly one R&R -/+ item (before={expected}, after={len(rows)})."
                 )
             if physical_delta > 2:
-                raise AdapterError(
+                raise PhysicalStateUncertainError(
                     "Candidate activation changed the grid by more than one logical item; refusing to guess "
                     f"which item was created (before={expected}, after={len(rows)})."
                 )
             if physical_delta < 0:
-                raise AdapterError("Candidate activation removed physical rows; refusing to infer a pending item.")
+                raise PhysicalStateUncertainError(
+                    "Candidate activation removed physical rows; refusing to infer a pending item."
+                )
             if self._unexpected_dialog_present():
-                raise AdapterError(
+                raise PhysicalStateUncertainError(
                     "An unexpected dialog appeared while confirming pending-item creation."
                 )
             if time.time() - start >= timeout_s:
@@ -3390,6 +3414,121 @@ class WindowsXactimateAdapter(XactimateAdapter):
             activity_ordinal=len(matching_indices),
             physical_row_delta=2 if is_rr else 1,
         )
+
+    def _ordinary_single_row_target_from_selected_candidate(
+        self,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> PendingQuantityTarget | None:
+        """Bind one newly activated ordinary row without reading quantity.
+
+        The selected CAT/SEL comes from exact live UI Automation text. The
+        target row must uniquely match that code plus the existing normalized
+        description rule, must not carry a real R&R activity, and every
+        baseline row must remain structurally accountable after excluding the
+        target. Baseline descriptions are deliberately not re-litigated here:
+        the saved 0006 frames show an unchanged 300S row repainting ``rfg.``
+        as ``rig.`` while its CAT/SEL/activity structure stayed fixed.
+
+        Quantity is neither accepted nor inspected by this method.
+        """
+        from collections import Counter
+
+        selected = self._last_selected
+        if selected is None or len(after_rows) != len(before_rows) + 1:
+            return None
+        expected_identity = (
+            self._normalized_pair_text(selected.category),
+            self._normalized_pair_text(selected.selector),
+            self._normalized_pair_text(selected.description),
+        )
+        if not all(expected_identity):
+            return None
+
+        plausible: list[int] = []
+        for index, row in enumerate(after_rows):
+            if self._activity_token(row) in ("-", "+"):
+                continue
+            code_match = check_category_selector_match(
+                selected.category, selected.selector, row.category, row.selector,
+            )
+            observed_identity = self._activation_identity(row)
+            if (
+                code_match.match_state in ("exact_match", "normalized_match")
+                and self._ordinary_activation_identity_matches(observed_identity, expected_identity)
+            ):
+                plausible.append(index)
+        if len(plausible) != 1:
+            return None
+
+        target_index = plausible[0]
+
+        def structural_key(row: ActivationRowSnapshot):
+            token = self._activity_token(row)
+            return (
+                self._normalized_pair_text(row.category),
+                self._normalized_pair_text(row.selector),
+                token if token in ("-", "+") else None,
+            )
+
+        before_structure = Counter(structural_key(row) for row in before_rows)
+        after_structure = Counter(
+            structural_key(row) for index, row in enumerate(after_rows) if index != target_index
+        )
+        if before_structure != after_structure:
+            return None
+
+        return PendingQuantityTarget(
+            identity=self._activation_identity(after_rows[target_index]),
+            activity=None,
+            after_index=target_index,
+            activity_ordinal=1,
+            physical_row_delta=1,
+            allow_initial_quantity_overwrite=True,
+        )
+
+    @classmethod
+    def _ordinary_activation_identity_matches(
+        cls,
+        observed: tuple[str, str, str],
+        expected: tuple[str, str, str],
+    ) -> bool:
+        """Conservatively corroborate an exact-CAT/SEL ordinary activation.
+
+        CAT/SEL equality is mandatory and cannot be overridden here. After
+        punctuation/case/spacing normalization, allow a small edit distance
+        scaled to description length: one edit through 20 characters, two
+        through 50, and three beyond that. This tolerates ordinary OCR glyph
+        errors without allowing a materially different description to bind.
+        It is activation-only and does not alter quantity confirmation.
+        """
+        if cls._quantity_identity_matches(observed, expected):
+            return True
+        if observed[0] != expected[0] or observed[1] != expected[1]:
+            return False
+        observed_description = observed[2].replace(" ", "")
+        expected_description = expected[2].replace(" ", "")
+        if not observed_description or not expected_description:
+            return False
+
+        max_length = max(len(observed_description), len(expected_description))
+        max_edits = 1 if max_length <= 20 else 2 if max_length <= 50 else 3
+        if abs(len(observed_description) - len(expected_description)) > max_edits:
+            return False
+
+        previous = list(range(len(expected_description) + 1))
+        for observed_index, observed_char in enumerate(observed_description, start=1):
+            current = [observed_index]
+            for expected_index, expected_char in enumerate(expected_description, start=1):
+                current.append(min(
+                    current[-1] + 1,
+                    previous[expected_index] + 1,
+                    previous[expected_index - 1] + (observed_char != expected_char),
+                ))
+            if min(current) > max_edits:
+                return False
+            previous = current
+        return previous[-1] <= max_edits
 
     @classmethod
     def _rows_by_activation_identity(

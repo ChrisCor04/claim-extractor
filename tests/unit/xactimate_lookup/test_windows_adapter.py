@@ -2856,6 +2856,183 @@ def test_pending_detector_accepts_one_quantity_bearing_plus_row_as_rr_item(monke
     assert adapter._pending_quantity_target.physical_row_delta == 1
 
 
+def _selected_ordinary(cat="RFG", sel="GCR300", desc="Gable cornice return - laminated"):
+    return DropdownResult(
+        raw_text=f"{cat} {sel} {desc}", row_position=0,
+        category=cat, selector=sel, description=desc,
+    )
+
+
+@pytest.mark.parametrize(
+    "initial_quantity, expect_write",
+    [(None, True), (0.0, True), (4.0, False), (1.0, True)],
+)
+def test_selected_unique_ordinary_row_binds_regardless_of_initial_quantity(
+    monkeypatch, initial_quantity, expect_write,
+):
+    """Identity is established before and independently of quantity."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [
+        ActivationRowSnapshot("RFG", "3008", "Laminated comp shingle rfg without felt", "-"),
+        ActivationRowSnapshot("RFG", "3008", "Laminated comp shingle rfg without felt", "+"),
+    ]
+    after = [
+        # Unchanged companion structure with harmless description repaint.
+        ActivationRowSnapshot("RFG", "3008", "Laminated comp shingle rig without felt", "-"),
+        ActivationRowSnapshot("RFG", "3008", "Laminated comp shingle rig without felt", "+"),
+        ActivationRowSnapshot("RFG", "GCR300", "Gable cornice return laminated", "&"),
+    ]
+    adapter._last_selected = _selected_ordinary()
+    adapter._last_activation_baseline_rows = before
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    assert adapter.pending_item_created(
+        [(row.category, row.selector) for row in before], timeout_s=0,
+    ) is True
+    assert adapter._pending_quantity_target.after_index == 2
+    assert adapter._pending_quantity_target.activity is None
+    assert adapter._pending_quantity_target.allow_initial_quantity_overwrite is True
+
+    state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, after, [0.0, 0.0, initial_quantity], 4.0,
+    )
+    adapter.enter_quantity(4.0)
+
+    assert state["typed"] is expect_write
+    assert set(reads) == {2}
+
+
+def test_gcr300_default_one_ea_is_replaced_with_expected_four(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("RFG", "GCR300", "Gable cornice return laminated", "&")]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("rfg", "gcr300", "gable cornice return laminated"), None, 0, 1,
+        allow_initial_quantity_overwrite=True,
+    )
+    state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, rows, [1.0], 4.0,
+    )
+
+    adapter.enter_quantity(4.0)
+
+    assert state["typed"] is True
+    assert reads == [0, 0]
+    assert adapter.last_quantity_confirmation.expected == 4.0
+    assert adapter.last_quantity_confirmation.observed == 4.0
+
+
+def test_live_gcr300_activation_accepts_single_rn_to_m_ocr_repaint(monkeypatch):
+    """Exact live 0006 repro is accepted by generic edit-distance matching."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [
+        ActivationRowSnapshot("RFG", "3008", "Laminated - comp. shingle rig. - w/out felt", "-"),
+        ActivationRowSnapshot("RFG", "3008", "Laminated - comp. shingle rig. - w/out felt", "+"),
+        ActivationRowSnapshot("RFG", "ARMV>", "Tear off, haul and dispose of comp. shingles -", ". -"),
+        ActivationRowSnapshot("RFG", "FELT15", "Roofing felt - 15 Ib.", "+"),
+    ]
+    after = before + [
+        ActivationRowSnapshot("RFG", "GCR300", "Gable comice return - laminated", "7 &"),
+    ]
+    adapter._last_selected = _selected_ordinary(
+        cat="RFG", sel="GCR300", desc="Gable cornice return - laminated",
+    )
+    adapter._last_activation_baseline_rows = before
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    assert adapter.pending_item_created(
+        [(row.category, row.selector) for row in before], timeout_s=0,
+    ) is True
+    assert adapter._pending_quantity_target.identity == (
+        "rfg", "gcr300", "gable comice return laminated",
+    )
+    assert adapter._pending_quantity_target.after_index == 4
+    assert adapter._pending_quantity_target.activity is None
+    assert adapter._pending_quantity_target.allow_initial_quantity_overwrite is True
+
+
+@pytest.mark.parametrize(
+    "expected, observed",
+    [
+        ("Gable cornice return laminated", "Gable cornice return laminated"),
+        ("Gable cornice return laminated", "Gable comice return laminated"),
+        ("Granite countertop", "Granmite countertop"),
+        ("Gable, cornice-return: laminated", "gable cornice return laminated"),
+        ("Roof vent aluminum", "Roof vent aluminun"),
+    ],
+)
+def test_ordinary_activation_uses_generic_conservative_description_similarity(expected, observed):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    observed_identity = ("rfg", "gcr300", adapter._normalized_pair_text(observed))
+    expected_identity = ("rfg", "gcr300", adapter._normalized_pair_text(expected))
+
+    assert adapter._ordinary_activation_identity_matches(observed_identity, expected_identity) is True
+
+
+def test_ordinary_activation_similarity_rejects_material_description_difference():
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    assert adapter._ordinary_activation_identity_matches(
+        ("rfg", "gcr300", "gable cornice return metal"),
+        ("rfg", "gcr300", "gable cornice return laminated"),
+    ) is False
+
+
+def test_ordinary_activation_similarity_never_overrides_cat_sel_conflict():
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    assert adapter._ordinary_activation_identity_matches(
+        ("rfg", "gcr301", "gable cornice return laminated"),
+        ("rfg", "gcr300", "gable cornice return laminated"),
+    ) is False
+
+
+def test_selected_ordinary_row_fails_closed_when_multiple_rows_are_plausible(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    row = ActivationRowSnapshot("RFG", "GCR300", "Gable cornice return laminated", None)
+    adapter._last_selected = _selected_ordinary()
+    adapter._last_activation_baseline_rows = [row]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [row, row])
+
+    with pytest.raises(AdapterError, match="not one safe ordinary row"):
+        adapter.pending_item_created([("RFG", "GCR300")], timeout_s=0)
+
+
+def test_selected_ordinary_row_fails_closed_for_wrong_cat_sel(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected = _selected_ordinary()
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot("RFG", "GCR301", "Gable cornice return laminated", None),
+    ])
+
+    with pytest.raises(AdapterError, match="not one safe ordinary row"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+def test_selected_ordinary_row_fails_closed_for_material_description_conflict(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected = _selected_ordinary()
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot("RFG", "GCR300", "Gable cornice return metal", None),
+    ])
+
+    with pytest.raises(AdapterError, match="not one safe ordinary row"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+def test_selected_ordinary_row_fails_closed_for_unrelated_baseline_mutation(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    before = [ActivationRowSnapshot("SFG", "GUTA", "Gutter", None)]
+    adapter._last_selected = _selected_ordinary()
+    adapter._last_activation_baseline_rows = before
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot("SFG", "GSG", "Splash guard", None),
+        ActivationRowSnapshot("RFG", "GCR300", "Gable cornice return laminated", None),
+    ])
+
+    with pytest.raises(AdapterError, match="not one safe ordinary row"):
+        adapter.pending_item_created([("SFG", "GUTA")], timeout_s=0)
+
+
 def test_pending_detector_accepts_new_pair_after_existing_rows(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     existing = _activation_row(cat="SFG", sel="GUTA", desc="Gutter", activity="+")

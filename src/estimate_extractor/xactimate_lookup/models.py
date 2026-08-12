@@ -43,6 +43,7 @@ STOP_REASON_ADAPTER_ERROR = "adapter_error"
 STOP_REASON_UNIT_MISMATCH = "unit_mismatch"
 STOP_REASON_UNSUPPORTED_ADAPTER = "unsupported_adapter"
 STOP_REASON_UNEXPECTED_DIALOG = "unexpected_dialog"
+STOP_REASON_PHYSICAL_STATE_UNCERTAIN = "physical_state_uncertain"
 
 
 def utc_now_iso() -> str:
@@ -252,6 +253,11 @@ class LookupOutcome:
     #: separate from ``committed``: a later OCR/quantity/commit error
     #: must not make a physically-created row look like nothing landed.
     physical_item_created: bool = False
+    #: True when a UI action changed, removed, or ambiguously populated
+    #: physical rows and the result cannot be reconciled safely. This is
+    #: distinct from OCR-only uncertainty and forces the execution runner
+    #: to stop before any later task.
+    physical_state_uncertain: bool = False
     #: The adapter's independent post-commit verification result (Phase
     #: 4.8's `CommitVerification`, from `WindowsXactimateAdapter.
     #: verify_commit()`), when the adapter supports it. Deliberately
@@ -294,5 +300,6 @@ class LookupOutcome:
             "stop_detail": self.stop_detail,
             "evidence_reference": self.evidence_reference,
             "committed": self.committed,
+            "physical_state_uncertain": self.physical_state_uncertain,
             "verification_trust_state": getattr(self.verification, "trust_state", None),
         }

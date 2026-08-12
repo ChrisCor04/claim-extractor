@@ -93,6 +93,7 @@ from estimate_extractor.xactimate_lookup.models import (
     RecommendationInput,
     STOP_REASON_EXTRACTION_FAILED,
     STOP_REASON_NO_RESULTS,
+    STOP_REASON_UNEXPECTED_DIALOG,
 )
 from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, generate_search_phrase
 from estimate_extractor.xactimate_lookup.ranking import RankingConfig
@@ -285,6 +286,16 @@ def _apply_outcome_to_task(task: ExecutionTask, outcome, dry_run: bool) -> None:
     task.stop_reason = outcome.stop_reason
     task.stop_detail = outcome.stop_detail
     task.evidence_path = outcome.evidence_reference
+    task.physical_state_uncertain = bool(
+        getattr(outcome, "physical_state_uncertain", False)
+        or outcome.stop_reason == STOP_REASON_UNEXPECTED_DIALOG
+    )
+    selected = getattr(outcome, "selected", None)
+    selected_dropdown = getattr(selected, "dropdown", None)
+    if selected_dropdown is not None:
+        task.selected_category = selected_dropdown.category
+        task.selected_selector = selected_dropdown.selector
+        task.selected_description = selected_dropdown.description
 
     if dry_run:
         # Nothing was actually executed -- record what WOULD happen
@@ -310,11 +321,15 @@ def _apply_outcome_to_task(task: ExecutionTask, outcome, dry_run: bool) -> None:
         # docstring) so it is never silently retried/duplicated.
         task.commit_state = TASK_COMMIT_STATE_COMMITTED
         task.state = TASK_REVIEW_REQUIRED
-        task.stop_detail = (task.stop_detail or "") + " Committed, but the adapter does not support commit verification."
+        task.review_reason = "Committed, but the adapter does not support commit verification."
+        task.stop_detail = (task.stop_detail or "") + f" {task.review_reason}"
         return
 
     task.trust_state = getattr(verification, "trust_state", None)
     task.commit_state = commit_state_from_trust_state(task.trust_state)
+    if task.trust_state == "VERIFICATION_FAILED" and getattr(outcome, "physical_item_created", False):
+        task.commit_state = TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+        task.physical_state_uncertain = True
     task.observed_quantity = getattr(verification, "quantity_observed", None)
     observed_unit = getattr(verification, "unit", None)
     task.observed_unit = getattr(observed_unit, "observed_xactimate_unit", None) if observed_unit is not None else None
@@ -337,8 +352,10 @@ def _apply_outcome_to_task(task: ExecutionTask, outcome, dry_run: bool) -> None:
 
     if task.trust_state == _VERIFIED_TRUST_STATE:
         task.state = TASK_COMPLETED
+        task.review_reason = None
     else:
         task.state = TASK_REVIEW_REQUIRED
+        task.review_reason = getattr(verification, "reason", None) or task.trust_state
 
 
 #: Phase 5.5: the state label on a proposal saved by
@@ -704,7 +721,10 @@ def run_execution_plan(
         (
             task for task in plan.tasks
             if task.state == TASK_PENDING
-            and task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+            and (
+                task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+                or task.physical_state_uncertain
+            )
         ),
         None,
     )
@@ -777,7 +797,10 @@ def run_execution_plan(
             # PENDING.  Treat that resumed shape exactly like an
             # in-process post-creation failure: stop before touching
             # this task, any sibling task, or any later group.
-            if not dry_run and task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED:
+            if not dry_run and (
+                task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+                or task.physical_state_uncertain
+            ):
                 plan.run_state = RUN_STATE_PAUSED
                 plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
                 plan.resume_cursor = plan.tasks.index(task)
@@ -922,7 +945,10 @@ def run_execution_plan(
                 # task/group operate on dirty, divergent state.  Leave
                 # all untouched work PENDING with attempts=0 and pause
                 # at this task until a human reconciles the physical row.
-                if task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED:
+                if (
+                    task.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+                    or task.physical_state_uncertain
+                ):
                     plan.run_state = RUN_STATE_PAUSED
                     plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
                     plan.resume_cursor = plan.tasks.index(task)

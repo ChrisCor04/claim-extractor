@@ -167,6 +167,10 @@ def task_has_committed_row(task: "ExecutionTask") -> bool:
     `trust_state` for a plan built before that field existed, so old
     persisted plans are never silently treated as "nothing committed"
     just because they predate this phase."""
+    if task.physical_state_uncertain:
+        # A retry is unsafe until a human reconciles whether the prior UI
+        # action left a row, duplicate, or disappearance behind.
+        return True
     if task.state == TASK_COMPLETED:
         return True
     if task.commit_state == TASK_COMMIT_STATE_COMMITTED:
@@ -246,6 +250,12 @@ class ExecutionTask:
     observed_selector: str | None = None
     observed_description: str | None = None
     observed_activity: str | None = None
+    #: Exact candidate identity from the positively selected dropdown row.
+    #: Unlike observed_* (post-commit OCR), these values come from UIA and
+    #: remain the authoritative audit record when later OCR is noisy.
+    selected_category: str | None = None
+    selected_selector: str | None = None
+    selected_description: str | None = None
     #: Phase 5.5B: audit trail of the routing decision execution_
     #: runner.py's _task_to_lookup_plan() actually made -- `lookup_
     #: strategy` above is the REQUESTED strategy, fixed at plan-build
@@ -259,6 +269,12 @@ class ExecutionTask:
     lookup_strategy_reason: str | None = None
     state: str = TASK_PENDING
     trust_state: str | None = None
+    #: Human-facing reason a physically committed task needs review.
+    #: None for fully verified tasks and for tasks that never committed.
+    review_reason: str | None = None
+    #: True only for unexplained physical/mechanical state. OCR-only
+    #: uncertainty must never set this flag.
+    physical_state_uncertain: bool = False
     #: Phase 5.9: whether a real row is known to have landed in
     #: Xactimate for this task -- set explicitly by execution_runner.
     #: _apply_outcome_to_task() based on orchestrator.execute_plan()'s
