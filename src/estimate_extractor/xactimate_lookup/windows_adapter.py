@@ -1618,6 +1618,55 @@ class WindowsXactimateAdapter(XactimateAdapter):
                             return (field_left, top, field_right, bottom + 1)
         return None
 
+    def _locate_search_subtab(self, image) -> tuple[int, int, int, int] | None:
+        """Locate the small 'Search' sub-tab inside the Quick Entry panel
+        -- distinct from the outer Items tab and from
+        _locate_search_field()'s own broader Search heading/button
+        matches. Quick Entry shows this sub-tab alongside a sibling
+        'Macros' sub-tab; a match is accepted only when 'Macros' sits
+        immediately to its right on the same row, the same neighbor-
+        corroboration pattern _locate_items_tab() uses for its own tab
+        strip. Live-caught (this diagnosis): after a candidate is
+        selected/activated, this inner sub-tab can end up off 'Search'
+        while the OUTER Items tab remains active throughout -- clicking
+        the outer tab again is then a no-op, since it was never the
+        thing that changed.
+
+        Returns None -- ambiguous, never guessed at -- unless EXACTLY
+        one such Search/Macros pair is found, deliberately stricter than
+        _locate_items_tab()'s first-match behavior: a second bounded
+        recovery click is only ever safe to make from a uniquely
+        identified target."""
+        pytesseract = self._pytesseract()
+        from pytesseract import Output
+
+        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        search_boxes = []
+        macros_boxes = []
+        for i, text in enumerate(data["text"]):
+            clean = re.sub(r"[^a-z]+", "", str(text).lower())
+            box = (
+                data["left"][i], data["top"][i],
+                data["left"][i] + data["width"][i],
+                data["top"][i] + data["height"][i],
+            )
+            if clean == "search":
+                search_boxes.append(box)
+            elif clean == "macros":
+                macros_boxes.append(box)
+
+        matches = []
+        for search in search_boxes:
+            search_mid_y = (search[1] + search[3]) // 2
+            for macros in macros_boxes:
+                macros_mid_y = (macros[1] + macros[3]) // 2
+                if search[0] < macros[0] and abs(search_mid_y - macros_mid_y) <= 12:
+                    matches.append(search)
+                    break
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
     def _locate_items_tab(self, image) -> tuple[int, int, int, int] | None:
         """Locate Items only when a neighboring tab proves tab context.
 
@@ -2020,11 +2069,30 @@ class WindowsXactimateAdapter(XactimateAdapter):
             )
         l, t, r, b = items
         self._click_client(hwnd, (l + r) // 2, (t + b) // 2)
-        if self._wait_for_search_field(hwnd) is None:
-            raise ItemsTabVerificationError(
-                "Items tab click did not produce a positively located Search field within the bounded readiness poll; "
-                "refusing to continue."
-            )
+        if self._wait_for_search_field(hwnd) is not None:
+            return
+        # Live-caught (this diagnosis): the OUTER Items tab can already
+        # be active the whole time -- the click above is then a no-op --
+        # while an INNER Quick Entry sub-tab (Search/Macros) has drifted
+        # off 'Search', which is what actually hides the Search field.
+        # Exactly ONE additional bounded, evidence-verified recovery: a
+        # fresh capture, a locate that fails closed on anything but a
+        # single unambiguous match, one click, one re-poll. No blind
+        # coordinate click, no loop, no Escape, no scroll, no dialog
+        # dismissal -- if this doesn't positively confirm Search, fail
+        # closed exactly as before (same exception, same message, same
+        # task-local handling downstream).
+        recovery_image = self._capture_client_image(hwnd)
+        search_subtab = self._locate_search_subtab(recovery_image)
+        if search_subtab is not None:
+            sl, st, sr, sb = search_subtab
+            self._click_client(hwnd, (sl + sr) // 2, (st + sb) // 2)
+            if self._wait_for_search_field(hwnd) is not None:
+                return
+        raise ItemsTabVerificationError(
+            "Items tab click did not produce a positively located Search field within the bounded readiness poll; "
+            "refusing to continue."
+        )
 
     def focus_search(self) -> None:
         """Live-caught (Phase 4.7): unlike the tab bar, the search box

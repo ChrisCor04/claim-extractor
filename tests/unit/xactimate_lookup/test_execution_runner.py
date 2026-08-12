@@ -219,6 +219,52 @@ def test_physical_unconfirmed_quantity_failure_hard_stops_entire_run(
     assert len(search_calls) == 1
 
 
+class ItemsTabFailureOnceFakeAdapter(GroupAwareFakeAdapter):
+    """Raises ItemsTabVerificationError from focus_search() on exactly
+    the first call, then behaves normally -- the live-caught Search-
+    subview degradation that doesn't recur on every later task."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._focus_search_calls = 0
+
+    def focus_search(self) -> None:
+        self._focus_search_calls += 1
+        if self._focus_search_calls == 1:
+            from estimate_extractor.xactimate_lookup.windows_adapter import ItemsTabVerificationError
+            self.log.record("focus_search")
+            raise ItemsTabVerificationError(
+                "Items tab click did not produce a positively located Search field within the bounded readiness "
+                "poll; refusing to continue."
+            )
+        super().focus_search()
+
+
+def test_items_tab_verification_error_is_task_local_and_later_tasks_still_run(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """Requirement 7: an ItemsTabVerificationError on one task's
+    focus_search() -- the bounded Search-subtab recovery having already
+    failed closed inside the adapter -- must remain task-local: the
+    task itself fails, but the run continues and later tasks (same
+    group and the next group) are still attempted, exactly like any
+    other task-level AdapterError. Not a project-level hard stop."""
+    plan = _plan_two_groups()
+    adapter = ItemsTabFailureOnceFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    first, second, third = result.tasks
+    assert first.state == TASK_FAILED
+    assert "Items tab" in (first.error or "")
+    assert result.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP
+    # Later tasks were still attempted -- same group and the next group.
+    assert second.attempts >= 1
+    assert third.attempts >= 1
+    assert adapter.ensure_group_calls == ["Dwelling Roof", "Fence"]
+
+
 def test_physical_state_uncertain_activation_stops_following_tasks(
     tmp_path, phrase_rules, ranking_config,
 ):

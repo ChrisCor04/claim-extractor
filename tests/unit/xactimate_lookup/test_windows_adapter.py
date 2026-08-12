@@ -479,6 +479,104 @@ def test_search_locator_focused_fallback_requires_full_price_list_heading(monkey
     assert adapter._locate_search_field(image) is None
 
 
+# ---------------------------------------------------------------------
+# _locate_search_subtab(): the inner Quick Entry 'Search' sub-tab
+# (distinct from the outer Items tab and from _locate_search_field()'s
+# own broader Search text matches) -- the one-shot bounded recovery
+# target added to _reset_scroll_state() below.
+# ---------------------------------------------------------------------
+
+
+def test_search_subtab_locator_accepts_unique_search_macros_pair(monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 210), "white")
+    data = {
+        "text": ["Search", "Macros"],
+        "left": [60, 130],
+        "top": [200, 201],
+        "width": [40, 45],
+        "height": [12, 12],
+    }
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(*args, **kwargs):
+            return data
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._locate_search_subtab(image) == (60, 200, 100, 212)
+
+
+def test_search_subtab_locator_rejects_search_without_macros_neighbor(monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 210), "white")
+    data = {
+        "text": ["Search"],
+        "left": [60],
+        "top": [200],
+        "width": [40],
+        "height": [12],
+    }
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(*args, **kwargs):
+            return data
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._locate_search_subtab(image) is None
+
+
+def test_search_subtab_locator_fails_closed_on_absent_text(monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 210), "white")
+    data = {"text": [], "left": [], "top": [], "width": [], "height": []}
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(*args, **kwargs):
+            return data
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._locate_search_subtab(image) is None
+
+
+def test_search_subtab_locator_fails_closed_on_ambiguous_match(monkeypatch):
+    """Two valid Search/Macros pairs on the same frame -- deliberately
+    stricter than _locate_items_tab()'s first-match behavior: a second
+    bounded recovery click is only ever safe from a uniquely identified
+    target, so ambiguity must fail closed, never guess the first one."""
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 210), "white")
+    data = {
+        "text": ["Search", "Macros", "Search", "Macros"],
+        "left": [60, 130, 60, 130],
+        "top": [200, 201, 400, 401],
+        "width": [40, 45, 40, 45],
+        "height": [12, 12, 12, 12],
+    }
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(*args, **kwargs):
+            return data
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._locate_search_subtab(image) is None
+
+
 def test_reset_scroll_state_does_not_click_when_items_search_is_already_ready(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     clicks = []
@@ -536,6 +634,10 @@ def test_reset_scroll_state_requires_live_items_tab_and_search_pane(monkeypatch)
     monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
     monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    # The Items-tab click alone still fails to reveal Search here -- the
+    # one-shot Search-subtab recovery is also given no unique target, so
+    # this must still fail closed exactly as before this fix.
+    monkeypatch.setattr(adapter, "_locate_search_subtab", lambda image: None)
 
     from estimate_extractor.xactimate_lookup.windows_adapter import ItemsTabVerificationError
 
@@ -561,6 +663,152 @@ def test_reset_scroll_state_clicks_inactive_items_then_accepts_later_bounded_cap
 
     assert clicks == [(101, 20, 15)]
     assert captures == [101, 101]
+
+
+# ---------------------------------------------------------------------
+# _reset_scroll_state()'s one-shot Search-subtab recovery: the OUTER
+# Items tab can already be active (its own click is then a no-op) while
+# an INNER Quick Entry sub-tab has drifted off 'Search'. Exactly one
+# additional bounded, evidence-verified recovery attempt after the
+# Items-tab click still fails to reveal Search -- never a blind click,
+# never a loop, never Escape/scroll/dialog dismissal.
+# ---------------------------------------------------------------------
+
+
+def test_reset_scroll_state_already_ready_never_probes_search_subtab(monkeypatch):
+    """Requirement 1: Search already ready -> no recovery click at all,
+    and the subtab locator is never even consulted."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    subtab_calls = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "ready")
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: (100, 40, 300, 65))
+    monkeypatch.setattr(adapter, "_locate_search_subtab", lambda image: subtab_calls.append(image) or (0, 0, 1, 1))
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    adapter._reset_scroll_state()
+
+    assert clicks == []
+    assert subtab_calls == []
+
+
+def test_reset_scroll_state_search_subtab_recovery_restores_readiness(monkeypatch):
+    """Requirement 2: Items active but the inner Search subview isn't
+    -- one bounded Search-subtab click restores readiness and the task
+    continues (no exception)."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "frame")
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
+    # Items-tab click's own poll fails; the recovery poll (after the
+    # subtab click) succeeds.
+    readiness = iter([None, None, (100, 40, 300, 65)])
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
+    monkeypatch.setattr(adapter, "_locate_search_subtab", lambda image: (60, 200, 100, 212))
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    adapter._reset_scroll_state()  # must not raise
+
+    assert clicks == [(101, 20, 15), (101, 80, 206)]  # Items tab, then Search subtab
+
+
+def test_reset_scroll_state_search_subtab_ambiguous_fails_closed(monkeypatch):
+    """Requirement 3: Search-subtab ambiguous (locator returns None) ->
+    fail closed exactly as before, no recovery click attempted."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "frame")
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
+    readiness = iter([None, None])
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
+    monkeypatch.setattr(adapter, "_locate_search_subtab", lambda image: None)
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import ItemsTabVerificationError
+
+    with pytest.raises(ItemsTabVerificationError, match="did not produce"):
+        adapter._reset_scroll_state()
+
+    assert clicks == [(101, 20, 15)]  # only the Items-tab click -- no subtab click attempted
+
+
+def test_reset_scroll_state_search_subtab_absent_fails_closed(monkeypatch):
+    """Requirement 4: Search-subtab absent (locator returns None, same
+    as ambiguous from the caller's perspective) -> fail closed."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "frame")
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
+    readiness = iter([None, None])
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
+    monkeypatch.setattr(adapter, "_locate_search_subtab", lambda image: None)
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import ItemsTabVerificationError
+
+    with pytest.raises(ItemsTabVerificationError):
+        adapter._reset_scroll_state()
+
+    assert clicks == [(101, 20, 15)]
+
+
+def test_reset_scroll_state_search_subtab_recovery_click_happens_at_most_once(monkeypatch):
+    """Requirement 5: the recovery click occurs at most once, even when
+    the locator/poll are consulted repeatedly -- no loop."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    subtab_calls = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "frame")
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
+    readiness = iter([None, None, None])
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
+
+    def locate_subtab(image):
+        subtab_calls.append(image)
+        return (60, 200, 100, 212)
+
+    monkeypatch.setattr(adapter, "_locate_search_subtab", locate_subtab)
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import ItemsTabVerificationError
+
+    with pytest.raises(ItemsTabVerificationError):
+        adapter._reset_scroll_state()
+
+    assert len(subtab_calls) == 1  # located at most once
+    assert clicks == [(101, 20, 15), (101, 80, 206)]  # Items tab click + exactly one subtab click, never more
+
+
+def test_reset_scroll_state_readiness_still_absent_after_subtab_click_fails_closed(monkeypatch):
+    """Requirement 6: the subtab is found and clicked, but Search still
+    cannot be positively confirmed afterward -> fail closed, same
+    exception/message as before this fix, still task-local downstream."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    clicks = []
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 101)
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: "frame")
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 30, 20))
+    readiness = iter([None, None, None])  # even the post-subtab-click poll comes back empty
+    monkeypatch.setattr(adapter, "_wait_for_search_field", lambda hwnd: next(readiness))
+    monkeypatch.setattr(adapter, "_locate_search_subtab", lambda image: (60, 200, 100, 212))
+    monkeypatch.setattr(adapter, "_click_client", lambda *args: clicks.append(args))
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import ItemsTabVerificationError
+
+    with pytest.raises(ItemsTabVerificationError, match="did not produce"):
+        adapter._reset_scroll_state()
+
+    assert clicks == [(101, 20, 15), (101, 80, 206)]
 
 
 def test_components_search_like_control_is_not_accepted_as_items_search(monkeypatch):
