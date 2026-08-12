@@ -28,6 +28,7 @@ from estimate_extractor.ui.components.extraction_panel import render_claim_summa
 from estimate_extractor.ui.components.issue_panel import render_review_history
 from estimate_extractor.ui.components.mapping_table import render_mapping_review
 from estimate_extractor.ui.components.project_summary import render_projects_panel
+from estimate_extractor.ui.components.quick_run_panel import render_quick_run_panel
 from estimate_extractor.ui.components.upload_panel import render_upload_panel
 from estimate_extractor.ui.components.verified_catalog_panel import render_verified_catalog_tab
 from estimate_extractor.ui.project_service import ProjectService
@@ -63,10 +64,17 @@ def main() -> None:
             st.exception(exc)
         return
 
-    st.title("ClaimXtract — Local Claim Review")
-    st.caption(f"Local-only, offline. Projects stored at: {projects_dir}")
+    st.title("ClaimXtract")
+    st.caption("Add a claim PDF and execute it in Xactimate. Everything stays on this computer.")
 
     with st.sidebar:
+        workspace = st.radio(
+            "Workspace",
+            ["Quick Run", "Advanced"],
+            key="workspace_mode",
+            help="Quick Run is the normal add-file-and-execute workflow. Advanced keeps every review and diagnostic tool.",
+        )
+        st.markdown("---")
         st.subheader("Reviewer")
         name = st.text_input("Reviewer / workstation name", value=ui_state.get_reviewer_name())
         ui_state.set_reviewer_name(name)
@@ -74,8 +82,14 @@ def main() -> None:
         active = ui_state.get_active_project()
         st.caption(f"Active project: {active or '(none)'}")
         st.markdown("---")
-        st.caption("estimate_extractor Phase 3 — no network calls, no telemetry, no cloud storage.")
+        st.caption(f"Local projects: {projects_dir}")
+        st.caption("No network calls · no telemetry · no cloud storage")
 
+    if workspace == "Quick Run":
+        render_quick_run_panel(projects, config, engine_config)
+        return
+
+    st.info("Advanced workspace: detailed review, mapping, plan maintenance, diagnostics, and exports.")
     tabs = st.tabs(
         [
             "Projects",
