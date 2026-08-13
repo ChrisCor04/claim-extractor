@@ -2182,6 +2182,94 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     break
         return last_populated_index + 1
 
+    def _activation_rows_from_same_image(
+        self, image, offset: tuple[int, int],
+    ) -> tuple[list[ActivationRowSnapshot], int]:
+        """Read activation rows while determining their extent once.
+
+        This is the same bounded row walk and the same three content
+        signals as :meth:`_count_grid_rows`, but retains the activation
+        fields already read from this image instead of OCR-reading every
+        populated row a second time. The returned integer is the first-row
+        top used by callers' existing trailing-row probes.
+        """
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        scanned: list[ActivationRowSnapshot] = []
+        last_populated_index = -1
+        consecutive_empty = 0
+        for index in range(self._MAX_ROW_SCAN):
+            row_top = row_1_top + index * _GRID_ROW_HEIGHT
+            if not self._row_is_visible(image, row_top):
+                break
+            row = self._read_activation_row_at(image, offset, row_top)
+            scanned.append(row)
+            has_content = (
+                self._is_meaningful_ocr_text(row.category, self._MEANINGFUL_TEXT_MIN_LEN["category"])
+                and self._is_meaningful_ocr_text(row.selector, self._MEANINGFUL_TEXT_MIN_LEN["selector"])
+            ) or self._is_meaningful_ocr_text(
+                row.description, self._MEANINGFUL_TEXT_MIN_LEN["description"],
+            )
+            if not has_content:
+                quantity = self._read_quantity_at(image, offset, row_top)
+                if quantity is not None:
+                    raw_unit, _normalized_unit = self._read_unit_at(image, offset, row_top)
+                    has_content = self._is_meaningful_ocr_text(
+                        raw_unit, self._MEANINGFUL_TEXT_MIN_LEN["unit"],
+                    )
+            if has_content:
+                last_populated_index = index
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+        return scanned[:last_populated_index + 1], row_1_top
+
+    def _commit_rows_from_same_image(
+        self, image, offset: tuple[int, int],
+    ) -> list[CommitRowSnapshot]:
+        """Read rich commit rows while determining their extent once."""
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        scanned: list[CommitRowSnapshot] = []
+        last_populated_index = -1
+        consecutive_empty = 0
+        for index in range(self._MAX_ROW_SCAN):
+            row_top = row_1_top + index * _GRID_ROW_HEIGHT
+            if not self._row_is_visible(image, row_top):
+                break
+            activation = self._read_activation_row_at(image, offset, row_top)
+            raw_unit, unit = self._read_unit_at(image, offset, row_top)
+            quantity = self._read_quantity_at(image, offset, row_top)
+            scanned.append(CommitRowSnapshot(
+                category=activation.category,
+                selector=activation.selector,
+                description=activation.description,
+                activity=activation.activity,
+                quantity=quantity,
+                unit=unit,
+            ))
+            has_content = (
+                self._is_meaningful_ocr_text(
+                    activation.category, self._MEANINGFUL_TEXT_MIN_LEN["category"],
+                )
+                and self._is_meaningful_ocr_text(
+                    activation.selector, self._MEANINGFUL_TEXT_MIN_LEN["selector"],
+                )
+            ) or self._is_meaningful_ocr_text(
+                activation.description, self._MEANINGFUL_TEXT_MIN_LEN["description"],
+            ) or (
+                quantity is not None
+                and self._is_meaningful_ocr_text(raw_unit, self._MEANINGFUL_TEXT_MIN_LEN["unit"])
+            )
+            if has_content:
+                last_populated_index = index
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+        return scanned[:last_populated_index + 1]
+
     # ------------------------------------------------------------------
     # XactimateAdapter contract
     # ------------------------------------------------------------------
@@ -3035,16 +3123,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def _quantity_target_candidates(self, image, offset, target: PendingQuantityTarget):
         """Read all currently visible rows matching the retained target."""
-        geom = self._last_row_geometry(image, offset)
-        if geom is None:
+        rows, row_1_top = self._activation_rows_from_same_image(image, offset)
+        if not rows:
+            # _last_row_geometry() previously returned None here before
+            # either caller-specific trailing-row guard could run.
             return []
-        row_count, _last_row_top = geom
-        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
         if target.allow_initial_quantity_overwrite:
-            rows = [
-                self._read_activation_row_at(image, offset, row_1_top + index * _GRID_ROW_HEIGHT)
-                for index in range(row_count)
-            ]
             for _probe in range(2):
                 row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
                 if row_top < 0 or row_top + _GRID_ROW_HEIGHT > image.height:
@@ -3068,14 +3152,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         matches = []
         # Retain the activation snapshot's two-row undercount guard.
-        for index in range(row_count + 2):
-            row_top = row_1_top + index * _GRID_ROW_HEIGHT
+        candidate_rows = list(rows)
+        for _probe in range(2):
+            row_top = row_1_top + len(candidate_rows) * _GRID_ROW_HEIGHT
             if row_top < 0 or row_top + _GRID_ROW_HEIGHT > image.height:
-                continue
-            row = self._read_activation_row_at(image, offset, row_top)
-            identity = self._activation_identity(row)
-            if index >= row_count and not all(identity[:2]):
                 break
+            trailing = self._read_activation_row_at(image, offset, row_top)
+            if not all(self._activation_identity(trailing)[:2]):
+                break
+            candidate_rows.append(trailing)
+        for index, row in enumerate(candidate_rows):
+            row_top = row_1_top + index * _GRID_ROW_HEIGHT
+            identity = self._activation_identity(row)
             if not self._quantity_identity_matches(identity, target.identity):
                 continue
             # Only real R&R activity glyphs are stable identity evidence.
@@ -5287,6 +5375,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
             return []
+        if row_top_nudge == 0:
+            return self._commit_rows_from_same_image(image, offset)
+        # Preserve the non-default nudge path exactly: its row extent is
+        # intentionally established at the unnudged geometry before fields
+        # are read at the caller-supplied vertical offset.
         geom = self._last_row_geometry(image, offset)
         if geom is None:
             return []
@@ -5454,13 +5547,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     "Cannot positively locate the current Items grid for search-fallback state verification."
                 )
             return []
-        geom = self._last_row_geometry(image, offset)
-        row_count = geom[0] if geom is not None else 0
-        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
-        rows = [
-            self._read_activation_row_at(image, offset, row_1_top + index * _GRID_ROW_HEIGHT)
-            for index in range(row_count)
-        ]
+        rows, row_1_top = self._activation_rows_from_same_image(image, offset)
         for _probe in range(2):
             next_row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
             if next_row_top < 0 or next_row_top + _GRID_ROW_HEIGHT > image.height:

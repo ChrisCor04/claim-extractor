@@ -5771,6 +5771,8 @@ def _wire_identity_quantity_flow(
 
     def read_quantity(image, offset, row_top, **kwargs):
         index = (row_top - row_1_top) // 25
+        if not 0 <= index < len(quantities_before):
+            return None
         reads.append(index)
         if state["typed"] and index == state.get("clicked_index"):
             return expected if confirmed_quantity is ... else confirmed_quantity
@@ -6500,6 +6502,119 @@ def test_downstream_snapshots_return_all_six_rows_when_number_column_unreadable(
     assert [r.category for r in activation] == ["TMP", "POL", "POL", "DMO", "WDR", "WDR"]
 
 
+def test_activation_snapshot_preserves_duplicate_rows_without_preliminary_count(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "RFG", "selector": "300S", "description": "Composition shingles", "activity": "-"},
+        {"category": "RFG", "selector": "300S", "description": "Composition shingles", "activity": "+"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (image, offset))
+    monkeypatch.setattr(
+        adapter, "_count_grid_rows",
+        lambda *args, **kwargs: pytest.fail("activation snapshot must determine extent while extracting rows"),
+    )
+
+    assert adapter._snapshot_activation_rows() == [
+        ActivationRowSnapshot("RFG", "300S", "Composition shingles", "-"),
+        ActivationRowSnapshot("RFG", "300S", "Composition shingles", "+"),
+    ]
+
+
+def test_commit_snapshot_preserves_all_rich_fields_without_preliminary_count(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {
+            "category": "RFG", "selector": "300S", "description": "Composition shingles",
+            "activity": "-", "quantity": 0.0, "unit": "SQ",
+        },
+        {
+            "category": "RFG", "selector": "300S", "description": "Composition shingles",
+            "activity": "+", "quantity": 35.33, "unit": "SQ",
+        },
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd, attempts=6, delay_s=0.6: (image, offset))
+    monkeypatch.setattr(
+        adapter, "_count_grid_rows",
+        lambda *args, **kwargs: pytest.fail("commit snapshot must determine extent while extracting rows"),
+    )
+
+    assert adapter._snapshot_commit_rows() == [
+        CommitRowSnapshot("RFG", "300S", "Composition shingles", "-", 0.0, "SQ"),
+        CommitRowSnapshot("RFG", "300S", "Composition shingles", "+", 35.33, "SQ"),
+    ]
+
+
+def test_same_image_snapshots_preserve_empty_and_viewport_edge_rules(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+
+    empty_image, empty_offset = _wire_row_content(monkeypatch, adapter, [None, None, None])
+    monkeypatch.setattr(
+        adapter, "_capture_and_locate",
+        lambda hwnd, attempts=6, delay_s=0.6: (empty_image, empty_offset),
+    )
+    assert adapter._snapshot_activation_rows() == []
+    assert adapter._snapshot_commit_rows() == []
+
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary repairs", "quantity": 1.0, "unit": "HR"},
+        {"category": "POL", "selector": "LAB", "description": "Pool labor", "quantity": 2.0, "unit": "HR"},
+        {"category": "RFG", "selector": "240", "description": "Viewport edge row", "quantity": 3.0, "unit": "SQ"},
+    ]
+    row_1_top = adapter._shifted_anchor("grid_row_1", (0, 0))[1]
+    edge_height = row_1_top + 3 * _GRID_ROW_HEIGHT + 5
+    edge_image, edge_offset = _wire_row_content(
+        monkeypatch, adapter, rows, image_height=edge_height,
+    )
+    monkeypatch.setattr(
+        adapter, "_capture_and_locate",
+        lambda hwnd, attempts=6, delay_s=0.6: (edge_image, edge_offset),
+    )
+
+    # Activation's established two-row edge probe includes a fully visible
+    # row lacking the count primitive's extra margin; commit semantics do not.
+    assert len(adapter._snapshot_activation_rows()) == 3
+    assert len(adapter._snapshot_commit_rows()) == 2
+
+    partial_height = row_1_top + 3 * _GRID_ROW_HEIGHT - 1
+    partial_image, partial_offset = _wire_row_content(
+        monkeypatch, adapter, rows, image_height=partial_height,
+    )
+    monkeypatch.setattr(
+        adapter, "_capture_and_locate",
+        lambda hwnd, attempts=6, delay_s=0.6: (partial_image, partial_offset),
+    )
+    assert len(adapter._snapshot_activation_rows()) == 2
+    assert len(adapter._snapshot_commit_rows()) == 1
+
+
+def test_quantity_targeting_preserves_causal_ordinary_delta_without_count_reread(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "RFG", "selector": "ARMV>", "description": "Roof membrane", "quantity": 33.66, "unit": "SQ"},
+        {"category": "RFG", "selector": "GCR300", "description": "Ridge cap shingles", "quantity": 1.0, "unit": "EA"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+    baseline = ActivationRowSnapshot("RFG", "ARMV>", "Roof membrane", None)
+    target = PendingQuantityTarget(
+        identity=("rfg", "gcr300", "ridge cap shingles"), activity=None,
+        after_index=1, activity_ordinal=1, allow_initial_quantity_overwrite=True,
+        activation_baseline_rows=(baseline,),
+    )
+    monkeypatch.setattr(
+        adapter, "_count_grid_rows",
+        lambda *args, **kwargs: pytest.fail("quantity targeting must determine extent while extracting rows"),
+    )
+
+    assert adapter._quantity_target_candidates(image, offset, target) == [
+        (1, adapter._shifted_anchor("grid_row_1", offset)[1] + _GRID_ROW_HEIGHT, 1.0),
+    ]
+
+
 def test_last_row_geometry_targets_correct_index_for_quantity_entry(monkeypatch):
     """enter_quantity() locates the row to type into from
     _last_row_geometry()'s (row_count, last_row_top) -- for the 6-row
@@ -7118,6 +7233,8 @@ def _wire_rr_pair_quantity_flow(
 
     def read_quantity(image, offset, row_top, **kwargs):
         index = (row_top - row_1_top) // _GRID_ROW_HEIGHT
+        if not 0 <= index < len(effective_rows()):
+            return None
         reads.append(index)
         if index in typed_indices:
             if confirmed_by_index is not None and index in confirmed_by_index:
