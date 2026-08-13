@@ -603,17 +603,42 @@ def _is_clean_retrieval_failure(outcome) -> bool:
     )
 
 
-def _run_description_first_task(
+def _bounded_description_first_decision(
     task: ExecutionTask, item: RecommendationInput, adapter, ranking_config: RankingConfig,
     phrase_rules: PhraseRules, project_dir: Path, dry_run: bool,
-):
-    """Run fallbacks only across positively clean retrieval failures.
+) -> tuple:
+    """The bounded, multi-attempt SEARCH/RANK/DECIDE sequence for a
+    `LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST` task -- extracted (Phase
+    5.24) from `_run_description_first_task()` so a coordinated R&R
+    pair's activation task can reuse the EXACT same established
+    lookup policy (verified-observed-mapping reuse, verified-search-
+    description reuse, exact description, generic-cleaning fallback,
+    and the "advance only across a positively clean retrieval
+    failure" safety rule) instead of the single, direct description
+    search it previously fell back to. This is the "smallest shared
+    abstraction" the two callers need: it calls orchestrator._search_
+    rank_and_decide() -- decide-only, NEVER select_candidate()/enter_
+    quantity()/commit_item() -- at every attempt, so NOTHING is ever
+    physically activated here, no matter how many attempts run. A
+    caller (either `_run_description_first_task()` below, for an
+    ordinary non-paired task, or `_run_coordinated_pair()`, for a
+    pair's activation task) is responsible for activating the single
+    WINNING outcome this returns, exactly once, however it needs to
+    (the ordinary single-row tail, or Stage 3's dual-target pair
+    binding) -- never forked here.
 
+    Run fallbacks only across positively clean retrieval failures.
     Any candidate-bearing ranking decision or physical interaction is
     terminal. Before every later query, both persisted task state and
     the adapter's read-only selection/dialog/grid checkpoint must prove
     the task is still clean.
-    """
+
+    Returns (outcome, actual_strategy, reason) -- identical shape to
+    `_task_to_lookup_plan()`'s own return, so both callers can treat
+    the two lookup strategies uniformly. `outcome` is either already
+    terminal or one DECISION_AUTO_SELECT outcome ready for activation,
+    exactly like `orchestrator._search_rank_and_decide()`'s own
+    contract."""
     attempts = _description_first_search_attempts(task, phrase_rules, project_dir)
     if not attempts:
         raise UnsafeLookupRouting(
@@ -630,7 +655,7 @@ def _run_description_first_task(
 
     outcome = None
     for attempt_number, (search_type, attempt_plan) in enumerate(attempts, start=1):
-        outcome = orchestrator.execute_plan(
+        outcome = orchestrator._search_rank_and_decide(
             attempt_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run,
         )
         is_last_attempt = attempt_number == len(attempts)
@@ -693,6 +718,31 @@ def _run_description_first_task(
         f"({task.search_attempts[-1]['search_type']}) -- {task.search_attempts[-1]['advance_reason']}."
     )
     actual_strategy = LOOKUP_PATH_TRUSTED if outcome.plan.path == LOOKUP_PATH_TRUSTED else LOOKUP_PATH_DESCRIPTION_SEARCH
+    return outcome, actual_strategy, reason
+
+
+def _run_description_first_task(
+    task: ExecutionTask, item: RecommendationInput, adapter, ranking_config: RankingConfig,
+    phrase_rules: PhraseRules, project_dir: Path, dry_run: bool,
+):
+    """Ordinary (non-paired) description-first task entry point.
+
+    Phase 5.24: the bounded multi-attempt search/decide sequence
+    itself now lives in `_bounded_description_first_decision()` above,
+    reused verbatim -- this function is unchanged in behavior. Its own
+    former inline activation (via `orchestrator.execute_plan()` at
+    each attempt) is now a separate, explicit step: the bounded
+    decision never activates anything itself, so the ONE winning
+    AUTO_SELECT outcome (if any, and only when not dry_run) is
+    activated here via `orchestrator._activate_and_commit_ordinary_
+    row()` -- the exact same ordinary single-row tail `execute_plan()`
+    itself uses -- after the bounded loop has already finished."""
+    outcome, actual_strategy, reason = _bounded_description_first_decision(
+        task, item, adapter, ranking_config, phrase_rules, project_dir, dry_run,
+    )
+    if not dry_run and outcome.decision == DECISION_AUTO_SELECT:
+        attempt_plan = outcome.plan
+        outcome = orchestrator._activate_and_commit_ordinary_row(attempt_plan, item, adapter, outcome)
     return outcome, actual_strategy, reason
 
 
@@ -834,7 +884,7 @@ def _finalize_pair_task(
 def _write_verify_and_finalize_rr_pair(
     pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
     pair_target, before_snapshot, populated_unit: str | None,
-    adapter, plan: ExecutionPlan, project_dir: Path,
+    adapter, plan: ExecutionPlan, project_dir: Path, plan_path: Path | None,
 ) -> bool:
     """Shared tail for EVERY path that reaches "both halves physically
     bound, ready to write/verify quantities and finish" -- a fresh
@@ -847,7 +897,7 @@ def _write_verify_and_finalize_rr_pair(
         pair.minus_written = True
         pair.minus_verified_ok = getattr(confirmation, "confidence", None) == "CONFIRMED"
         pair.pair_state = PAIR_MINUS_VERIFIED
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
 
     try:
         result = adapter.write_and_verify_rr_pair_quantities(
@@ -878,7 +928,7 @@ def _write_verify_and_finalize_rr_pair(
                 pair, remove_task, replace_task, STOP_REASON_QUANTITY_CONFIRMATION_FAILED, detail,
                 review_reason="Plus-side quantity entry failed after the minus side was already verified.",
             )
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return False
 
     pair.minus_written = True
@@ -886,18 +936,18 @@ def _write_verify_and_finalize_rr_pair(
     pair.minus_verified_ok = result.minus_confirmation.confidence == "CONFIRMED"
     pair.plus_verified_ok = result.plus_confirmation.confidence == "CONFIRMED"
     pair.pair_state = PAIR_PLUS_VERIFIED
-    save_execution_plan(plan, project_dir)
+    save_execution_plan(plan, project_dir, plan_path=plan_path)
 
     return _commit_and_finalize_rr_pair(
         pair, remove_task, replace_task, result.minus_confirmation, result.plus_confirmation,
-        before_snapshot, populated_unit, adapter, plan, project_dir,
+        before_snapshot, populated_unit, adapter, plan, project_dir, plan_path,
     )
 
 
 def _commit_and_finalize_rr_pair(
     pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
     minus_confirmation, plus_confirmation, before_snapshot, populated_unit: str | None,
-    adapter, plan: ExecutionPlan, project_dir: Path,
+    adapter, plan: ExecutionPlan, project_dir: Path, plan_path: Path | None,
 ) -> bool:
     """The ONE shared save (commit_item()) and ONE shared structural
     reconciliation (verify_commit(), reused completely unmodified --
@@ -948,7 +998,7 @@ def _commit_and_finalize_rr_pair(
     except AdapterError as exc:
         adapter.recover()
         _mark_pair_task_local_review(pair, remove_task, replace_task, STOP_REASON_ADAPTER_ERROR, str(exc))
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return False
 
     evidence_reference = adapter.capture_evidence() if hasattr(adapter, "capture_evidence") else None
@@ -973,7 +1023,7 @@ def _commit_and_finalize_rr_pair(
             pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
             f"Commit could not be independently verified in the grid: {getattr(verification, 'reason', None)!r}.",
         )
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return True
 
     remove_task.evidence_path = evidence_reference
@@ -992,13 +1042,13 @@ def _commit_and_finalize_rr_pair(
         PAIR_SATISFIED if remove_task.state == TASK_COMPLETED and replace_task.state == TASK_COMPLETED
         else PAIR_BOTH_VERIFIED
     )
-    save_execution_plan(plan, project_dir)
+    save_execution_plan(plan, project_dir, plan_path=plan_path)
     return False
 
 
 def _resume_rr_pair(
     pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
-    adapter, plan: ExecutionPlan, project_dir: Path,
+    adapter, plan: ExecutionPlan, project_dir: Path, plan_path: Path | None,
 ) -> bool:
     """Crash-safe resume -- NEVER re-searches, re-ranks, or re-
     activates a candidate; only Stage 3's read-only re-identification
@@ -1038,7 +1088,7 @@ def _resume_rr_pair(
             f"Coordinated pair {pair.pair_id!r} has pair_state={pair.pair_state!r} but no usable persisted "
             f"minus/plus binding identity -- refusing to guess at physical state on resume.",
         )
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return True
 
     if pair.pair_state == PAIR_BOTH_BOUND:
@@ -1049,10 +1099,10 @@ def _resume_rr_pair(
                 f"Coordinated pair {pair.pair_id!r} was previously bound but its physical -/+ rows could not "
                 f"be uniquely re-identified on resume; refusing to reactivate the candidate.",
             )
-            save_execution_plan(plan, project_dir)
+            save_execution_plan(plan, project_dir, plan_path=plan_path)
             return True
         return _write_verify_and_finalize_rr_pair(
-            pair, remove_task, replace_task, pair_target, None, None, adapter, plan, project_dir,
+            pair, remove_task, replace_task, pair_target, None, None, adapter, plan, project_dir, plan_path,
         )
 
     if pair.pair_state == PAIR_MINUS_VERIFIED:
@@ -1066,7 +1116,7 @@ def _resume_rr_pair(
                 f"Coordinated pair {pair.pair_id!r}'s previously-verified minus half could not be "
                 f"re-identified on resume; refusing to guess at physical state.",
             )
-            save_execution_plan(plan, project_dir)
+            save_execution_plan(plan, project_dir, plan_path=plan_path)
             return True
         try:
             plus_confirmation = adapter.write_and_verify_existing_rr_pair_half_quantity(
@@ -1078,14 +1128,15 @@ def _resume_rr_pair(
                 pair, remove_task, replace_task, STOP_REASON_QUANTITY_CONFIRMATION_FAILED, str(exc),
                 review_reason="Plus-side quantity entry failed while resuming a pair whose minus side was already verified.",
             )
-            save_execution_plan(plan, project_dir)
+            save_execution_plan(plan, project_dir, plan_path=plan_path)
             return False
         pair.plus_written = True
         pair.plus_verified_ok = plus_confirmation.confidence == "CONFIRMED"
         pair.pair_state = PAIR_PLUS_VERIFIED
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return _commit_and_finalize_rr_pair(
             pair, remove_task, replace_task, affirm, plus_confirmation, None, None, adapter, plan, project_dir,
+            plan_path,
         )
 
     if pair.pair_state in (PAIR_PLUS_VERIFIED, PAIR_BOTH_VERIFIED):
@@ -1103,10 +1154,11 @@ def _resume_rr_pair(
                 f"Coordinated pair {pair.pair_id!r}'s previously-verified halves could not be re-identified "
                 f"on resume; refusing to guess at physical state.",
             )
-            save_execution_plan(plan, project_dir)
+            save_execution_plan(plan, project_dir, plan_path=plan_path)
             return True
         return _commit_and_finalize_rr_pair(
             pair, remove_task, replace_task, minus_affirm, plus_affirm, None, None, adapter, plan, project_dir,
+            plan_path,
         )
 
     _mark_pair_physical_state_uncertain(
@@ -1114,13 +1166,13 @@ def _resume_rr_pair(
         f"Coordinated pair {pair.pair_id!r} has an unrecoverable persisted pair_state={pair.pair_state!r} on "
         f"resume; refusing to guess at physical state.",
     )
-    save_execution_plan(plan, project_dir)
+    save_execution_plan(plan, project_dir, plan_path=plan_path)
     return True
 
 
 def _run_coordinated_pair(
     pair: CoordinatedPair, plan: ExecutionPlan, adapter, ranking_config: RankingConfig,
-    phrase_rules: PhraseRules, project_dir: Path, dry_run: bool,
+    phrase_rules: PhraseRules, project_dir: Path, dry_run: bool, plan_path: Path | None = None,
 ) -> bool:
     """Executes (or safely resumes) one coordinated remove/replace pair
     as ONE atomic unit of work -- see run_execution_plan()'s own
@@ -1135,7 +1187,21 @@ def _run_coordinated_pair(
     Returns True if the whole run must hard-stop (genuine project-
     level physical-state uncertainty -- mirrors an ordinary task's own
     physical_state_uncertain hard-stop), False otherwise (normal
-    continuation, whether satisfied or task-locally reviewed)."""
+    continuation, whether satisfied or task-locally reviewed).
+
+    Phase 5.24: the activation task's OWN lookup_strategy decides how
+    its search/rank/decide sequence is built -- mirroring EXACTLY the
+    branch run_execution_plan()'s own ordinary per-task loop already
+    uses for a non-paired task (LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST
+    -> the same bounded, multi-attempt _bounded_description_first_
+    decision(), reused verbatim, never forked; anything else ->
+    _task_to_lookup_plan() + a single _search_rank_and_decide() call,
+    exactly as before). Multiple search ATTEMPTS may happen before a
+    winning decision is found -- _bounded_description_first_decision()
+    never activates anything itself, only decides -- but activation
+    (select_candidate()/bind_rr_pair_after_activation()) below still
+    happens at most ONCE per pair, on the single winning outcome,
+    exactly as it always has."""
     remove_task = plan.task_by_id(pair.remove_task_id)
     replace_task = plan.task_by_id(pair.replace_task_id)
     activation_task = plan.task_by_id(pair.activation_task_id) or remove_task
@@ -1159,25 +1225,10 @@ def _run_coordinated_pair(
             task.state = TASK_REVIEW_REQUIRED
             task.stop_reason = STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED
             task.stop_detail = detail
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return False
 
-    try:
-        lookup_plan, actual_strategy, reason = _task_to_lookup_plan(activation_task, phrase_rules)
-    except UnsafeLookupRouting as exc:
-        for task in (remove_task, replace_task):
-            task.attempts += 1
-            task.completed_at = utc_now_iso()
-            task.error = str(exc)
-            if not dry_run:
-                task.state = TASK_FAILED
-        if not dry_run:
-            save_execution_plan(plan, project_dir)
-        return False
-    activation_task.actual_lookup_strategy = actual_strategy
-    activation_task.lookup_strategy_reason = reason
     item = _task_to_recommendation_input(activation_task)
-
     resumed = pair_has_physical_activity(pair)
 
     if hasattr(adapter, "set_execution_context"):
@@ -1213,17 +1264,44 @@ def _run_coordinated_pair(
         # -- the candidate already physically exists. Route straight
         # to resume handling, entirely via Stage 3's read-only
         # re-identification primitives.
-        return _resume_rr_pair(pair, remove_task, replace_task, adapter, plan, project_dir)
+        return _resume_rr_pair(pair, remove_task, replace_task, adapter, plan, project_dir, plan_path)
 
-    outcome = orchestrator._search_rank_and_decide(
-        lookup_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run,
-    )
+    try:
+        if activation_task.lookup_strategy == LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST:
+            outcome, actual_strategy, reason = _bounded_description_first_decision(
+                activation_task, item, adapter, ranking_config, phrase_rules, project_dir, dry_run,
+            )
+        else:
+            lookup_plan, actual_strategy, reason = _task_to_lookup_plan(activation_task, phrase_rules)
+            outcome = orchestrator._search_rank_and_decide(
+                lookup_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run,
+            )
+    except UnsafeLookupRouting as exc:
+        # Mirrors the ordinary per-task loop's own identical guard --
+        # routing itself refused, before any live adapter interaction
+        # happened for either member -- a safe task-level failure,
+        # never a whole-run abort. Covers BOTH branches above: an
+        # empty/unusable description (_bounded_description_first_
+        # decision()'s own check) or an unexpected populated-CAT/SEL-
+        # on-a-description-first-task shape (_task_to_lookup_plan()'s).
+        for task in (remove_task, replace_task):
+            task.attempts += 1
+            task.completed_at = utc_now_iso()
+            task.error = str(exc)
+            if not dry_run:
+                task.state = TASK_FAILED
+        if not dry_run:
+            save_execution_plan(plan, project_dir, plan_path=plan_path)
+        return False
+    activation_task.actual_lookup_strategy = actual_strategy
+    activation_task.lookup_strategy_reason = reason
+
     if dry_run or outcome.decision != DECISION_AUTO_SELECT:
         _mark_pair_members_pre_activation(
             pair, remove_task, replace_task, outcome.decision, outcome.stop_reason, outcome.stop_detail, dry_run,
         )
         if not dry_run:
-            save_execution_plan(plan, project_dir)
+            save_execution_plan(plan, project_dir, plan_path=plan_path)
         return False
 
     top = outcome.selected
@@ -1235,29 +1313,35 @@ def _run_coordinated_pair(
         before_snapshot = None
 
     try:
+        # Phase 5.24: exactly ONE select_candidate()/bind_rr_pair_after_
+        # activation() call per pair, regardless of how many search
+        # ATTEMPTS preceded this point (_bounded_description_first_
+        # decision() above never touches the adapter beyond search/
+        # capture) -- this is the single physical activation Stage 4's
+        # whole design guarantees.
         adapter.select_candidate(top.dropdown)
         pair_target = adapter.bind_rr_pair_after_activation(before_snapshot or [])
     except UnexpectedDialogError as exc:
         _mark_pair_physical_state_uncertain(
             pair, remove_task, replace_task, STOP_REASON_UNEXPECTED_DIALOG, str(exc),
         )
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return True
     except PhysicalStateUncertainError as exc:
         _mark_pair_physical_state_uncertain(
             pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN, str(exc),
         )
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return True
     except TaskLocalRowReconciliationError as exc:
         adapter.recover()
         _mark_pair_task_local_review(pair, remove_task, replace_task, STOP_REASON_TASK_LOCAL_ROW_RECONCILIATION, str(exc))
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return False
     except AdapterError as exc:
         adapter.recover()
         _mark_pair_task_local_review(pair, remove_task, replace_task, STOP_REASON_ADAPTER_ERROR, str(exc))
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return False
 
     # Bind checkpoint -- persisted BEFORE any quantity mutation, exactly
@@ -1266,11 +1350,12 @@ def _run_coordinated_pair(
     pair.minus_binding = _binding_dict(pair_target.minus_target.identity, "-")
     pair.plus_binding = _binding_dict(pair_target.plus_target.identity, "+")
     pair.pair_state = PAIR_BOTH_BOUND
-    save_execution_plan(plan, project_dir)
+    save_execution_plan(plan, project_dir, plan_path=plan_path)
 
     populated_unit = None  # No populated_fields OCR read is taken for the pair path (mirrors ordinary tasks' own deliberate omission before quantity entry).
     return _write_verify_and_finalize_rr_pair(
         pair, remove_task, replace_task, pair_target, before_snapshot, populated_unit, adapter, plan, project_dir,
+        plan_path,
     )
 
 
@@ -1282,6 +1367,8 @@ def run_execution_plan(
     project_dir: Path,
     *,
     dry_run: bool = True,
+    plan_path: Path | None = None,
+    reports_dir: Path | None = None,
 ) -> ExecutionPlan:
     """Executes every PENDING task in `plan`, group by group, in source
     order, persisting progress after each task so an interrupted run can
@@ -1289,6 +1376,19 @@ def run_execution_plan(
     plan (reloaded via execution_plan.load_execution_plan()). Never
     raises on a task- or group-level failure -- see module docstring for
     exactly what stops the whole run versus one task.
+
+    `plan_path`/`reports_dir` (Phase 5.24, default None -- every
+    existing call site is unaffected): when given, every checkpoint
+    this run persists (and every report it writes) goes to those exact
+    locations instead of project_dir's own canonical `execution_plan.
+    json`/`execution/reports/`. See execution_plan.restricted_plan_
+    path()'s own docstring -- this is what lets an intentionally
+    restricted plan (e.g. `build_execution_plan(..., line_item_ids=
+    [...])`) checkpoint and resume independently of, and without ever
+    touching, the canonical project-wide plan. The runner always knows
+    exactly which persisted plan it is checkpointing: `plan_path` IS
+    that answer, threaded unchanged through every internal save this
+    function (and the coordinated-pair helpers it calls) performs.
 
     Phase 5.5D: refuses outright (no group/task is touched) if `plan`
     is stale (see execution_plan.is_plan_stale()) -- the UI's own
@@ -1302,7 +1402,7 @@ def run_execution_plan(
     if not dry_run and is_plan_stale(plan):
         plan.run_state = RUN_STATE_PAUSED
         plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return plan
 
     # Phase 5.5B, Objective 3: recorded BEFORE anything else runs, so
@@ -1318,12 +1418,12 @@ def run_execution_plan(
     if not adapter.verify_application():
         plan.run_state = RUN_STATE_PAUSED
         plan.stop_reason_category = STOP_REASON_PROJECT_VERIFICATION_FAILURE
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return plan
     if not adapter.verify_project():
         plan.run_state = RUN_STATE_PAUSED
         plan.stop_reason_category = STOP_REASON_PROJECT_VERIFICATION_FAILURE
-        save_execution_plan(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
         return plan
 
     resumed_physical = next(
@@ -1348,8 +1448,8 @@ def run_execution_plan(
         )
         if retry_detail not in prior_detail:
             resumed_physical.stop_detail = f"{prior_detail} {retry_detail}".strip()
-        save_execution_plan(plan, project_dir)
-        write_all_execution_reports(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
+        write_all_execution_reports(plan, project_dir, reports_dir=reports_dir)
         return plan
 
     plan.run_state = RUN_STATE_IN_PROGRESS
@@ -1372,8 +1472,8 @@ def run_execution_plan(
             if not (adapter.verify_application() and adapter.verify_project()):
                 plan.run_state = RUN_STATE_PAUSED
                 plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
-                save_execution_plan(plan, project_dir)
-                write_all_execution_reports(plan, project_dir)
+                save_execution_plan(plan, project_dir, plan_path=plan_path)
+                write_all_execution_reports(plan, project_dir, reports_dir=reports_dir)
                 return plan
 
             group.state = GROUP_IN_PROGRESS
@@ -1386,8 +1486,8 @@ def run_execution_plan(
                 plan.stop_reason_category = STOP_REASON_PROTECTED_ROW_REFUSAL
                 group.state = GROUP_FAILED
                 group.error = str(exc)
-                save_execution_plan(plan, project_dir)
-                write_all_execution_reports(plan, project_dir)
+                save_execution_plan(plan, project_dir, plan_path=plan_path)
+                write_all_execution_reports(plan, project_dir, reports_dir=reports_dir)
                 return plan
             if not verified:
                 group.state = GROUP_FAILED
@@ -1397,7 +1497,7 @@ def run_execution_plan(
                     task.stop_reason = STOP_REASON_GROUP_SETUP_BLOCKED
                     task.stop_detail = f"Group not verified: {detail}"
                     task.completed_at = utc_now_iso()
-                save_execution_plan(plan, project_dir)
+                save_execution_plan(plan, project_dir, plan_path=plan_path)
                 continue
 
         for task in pending_tasks:
@@ -1424,8 +1524,8 @@ def run_execution_plan(
                 plan.run_state = RUN_STATE_PAUSED
                 plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
                 plan.resume_cursor = plan.tasks.index(task)
-                save_execution_plan(plan, project_dir)
-                write_all_execution_reports(plan, project_dir)
+                save_execution_plan(plan, project_dir, plan_path=plan_path)
+                write_all_execution_reports(plan, project_dir, reports_dir=reports_dir)
                 return plan
 
             # Phase 5.9: defense-in-depth, independent of reset_
@@ -1449,7 +1549,7 @@ def run_execution_plan(
                 _record_terminal(adapter, task)
                 if not dry_run:
                     plan.resume_cursor = plan.tasks.index(task) + 1
-                    save_execution_plan(plan, project_dir)
+                    save_execution_plan(plan, project_dir, plan_path=plan_path)
                 continue
 
             # Phase 5.23 (R&R Stage 4): a task belonging to a
@@ -1476,9 +1576,11 @@ def run_execution_plan(
                     _record_terminal(adapter, task)
                     if not dry_run:
                         plan.resume_cursor = plan.tasks.index(task) + 1
-                        save_execution_plan(plan, project_dir)
+                        save_execution_plan(plan, project_dir, plan_path=plan_path)
                     continue
-                hard_stop = _run_coordinated_pair(pair, plan, adapter, ranking_config, phrase_rules, project_dir, dry_run)
+                hard_stop = _run_coordinated_pair(
+                    pair, plan, adapter, ranking_config, phrase_rules, project_dir, dry_run, plan_path,
+                )
                 remove_task = plan.task_by_id(pair.remove_task_id)
                 replace_task = plan.task_by_id(pair.replace_task_id)
                 for member in (remove_task, replace_task):
@@ -1488,12 +1590,12 @@ def run_execution_plan(
                     plan.run_state = RUN_STATE_PAUSED
                     plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
                     plan.resume_cursor = plan.tasks.index(task)
-                    save_execution_plan(plan, project_dir)
-                    write_all_execution_reports(plan, project_dir)
+                    save_execution_plan(plan, project_dir, plan_path=plan_path)
+                    write_all_execution_reports(plan, project_dir, reports_dir=reports_dir)
                     return plan
                 if not dry_run:
                     plan.resume_cursor = plan.tasks.index(task) + 1
-                    save_execution_plan(plan, project_dir)
+                    save_execution_plan(plan, project_dir, plan_path=plan_path)
                 continue
 
             task.started_at = task.started_at or utc_now_iso()
@@ -1524,7 +1626,7 @@ def run_execution_plan(
                     )
                     if not dry_run:
                         plan.resume_cursor = plan.tasks.index(task) + 1
-                        save_execution_plan(plan, project_dir)
+                        save_execution_plan(plan, project_dir, plan_path=plan_path)
                     _record_terminal(adapter, task)
                     continue
 
@@ -1541,7 +1643,7 @@ def run_execution_plan(
                 # this phase.
                 def _checkpoint_physical_item_created() -> None:
                     task.commit_state = TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
-                    save_execution_plan(plan, project_dir)
+                    save_execution_plan(plan, project_dir, plan_path=plan_path)
 
                 adapter.set_physical_item_created_callback(
                     None if dry_run else _checkpoint_physical_item_created
@@ -1575,7 +1677,7 @@ def run_execution_plan(
                 task.completed_at = utc_now_iso()
                 if not dry_run:
                     plan.resume_cursor = plan.tasks.index(task) + 1
-                    save_execution_plan(plan, project_dir)
+                    save_execution_plan(plan, project_dir, plan_path=plan_path)
                 _record_terminal(adapter, task)
                 continue
             except ProtectedCommittedRowError as exc:
@@ -1588,8 +1690,8 @@ def run_execution_plan(
                 task.completed_at = utc_now_iso()
                 if not dry_run:
                     plan.resume_cursor = plan.tasks.index(task) + 1
-                    save_execution_plan(plan, project_dir)
-                    write_all_execution_reports(plan, project_dir)
+                    save_execution_plan(plan, project_dir, plan_path=plan_path)
+                    write_all_execution_reports(plan, project_dir, reports_dir=reports_dir)
                 _record_terminal(adapter, task)
                 return plan
             except Exception as exc:  # noqa: BLE001 -- one task's unexpected failure must never abort the run
@@ -1616,11 +1718,11 @@ def run_execution_plan(
                     plan.run_state = RUN_STATE_PAUSED
                     plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
                     plan.resume_cursor = plan.tasks.index(task)
-                    save_execution_plan(plan, project_dir)
-                    write_all_execution_reports(plan, project_dir)
+                    save_execution_plan(plan, project_dir, plan_path=plan_path)
+                    write_all_execution_reports(plan, project_dir, reports_dir=reports_dir)
                     return plan
                 plan.resume_cursor = plan.tasks.index(task) + 1
-                save_execution_plan(plan, project_dir)
+                save_execution_plan(plan, project_dir, plan_path=plan_path)
 
         if not dry_run:
             group.state = GROUP_COMPLETED if all(t.state != TASK_PENDING for t in group_tasks) else group.state
@@ -1634,21 +1736,27 @@ def run_execution_plan(
             plan.stop_reason_category = STOP_REASON_GROUP_VERIFICATION_FAILURE
         else:
             plan.stop_reason_category = STOP_REASON_TASK_LEVEL_STOPS
-        save_execution_plan(plan, project_dir)
-        write_all_execution_reports(plan, project_dir)
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
+        write_all_execution_reports(plan, project_dir, reports_dir=reports_dir)
 
     return plan
 
 
-def skip_task(plan: ExecutionPlan, task_id: str, reason: str, project_dir: Path) -> ExecutionTask:
+def skip_task(
+    plan: ExecutionPlan, task_id: str, reason: str, project_dir: Path, *, plan_path: Path | None = None,
+) -> ExecutionTask:
     """Marks one task SKIPPED without executing it -- e.g. a reviewer
     decides mid-run a specific approved item should not actually be sent
-    to Xactimate this pass. Persists immediately."""
+    to Xactimate this pass. Persists immediately.
+
+    `plan_path` (Phase 5.24, default None): persists a restricted
+    plan's own state at that exact path -- see save_execution_plan()'s
+    own `plan_path` parameter."""
     task = plan.task_by_id(task_id)
     if task is None:
         raise ValueError(f"Unknown task_id {task_id!r}.")
     task.state = TASK_SKIPPED
     task.stop_detail = reason
     task.completed_at = utc_now_iso()
-    save_execution_plan(plan, project_dir)
+    save_execution_plan(plan, project_dir, plan_path=plan_path)
     return task

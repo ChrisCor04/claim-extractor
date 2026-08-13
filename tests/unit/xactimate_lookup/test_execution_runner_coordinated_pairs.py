@@ -33,9 +33,11 @@ from estimate_extractor.xactimate_lookup.adapter import (
 from estimate_extractor.xactimate_lookup.execution_plan import (
     CoordinatedPair,
     ExecutionPlan,
+    ExecutionPlanOverwriteRefused,
     ExecutionTask,
     GroupExecutionState,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
+    LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
     PAIR_BOTH_BOUND,
     PAIR_BOTH_VERIFIED,
     PAIR_MINUS_VERIFIED,
@@ -48,13 +50,20 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED,
     STOP_REASON_PROJECT_LEVEL_HARD_STOP,
     TASK_COMPLETED,
+    TASK_FAILED,
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
     load_execution_plan,
     reset_unfinished_tasks,
+    restricted_plan_path,
+    restricted_reports_dir,
     save_execution_plan,
 )
-from estimate_extractor.xactimate_lookup.execution_runner import run_execution_plan
+from estimate_extractor.xactimate_lookup.execution_runner import (
+    _bounded_description_first_decision,
+    _description_first_search_attempts,
+    run_execution_plan,
+)
 from estimate_extractor.xactimate_lookup.models import DropdownResult
 from estimate_extractor.xactimate_lookup.ranking import rank_dropdown_results
 
@@ -810,3 +819,311 @@ def test_ranking_behavior_unaffected_by_coordinated_pair_reuse(phrase_rules, ran
     assert len(candidates_direct) == 1
     assert candidates_direct[0].dropdown.category == "RFG"
     assert candidates_direct[0].dropdown.selector == "REM"
+
+
+# ---------------------------------------------------------------------
+# Phase 5.24 Part A: a restricted execution plan must checkpoint/resume
+# independently of, and never overwrite/shrink/corrupt, the canonical
+# project-wide plan -- see execution_plan.restricted_plan_path()'s own
+# tests for the pure save/load-level proof; this exercises the SAME
+# mechanism end-to-end through run_execution_plan() with a real
+# coordinated-pair run.
+# ---------------------------------------------------------------------
+
+
+def test_restricted_execution_does_not_alter_canonical_plan(tmp_path, phrase_rules, ranking_config):
+    canonical = ExecutionPlan(
+        plan_id="canonical", project_slug="test", source_filename=None, created_at="now",
+        groups=[GroupExecutionState(
+            group_id="Other", area_name=None, section_name="Other", xactimate_group_name="Other",
+            group_name_reviewed=True, task_ids=[f"other_{i}" for i in range(35)],
+        )],
+        tasks=[
+            _task(f"other_{i}", f"line_other_{i}", "Other", "XXX", "YYY", i, qty=1.0)
+            for i in range(35)
+        ],
+    )
+    for t in canonical.tasks:
+        t.state = TASK_COMPLETED
+    save_execution_plan(canonical, tmp_path)
+
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    path = restricted_plan_path(tmp_path, "six-task-validation")
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+
+    run_execution_plan(
+        plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False, plan_path=path,
+    )
+
+    assert remove_task.state == TASK_COMPLETED
+    assert replace_task.state == TASK_COMPLETED
+
+    canonical_reloaded = load_execution_plan(tmp_path)
+    assert canonical_reloaded.plan_id == "canonical"
+    assert len(canonical_reloaded.tasks) == 35
+    assert all(t.state == TASK_COMPLETED for t in canonical_reloaded.tasks)
+
+    restricted_reloaded = load_execution_plan(tmp_path, plan_path=path)
+    assert restricted_reloaded.plan_id == "p1"
+    assert len(restricted_reloaded.tasks) == 2
+
+
+def test_restricted_execution_would_have_raised_without_plan_path(tmp_path, phrase_rules, ranking_config):
+    """Proves the blocker this whole mechanism fixes was real: the
+    SAME 2-task plan, saved WITHOUT plan_path against a pre-existing
+    larger canonical plan, raises ExecutionPlanOverwriteRefused."""
+    canonical = ExecutionPlan(
+        plan_id="canonical", project_slug="test", source_filename=None, created_at="now",
+        tasks=[_task(f"other_{i}", f"line_other_{i}", "Other", "XXX", "YYY", i) for i in range(35)],
+    )
+    save_execution_plan(canonical, tmp_path)
+
+    plan, _remove_task, _replace_task, _pair, _ = _plan_with_one_pair()
+    with pytest.raises(ExecutionPlanOverwriteRefused):
+        save_execution_plan(plan, tmp_path)
+
+
+def test_restricted_execution_checkpoints_and_resumes(tmp_path, phrase_rules, ranking_config):
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    path = restricted_plan_path(tmp_path, "resume-validation")
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.plus_write_outcome = "fail"  # stop mid-way, leaving a real checkpoint
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False, plan_path=path)
+    assert pair.minus_written is True
+    assert pair.plus_written is False
+    assert pair.pair_state == PAIR_REVIEW_REQUIRED
+
+    reloaded = load_execution_plan(tmp_path, plan_path=path)
+    assert reloaded is not None
+    reloaded_pair = reloaded.coordinated_pairs[0]
+    assert reloaded_pair.minus_written is True
+    assert reloaded_pair.minus_binding is not None
+
+
+def test_normal_full_plan_persistence_is_unchanged_by_plan_path_addition(tmp_path, phrase_rules, ranking_config):
+    """Omitting plan_path entirely (every pre-existing caller) behaves
+    exactly as before this addition -- persists to the canonical path."""
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    reloaded = load_execution_plan(tmp_path)
+    assert reloaded is not None
+    assert reloaded.plan_id == "p1"
+    assert reloaded.pair_by_id(pair.pair_id).pair_state == PAIR_SATISFIED
+
+
+# ---------------------------------------------------------------------
+# Phase 5.24 Part B: a coordinated pair's activation task, when it is
+# LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST, must get the SAME bounded,
+# multi-attempt description-first search policy an ordinary unmapped
+# task gets (execution_runner._bounded_description_first_decision(),
+# shared with _run_description_first_task()) -- never the single,
+# direct search Stage 4 originally fell back to. Exactly one physical
+# candidate activation must still happen per pair, regardless of how
+# many search attempts ran first.
+# ---------------------------------------------------------------------
+
+
+def _matching_dropdown(task, cat="RFG", sel="3TAB"):
+    """A single, unambiguous dropdown result that reliably scores
+    AUTO_SELECT against `task`'s own original description -- mirrors
+    test_execution_runner.py's own `_felt_dropdown()`/`_FELT_FULL_
+    DESCRIPTION` precedent: an exact description echo is what
+    rank_dropdown_results() needs to score confidently, independent
+    of any real catalog data."""
+    return DropdownResult(
+        raw_text=f"{cat} {sel}", row_position=0, category=cat, selector=sel,
+        description=task.description, extraction_confidence=1.0,
+    )
+
+
+def _unmapped_task(
+    task_id, line_item_id, section_name, source_order, description, *,
+    qty=10.0, unit="SQ", action="remove", trade="roofing", component="composition_shingles", material="3-tab",
+):
+    return ExecutionTask(
+        task_id=task_id, line_item_id=line_item_id, source_order=source_order,
+        area_name=None, section_name=section_name, description=description,
+        category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+        source_quantity=qty, source_unit=unit, expected_unit=unit,
+        began_unmapped=True, normalized_action=action, normalized_trade=trade,
+        normalized_component=component, normalized_material=material,
+    )
+
+
+def _plan_with_one_unmapped_pair(*, minus_qty=10.0, plus_qty=12.0, unit="SQ"):
+    remove_task = _unmapped_task(
+        "task_remove", "line_remove", "Dwelling Roof", 0, "Remove old shingle roofing",
+        qty=minus_qty, unit=unit, action="remove",
+    )
+    replace_task = _unmapped_task(
+        "task_replace", "line_replace", "Dwelling Roof", 1, "New shingle roofing installed",
+        qty=plus_qty, unit=unit, action="unknown",
+    )
+    pair_id = "pair_task_remove_task_replace"
+    remove_task.coordinated_pair_id = pair_id
+    replace_task.coordinated_pair_id = pair_id
+    group = GroupExecutionState(
+        group_id="Dwelling Roof", area_name=None, section_name="Dwelling Roof",
+        xactimate_group_name="Dwelling Roof", group_name_reviewed=True,
+        task_ids=["task_remove", "task_replace"],
+    )
+    pair = CoordinatedPair(
+        pair_id=pair_id, remove_task_id="task_remove", replace_task_id="task_replace",
+        pair_state=PAIR_UNACTIVATED, activation_task_id="task_remove",
+        expected_minus_quantity=minus_qty, expected_minus_unit=unit,
+        expected_plus_quantity=plus_qty, expected_plus_unit=unit,
+    )
+    plan = ExecutionPlan(
+        plan_id="p1", project_slug="test", source_filename=None, created_at="now",
+        groups=[group], tasks=[remove_task, replace_task], coordinated_pairs=[pair],
+    )
+    return plan, remove_task, replace_task, pair
+
+
+def test_paired_description_first_task_gets_bounded_multi_attempt_search(tmp_path, phrase_rules, ranking_config):
+    """First attempt (the exact source description) yields a clean
+    NO_MATCH; the bounded sequence must advance to a later attempt --
+    the SAME policy _run_description_first_task() gives an ordinary
+    unmapped task, proven here by reusing _description_first_search_
+    attempts() directly to discover the real fallback text."""
+    plan, remove_task, replace_task, pair = _plan_with_one_unmapped_pair()
+    attempts = _description_first_search_attempts(remove_task, phrase_rules, tmp_path)
+    assert len(attempts) >= 2, "fixture must produce at least 2 distinct search attempts"
+    fallback_text = attempts[1][1].search_input
+
+    adapter = _rr_adapter(dropdown_script={
+        remove_task.description: [],  # attempt 1: clean retrieval failure
+        fallback_text: [_matching_dropdown(remove_task)],  # attempt 2: succeeds
+    })
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert len(remove_task.search_attempts) == 2
+    assert remove_task.search_attempts[0]["advanced_to_next_attempt"] is True
+    assert remove_task.search_attempts[1]["search_text"] == fallback_text
+    assert remove_task.state == TASK_COMPLETED
+    assert replace_task.state == TASK_COMPLETED
+
+
+def test_failed_search_attempts_cause_zero_physical_activation(tmp_path, phrase_rules, ranking_config):
+    plan, remove_task, replace_task, pair = _plan_with_one_unmapped_pair()
+    adapter = _rr_adapter(dropdown_script={})  # every attempt returns empty -> NO_MATCH throughout
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert adapter.select_candidate_calls == 0
+    assert adapter.bind_calls == 0
+    assert adapter.write_pair_calls == 0
+    assert adapter.commit_item_calls == 0
+    assert pair.pair_state == PAIR_UNACTIVATED
+    assert pair.minus_binding is None
+    assert len(remove_task.search_attempts) >= 1
+
+
+def test_successful_pair_execution_after_multiple_attempts_still_activates_once(tmp_path, phrase_rules, ranking_config):
+    plan, remove_task, replace_task, pair = _plan_with_one_unmapped_pair()
+    attempts = _description_first_search_attempts(remove_task, phrase_rules, tmp_path)
+    fallback_text = attempts[1][1].search_input
+    adapter = _rr_adapter(dropdown_script={
+        remove_task.description: [],
+        fallback_text: [_matching_dropdown(remove_task)],
+    })
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert len(remove_task.search_attempts) == 2  # two search ATTEMPTS
+    assert adapter.select_candidate_calls == 1  # exactly one ACTIVATION
+    assert adapter.bind_calls == 1
+    assert adapter.write_pair_calls == 1
+    assert adapter.commit_item_calls == 1
+    assert pair.pair_state == PAIR_SATISFIED
+
+
+def test_partner_task_never_independently_executes_with_description_first_pair(tmp_path, phrase_rules, ranking_config):
+    plan, remove_task, replace_task, pair = _plan_with_one_unmapped_pair()
+    attempts = _description_first_search_attempts(remove_task, phrase_rules, tmp_path)
+    fallback_text = attempts[1][1].search_input
+    adapter = _rr_adapter(dropdown_script={
+        remove_task.description: [],
+        fallback_text: [_matching_dropdown(remove_task)],
+    })
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    searched_texts = [call[1][0] for call in adapter.log.calls if call[0] == "search_by_description"]
+    assert replace_task.description not in searched_texts
+    assert replace_task.actual_lookup_strategy is None
+    assert replace_task.state == TASK_COMPLETED  # closed via the pair, never independently
+
+
+def test_pair_resume_protection_after_description_first_activation(tmp_path, phrase_rules, ranking_config):
+    """Mirrors test_restart_after_activation_does_not_reactivate() but
+    for a pair whose activation task is description-first -- resume
+    must still never re-search or re-activate."""
+    plan, remove_task, replace_task, pair = _plan_with_one_unmapped_pair()
+    pair.pair_state = PAIR_BOTH_BOUND
+    pair.minus_binding = {"category": "RFG", "selector": "3TAB", "description": "RFG/3TAB description", "activity": "-"}
+    pair.plus_binding = {"category": "RFG", "selector": "3TAB", "description": "RFG/3TAB description", "activity": "+"}
+    save_execution_plan(plan, tmp_path)
+    adapter = _rr_adapter(dropdown_script={remove_task.description: [_dropdown("RFG", "3TAB")]})
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert adapter.select_candidate_calls == 0
+    assert adapter.bind_calls == 0
+    assert len(adapter.locate_pair_calls) == 1
+    assert remove_task.state == TASK_COMPLETED
+    assert replace_task.state == TASK_COMPLETED
+    assert pair.pair_state == PAIR_SATISFIED
+    assert remove_task.search_attempts == []  # resume never re-enters the search-attempt loop at all
+
+
+def test_bounded_description_first_decision_reuses_same_attempt_list_as_ordinary_tasks(tmp_path, phrase_rules, ranking_config):
+    """Direct, unit-level proof that the pair path and the ordinary
+    unmapped-task path build search attempts through the exact same,
+    unforked function."""
+    plan, remove_task, replace_task, pair = _plan_with_one_unmapped_pair()
+    adapter = _rr_adapter(dropdown_script={})
+
+    outcome, actual_strategy, reason = _bounded_description_first_decision(
+        remove_task, _task_to_recommendation_input_for_test(remove_task), adapter, ranking_config, phrase_rules,
+        tmp_path, False,
+    )
+
+    direct_attempts = _description_first_search_attempts(remove_task, phrase_rules, tmp_path)
+    assert len(remove_task.search_attempts) == len(direct_attempts)
+    assert outcome.committed is False  # decide-only -- never activates
+
+
+def _task_to_recommendation_input_for_test(task):
+    from estimate_extractor.xactimate_lookup.models import RecommendationInput
+    return RecommendationInput(
+        line_item_id=task.line_item_id, original_description=task.description,
+        quantity=task.source_quantity, source_unit=task.source_unit,
+        action=task.normalized_action, trade=task.normalized_trade,
+        component=task.normalized_component, material=task.normalized_material,
+    )
+
+
+def test_unsafe_lookup_routing_from_description_first_branch_fails_both_tasks_not_the_run(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """_bounded_description_first_decision() raises UnsafeLookupRouting
+    when the activation task's description is empty -- this must be a
+    safe, task-level failure for BOTH pair members (never a whole-run
+    crash), exactly like the ordinary per-task loop's own identical
+    guard around _run_description_first_task()."""
+    plan, remove_task, replace_task, pair = _plan_with_one_unmapped_pair()
+    remove_task.description = "   "  # empty after strip() -> no attempts can be built
+    adapter = _rr_adapter(dropdown_script={})
+
+    result_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert remove_task.state == TASK_FAILED
+    assert replace_task.state == TASK_FAILED
+    assert adapter.select_candidate_calls == 0
+    assert result_plan.run_state != RUN_STATE_PAUSED or result_plan.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP

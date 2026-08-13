@@ -449,14 +449,43 @@ def execute_plan(
     Phase 5.23 (R&R Stage 4): the search/rank/decide sequence itself
     now lives in _search_rank_and_decide() above, reused verbatim --
     this function is unchanged in behavior, just its own former top
-    portion moved into a shared helper."""
+    portion moved into a shared helper. Phase 5.24: its own former
+    BOTTOM portion (activation through commit/verify) is now also a
+    shared helper, _activate_and_commit_ordinary_row() below -- see
+    that function's own docstring for why."""
     outcome = _search_rank_and_decide(
         plan, item, adapter, ranking_config, phrase_rules,
         dry_run=dry_run, force_auto_select_for_trusted_mapping=force_auto_select_for_trusted_mapping,
     )
     if dry_run or outcome.decision != DECISION_AUTO_SELECT:
         return outcome
+    return _activate_and_commit_ordinary_row(plan, item, adapter, outcome)
 
+
+def _activate_and_commit_ordinary_row(
+    plan: LookupPlan, item: RecommendationInput, adapter: XactimateAdapter, outcome: LookupOutcome,
+) -> LookupOutcome:
+    """Phase 5.24: the ordinary single-row activation/quantity/commit/
+    verify tail, extracted from execute_plan() so a caller with its
+    OWN bounded, multi-attempt search/decide sequence (execution_
+    runner._bounded_description_first_decision(), reused by both an
+    ordinary unmapped task and a coordinated R&R pair's activation
+    task) can still finish an ordinary (non-paired) task through the
+    EXACT same activation/commit/verify code execute_plan() has always
+    used, without re-running search/rank/decide a second time. A
+    coordinated R&R pair NEVER calls this -- it has its own Stage-3
+    dual-target activation/write/verify tail instead (see execution_
+    runner._write_verify_and_finalize_rr_pair()); this function is
+    reused ONLY by execute_plan() itself and by _run_description_
+    first_task() for a task that turns out NOT to be part of a
+    coordinated pair.
+
+    `outcome` must be an already-DECIDED DECISION_AUTO_SELECT outcome
+    (from _search_rank_and_decide(), or an equivalent bounded search)
+    with `.selected` populated and `.committed` still False -- exactly
+    what execute_plan() itself guarantees before calling this. Mutates
+    and returns the SAME outcome object, matching execute_plan()'s own
+    prior behavior byte-for-byte."""
     top = outcome.selected
 
     # Phase 4.8: a before-commit grid snapshot must be taken BEFORE

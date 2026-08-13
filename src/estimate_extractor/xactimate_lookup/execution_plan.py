@@ -25,6 +25,7 @@ phrase-based description search. See docs/build-estimate.md.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -681,15 +682,77 @@ def _plan_path(project_dir: Path) -> Path:
     return project_dir / "execution" / "execution_plan.json"
 
 
-def save_execution_plan(plan: ExecutionPlan, project_dir: Path, *, allow_shrink: bool = False) -> None:
+#: Phase 5.24: sanitizes an arbitrary caller-supplied name into a safe
+#: filename component -- shared by restricted_plan_path() and
+#: restricted_reports_dir() so the two locations a restricted plan's
+#: state lives in (its own plan file, its own reports directory) are
+#: derived identically from the same name.
+_SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _safe_name_component(name: str) -> str:
+    safe = _SAFE_NAME_PATTERN.sub("_", name.strip())
+    if not safe:
+        raise ExecutionPlanError(f"restricted plan name {name!r} has no usable filename characters.")
+    return safe
+
+
+def restricted_plan_path(project_dir: Path, name: str) -> Path:
+    """Phase 5.24: the persisted-state path for an INTENTIONALLY
+    restricted execution plan (e.g. a validation subset of the
+    canonical, project-wide plan) that must checkpoint and resume
+    independently of, and NEVER overwrite, the canonical plan at
+    `_plan_path(project_dir)`.
+
+    `name` identifies this restricted plan within the project (any
+    short, caller-chosen slug -- e.g. a validation run's own label);
+    the same name always resolves to the same path, so calling this
+    again with the same name and passing it to `save_execution_plan`/
+    `load_execution_plan`/`run_execution_plan` resumes the SAME
+    restricted plan's own state. Deliberately a SEPARATE directory
+    (`execution/restricted_plans/`) from the canonical plan file, not
+    merely a differently-named file beside it, so a directory-level
+    listing/cleanup can distinguish "the one real plan" from "every
+    restricted plan ever run" at a glance.
+
+    This is a general-purpose mechanism, not tied to any specific
+    caller, benchmark, or task subset -- any code that builds a
+    restricted `ExecutionPlan` (e.g. via `build_execution_plan(...,
+    line_item_ids=[...])`) can use it to get independent, resumable
+    persistence without touching the canonical plan at all."""
+    return project_dir / "execution" / "restricted_plans" / f"{_safe_name_component(name)}.json"
+
+
+def restricted_reports_dir(project_dir: Path, name: str) -> Path:
+    """Phase 5.24: the reports directory for the SAME restricted plan
+    `restricted_plan_path(project_dir, name)` persists -- passed as
+    `execution_reports.write_all_execution_reports(..., reports_dir=
+    restricted_reports_dir(project_dir, name))` so a restricted plan's
+    reports never land in, or overwrite, the canonical project's own
+    `execution/reports/` directory."""
+    return project_dir / "execution" / "restricted_plans" / f"{_safe_name_component(name)}_reports"
+
+
+def save_execution_plan(
+    plan: ExecutionPlan, project_dir: Path, *, allow_shrink: bool = False, plan_path: Path | None = None,
+) -> None:
     """Phase 5.9: refuses (raises ExecutionPlanOverwriteRefused, writes
-    nothing) if a plan ALREADY exists at `project_dir`'s path and `plan`
+    nothing) if a plan ALREADY exists at the target path and `plan`
     has FEWER tasks than it -- unless `allow_shrink=True`. Every normal
     resumable save (execution_runner.py re-saving the SAME plan object
     after each task) never shrinks the task count, so this is invisible
     to that path; only a genuinely different, smaller plan being saved
-    over a larger existing one trips it. See ExecutionPlanOverwriteRefused."""
-    path = _plan_path(project_dir)
+    over a larger existing one trips it. See ExecutionPlanOverwriteRefused.
+
+    `plan_path` (Phase 5.24, default None -- every existing call site
+    is unaffected): when given, persists to that EXACT path instead of
+    the canonical `_plan_path(project_dir)` -- see
+    `restricted_plan_path()`. The overwrite-shrink guard above still
+    applies, scoped to whatever plan (if any) already exists at THAT
+    path; a restricted plan's own persisted state is therefore just as
+    protected against an accidental shrink as the canonical plan is,
+    and the two can never collide since they never share a path."""
+    path = plan_path if plan_path is not None else _plan_path(project_dir)
     if not allow_shrink and path.exists():
         try:
             existing_task_count = len(json.loads(path.read_text(encoding="utf-8")).get("tasks", []))
@@ -706,15 +769,25 @@ def save_execution_plan(plan: ExecutionPlan, project_dir: Path, *, allow_shrink:
     path.write_text(json.dumps(plan.to_dict(), indent=2, default=str), encoding="utf-8")
 
 
-def load_execution_plan(project_dir: Path) -> ExecutionPlan | None:
-    path = _plan_path(project_dir)
+def load_execution_plan(project_dir: Path, *, plan_path: Path | None = None) -> ExecutionPlan | None:
+    """`plan_path` (Phase 5.24, default None): loads from that exact
+    path instead of the canonical `_plan_path(project_dir)` -- the
+    read counterpart to `save_execution_plan(..., plan_path=...)`."""
+    path = plan_path if plan_path is not None else _plan_path(project_dir)
     if not path.exists():
         return None
     return ExecutionPlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
-def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset: bool = False) -> int:
-    """Phase 5.5B, Objective 4: resets every task back to TASK_PENDING
+def reset_unfinished_tasks(
+    plan: ExecutionPlan, project_dir: Path, *, full_reset: bool = False, plan_path: Path | None = None,
+) -> int:
+    """`plan_path` (Phase 5.24, default None): resets/persists a
+    restricted plan at that exact path instead of the canonical
+    `_plan_path(project_dir)` -- see `save_execution_plan()`'s own
+    `plan_path` parameter.
+
+    Phase 5.5B, Objective 4: resets every task back to TASK_PENDING
     EXCEPT TASK_COMPLETED ones (REVIEW_REQUIRED, FAILED, SKIPPED are all
     reset; an already-PENDING task is a no-op) -- so a run that stopped
     partway through can be safely retried without re-approving, re-
@@ -841,7 +914,7 @@ def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset
     plan.run_state = RUN_STATE_NOT_STARTED if reset_count == len(plan.tasks) else RUN_STATE_IN_PROGRESS
     if any(t.state == TASK_PENDING for t in plan.tasks):
         plan.resume_cursor = None
-    save_execution_plan(plan, project_dir)
+    save_execution_plan(plan, project_dir, plan_path=plan_path)
     return reset_count
 
 

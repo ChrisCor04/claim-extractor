@@ -34,6 +34,8 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     diagnose_run,
     load_execution_plan,
     reset_unfinished_tasks,
+    restricted_plan_path,
+    restricted_reports_dir,
     save_execution_plan,
     task_has_committed_row,
 )
@@ -874,6 +876,145 @@ def test_save_execution_plan_never_refuses_when_growing_or_same_size(tmp_path):
         source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
     ))
     save_execution_plan(plan, project_dir)  # growing -- must not raise
+
+
+# ---------------------------------------------------------------------
+# Phase 5.24: restricted execution plans -- an intentionally restricted
+# plan (e.g. a validation subset built via build_execution_plan(...,
+# line_item_ids=[...])) must checkpoint/resume independently of, and
+# never overwrite/shrink/corrupt, the canonical project-wide plan.
+# ---------------------------------------------------------------------
+
+
+def _five_task_plan(plan_id="real"):
+    plan = ExecutionPlan(plan_id=plan_id, project_slug="s", source_filename=None, created_at="now")
+    plan.tasks = [
+        ExecutionTask(
+            task_id=f"t{i}", line_item_id=f"line_{i}", source_order=i, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
+        )
+        for i in range(5)
+    ]
+    return plan
+
+
+def test_restricted_plan_path_is_deterministic_and_distinct_from_canonical(tmp_path):
+    project_dir = tmp_path / "proj"
+    path_a = restricted_plan_path(project_dir, "validation-run")
+    path_b = restricted_plan_path(project_dir, "validation-run")
+    path_other = restricted_plan_path(project_dir, "other-run")
+
+    assert path_a == path_b  # same name -> same path, every time (resumable)
+    assert path_a != path_other
+    from estimate_extractor.xactimate_lookup.execution_plan import _plan_path
+    assert path_a != _plan_path(project_dir)
+    assert path_a.parent != project_dir / "execution"
+
+
+def test_restricted_plan_save_cannot_alter_or_shrink_the_canonical_plan(tmp_path):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    canonical = _five_task_plan("canonical")
+    save_execution_plan(canonical, project_dir)
+
+    restricted = ExecutionPlan(plan_id="restricted", project_slug="s", source_filename=None, created_at="now")
+    restricted.tasks = [canonical.tasks[0]]  # a genuine 1-task SUBSET
+    path = restricted_plan_path(project_dir, "six-task-validation")
+
+    # Must succeed without allow_shrink=True and without ever touching
+    # the canonical plan's own path -- these are two DIFFERENT files.
+    save_execution_plan(restricted, project_dir, plan_path=path)
+
+    canonical_reloaded = load_execution_plan(project_dir)
+    assert len(canonical_reloaded.tasks) == 5
+    assert canonical_reloaded.plan_id == "canonical"
+
+    restricted_reloaded = load_execution_plan(project_dir, plan_path=path)
+    assert len(restricted_reloaded.tasks) == 1
+    assert restricted_reloaded.plan_id == "restricted"
+
+
+def test_restricted_plan_state_can_checkpoint_and_resume(tmp_path):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    path = restricted_plan_path(project_dir, "resume-check")
+    restricted = ExecutionPlan(plan_id="restricted", project_slug="s", source_filename=None, created_at="now")
+    restricted.tasks = [
+        ExecutionTask(
+            task_id="t0", line_item_id="line_0", source_order=0, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
+        ),
+    ]
+    save_execution_plan(restricted, project_dir, plan_path=path)
+
+    reloaded = load_execution_plan(project_dir, plan_path=path)
+    assert reloaded is not None
+    assert reloaded.plan_id == "restricted"
+    reloaded.tasks[0].state = TASK_COMPLETED
+    save_execution_plan(reloaded, project_dir, plan_path=path)
+
+    resumed = load_execution_plan(project_dir, plan_path=path)
+    assert resumed.tasks[0].state == TASK_COMPLETED
+
+    # No canonical plan was ever created by any of this.
+    assert load_execution_plan(project_dir) is None
+
+
+def test_restricted_plan_own_shrink_protection_still_applies(tmp_path):
+    """The overwrite-shrink guard generalizes to whatever plan lives at
+    the target path -- a restricted plan is just as protected against
+    an accidental shrink as the canonical plan is."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    path = restricted_plan_path(project_dir, "shrink-check")
+    big = ExecutionPlan(plan_id="big_restricted", project_slug="s", source_filename=None, created_at="now")
+    big.tasks = [
+        ExecutionTask(
+            task_id=f"t{i}", line_item_id=f"line_{i}", source_order=i, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ",
+        )
+        for i in range(3)
+    ]
+    save_execution_plan(big, project_dir, plan_path=path)
+
+    small = ExecutionPlan(plan_id="smaller_restricted", project_slug="s", source_filename=None, created_at="now")
+    small.tasks = [big.tasks[0]]
+
+    with pytest.raises(ExecutionPlanOverwriteRefused):
+        save_execution_plan(small, project_dir, plan_path=path)
+
+
+def test_restricted_reports_dir_is_distinct_from_canonical_reports(tmp_path):
+    project_dir = tmp_path / "proj"
+    reports_dir = restricted_reports_dir(project_dir, "validation-run")
+    assert reports_dir != project_dir / "execution" / "reports"
+    assert "validation-run" in reports_dir.name or "validation-run" in str(reports_dir)
+
+
+def test_reset_unfinished_tasks_respects_plan_path(tmp_path):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    path = restricted_plan_path(project_dir, "reset-check")
+    restricted = ExecutionPlan(plan_id="restricted", project_slug="s", source_filename=None, created_at="now")
+    restricted.tasks = [
+        ExecutionTask(
+            task_id="t0", line_item_id="line_0", source_order=0, area_name=None, section_name="Roof",
+            description="d", category=None, selector=None, lookup_strategy=LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+            source_quantity=1.0, source_unit="SQ", expected_unit="SQ", state=TASK_REVIEW_REQUIRED,
+        ),
+    ]
+    save_execution_plan(restricted, project_dir, plan_path=path)
+
+    reset_count = reset_unfinished_tasks(restricted, project_dir, plan_path=path)
+
+    assert reset_count == 1
+    assert restricted.tasks[0].state == TASK_PENDING
+    reloaded = load_execution_plan(project_dir, plan_path=path)
+    assert reloaded.tasks[0].state == TASK_PENDING
+    assert load_execution_plan(project_dir) is None  # canonical untouched/never created
 
 
 def test_diagnose_run_reports_exact_counts_and_stop_reason(tmp_path):

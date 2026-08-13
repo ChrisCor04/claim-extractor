@@ -261,10 +261,18 @@ def write_structured_audit(plan: ExecutionPlan, path: Path, pretty: bool = True)
     path.write_text(_dump(data, pretty), encoding="utf-8")
 
 
-def write_all_execution_reports(plan: ExecutionPlan, project_dir: Path, pretty: bool = True) -> Path:
-    """Writes every report under project_dir/execution/reports/ and
-    returns that directory."""
-    reports_dir = project_dir / "execution" / "reports"
+def write_all_execution_reports(
+    plan: ExecutionPlan, project_dir: Path, pretty: bool = True, *, reports_dir: Path | None = None,
+) -> Path:
+    """Writes every report under project_dir/execution/reports/ (or, if
+    `reports_dir` is given, under that exact directory instead -- Phase
+    5.24, default None so every existing call site is unaffected) and
+    returns that directory. See execution_plan.restricted_plan_path()'s
+    own docstring: a restricted execution plan's reports must land in
+    their own directory too, never overwriting the canonical project's
+    reports with a subset's own view."""
+    if reports_dir is None:
+        reports_dir = project_dir / "execution" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     write_execution_report_json(plan, reports_dir / "execution_report.json", pretty)
     write_execution_report_csv(plan, reports_dir / "execution_report.csv")
