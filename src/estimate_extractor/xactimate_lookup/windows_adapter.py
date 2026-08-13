@@ -83,6 +83,7 @@ from estimate_extractor.xactimate_lookup.destructive_audit import (
 from estimate_extractor.xactimate_lookup.execution_diagnostics import (
     RRBindingDiagnosticLedger,
     RowLifecycleLedger,
+    ZeroDeltaCommitDiagnosticLedger,
 )
 from estimate_extractor.xactimate_lookup.models import DropdownResult, PopulatedFields
 
@@ -1101,6 +1102,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._row_lifecycle_ledger = RowLifecycleLedger(self.evidence_dir / "row_lifecycle_ledger.jsonl")
         self._rr_binding_diagnostic_ledger = RRBindingDiagnosticLedger(
             self.evidence_dir / "rr_binding_diagnostics.jsonl",
+        )
+        self._zero_delta_commit_diagnostic_ledger = ZeroDeltaCommitDiagnosticLedger(
+            self.evidence_dir / "zero_delta_commit_diagnostics.jsonl",
         )
 
         #: Phase 5.7B: names (normalized lowercase) of groups this
@@ -6626,7 +6630,82 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     f"row count did not change within {timeout_s}s ({attempts} attempts) -- commit not detected",
                     row_count_after=row_count_after,
                 )
+            if delta == 0:
+                self._persist_zero_delta_commit_diagnostic({
+                    "attempt": attempts,
+                    "elapsed_s": round(elapsed, 3),
+                    "row_count_before": row_count_before,
+                    "row_count_after": row_count_after,
+                    "pre_activation_protected_baseline_rows": self._safe_zero_delta_rows_diagnostic(
+                        protected_activation_baseline_rows,
+                    ),
+                    "fresh_post_commit_rows": self._safe_zero_delta_rows_diagnostic(after_rows),
+                    "baseline_alignment_result": "not_evaluated_before_timeout",
+                    "protected_multiset_reconciliation_result": "not_evaluated_before_timeout",
+                    "candidate_activation_delta_rows": [],
+                    "retained_target": self._safe_zero_delta_target_diagnostic(self._pending_quantity_target),
+                    "identity_activity_match_result": "not_evaluated_before_timeout",
+                    "duplicate_extra_row_result": "not_evaluated_before_timeout",
+                    "final_fresh_reread": None,
+                    "first_rejection_reason": None,
+                    "final_zero_delta_reconciliation_result": "pending",
+                })
             time.sleep(0.1 if attempts < 5 else 0.4)
+
+    @classmethod
+    def _zero_delta_rows_diagnostic(cls, rows: list[CommitRowSnapshot]) -> list[dict]:
+        result = []
+        for index, row in enumerate(rows):
+            activation = ActivationRowSnapshot(row.category, row.selector, row.description, row.activity)
+            result.append({
+                "row_index": index,
+                "raw": {
+                    "category": row.category, "selector": row.selector,
+                    "description": row.description, "activity": row.activity,
+                    "quantity": row.quantity, "unit": row.unit,
+                },
+                "normalized": {
+                    "category": cls._normalized_pair_text(row.category),
+                    "selector": cls._normalized_pair_text(row.selector),
+                    "description": cls._activation_identity(activation)[2],
+                    "activity": cls._activity_token(activation),
+                    "unit": str(row.unit or "").strip().upper() or None,
+                },
+            })
+        return result
+
+    def _safe_zero_delta_rows_diagnostic(self, rows: list[CommitRowSnapshot]) -> list[dict]:
+        try:
+            return self._zero_delta_rows_diagnostic(rows)
+        except Exception:
+            return [{"diagnostic_error": "row_serialization_failed", "row_count": len(rows)}]
+
+    @staticmethod
+    def _zero_delta_target_diagnostic(target: PendingQuantityTarget | None) -> dict | None:
+        if target is None:
+            return None
+        return {
+            "identity": list(target.identity), "activity": target.activity,
+            "after_index": target.after_index, "physical_row_delta": target.physical_row_delta,
+        }
+
+    def _safe_zero_delta_target_diagnostic(self, target: PendingQuantityTarget | None) -> dict | None:
+        try:
+            return self._zero_delta_target_diagnostic(target)
+        except Exception:
+            return {"diagnostic_error": "target_serialization_failed"}
+
+    def _persist_zero_delta_commit_diagnostic(self, entry: dict) -> None:
+        """Observational only; construction or persistence can never affect verification."""
+        try:
+            context = self._execution_context
+            self._zero_delta_commit_diagnostic_ledger.record({
+                "run_id": context.run_id, "task_id": context.task_id,
+                "source_row": context.source_row, "group": context.group,
+                **entry,
+            })
+        except Exception:
+            pass
 
     def _verify_via_retained_pending_target(
         self,
@@ -6679,24 +6758,49 @@ class WindowsXactimateAdapter(XactimateAdapter):
         single-row binding) -- an R&R -/+ pair binding is never
         corroborated here, so R&R reconciliation behavior is completely
         untouched by this method."""
+        diagnostic = {
+            "attempt": attempts, "elapsed_s": round(time.time() - start, 3),
+            "row_count_before": row_count_before, "row_count_after": len(after_rows),
+            "pre_activation_protected_baseline_rows": self._safe_zero_delta_rows_diagnostic(baseline_rows),
+            "fresh_post_commit_rows": self._safe_zero_delta_rows_diagnostic(after_rows),
+            "baseline_alignment_result": None,
+            "protected_multiset_reconciliation_result": None,
+            "candidate_activation_delta_rows": [],
+            "retained_target": self._safe_zero_delta_target_diagnostic(self._pending_quantity_target),
+            "identity_activity_match_result": None,
+            "duplicate_extra_row_result": None,
+            "final_fresh_reread": None,
+            "first_rejection_reason": None,
+            "final_zero_delta_reconciliation_result": None,
+        }
+
+        def reject(reason: str) -> None:
+            diagnostic["first_rejection_reason"] = reason
+            diagnostic["final_zero_delta_reconciliation_result"] = "rejected"
+            self._persist_zero_delta_commit_diagnostic(diagnostic)
+            return None
+
         target = self._pending_quantity_target
         if target is None or target.physical_row_delta != 1:
-            return None
+            return reject("retained_target_missing_or_not_ordinary_single_row")
         expected_code = (
             self._normalized_pair_text(category),
             self._normalized_pair_text(selector),
         )
         if target.identity[:2] != expected_code:
-            return None
+            diagnostic["identity_activity_match_result"] = False
+            return reject("retained_target_cat_sel_mismatch")
 
         rich_activation_baseline = [
             ActivationRowSnapshot(row.category, row.selector, row.description, row.activity)
             for row in baseline_rows
         ]
-        if not self._baseline_rows_accounted(
+        baseline_aligned = self._baseline_rows_accounted(
             list(target.activation_baseline_rows), rich_activation_baseline,
-        ):
-            return None
+        )
+        diagnostic["baseline_alignment_result"] = baseline_aligned
+        if not baseline_aligned:
+            return reject("activation_baseline_not_aligned_with_rich_protected_baseline")
 
         # Candidate activation, not Ctrl+S, creates the pending row.  The
         # supplied count can therefore already include it.  Reconcile the
@@ -6704,41 +6808,67 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # all protected rows must survive unchanged and exactly one ordinary
         # delta must remain, matching the target bound at activation.
         if len(after_rows) != len(baseline_rows) + 1:
-            return None
+            diagnostic["duplicate_extra_row_result"] = (
+                "missing_row" if len(after_rows) < len(baseline_rows) + 1 else "duplicate_or_extra_rows"
+            )
+            return reject("post_commit_row_count_not_protected_baseline_plus_one")
         preexisting_unchanged, new_indices = self._order_independent_commit_delta(
             baseline_rows, after_rows,
         )
+        diagnostic["protected_multiset_reconciliation_result"] = preexisting_unchanged
+        diagnostic["candidate_activation_delta_rows"] = self._safe_zero_delta_rows_diagnostic(
+            [after_rows[index] for index in new_indices],
+        )
         if not preexisting_unchanged or len(new_indices) != 1:
-            return None
+            diagnostic["duplicate_extra_row_result"] = (
+                "protected_rows_changed" if not preexisting_unchanged else "duplicate_or_extra_rows"
+            )
+            return reject("protected_multiset_not_unchanged_plus_one_unique_delta")
+        diagnostic["duplicate_extra_row_result"] = "none"
         row_index = new_indices[0]
         delta_row = after_rows[row_index]
         delta_activation = ActivationRowSnapshot(
             delta_row.category, delta_row.selector,
             delta_row.description, delta_row.activity,
         )
-        if self._activation_identity(delta_activation) != target.identity:
-            return None
+        identity_matches = self._activation_identity(delta_activation) == target.identity
         snapshot_activity = self._activity_token(delta_activation)
-        if target.activity is not None and snapshot_activity != target.activity:
-            return None
+        activity_matches = target.activity is None or snapshot_activity == target.activity
+        diagnostic["identity_activity_match_result"] = {
+            "identity_matches": identity_matches, "activity_matches": activity_matches,
+        }
+        if not identity_matches:
+            return reject("unique_delta_identity_mismatch")
+        if not activity_matches:
+            return reject("unique_delta_activity_mismatch")
 
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
         if offset is None:
-            return None
+            return reject("final_fresh_grid_relocation_failed")
         row_top = self._shifted_anchor("grid_row_1", offset)[1] + row_index * _GRID_ROW_HEIGHT
 
         cat_observed, sel_observed = self._read_category_selector_for_verify_commit(image, offset, row_top)
+        diagnostic["final_fresh_reread"] = {
+            "category": cat_observed, "selector": sel_observed,
+            "description": None, "activity": None, "quantity": None,
+            "unit_raw": None, "unit_normalized": None,
+        }
         if cat_observed != category or sel_observed != selector:
-            return None
+            return reject("final_fresh_cat_sel_mismatch")
 
         activity_observed = self._read_activation_activity_at(image, offset, row_top)
+        diagnostic["final_fresh_reread"]["activity"] = activity_observed
         if target.activity is not None and activity_observed != target.activity:
-            return None
+            return reject("final_fresh_activity_mismatch")
 
         description_observed = self._read_description_at(image, offset, row_top)
         quantity_observed = self._read_quantity_at(image, offset, row_top)
         unit_raw, unit_normalized = self._read_unit_at(image, offset, row_top)
+        diagnostic["final_fresh_reread"].update({
+            "description": description_observed, "quantity": quantity_observed,
+            "unit_raw": unit_raw, "unit_normalized": unit_normalized,
+        })
         # Phase 5.27: quantity is advisory evidence here, not a gate --
         # see this method's own docstring.
         quantity_matched = quantity_observed is not None and quantity_observed == expected_quantity
@@ -6754,7 +6884,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             unit_result.observed_xactimate_unit = unit_raw
         compatibility = self._UNIT_STATE_TO_COMPATIBILITY.get(unit_result.unit_match_state, "review_required")
         if compatibility == "hard_stop":
-            return None
+            return reject("final_fresh_unit_hard_stop")
 
         samples.append({
             "elapsed_s": round(time.time() - start, 3),
@@ -6766,6 +6896,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
             "activity_observed": activity_observed, "quantity_observed": quantity_observed,
             "unit_raw": unit_raw, "unit_normalized": unit_normalized, "unit_source": unit_source,
         })
+        diagnostic["first_rejection_reason"] = None
+        diagnostic["final_zero_delta_reconciliation_result"] = "verified"
+        self._persist_zero_delta_commit_diagnostic(diagnostic)
         return CommitVerification(
             trust_state="VERIFIED",
             reason=(

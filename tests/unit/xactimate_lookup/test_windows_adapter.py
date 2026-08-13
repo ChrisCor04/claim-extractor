@@ -2173,35 +2173,48 @@ def test_verify_commit_unchanged_immediate_count_reconciles_unique_activation_de
     assert result.preexisting_rows_unchanged is True
     assert result.samples[-1]["protected_baseline_reconciled"] is True
     assert result.samples[-1]["unique_activation_delta_reconfirmed"] is True
+    diagnostic = adapter._zero_delta_commit_diagnostic_ledger.entries[-1]
+    assert diagnostic["baseline_alignment_result"] is True
+    assert diagnostic["protected_multiset_reconciliation_result"] is True
+    assert diagnostic["duplicate_extra_row_result"] == "none"
+    assert diagnostic["identity_activity_match_result"] == {
+        "identity_matches": True, "activity_matches": True,
+    }
+    assert diagnostic["final_fresh_reread"]["category"] == "RFG"
+    assert diagnostic["final_zero_delta_reconciliation_result"] == "verified"
+    assert diagnostic["first_rejection_reason"] is None
 
 
-@pytest.mark.parametrize("bad_after", [
+@pytest.mark.parametrize(("bad_after", "expected_reason"), [
     # Target missing.
-    [CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF")],
+    ([CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF")],
+     "post_commit_row_count_not_protected_baseline_plus_one"),
     # Additional/duplicate target row.
-    [
+    ([
         CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF"),
         CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
         CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
-    ],
+    ], "post_commit_row_count_not_protected_baseline_plus_one"),
     # Additional unrelated row.
-    [
+    ([
         CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF"),
         CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
         CommitRowSnapshot("RFG", "DRIP", "drip edge", None, 325.53, "LF"),
-    ],
+    ], "post_commit_row_count_not_protected_baseline_plus_one"),
     # Protected row changed.
-    [
+    ([
         CommitRowSnapshot("SFG", "GUTA", "old", None, 199.0, "LF"),
         CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
-    ],
+    ], "protected_multiset_not_unchanged_plus_one_unique_delta"),
     # Target identity has the wrong description.
-    [
+    ([
         CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF"),
         CommitRowSnapshot("RFG", "IWS", "different item", None, 532.45, "SF"),
-    ],
+    ], "unique_delta_identity_mismatch"),
 ])
-def test_verify_commit_unchanged_count_reconciliation_fails_closed(monkeypatch, bad_after):
+def test_verify_commit_unchanged_count_reconciliation_fails_closed(
+    monkeypatch, bad_after, expected_reason,
+):
     protected = CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF")
     adapter = _adapter_with_fake_commit_grid(
         monkeypatch, row_sequence=[], baseline_rows=[protected],
@@ -2215,12 +2228,107 @@ def test_verify_commit_unchanged_count_reconciliation_fails_closed(monkeypatch, 
         ),
     )
 
+    result = adapter._verify_via_retained_pending_target(
+        category="RFG", selector="IWS", expected_quantity=532.45,
+        source_unit="SF", expected_xactimate_unit="SF", populated_unit=None,
+        row_count_before=2, attempts=2, start=1000.0, samples=[],
+        baseline_rows=[protected], after_rows=bad_after,
+    )
+
+    assert result is None
+    diagnostic = adapter._zero_delta_commit_diagnostic_ledger.entries[-1]
+    assert diagnostic["first_rejection_reason"] == expected_reason
+    assert diagnostic["final_zero_delta_reconciliation_result"] == "rejected"
+
+
+def test_zero_delta_diagnostic_failure_cannot_flip_success(monkeypatch):
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[[('SFG', 'GUTRS')]],
+        unit_reads=[("LF", "LF")], quantity_reads=[129.07],
+    )
+    adapter._pending_quantity_target = _row13_shaped_target()
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda *_args: None)
+    monkeypatch.setattr(
+        adapter, "_zero_delta_rows_diagnostic",
+        lambda _rows: (_ for _ in ()).throw(ValueError("diagnostic serialization unavailable")),
+    )
+    monkeypatch.setattr(
+        adapter._zero_delta_commit_diagnostic_ledger, "record",
+        lambda _entry: (_ for _ in ()).throw(OSError("diagnostic disk unavailable")),
+    )
+
     result = adapter.verify_commit(
-        [("SFG", "GUTA"), ("RFG", "IWS")], "RFG", "IWS", 532.45,
+        [("SFG", "GUTRS")], "SFG", "GUTRS", 129.07,
+        source_unit="LF", expected_xactimate_unit="LF", timeout_s=0.1,
+    )
+
+    assert result.trust_state == "VERIFIED"
+
+
+def test_zero_delta_diagnostic_failure_cannot_flip_rejection(monkeypatch):
+    adapter = _adapter_with_fake_commit_grid(monkeypatch, row_sequence=[[]])
+    adapter._pending_quantity_target = _row13_shaped_target()
+    monkeypatch.setattr(
+        adapter._zero_delta_commit_diagnostic_ledger, "record",
+        lambda _entry: (_ for _ in ()).throw(OSError("diagnostic disk unavailable")),
+    )
+
+    result = adapter.verify_commit(
+        [], "SFG", "GUTRS", 129.07,
+        source_unit="LF", expected_xactimate_unit="LF", timeout_s=0.1,
+    )
+
+    assert result.trust_state == "VERIFICATION_FAILED"
+
+
+def test_zero_delta_diagnostic_reports_baseline_alignment_subguard(monkeypatch):
+    protected = CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF")
+    target_row = CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[protected],
+        commit_row_sequence=[[protected, target_row]] * 10,
+    )
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        identity=("rfg", "iws", "ice barrier"), activity=None,
+        after_index=1, activity_ordinal=1, physical_row_delta=1,
+        activation_baseline_rows=(ActivationRowSnapshot("PLM", "TLT", "wrong", None),),
+    )
+
+    result = adapter.verify_commit(
+        [("SFG", "GUTA"), ("RFG", "IWS")], "RFG", "IWS", 532.45, timeout_s=0.1,
+    )
+
+    assert result.trust_state == "VERIFICATION_FAILED"
+    assert adapter._zero_delta_commit_diagnostic_ledger.entries[-1]["first_rejection_reason"] == (
+        "activation_baseline_not_aligned_with_rich_protected_baseline"
+    )
+
+
+@pytest.mark.parametrize(("final_cat_sel", "unit_read", "expected_reason"), [
+    (("RFG", "DRIP"), ("SF", "SF"), "final_fresh_cat_sel_mismatch"),
+    (("RFG", "IWS"), ("LF", "LF"), "final_fresh_unit_hard_stop"),
+])
+def test_zero_delta_diagnostic_reports_final_reread_subguards(
+    monkeypatch, final_cat_sel, unit_read, expected_reason,
+):
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[[('RFG', 'IWS')]],
+        unit_reads=[unit_read], quantity_reads=[532.45],
+    )
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        identity=("rfg", "iws", "desc"), activity=None,
+        after_index=0, activity_ordinal=1, physical_row_delta=1,
+    )
+    monkeypatch.setattr(adapter, "_read_category_selector_for_verify_commit", lambda *_args: final_cat_sel)
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda *_args: None)
+
+    result = adapter.verify_commit(
+        [("RFG", "IWS")], "RFG", "IWS", 532.45,
         source_unit="SF", expected_xactimate_unit="SF", timeout_s=0.1,
     )
 
-    assert result.trust_state != "VERIFIED"
+    assert result.trust_state == "VERIFICATION_FAILED"
+    assert adapter._zero_delta_commit_diagnostic_ledger.entries[-1]["first_rejection_reason"] == expected_reason
 
 
 def test_verify_commit_retained_target_wrong_quantity_still_verifies(monkeypatch):

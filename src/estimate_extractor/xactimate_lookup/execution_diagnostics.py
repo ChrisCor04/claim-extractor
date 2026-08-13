@@ -116,3 +116,21 @@ class RRBindingDiagnosticLedger:
                 f.write(json.dumps(persisted, default=str) + "\n")
         except Exception:
             pass
+
+
+class ZeroDeltaCommitDiagnosticLedger:
+    """Best-effort evidence for ordinary zero-delta commit verification."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.entries: list[dict] = []
+
+    def record(self, entry: dict) -> None:
+        persisted = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry}
+        self.entries.append(persisted)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(persisted, default=str) + "\n")
+        except Exception:
+            pass
