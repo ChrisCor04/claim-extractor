@@ -1055,7 +1055,6 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_dropdown_rows: list[_RawDropdownRow] = []
         self._last_selected: DropdownResult | None = None
         self._candidate_selection_count = 0
-        self._last_selected_row_count_before: int | None = None
         # Rich counterpart to snapshot_grid_identities_for_activation()'s
         # public tuple baseline. Xactimate can regroup duplicate R&R rows
         # by activity (-,-,+,+), so pending detection must compare a
@@ -2589,11 +2588,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 f"live popup -- refusing to click a stale/guessed position."
             )
 
-        hwnd = self._ensure_main_window()
-        before_img, offset = self._capture_and_locate(hwnd)
-        self._last_selected_row_count_before = (
-            self._count_grid_rows(before_img, offset) if offset is not None else None
-        )
+        # Preserve the existing fail-closed main-window availability check,
+        # but do not OCR the Items grid here. The authoritative activation
+        # baseline was already captured before this method, and the causal
+        # post-click delta is established by pending_item_created() or
+        # bind_rr_pair_after_activation(). The former row-count value stored
+        # here had no production consumer.
+        self._ensure_main_window()
 
         # re-read the row's rectangle live, immediately before clicking --
         # never the rect captured during parse_dropdown().

@@ -994,6 +994,98 @@ def test_select_candidate_rejects_wrong_live_uia_identity_before_click(monkeypat
     assert clicks == []
 
 
+def test_select_candidate_skips_dead_grid_count_and_activation_delta_remains_authoritative(monkeypatch):
+    """Selection keeps its exact UIA click behavior without a pre-click
+    grid OCR pass; the existing post-click activation snapshot still creates
+    the retained physical binding."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_dropdown_hwnd = 999
+    candidate = DropdownResult(
+        raw_text="RFGGCR300 Ridge cap shingles", row_position=2,
+        category="RFG", selector="GCR300", description="Ridge cap shingles",
+    )
+    live_row = _raw_row("RFGGCR300", "Ridge cap shingles", "$10.00", pos=2, hwnd=999)
+
+    class _Win32:
+        @staticmethod
+        def IsWindow(hwnd):
+            return True
+
+    class _Rect:
+        left, top, right, bottom = 100, 200, 300, 240
+
+    class _Node:
+        def __init__(self, name=None, rect=None):
+            self.CurrentName = name
+            self.CurrentBoundingRectangle = rect
+
+    root = _Node()
+    scrollviewer = _Node()
+    item = _Node(rect=_Rect())
+    code = _Node(name="RFGGCR300")
+
+    class _Walker:
+        @staticmethod
+        def GetFirstChildElement(element):
+            return {root: scrollviewer, scrollviewer: item, item: code}.get(element)
+
+        @staticmethod
+        def GetNextSiblingElement(element):
+            return None
+
+    class _Automation:
+        RawViewWalker = _Walker()
+
+        @staticmethod
+        def ElementFromHandle(hwnd):
+            return root
+
+    main_window_checks = []
+    clicks = []
+    activation_reads = []
+    monkeypatch.setattr(adapter, "_win32gui", lambda: _Win32)
+    monkeypatch.setattr(adapter, "_read_dropdown_rows", lambda hwnd: [live_row])
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: main_window_checks.append(1) or 123)
+    monkeypatch.setattr(
+        adapter, "_capture_and_locate",
+        lambda *args, **kwargs: pytest.fail("select_candidate() must not capture/OCR the grid"),
+    )
+    monkeypatch.setattr(
+        adapter, "_count_grid_rows",
+        lambda *args, **kwargs: pytest.fail("select_candidate() must not count grid rows"),
+    )
+    monkeypatch.setattr(adapter, "_uia", lambda: (_Automation(), object()))
+    monkeypatch.setattr(adapter, "_click_screen", lambda x, y: clicks.append((x, y)))
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    adapter.select_candidate(candidate)
+
+    assert main_window_checks == [1]
+    assert clicks == [(200, 220)]
+    assert adapter._candidate_selection_count == 1
+    assert adapter._last_selected is candidate
+    assert adapter.last_candidate_click == {
+        "expected_category": "RFG", "expected_selector": "GCR300",
+        "row_position": 2, "row_text_before_click": "RFGGCR300",
+        "row_bounds": (100, 200, 300, 240), "click_xy": (200, 220),
+    }
+    assert not hasattr(adapter, "_last_selected_row_count_before")
+
+    adapter._last_activation_baseline_rows = []
+    monkeypatch.setattr(
+        adapter, "_snapshot_activation_rows",
+        lambda: activation_reads.append(1) or [
+            ActivationRowSnapshot("RFG", "GCR300", "Ridge cap shingles", None),
+        ],
+    )
+
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert activation_reads == [1]
+    assert adapter._pending_quantity_target is not None
+    assert adapter._pending_quantity_target.identity[:2] == ("rfg", "gcr300")
+
+
 def test_get_adapter_diagnostics_reports_not_found_state():
     """Diagnostics must report whatever supports_live_execution
     ACTUALLY is on this instance -- set explicitly here so the
@@ -5422,8 +5514,6 @@ def test_enter_quantity_scrolls_when_target_row_is_below_viewport(monkeypatch):
     """Item 1: a target row computed below the visible client area
     must trigger scrolling, not an immediate blind click."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    adapter._last_selected_row_count_before = 15
-
     def reveal(scroll_call_n):
         return (16, 500)  # second read reports the row now comfortably on-screen
 
@@ -5439,8 +5529,6 @@ def test_enter_quantity_stops_scrolling_once_target_visible(monkeypatch):
     """Item 2: scrolling must stop as soon as the target becomes
     visible -- not continue for the full bounded budget regardless."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    adapter._last_selected_row_count_before = 15
-
     def reveal(scroll_call_n):
         return (16, 500)  # visible on the very first scroll attempt
 
@@ -5457,8 +5545,6 @@ def test_enter_quantity_fails_closed_when_never_visible(monkeypatch):
     bounded budget must fail closed (RowOffscreenError), never click a
     coordinate outside the captured viewport."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    adapter._last_selected_row_count_before = 15
-
     state, calls = _mock_enter_quantity(
         monkeypatch, adapter, row_count=16, row_top=1050, image_height=1023,
         scroll_effect=lambda n: (16, 1050),  # never moves into view
@@ -5473,8 +5559,6 @@ def test_enter_quantity_does_not_scroll_when_already_visible(monkeypatch):
     on-screen) must never scroll at all -- the fix must not slow down
     or destabilize a short grid that never needed it."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    adapter._last_selected_row_count_before = None  # first row ever -- always "an increase"
-
     state, calls = _mock_enter_quantity(
         monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
     )
@@ -5487,8 +5571,6 @@ def test_enter_quantity_confirms_quantity_before_returning(monkeypatch):
     """Item 5: a successful call must have positively read back the
     typed value -- not merely assume the click+type worked."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    adapter._last_selected_row_count_before = None
-
     state, calls = _mock_enter_quantity(
         monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
     )
@@ -5504,8 +5586,6 @@ def test_enter_quantity_records_review_when_stable_confirmation_mismatches(monke
     unconfirmed physical creation.
     """
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    adapter._last_selected_row_count_before = None
-
     state, calls = _mock_enter_quantity(
         monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
         confirmed_qty_offset=-33.66,  # read-back always comes back as 0
@@ -5521,8 +5601,6 @@ def test_enter_quantity_refuses_to_overwrite_identity_matched_populated_row(monk
     """A retained target that is no longer blank is dirty/ambiguous;
     quantity entry fails closed instead of advancing to a guessed row."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    adapter._last_selected_row_count_before = 15
-
     state, calls = _mock_enter_quantity(
         monkeypatch, adapter, row_count=16, row_top=600, image_height=1023,
         existing_qty_at_target=9.0,  # the computed row is already populated
@@ -5654,8 +5732,6 @@ def test_enter_quantity_resets_scroll_state_after_scrolling(monkeypatch):
     a subsequent, unrelated search malfunctioning after a prior
     enter_quantity() call left the page scrolled away mid-page."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
-    adapter._last_selected_row_count_before = 15
-
     state, calls = _mock_enter_quantity(
         monkeypatch, adapter, row_count=16, row_top=1050, image_height=1023,
         scroll_effect=lambda n: (16, 500),
