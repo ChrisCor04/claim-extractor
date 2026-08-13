@@ -6342,7 +6342,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         samples: list[dict] = []
         attempts = 0
         row_count_before = len(before_snapshot)
-        baseline_rows = list(self._last_commit_baseline_rows or [])
+        protected_activation_baseline_rows = list(self._last_commit_baseline_rows or [])
+        baseline_rows = list(protected_activation_baseline_rows)
         baseline_identities = [(row.category, row.selector) for row in baseline_rows]
         supplied_identities = list(before_snapshot)
         baseline_identity_multiset_matches = len(baseline_identities) == len(supplied_identities)
@@ -6616,6 +6617,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     source_unit=source_unit, expected_xactimate_unit=expected_xactimate_unit,
                     populated_unit=populated_unit, row_count_before=row_count_before,
                     attempts=attempts, start=start, samples=samples,
+                    baseline_rows=protected_activation_baseline_rows, after_rows=after_rows,
                 )
                 if retained is not None:
                     return retained
@@ -6639,6 +6641,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         attempts: int,
         start: float,
         samples: list[dict],
+        baseline_rows: list[CommitRowSnapshot],
+        after_rows: list[CommitRowSnapshot],
     ) -> "CommitVerification | None":
         """Last-resort corroboration for verify_commit()'s zero-row-
         count-delta timeout, used ONLY there -- never in place of the
@@ -6653,14 +6657,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
         COMMIT is therefore not evidence of failure by itself when a
         trustworthy binding from that earlier activation still exists:
         self._pending_quantity_target already positively identified
-        this exact row's identity/activity/position before quantity
-        was ever entered. This re-confirms that SAME already-proven
-        row -- it never searches for some other matching row, and it
-        is deliberately narrower than the normal structural path: every
-        IDENTITY check here (category, selector, activity, unit
-        compatibility) must be POSITIVELY read and POSITIVELY
-        matching, or this returns None and the caller falls through to
-        the existing, unchanged VERIFICATION_FAILED failure. Phase
+        this exact row's identity/activity before quantity was ever
+        entered. The rich protected baseline comes from that same
+        pre-activation frame. This re-confirms the SAME already-proven
+        row as the sole post-commit multiset delta -- it never searches
+        for an arbitrary matching row -- and then positively rereads
+        identity, activity, and unit at that freshly derived position.
+        Any missing/extra/changed row or failed positive check returns
+        None and falls through to the existing VERIFICATION_FAILED.
+        Phase
         5.27: quantity is deliberately NOT one of those gating checks
         (see verify_commit()'s own docstring, point 6) -- this target
         was already positively bound at activation time, before
@@ -6677,14 +6682,51 @@ class WindowsXactimateAdapter(XactimateAdapter):
         target = self._pending_quantity_target
         if target is None or target.physical_row_delta != 1:
             return None
-        if target.identity[0] != category or target.identity[1] != selector:
+        expected_code = (
+            self._normalized_pair_text(category),
+            self._normalized_pair_text(selector),
+        )
+        if target.identity[:2] != expected_code:
+            return None
+
+        rich_activation_baseline = [
+            ActivationRowSnapshot(row.category, row.selector, row.description, row.activity)
+            for row in baseline_rows
+        ]
+        if not self._baseline_rows_accounted(
+            list(target.activation_baseline_rows), rich_activation_baseline,
+        ):
+            return None
+
+        # Candidate activation, not Ctrl+S, creates the pending row.  The
+        # supplied count can therefore already include it.  Reconcile the
+        # fresh post-commit rows against the rich pre-activation baseline:
+        # all protected rows must survive unchanged and exactly one ordinary
+        # delta must remain, matching the target bound at activation.
+        if len(after_rows) != len(baseline_rows) + 1:
+            return None
+        preexisting_unchanged, new_indices = self._order_independent_commit_delta(
+            baseline_rows, after_rows,
+        )
+        if not preexisting_unchanged or len(new_indices) != 1:
+            return None
+        row_index = new_indices[0]
+        delta_row = after_rows[row_index]
+        delta_activation = ActivationRowSnapshot(
+            delta_row.category, delta_row.selector,
+            delta_row.description, delta_row.activity,
+        )
+        if self._activation_identity(delta_activation) != target.identity:
+            return None
+        snapshot_activity = self._activity_token(delta_activation)
+        if target.activity is not None and snapshot_activity != target.activity:
             return None
 
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
         if offset is None:
             return None
-        row_top = self._shifted_anchor("grid_row_1", offset)[1] + target.after_index * _GRID_ROW_HEIGHT
+        row_top = self._shifted_anchor("grid_row_1", offset)[1] + row_index * _GRID_ROW_HEIGHT
 
         cat_observed, sel_observed = self._read_category_selector_for_verify_commit(image, offset, row_top)
         if cat_observed != category or sel_observed != selector:
@@ -6717,7 +6759,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         samples.append({
             "elapsed_s": round(time.time() - start, 3),
             "retained_pending_target_corroboration": True,
-            "after_index": target.after_index,
+            "after_index": row_index,
+            "protected_baseline_reconciled": True,
+            "unique_activation_delta_reconfirmed": True,
             "category_observed": cat_observed, "selector_observed": sel_observed,
             "activity_observed": activity_observed, "quantity_observed": quantity_observed,
             "unit_raw": unit_raw, "unit_normalized": unit_normalized, "unit_source": unit_source,
@@ -6731,7 +6775,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 "(quantity OCR is advisory only; the deterministic write to this positively-identified row is "
                 "treated as authoritative)"
             ),
-            row_count_before=row_count_before, row_count_after=row_count_before, row_index=target.after_index,
+            row_count_before=row_count_before, row_count_after=len(after_rows), row_index=row_index,
             preexisting_rows_unchanged=True,
             category_expected=category, selector_expected=selector,
             category_observed=cat_observed, selector_observed=sel_observed, category_selector_ocr_agrees=True,

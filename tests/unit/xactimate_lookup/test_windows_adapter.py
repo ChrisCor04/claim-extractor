@@ -2111,8 +2111,8 @@ def test_verify_commit_times_out_when_row_count_never_changes(monkeypatch):
 
 def _row13_shaped_target(**overrides):
     defaults = dict(
-        identity=("SFG", "GUTRS", "Gutter / downspout - Detach & reset"),
-        activity="+", after_index=0, activity_ordinal=1, physical_row_delta=1,
+        identity=("sfg", "gutrs", "desc"),
+        activity=None, after_index=0, activity_ordinal=1, physical_row_delta=1,
     )
     defaults.update(overrides)
     return PendingQuantityTarget(**defaults)
@@ -2142,6 +2142,85 @@ def test_verify_commit_retained_target_confirms_row13_shape(monkeypatch):
     assert result.quantity_matched is True
     assert result.compatibility == "compatible"
     assert "already positively bound during activation" in result.reason
+
+
+def test_verify_commit_unchanged_immediate_count_reconciles_unique_activation_delta(monkeypatch):
+    """Fresh ordinary activation owns the one row added before Ctrl+S."""
+    protected = CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF")
+    target_row = CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[protected],
+        commit_row_sequence=[[protected, target_row]] * 10,
+        unit_reads=[("SF", "SF")], quantity_reads=[532.45],
+    )
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        identity=("rfg", "iws", "ice barrier"), activity=None,
+        after_index=1, activity_ordinal=1, physical_row_delta=1,
+        activation_baseline_rows=(
+            ActivationRowSnapshot("SFG", "GUTA", "old", None),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda *_args: None)
+
+    # The supplied viewport count already includes the activated row.
+    result = adapter.verify_commit(
+        [("SFG", "GUTA"), ("RFG", "IWS")], "RFG", "IWS", 532.45,
+        source_unit="SF", expected_xactimate_unit="SF", timeout_s=0.1,
+    )
+
+    assert result.trust_state == "VERIFIED"
+    assert result.row_count_before == result.row_count_after == 2
+    assert result.preexisting_rows_unchanged is True
+    assert result.samples[-1]["protected_baseline_reconciled"] is True
+    assert result.samples[-1]["unique_activation_delta_reconfirmed"] is True
+
+
+@pytest.mark.parametrize("bad_after", [
+    # Target missing.
+    [CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF")],
+    # Additional/duplicate target row.
+    [
+        CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF"),
+        CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
+        CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
+    ],
+    # Additional unrelated row.
+    [
+        CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF"),
+        CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
+        CommitRowSnapshot("RFG", "DRIP", "drip edge", None, 325.53, "LF"),
+    ],
+    # Protected row changed.
+    [
+        CommitRowSnapshot("SFG", "GUTA", "old", None, 199.0, "LF"),
+        CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
+    ],
+    # Target identity has the wrong description.
+    [
+        CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF"),
+        CommitRowSnapshot("RFG", "IWS", "different item", None, 532.45, "SF"),
+    ],
+])
+def test_verify_commit_unchanged_count_reconciliation_fails_closed(monkeypatch, bad_after):
+    protected = CommitRowSnapshot("SFG", "GUTA", "old", None, 200.0, "LF")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], baseline_rows=[protected],
+        commit_row_sequence=[bad_after], unit_reads=[("SF", "SF")], quantity_reads=[532.45],
+    )
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        identity=("rfg", "iws", "ice barrier"), activity=None,
+        after_index=1, activity_ordinal=1, physical_row_delta=1,
+        activation_baseline_rows=(
+            ActivationRowSnapshot("SFG", "GUTA", "old", None),
+        ),
+    )
+
+    result = adapter.verify_commit(
+        [("SFG", "GUTA"), ("RFG", "IWS")], "RFG", "IWS", 532.45,
+        source_unit="SF", expected_xactimate_unit="SF", timeout_s=0.1,
+    )
+
+    assert result.trust_state != "VERIFIED"
 
 
 def test_verify_commit_retained_target_wrong_quantity_still_verifies(monkeypatch):
@@ -2249,7 +2328,7 @@ def test_verify_commit_retained_target_activity_mismatch_does_not_verify(monkeyp
         quantity_reads=[129.07],
     )
     monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda image, offset, row_top: "-")
-    adapter._pending_quantity_target = _row13_shaped_target()
+    adapter._pending_quantity_target = _row13_shaped_target(activity="+")
 
     result = adapter.verify_commit(
         [("SFG", "GUTRS")], "SFG", "GUTRS", 129.07,
