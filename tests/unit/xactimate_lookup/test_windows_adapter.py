@@ -7312,6 +7312,88 @@ def test_write_and_verify_existing_rr_pair_half_quantity_writes_and_confirms(mon
     assert typed_indices == {1}
 
 
+def test_write_and_verify_existing_rr_pair_half_quantity_discovers_already_correct_value_without_rewriting(monkeypatch):
+    """Phase 5.26: resume safety -- if the persisted checkpoint predates
+    a physical write that happened anyway (or a prior session already
+    wrote the correct value), a resumed write must DISCOVER the cell
+    already holds the right quantity and reconcile forward WITHOUT a
+    second click/type -- enter_quantity()'s own existing-value guard
+    (write_source_quantity_once=False on a resumed target) already
+    provides this; on_physical_write must still fire so the checkpoint
+    reflects reality even though no keystroke happened this call."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    monkeypatch.setattr(
+        adapter, "locate_existing_rr_pair_half",
+        lambda *, category, selector, description, activity: (
+            PendingQuantityTarget(
+                identity=("rfg", "steep", "steep charge"), activity="+", after_index=1, activity_ordinal=1,
+                physical_row_delta=2, write_source_quantity_once=False,
+            ),
+            12.0,
+        ),
+    )
+    # The physical "+" cell ALREADY holds 12.0 -- the exact expected quantity.
+    _reads, typed_indices, clicked_indices = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 12.0], {1: 12.0},
+    )
+    physical_write_calls = []
+
+    confirmation = adapter.write_and_verify_existing_rr_pair_half_quantity(
+        category="rfg", selector="steep", description="steep charge", activity="+", quantity=12.0,
+        on_physical_write=lambda: physical_write_calls.append(1),
+    )
+
+    assert confirmation.observed == 12.0
+    assert confirmation.confidence == "CONFIRMED"
+    assert typed_indices == set()  # no keystroke -- nothing was rewritten
+    assert clicked_indices == []
+    assert physical_write_calls == [1]  # checkpoint still fires -- the value IS correct
+
+
+def test_write_and_verify_existing_rr_pair_half_quantity_checkpoints_before_confirmation(monkeypatch):
+    """physical plus write checkpoints before verification: on_physical_
+    write must fire strictly BEFORE the confirmation read-back that
+    follows the click+type+Tab sequence -- proven by having the
+    callback assert the click has ALREADY happened but the (separate)
+    post-write OCR confirmation read has not yet been consulted for a
+    result."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    monkeypatch.setattr(
+        adapter, "locate_existing_rr_pair_half",
+        lambda *, category, selector, description, activity: (
+            PendingQuantityTarget(
+                identity=("rfg", "steep", "steep charge"), activity="+", after_index=1, activity_ordinal=1,
+                physical_row_delta=2, write_source_quantity_once=False,
+            ),
+            0.0,
+        ),
+    )
+    reads, typed_indices, clicked_indices = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {1: 12.0},
+    )
+    order = []
+    reads_len_at_write = []
+
+    def on_physical_write():
+        order.append("write")
+        assert 1 in typed_indices  # the click+type+Tab already happened
+        reads_len_at_write.append(len(reads))  # snapshot before confirmation reads begin
+
+    confirmation = adapter.write_and_verify_existing_rr_pair_half_quantity(
+        category="rfg", selector="steep", description="steep charge", activity="+", quantity=12.0,
+        on_physical_write=on_physical_write,
+    )
+
+    assert order == ["write"]
+    # The post-write confirmation OCR read(s) happened strictly AFTER the
+    # checkpoint callback fired -- proving physical-write-before-checkpoint
+    # ordering, not merely that both eventually happened.
+    assert len(reads) > reads_len_at_write[0]
+    assert confirmation.observed == 12.0
+
+
 def test_write_and_verify_existing_rr_pair_half_quantity_fails_closed_when_unlocatable(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(
@@ -7340,3 +7422,110 @@ def test_write_and_verify_existing_rr_pair_half_quantity_minus_side_label(monkey
         )
 
     assert excinfo.value.side == "minus"
+
+
+# --- Phase 5.26: every raw pytesseract call is bounded -- live-caught,
+# pytesseract.image_to_string()/image_to_data() default to timeout=0,
+# which its OWN timeout_manager() treats as "no timeout at all", an
+# unbounded subprocess.communicate() that can hang forever. A real
+# quantity-confirmation OCR read hung for 13+ minutes in exactly this
+# way; _ocr_text()/_ocr_data() are the ONLY two places any pytesseract
+# call happens in this file, so fixing them there bounds every caller
+# uniformly. -----------------------------------------------------
+
+
+def test_ocr_text_passes_a_bounded_positive_timeout_to_pytesseract(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    captured = {}
+
+    class _OCR:
+        @staticmethod
+        def image_to_string(image, config="", timeout=0):
+            captured["timeout"] = timeout
+            return "hello"
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._ocr_text("fake-image") == "hello"
+    assert captured["timeout"] == WindowsXactimateAdapter._OCR_CALL_TIMEOUT_S
+    assert captured["timeout"] > 0  # never pytesseract's own unbounded default of 0/falsy
+
+
+def test_ocr_text_timeout_returns_empty_string_instead_of_propagating(monkeypatch):
+    """The exact failure mode that hung the live run, reproduced
+    deterministically: pytesseract itself raises RuntimeError('Tesseract
+    process timeout') once its own bounded subprocess.communicate()
+    expires. _ocr_text() must treat this exactly like any other
+    unreadable/empty OCR result -- never propagate, never hang."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    class _OCR:
+        @staticmethod
+        def image_to_string(image, config="", timeout=0):
+            raise RuntimeError("Tesseract process timeout")
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    assert adapter._ocr_text("fake-image") == ""
+
+
+def test_ocr_text_non_timeout_runtime_error_still_propagates(monkeypatch):
+    """Only a genuine timeout is swallowed -- any OTHER RuntimeError
+    (a real, unexpected failure) must still surface loudly, never
+    silently reinterpreted as "just an empty OCR read"."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    class _OCR:
+        @staticmethod
+        def image_to_string(image, config="", timeout=0):
+            raise RuntimeError("some unrelated tesseract failure")
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    with pytest.raises(RuntimeError, match="some unrelated tesseract failure"):
+        adapter._ocr_text("fake-image")
+
+
+def test_ocr_data_passes_bounded_timeout_and_falls_back_cleanly_on_timeout(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    captured = {}
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(image, output_type=None, config="", timeout=0):
+            captured["timeout"] = timeout
+            raise RuntimeError("Tesseract process timeout")
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    data = adapter._ocr_data("fake-image")
+
+    assert captured["timeout"] == WindowsXactimateAdapter._OCR_CALL_TIMEOUT_S
+    # Every existing _ocr_data() caller only ever indexes these keys --
+    # an honest "found nothing this attempt", never a fabricated match.
+    assert data["text"] == []
+    assert data["left"] == []
+    assert data["top"] == []
+    assert data["width"] == []
+    assert data["height"] == []
+
+
+def test_ocr_data_non_timeout_runtime_error_still_propagates(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+
+    class _OCR:
+        @staticmethod
+        def image_to_data(image, output_type=None, config="", timeout=0):
+            raise RuntimeError("some unrelated tesseract failure")
+
+    monkeypatch.setattr(adapter, "_pytesseract", lambda: _OCR)
+
+    with pytest.raises(RuntimeError, match="some unrelated tesseract failure"):
+        adapter._ocr_data("fake-image")
+
+
+def test_ocr_call_timeout_bound_is_finite_and_reasonable():
+    """The whole point of Phase 5.26's fix: every OCR call is bounded,
+    never unbounded (pytesseract's own default of timeout=0 means NO
+    bound at all)."""
+    assert 0 < WindowsXactimateAdapter._OCR_CALL_TIMEOUT_S <= 30

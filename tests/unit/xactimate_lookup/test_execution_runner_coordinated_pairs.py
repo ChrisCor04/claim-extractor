@@ -41,8 +41,10 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     PAIR_BOTH_BOUND,
     PAIR_BOTH_VERIFIED,
     PAIR_MINUS_VERIFIED,
+    PAIR_MINUS_WRITE_UNCERTAIN,
     PAIR_PHYSICAL_STATE_UNCERTAIN,
     PAIR_PLUS_VERIFIED,
+    PAIR_PLUS_WRITE_UNCERTAIN,
     PAIR_REVIEW_REQUIRED,
     PAIR_SATISFIED,
     PAIR_UNACTIVATED,
@@ -219,19 +221,40 @@ class RRPairFakeAdapter(FakeXactimateAdapter):
             raise AdapterError("simulated adapter error during binding")
         return _FakePendingRRPairTarget(_PAIR_IDENTITY)
 
-    def write_and_verify_rr_pair_quantities(self, pair_target, minus_quantity, plus_quantity, *, on_minus_verified=None):
+    def write_and_verify_rr_pair_quantities(
+        self, pair_target, minus_quantity, plus_quantity,
+        *, on_minus_write=None, on_minus_verified=None, on_plus_write=None,
+    ):
         self.write_pair_calls += 1
-        if self.minus_write_outcome == "fail":
-            raise _FakeRRPairQuantityError("simulated minus write failure", side="minus")
+        # Mirrors the REAL adapter's own ordering precisely: physical
+        # write checkpoint fires BEFORE that side's confirmation is
+        # even computed, let alone returned/raised -- UNLESS the
+        # simulated failure is "fail_before_write" (a locate/click
+        # failure -- nothing physical ever happened), matching enter_
+        # quantity()'s own two distinct failure shapes.
+        if self.minus_write_outcome == "fail_before_write":
+            raise _FakeRRPairQuantityError("simulated minus locate/click failure (no physical write)", side="minus")
+        if on_minus_write is not None:
+            on_minus_write()
+        if self.minus_write_outcome in ("fail", "fail_after_write"):
+            raise _FakeRRPairQuantityError("simulated minus confirmation failure (after a real physical write)", side="minus")
         minus_confirmation = _FakeConfirmation(
             minus_quantity, minus_quantity,
             confidence="CONFIRMED" if self.minus_write_outcome == "success" else "LOW_CONFIDENCE",
         )
         if on_minus_verified is not None:
             on_minus_verified(minus_confirmation)
-        if self.plus_write_outcome == "fail":
+        if self.plus_write_outcome == "fail_before_write":
             raise _FakeRRPairQuantityError(
-                "simulated plus write failure", side="plus", minus_confirmation=minus_confirmation,
+                "simulated plus locate/click failure (no physical write)", side="plus",
+                minus_confirmation=minus_confirmation,
+            )
+        if on_plus_write is not None:
+            on_plus_write()
+        if self.plus_write_outcome in ("fail", "fail_after_write"):
+            raise _FakeRRPairQuantityError(
+                "simulated plus confirmation failure (after a real physical write)", side="plus",
+                minus_confirmation=minus_confirmation,
             )
         plus_confirmation = _FakeConfirmation(
             plus_quantity, plus_quantity,
@@ -254,8 +277,12 @@ class RRPairFakeAdapter(FakeXactimateAdapter):
             confidence="CONFIRMED" if outcome == "success" else "LOW_CONFIDENCE",
         )
 
-    def write_and_verify_existing_rr_pair_half_quantity(self, *, category, selector, description, activity, quantity):
+    def write_and_verify_existing_rr_pair_half_quantity(
+        self, *, category, selector, description, activity, quantity, on_physical_write=None,
+    ):
         outcome = self.write_half_outcome.get(activity, "success")
+        if on_physical_write is not None:
+            on_physical_write()
         if outcome == "fail":
             side = "minus" if activity == "-" else "plus"
             raise _FakeRRPairQuantityError("simulated resumed write failure", side=side)
@@ -344,10 +371,13 @@ def test_remove_source_quantity_goes_to_minus(tmp_path, phrase_rules, ranking_co
     seen = {}
     original = adapter.write_and_verify_rr_pair_quantities
 
-    def spy(pair_target, minus_quantity, plus_quantity, *, on_minus_verified=None):
+    def spy(pair_target, minus_quantity, plus_quantity, *, on_minus_write=None, on_minus_verified=None, on_plus_write=None):
         seen["minus"] = minus_quantity
         seen["plus"] = plus_quantity
-        return original(pair_target, minus_quantity, plus_quantity, on_minus_verified=on_minus_verified)
+        return original(
+            pair_target, minus_quantity, plus_quantity,
+            on_minus_write=on_minus_write, on_minus_verified=on_minus_verified, on_plus_write=on_plus_write,
+        )
 
     adapter.write_and_verify_rr_pair_quantities = spy
 
@@ -560,6 +590,13 @@ def test_commit_item_failure_is_task_local_review(tmp_path, phrase_rules, rankin
 
 
 def test_minus_write_failure_does_not_attempt_plus(tmp_path, phrase_rules, ranking_config):
+    """"fail" (== fail_after_write) simulates the realistic, live-caught
+    shape: the physical write itself succeeded, only the confirmation
+    that followed it failed -- Phase 5.26's truthful-checkpoint fix
+    means minus_written correctly stays True (a write DID happen),
+    never fabricated as False just because the overall call raised.
+    See test_minus_locate_failure_before_any_write_leaves_minus_
+    written_false for the OTHER, no-physical-write shape."""
     plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
     adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
     adapter.minus_write_outcome = "fail"
@@ -572,10 +609,35 @@ def test_minus_write_failure_does_not_attempt_plus(tmp_path, phrase_rules, ranki
     assert replace_task.state != TASK_COMPLETED
     assert adapter.commit_item_calls == 0
     assert pair.pair_state == PAIR_REVIEW_REQUIRED
+    assert pair.minus_written is True
+    assert pair.minus_verified_ok is False
+
+
+def test_minus_locate_failure_before_any_write_leaves_minus_written_false(tmp_path, phrase_rules, ranking_config):
+    """The OTHER minus failure shape: the row could not even be located/
+    clicked (enter_quantity()'s own locate step, not confirmation) --
+    genuinely nothing physical happened, so minus_written correctly
+    stays False. Distinguishes this from the "fail" (fail_after_write)
+    case above -- Phase 5.26's fix must never claim a write happened
+    when it didn't, in either direction."""
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.minus_write_outcome = "fail_before_write"
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
     assert pair.minus_written is False
+    assert pair.minus_verified_ok is False
+    assert pair.pair_state == PAIR_REVIEW_REQUIRED
 
 
 def test_plus_failure_preserves_verified_minus_checkpoint(tmp_path, phrase_rules, ranking_config):
+    """"fail" (== fail_after_write) simulates the plus side's physical
+    write succeeding (visible, correct value) while its OWN
+    confirmation fails afterward -- exactly the live-caught shape.
+    plus_written correctly stays True; only plus_verified_ok (never
+    set, since no confirmation was ever obtained) reflects the
+    uncertainty."""
     plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
     adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
     adapter.plus_write_outcome = "fail"
@@ -584,13 +646,144 @@ def test_plus_failure_preserves_verified_minus_checkpoint(tmp_path, phrase_rules
 
     assert pair.minus_written is True
     assert pair.minus_verified_ok is True
-    assert pair.plus_written is False
+    assert pair.plus_written is True
+    assert pair.plus_verified_ok is False
     assert adapter.commit_item_calls == 0
     # Neither task independently marked completed/committed -- nothing
     # was actually saved (commit_item() never reached).
     assert remove_task.state == TASK_REVIEW_REQUIRED
     assert replace_task.state == TASK_REVIEW_REQUIRED
     assert remove_task.commit_state != "committed"
+
+
+def test_low_confidence_minus_confirmation_is_never_reported_as_verified(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.26's core truthful-checkpoint requirement, proven
+    directly against the lifecycle ledger: a LOW_CONFIDENCE minus
+    confirmation (a real physical write, but an uncertain readback --
+    the live-caught shape) must emit its PAIR_MINUS_VERIFICATION event
+    with confidence=LOW_CONFIDENCE and verified_ok=False, and
+    pair.minus_verified_ok must land False even after the pair's
+    pipeline-position pair_state is later overwritten by the shared
+    commit/finalize tail (PAIR_SATISFIED/PAIR_BOTH_VERIFIED are
+    positions, not truth claims about either half -- see _commit_and_
+    finalize_rr_pair()'s own docstring)."""
+    class LedgerFakeAdapter(RRPairFakeAdapter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.events: list[tuple] = []
+
+        def record_lifecycle_event(self, event, **detail):
+            self.events.append((event, detail))
+
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    adapter = LedgerFakeAdapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.supports_live_execution = True
+    adapter.minus_write_outcome = "low_confidence"
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    minus_verification_events = [detail for name, detail in adapter.events if name == "PAIR_MINUS_VERIFICATION"]
+    assert len(minus_verification_events) == 1
+    assert minus_verification_events[0]["confidence"] == "LOW_CONFIDENCE"
+    assert minus_verification_events[0]["verified_ok"] is False
+    assert pair.minus_verified_ok is False
+    assert pair.plus_verified_ok is True
+    # The uncertain half is never silently upgraded to COMPLETED just
+    # because its partner's evidence looked good.
+    assert remove_task.state == TASK_REVIEW_REQUIRED
+    assert replace_task.state == TASK_COMPLETED
+
+
+def test_low_confidence_plus_confirmation_is_never_reported_as_verified(tmp_path, phrase_rules, ranking_config):
+    """Symmetric counterpart for the plus side."""
+    class LedgerFakeAdapter(RRPairFakeAdapter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.events: list[tuple] = []
+
+        def record_lifecycle_event(self, event, **detail):
+            self.events.append((event, detail))
+
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    adapter = LedgerFakeAdapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.supports_live_execution = True
+    adapter.plus_write_outcome = "low_confidence"
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    plus_verification_events = [detail for name, detail in adapter.events if name == "PAIR_PLUS_VERIFICATION"]
+    assert len(plus_verification_events) == 1
+    assert plus_verification_events[0]["confidence"] == "LOW_CONFIDENCE"
+    assert plus_verification_events[0]["verified_ok"] is False
+    assert pair.plus_verified_ok is False
+    assert pair.minus_verified_ok is True
+    assert remove_task.state == TASK_COMPLETED
+    assert replace_task.state == TASK_REVIEW_REQUIRED
+
+
+def test_physical_write_lifecycle_events_precede_their_own_verification_event(tmp_path, phrase_rules, ranking_config):
+    """Physical-write-before-checkpoint ordering, proven at the
+    lifecycle-ledger level rather than by inspecting internals: PAIR_
+    MINUS_WRITTEN must be recorded strictly before PAIR_MINUS_
+    VERIFICATION, and PAIR_PLUS_WRITTEN strictly before PAIR_PLUS_
+    VERIFICATION -- the write checkpoint is never merged into (or
+    recorded after) the confirmation checkpoint."""
+    class LedgerFakeAdapter(RRPairFakeAdapter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.events: list[tuple] = []
+
+        def record_lifecycle_event(self, event, **detail):
+            self.events.append((event, detail))
+
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    adapter = LedgerFakeAdapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.supports_live_execution = True
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    names = [name for name, _ in adapter.events]
+    assert names.index("PAIR_MINUS_WRITTEN") < names.index("PAIR_MINUS_VERIFICATION")
+    assert names.index("PAIR_PLUS_WRITTEN") < names.index("PAIR_PLUS_VERIFICATION")
+
+
+def test_coordinated_lifecycle_ledger_records_full_ordered_checkpoint_sequence(tmp_path, phrase_rules, ranking_config):
+    """Closes the Stage 4 observability gap the live stall exposed: a
+    fresh pair execution must emit a full, correctly-ordered lifecycle
+    sequence identifying the pair (pair_id + both logical task IDs on
+    every event), from candidate activation through finalization, so a
+    future live stall can be localized from the ledger alone without
+    inspecting the screen."""
+    class LedgerFakeAdapter(RRPairFakeAdapter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.events: list[tuple] = []
+
+        def record_lifecycle_event(self, event, **detail):
+            self.events.append((event, detail))
+
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    adapter = LedgerFakeAdapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.supports_live_execution = True
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    names = [name for name, _ in adapter.events]
+    expected_sequence = [
+        "PAIR_CANDIDATE_ACTIVATED", "PAIR_BOUND", "PAIR_MINUS_WRITTEN", "PAIR_MINUS_VERIFICATION",
+        "PAIR_PLUS_WRITTEN", "PAIR_PLUS_VERIFICATION", "PAIR_COMMIT_STARTED", "PAIR_COMMIT_RETURNED",
+        "PAIR_FINALIZED",
+    ]
+    positions = [names.index(event) for event in expected_sequence]
+    assert positions == sorted(positions), f"lifecycle events out of order: {names}"
+    # Every pair-lifecycle event identifies the pair by BOTH the pair ID
+    # and its two logical task IDs -- never conflated with an ordinary
+    # single-task event.
+    for name, detail in adapter.events:
+        if name in expected_sequence:
+            assert detail.get("pair_id") == pair.pair_id
+            assert detail.get("remove_task_id") == "task_remove"
+            assert detail.get("replace_task_id") == "task_replace"
 
 
 # ---------------------------------------------------------------------
@@ -631,6 +824,71 @@ def test_restart_after_minus_verification_writes_only_unfinished_plus(tmp_path, 
     assert adapter.select_candidate_calls == 0
     assert adapter.bind_calls == 0
     assert adapter.write_pair_calls == 0  # never the dual-write -- only the single resumed plus write
+    assert remove_task.state == TASK_COMPLETED
+    assert replace_task.state == TASK_COMPLETED
+    assert pair.pair_state == PAIR_SATISFIED
+
+
+def test_restart_from_minus_write_uncertain_resumes_plus_without_reactivation(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.26: the exact interrupted shape the live run left behind
+    -- minus physically written but only LOW-confidence confirmation
+    was ever obtained (pair_state=PAIR_MINUS_WRITE_UNCERTAIN, not the
+    old PAIR_MINUS_VERIFIED), plus not yet written at all. Resume must
+    dispatch identically to a PAIR_MINUS_VERIFIED checkpoint -- no
+    candidate re-activation, no re-binding -- and complete the plus
+    side via the single-target resume path."""
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    pair.pair_state = PAIR_MINUS_WRITE_UNCERTAIN
+    pair.minus_binding = {"category": "RFG", "selector": "REM", "description": "RFG/REM description", "activity": "-"}
+    pair.plus_binding = {"category": "RFG", "selector": "REM", "description": "RFG/REM description", "activity": "+"}
+    pair.minus_written = True
+    pair.minus_verified_ok = False
+    save_execution_plan(plan, tmp_path)
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert adapter.select_candidate_calls == 0
+    assert adapter.bind_calls == 0
+    assert adapter.write_pair_calls == 0  # never the dual-write -- only the single resumed plus write
+    assert pair.plus_written is True
+    assert pair.plus_verified_ok is True
+    # pair.minus_verified_ok is a record of the ORIGINAL write attempt's
+    # confidence and is never fabricated as True on resume; the fresh,
+    # independent re-affirmation obtained during THIS resume is what
+    # actually decides remove_task's own final verdict (see
+    # _finalize_pair_task()) -- these two can legitimately differ.
+    assert pair.minus_verified_ok is False
+    assert remove_task.state == TASK_COMPLETED
+    assert replace_task.state == TASK_COMPLETED
+
+
+def test_restart_after_physical_plus_write_predating_checkpoint_does_not_rewrite(tmp_path, phrase_rules, ranking_config):
+    """The precise live-caught gap: an OLDER, pre-fix checkpoint that
+    predates the on_physical_write wiring can have pair_state=PAIR_
+    MINUS_VERIFIED / plus_written=False in persistence while the
+    physical plus cell already holds the correct quantity (written,
+    just never checkpointed before the process was killed). Resume
+    must still route through the single-target plus path -- no second
+    candidate activation, no second bind -- and the checkpoint must
+    catch up to reality (plus_written becomes True) without any
+    fabricated second search/activation."""
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    pair.pair_state = PAIR_MINUS_VERIFIED
+    pair.minus_binding = {"category": "RFG", "selector": "REM", "description": "RFG/REM description", "activity": "-"}
+    pair.plus_binding = {"category": "RFG", "selector": "REM", "description": "RFG/REM description", "activity": "+"}
+    pair.minus_written = True
+    pair.minus_verified_ok = True
+    pair.plus_written = False  # the stale, pre-checkpoint-fix gap
+    save_execution_plan(plan, tmp_path)
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert adapter.select_candidate_calls == 0
+    assert adapter.bind_calls == 0
+    assert pair.plus_written is True
+    assert pair.plus_verified_ok is True
     assert remove_task.state == TASK_COMPLETED
     assert replace_task.state == TASK_COMPLETED
     assert pair.pair_state == PAIR_SATISFIED
@@ -906,7 +1164,7 @@ def test_restricted_execution_checkpoints_and_resumes(tmp_path, phrase_rules, ra
     plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
     path = restricted_plan_path(tmp_path, "resume-validation")
     adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
-    adapter.plus_write_outcome = "fail"  # stop mid-way, leaving a real checkpoint
+    adapter.plus_write_outcome = "fail_before_write"  # stop mid-way BEFORE any plus write, leaving a real checkpoint
 
     run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False, plan_path=path)
     assert pair.minus_written is True

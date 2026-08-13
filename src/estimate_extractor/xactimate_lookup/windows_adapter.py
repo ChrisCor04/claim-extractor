@@ -1498,9 +1498,61 @@ class WindowsXactimateAdapter(XactimateAdapter):
     # this is the only viable strategy for read_populated_fields()).
     # ------------------------------------------------------------------
 
+    #: Phase 5.26: live-caught -- a real quantity-confirmation OCR read
+    #: hung for 13+ minutes (manual process kill required) with no
+    #: tesseract.exe process visible by the time it was investigated,
+    #: and none of the surrounding control flow (enter_quantity()'s own
+    #: post-write confirmation is a single straight-line sequence, no
+    #: loop) can explain a multi-minute stall on its own. Root cause:
+    #: pytesseract.image_to_string()/image_to_data() default to
+    #: timeout=0, which pytesseract's own timeout_manager() treats as
+    #: "no timeout at all" -- an unbounded subprocess.communicate()
+    #: that blocks forever if the tesseract subprocess itself ever
+    #: hangs or deadlocks. Every raw pytesseract call in this file goes
+    #: through _ocr_text()/_ocr_data() below so this bound applies
+    #: uniformly, not just to the R&R quantity path that happened to
+    #: expose it. 10s is generous for a legitimate slow read under real
+    #: system load while remaining far short of "minutes".
+    _OCR_CALL_TIMEOUT_S = 10
+
     def _ocr_text(self, image, psm: int = 7) -> str:
         pytesseract = self._pytesseract()
-        return pytesseract.image_to_string(image, config=f"--psm {psm}").strip()
+        try:
+            return pytesseract.image_to_string(
+                image, config=f"--psm {psm}", timeout=self._OCR_CALL_TIMEOUT_S,
+            ).strip()
+        except RuntimeError as exc:
+            if "timeout" not in str(exc).lower():
+                raise
+            # Treated exactly like any other unreadable/empty OCR result
+            # -- every existing caller already handles "" as "nothing
+            # useful was read here", never as a structural signal.
+            return ""
+
+    #: Fallback shape callers already only ever index by these specific
+    #: keys (see every _ocr_data() call site) -- matches pytesseract's
+    #: own Output.DICT column set for the columns actually consumed.
+    _EMPTY_OCR_DATA = {"text": [], "left": [], "top": [], "width": [], "height": []}
+
+    def _ocr_data(self, image, config: str = "--psm 11") -> dict:
+        """Shared, bounded counterpart to _ocr_text() for every word-
+        level pytesseract.image_to_data() call in this file (label/tab/
+        anchor location) -- same timeout guard, same "a timeout is just
+        another unreadable/empty result" contract: every caller already
+        iterates `data["text"]` and treats no matches as "not found",
+        so an empty result set here is never a fabricated finding, just
+        an honest "found nothing this attempt."""
+        pytesseract = self._pytesseract()
+        from pytesseract import Output
+
+        try:
+            return pytesseract.image_to_data(
+                image, output_type=Output.DICT, config=config, timeout=self._OCR_CALL_TIMEOUT_S,
+            )
+        except RuntimeError as exc:
+            if "timeout" not in str(exc).lower():
+                raise
+            return dict(self._EMPTY_OCR_DATA)
 
     @staticmethod
     def _normalize_inch_mark(text: str) -> str:
@@ -1535,10 +1587,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         a wrong match -- no match at all) when its value box is empty,
         which is why `_anchor_offset()` no longer anchors on it at all
         -- see that method's docstring."""
-        pytesseract = self._pytesseract()
-        from pytesseract import Output
-
-        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        data = self._ocr_data(image)
         # Live-caught (Phase 5.3): PSM 11 reads the main grid's narrow
         # "Cat" column header with a bleeding column-divider artifact --
         # observed live as "Cat|" on one capture and "Cat," on the very
@@ -1579,10 +1628,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         relationships. Both horizontal borders are detected from current
         pixels; calibrated search-box coordinates are never consulted.
         """
-        pytesseract = self._pytesseract()
-        from pytesseract import Output
-
-        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        data = self._ocr_data(image)
         words = []
         word_boxes: dict[str, list[tuple[int, int, int, int]]] = {}
         for i, text in enumerate(data["text"]):
@@ -1717,10 +1763,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         _locate_items_tab()'s first-match behavior: a second bounded
         recovery click is only ever safe to make from a uniquely
         identified target."""
-        pytesseract = self._pytesseract()
-        from pytesseract import Output
-
-        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        data = self._ocr_data(image)
         search_boxes = []
         macros_boxes = []
         for i, text in enumerate(data["text"]):
@@ -1755,10 +1798,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         match and accept one only when Components, Supporting, or Summary
         is horizontally aligned to its right on the same tab strip.
         """
-        pytesseract = self._pytesseract()
-        from pytesseract import Output
-
-        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        data = self._ocr_data(image)
         items_boxes = []
         neighbor_boxes = []
         for i, text in enumerate(data["text"]):
@@ -1785,10 +1825,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def _locate_components_tab(self, image) -> tuple[int, int, int, int] | None:
         """Locate Components only within the verified Estimate Items tab strip."""
-        pytesseract = self._pytesseract()
-        from pytesseract import Output
-
-        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 11")
+        data = self._ocr_data(image)
         components_boxes = []
         neighbor_boxes = []
         for i, text in enumerate(data["text"]):
@@ -3251,6 +3288,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def write_and_verify_existing_rr_pair_half_quantity(
         self, *, category: str, selector: str, description: str, activity: str, quantity: float,
+        on_physical_write: Callable[[], None] | None = None,
     ) -> QuantityEntryConfirmation:
         """Phase 5.23 (R&R Stage 4 integration): the WRITE counterpart
         to verify_existing_rr_pair_half_quantity() -- re-identifies an
@@ -3265,6 +3303,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         must never be touched again; write_and_verify_rr_pair_
         quantities() itself always writes BOTH, so it cannot be reused
         for this one-sided resume shape.
+
+        `on_physical_write` (Phase 5.26): forwarded verbatim to enter_
+        quantity() -- see its own docstring. Lets a resuming caller
+        checkpoint "this side's physical write is a settled fact"
+        before the same slow/OCR-bound confirmation read that
+        motivated this parameter there.
 
         Raises RRPairQuantityError(side=activity's own "minus"/"plus"
         label) -- reusing the SAME failure type write_and_verify_rr_
@@ -3285,7 +3329,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         target, _observed = located
         self._pending_quantity_target = target
         try:
-            self.enter_quantity(quantity)
+            self.enter_quantity(quantity, on_physical_write=on_physical_write)
         except QuantityConfirmationError as exc:
             raise RRPairQuantityError(
                 f"R&R pair {activity!r}-side resumed quantity entry failed: {exc}", side=side,
@@ -3297,7 +3341,26 @@ class WindowsXactimateAdapter(XactimateAdapter):
             )
         return confirmation
 
-    def enter_quantity(self, quantity: float) -> None:
+    def enter_quantity(
+        self, quantity: float, *, on_physical_write: Callable[[], None] | None = None,
+    ) -> None:
+        """`on_physical_write` (Phase 5.26): an optional callback invoked
+        the moment this call has POSITIVE evidence the physical cell
+        holds `quantity` -- either because the click+type+Tab sequence
+        below just completed, or because the cell already held the
+        exact value and no write was needed -- and BEFORE the
+        (potentially slow, OCR-based) same-cell confirmation read that
+        follows. Live-caught: a real confirmation read hung for many
+        minutes with no bound at the time (see _ocr_text()'s own fix);
+        a caller that only checkpoints AFTER this whole call returns
+        has no way to durably record "the value was physically entered"
+        if that confirmation phase is what stalls or fails. Never
+        called if the target row can't even be located/edited (a
+        genuine "nothing happened yet" case) -- only once a write (or
+        an already-correct value) is a settled fact. Never raises on
+        the caller's behalf; any exception from the callback itself
+        propagates uncaught, exactly like record_physical_item_
+        created()'s own callback contract elsewhere in this file."""
         # Per-task state: never let an advisory from an earlier item leak
         # into the current item's post-commit outcome.
         self.last_quantity_confirmation = None
@@ -3332,6 +3395,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 expected=quantity, observed=before_quantity, confidence="CONFIRMED",
                 review_required=False, reason="Exact expected quantity was already populated; no write performed.",
             )
+            if on_physical_write is not None:
+                on_physical_write()
             if scrolled:
                 self._reset_scroll_state()
             return
@@ -3379,6 +3444,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
         time.sleep(0.2)
         self._press_key(0x09)  # Tab commits the cell edit; never Enter.
         time.sleep(1.0)
+
+        # Phase 5.26: the click+type+Tab sequence above has POSITIVELY
+        # happened -- checkpoint that fact now, before the confirmation
+        # read below (which can be slow/OCR-bound) even begins. See
+        # this method's own `on_physical_write` docstring.
+        if on_physical_write is not None:
+            on_physical_write()
 
         # Confirm from the SAME row/cell context. CAT/SEL/description/
         # activity OCR is deliberately not repeated here: it already
@@ -3445,7 +3517,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def write_and_verify_rr_pair_quantities(
         self, pair_target: "PendingRRPairTarget", minus_quantity: float, plus_quantity: float,
-        *, on_minus_verified: Callable[["QuantityEntryConfirmation"], None] | None = None,
+        *,
+        on_minus_write: Callable[[], None] | None = None,
+        on_minus_verified: Callable[["QuantityEntryConfirmation"], None] | None = None,
+        on_plus_write: Callable[[], None] | None = None,
     ) -> "RRPairQuantityResult":
         """Phase 6.3 (R&R Stage 3): write and independently verify BOTH
         halves of one bound R&R pair -- the remove ("-") quantity and
@@ -3501,10 +3576,20 @@ class WindowsXactimateAdapter(XactimateAdapter):
         A callback exception propagates uncaught -- exactly like
         record_physical_item_created()'s own callback contract, this
         is never swallowed, since a checkpoint that silently failed to
-        persist would be worse than a loud failure."""
+        persist would be worse than a loud failure.
+
+        `on_minus_write`/`on_plus_write` (Phase 5.26): forwarded
+        verbatim as `on_physical_write` to the respective enter_
+        quantity() call -- see that method's own docstring for exactly
+        when each fires (before that side's own confirmation read,
+        never after). Live-caught: the plus-side physical write can
+        complete and remain durably unrecorded if ONLY on_minus_
+        verified/the eventual return value are used to checkpoint,
+        since those both wait for confirmation to finish -- these two
+        callbacks close that gap for BOTH sides symmetrically."""
         self._pending_quantity_target = pair_target.minus_target
         try:
-            self.enter_quantity(minus_quantity)
+            self.enter_quantity(minus_quantity, on_physical_write=on_minus_write)
         except QuantityConfirmationError as exc:
             raise RRPairQuantityError(
                 f"R&R pair minus-side quantity entry failed: {exc}", side="minus",
@@ -3519,7 +3604,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         self._pending_quantity_target = pair_target.plus_target
         try:
-            self.enter_quantity(plus_quantity)
+            self.enter_quantity(plus_quantity, on_physical_write=on_plus_write)
         except QuantityConfirmationError as exc:
             raise RRPairQuantityError(
                 f"R&R pair plus-side quantity entry failed: {exc}", side="plus",

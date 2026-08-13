@@ -89,12 +89,36 @@ PAIR_BOTH_BOUND = "both_bound"
 PAIR_MINUS_VERIFIED = "minus_verified"
 PAIR_PLUS_VERIFIED = "plus_verified"
 PAIR_BOTH_VERIFIED = "both_verified"
+#: Phase 5.26: live-caught -- the ORIGINAL Stage 4 transition logic set
+#: pair_state=PAIR_MINUS_VERIFIED unconditionally once a minus write
+#: attempt returned, even when the same-cell OCR read-back came back
+#: LOW_CONFIDENCE (minus_verified_ok=False) -- a state literally named
+#: "verified" with no affirmative verification evidence backing it.
+#: These two states are the smallest additive, backward-compatible fix:
+#: reached instead of PAIR_MINUS_VERIFIED/PAIR_PLUS_VERIFIED whenever
+#: the corresponding side's own write attempt completed (minus_written/
+#: plus_written=True) but its confirmation was NOT positively CONFIRMED
+#: (minus_verified_ok/plus_verified_ok stay False). Never used to mean
+#: "nothing happened" -- see task_has_committed_row()'s own physical_
+#: state_uncertain precedent: a write DID occur, only the confirmation
+#: is uncertain. _resume_rr_pair() treats these identically to their
+#: "*_VERIFIED" siblings for ROUTING purposes (both mean "this side's
+#: write step is done, move on") -- the confidence distinction only
+#: ever affects the eventual per-task TASK_COMPLETED/TASK_REVIEW_
+#: REQUIRED decision (see execution_runner._finalize_pair_task()),
+#: never whether a resume can proceed. Old persisted plans that only
+#: ever produced PAIR_MINUS_VERIFIED/PAIR_PLUS_VERIFIED (the pre-fix
+#: behavior) remain fully valid and resumable -- this is purely
+#: additive, nothing existing was renamed or removed.
+PAIR_MINUS_WRITE_UNCERTAIN = "minus_write_uncertain"
+PAIR_PLUS_WRITE_UNCERTAIN = "plus_write_uncertain"
 PAIR_SATISFIED = "satisfied"
 PAIR_REVIEW_REQUIRED = "review_required"
 PAIR_PHYSICAL_STATE_UNCERTAIN = "physical_state_uncertain"
 VALID_PAIR_STATES = frozenset({
     PAIR_UNACTIVATED, PAIR_ACTIVATED_PENDING_BINDING, PAIR_BOTH_BOUND,
     PAIR_MINUS_VERIFIED, PAIR_PLUS_VERIFIED, PAIR_BOTH_VERIFIED,
+    PAIR_MINUS_WRITE_UNCERTAIN, PAIR_PLUS_WRITE_UNCERTAIN,
     PAIR_SATISFIED, PAIR_REVIEW_REQUIRED, PAIR_PHYSICAL_STATE_UNCERTAIN,
 })
 

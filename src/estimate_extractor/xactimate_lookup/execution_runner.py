@@ -68,8 +68,10 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     PAIR_BOTH_BOUND,
     PAIR_BOTH_VERIFIED,
     PAIR_MINUS_VERIFIED,
+    PAIR_MINUS_WRITE_UNCERTAIN,
     PAIR_PHYSICAL_STATE_UNCERTAIN,
     PAIR_PLUS_VERIFIED,
+    PAIR_PLUS_WRITE_UNCERTAIN,
     PAIR_REVIEW_REQUIRED,
     PAIR_SATISFIED,
     RUN_STATE_COMPLETED,
@@ -300,6 +302,35 @@ def _record_terminal(adapter, task: ExecutionTask) -> None:
             adapter.record_lifecycle_event("TERMINAL", task_state=task.state, stop_reason=task.stop_reason)
         except Exception:
             pass
+
+
+def _record_pair_lifecycle(adapter, pair: CoordinatedPair, event: str, **detail) -> None:
+    """Phase 5.26: the coordinated-pair counterpart to _record_terminal()
+    above -- best-effort, never raises, and always identifies the pair
+    by BOTH its own pair_id and its two logical task IDs (never just
+    one task, and never conflated with an ordinary single-task
+    lifecycle event). Closes the observability gap the first live
+    Stage 4 validation exposed: _run_coordinated_pair() activates,
+    binds, writes, and commits entirely through direct adapter calls
+    (select_candidate()/bind_rr_pair_after_activation()/write_and_
+    verify_rr_pair_quantities()/commit_item()), never through
+    orchestrator.execute_plan()'s own CANDIDATE_SELECTED/QUANTITY_
+    ENTERED/COMMIT_STARTED/COMMIT_RETURNED events -- so a coordinated
+    pair's ledger went silent after DECISION_MADE with no record of
+    activation, binding, either write, either verification, or commit
+    ever happening, making a live stall impossible to localize without
+    looking at the screen. See each call site below for exactly which
+    step it marks."""
+    if not hasattr(adapter, "record_lifecycle_event"):
+        return
+    try:
+        adapter.record_lifecycle_event(
+            event, pair_id=pair.pair_id,
+            remove_task_id=pair.remove_task_id, replace_task_id=pair.replace_task_id,
+            **detail,
+        )
+    except Exception:
+        pass
 
 
 def _apply_outcome_to_task(task: ExecutionTask, outcome, dry_run: bool) -> None:
@@ -881,6 +912,20 @@ def _finalize_pair_task(
         )
 
 
+def _pair_state_for_confirmation(confirmation, *, verified_name: str, uncertain_name: str) -> tuple[str, bool]:
+    """Phase 5.26: the ONE place that turns a QuantityEntryConfirmation
+    into a truthful pair_state -- never `verified_name` (a state
+    literally named "*_verified") unless `confirmation.confidence ==
+    "CONFIRMED"`; otherwise `uncertain_name`, preserving that a write
+    genuinely happened without claiming it was positively confirmed.
+    Returns (state, verified_ok) so a caller sets both `pair.pair_
+    state` and its sibling `pair.minus_verified_ok`/`plus_verified_ok`
+    from the SAME single source of truth, never two separately-
+    computed values that could drift apart from each other again."""
+    verified_ok = getattr(confirmation, "confidence", None) == "CONFIRMED"
+    return (verified_name if verified_ok else uncertain_name), verified_ok
+
+
 def _write_verify_and_finalize_rr_pair(
     pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
     pair_target, before_snapshot, populated_unit: str | None,
@@ -892,17 +937,51 @@ def _write_verify_and_finalize_rr_pair(
     Returns True on a genuine hard stop (structural VERIFICATION_
     FAILED -- the commit could not be detected in the grid at all,
     mirroring an ordinary task's own identical treatment), False
-    otherwise (satisfied or task-locally reviewed)."""
+    otherwise (satisfied or task-locally reviewed).
+
+    Phase 5.26 (live-caught, twice): (1) the ORIGINAL on_minus_verified
+    checkpoint set pair_state=PAIR_MINUS_VERIFIED unconditionally, even
+    when confidence was LOW -- a state named "verified" with no
+    affirmative verification evidence; fixed via _pair_state_for_
+    confirmation() above, applied to BOTH halves now. (2) a real live
+    run physically wrote the plus quantity (visible on screen, correct
+    value) while persistence still showed plus_written=False, because
+    NOTHING checkpointed the physical write itself -- only the fully-
+    confirmed result, and confirmation is a slow, OCR-bound read that
+    can stall. `on_minus_write`/`on_plus_write` below checkpoint the
+    instant enter_quantity() has positive evidence of a physical write,
+    strictly BEFORE that side's own confirmation read begins."""
+    def _checkpoint_minus_written() -> None:
+        if pair.minus_written:
+            return
+        pair.minus_written = True
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
+        _record_pair_lifecycle(adapter, pair, "PAIR_MINUS_WRITTEN")
+
     def _checkpoint_minus_verified(confirmation) -> None:
         pair.minus_written = True
-        pair.minus_verified_ok = getattr(confirmation, "confidence", None) == "CONFIRMED"
-        pair.pair_state = PAIR_MINUS_VERIFIED
+        pair.pair_state, pair.minus_verified_ok = _pair_state_for_confirmation(
+            confirmation, verified_name=PAIR_MINUS_VERIFIED, uncertain_name=PAIR_MINUS_WRITE_UNCERTAIN,
+        )
         save_execution_plan(plan, project_dir, plan_path=plan_path)
+        _record_pair_lifecycle(
+            adapter, pair, "PAIR_MINUS_VERIFICATION",
+            confidence=getattr(confirmation, "confidence", None), verified_ok=pair.minus_verified_ok,
+        )
+
+    def _checkpoint_plus_written() -> None:
+        if pair.plus_written:
+            return
+        pair.plus_written = True
+        save_execution_plan(plan, project_dir, plan_path=plan_path)
+        _record_pair_lifecycle(adapter, pair, "PAIR_PLUS_WRITTEN")
 
     try:
         result = adapter.write_and_verify_rr_pair_quantities(
             pair_target, pair.expected_minus_quantity, pair.expected_plus_quantity,
+            on_minus_write=_checkpoint_minus_written,
             on_minus_verified=_checkpoint_minus_verified,
+            on_plus_write=_checkpoint_plus_written,
         )
     except QuantityConfirmationError as exc:
         side = getattr(exc, "side", None)
@@ -913,14 +992,17 @@ def _write_verify_and_finalize_rr_pair(
             )
         else:
             # Plus failed after minus succeeded -- the evidence that
-            # minus was already verified was ALREADY persisted by
-            # _checkpoint_minus_verified() above (pair.pair_state ==
-            # PAIR_MINUS_VERIFIED, pair.minus_written/verified_ok set)
-            # before the plus write was even attempted; never lost,
-            # never re-derived from this exception. Neither task is
-            # marked COMPLETED here: commit_item() -- the one shared
-            # save for BOTH physical rows -- is never reached when the
-            # plus write fails, so nothing is actually saved yet.
+            # minus was already written (and, if confirmed, verified)
+            # was ALREADY persisted by _checkpoint_minus_written()/
+            # _checkpoint_minus_verified() above before the plus write
+            # was even attempted; never lost, never re-derived from
+            # this exception. pair.plus_written may ALSO already be
+            # True here (set by _checkpoint_plus_written() before a
+            # LATER confirmation-stage failure) -- never cleared. Never
+            # marked COMPLETED here regardless: commit_item() -- the
+            # one shared save for BOTH physical rows -- is never
+            # reached when the plus side doesn't finish cleanly, so
+            # nothing is actually saved yet.
             detail = str(exc)
             if minus_confirmation is not None:
                 detail += f" (minus side already verified: observed={getattr(minus_confirmation, 'observed', None)!r})."
@@ -933,10 +1015,18 @@ def _write_verify_and_finalize_rr_pair(
 
     pair.minus_written = True
     pair.plus_written = True
+    pair.pair_state, pair.plus_verified_ok = _pair_state_for_confirmation(
+        result.plus_confirmation, verified_name=PAIR_PLUS_VERIFIED, uncertain_name=PAIR_PLUS_WRITE_UNCERTAIN,
+    )
+    # minus_verified_ok was already set truthfully by _checkpoint_minus_
+    # verified() above; re-derive it here too so this line is correct
+    # even if a future caller ever skips that callback.
     pair.minus_verified_ok = result.minus_confirmation.confidence == "CONFIRMED"
-    pair.plus_verified_ok = result.plus_confirmation.confidence == "CONFIRMED"
-    pair.pair_state = PAIR_PLUS_VERIFIED
     save_execution_plan(plan, project_dir, plan_path=plan_path)
+    _record_pair_lifecycle(
+        adapter, pair, "PAIR_PLUS_VERIFICATION",
+        confidence=result.plus_confirmation.confidence, verified_ok=pair.plus_verified_ok,
+    )
 
     return _commit_and_finalize_rr_pair(
         pair, remove_task, replace_task, result.minus_confirmation, result.plus_confirmation,
@@ -978,7 +1068,17 @@ def _commit_and_finalize_rr_pair(
     OWN confirmation confidence (see _finalize_pair_task()) is still
     independently what decides TASK_COMPLETED vs TASK_REVIEW_REQUIRED,
     so this never fabricates success beyond what was actually
-    reaffirmed."""
+    reaffirmed.
+
+    Phase 5.26: PAIR_BOTH_VERIFIED (unchanged, not renamed) means "both
+    halves reached this shared commit/finalize step" -- a PIPELINE
+    POSITION, same as it always was -- never "both were positively
+    confirmed" on its own; consult pair.minus_verified_ok/plus_
+    verified_ok and each task's own final state for that truth. Only
+    the MINUS/PLUS-specific checkpoints that used to conflate "wrote"
+    with "confirmed" (PAIR_MINUS_VERIFIED/PAIR_PLUS_VERIFIED, see
+    _write_verify_and_finalize_rr_pair()) needed a truthful sibling
+    state -- this shared final step was never the source of that bug."""
     plus_binding = pair.plus_binding or {}
     category = plus_binding.get("category")
     selector = plus_binding.get("selector")
@@ -993,6 +1093,7 @@ def _commit_and_finalize_rr_pair(
         except Exception:
             pass
 
+    _record_pair_lifecycle(adapter, pair, "PAIR_COMMIT_STARTED")
     try:
         adapter.commit_item()
     except AdapterError as exc:
@@ -1000,6 +1101,7 @@ def _commit_and_finalize_rr_pair(
         _mark_pair_task_local_review(pair, remove_task, replace_task, STOP_REASON_ADAPTER_ERROR, str(exc))
         save_execution_plan(plan, project_dir, plan_path=plan_path)
         return False
+    _record_pair_lifecycle(adapter, pair, "PAIR_COMMIT_RETURNED")
 
     evidence_reference = adapter.capture_evidence() if hasattr(adapter, "capture_evidence") else None
 
@@ -1043,6 +1145,10 @@ def _commit_and_finalize_rr_pair(
         else PAIR_BOTH_VERIFIED
     )
     save_execution_plan(plan, project_dir, plan_path=plan_path)
+    _record_pair_lifecycle(
+        adapter, pair, "PAIR_FINALIZED", pair_state=pair.pair_state,
+        remove_task_state=remove_task.state, replace_task_state=replace_task.state,
+    )
     return False
 
 
@@ -1056,19 +1162,30 @@ def _resume_rr_pair(
     on pair.pair_state, the single source of truth for "how far did
     the prior attempt get":
 
-    * PAIR_BOTH_BOUND: neither quantity verified yet -- re-identify
+    * PAIR_BOTH_BOUND: neither quantity written yet -- re-identify
       BOTH halves (locate_existing_rr_pair()) and write both, reusing
       the exact same _write_verify_and_finalize_rr_pair() tail a fresh
-      activation uses.
-    * PAIR_MINUS_VERIFIED: re-affirm minus read-only (never rewritten
-      -- see write_and_verify_existing_rr_pair_half_quantity()'s own
-      docstring for why the OTHER, already-verified side must never be
-      touched again), then write ONLY the plus side.
-    * PAIR_PLUS_VERIFIED / PAIR_BOTH_VERIFIED: both sides already have
-      a real write/verify from a prior attempt but the shared commit/
-      task-persistence step never completed -- re-affirm both read-
-      only (no write at all) and go straight to the shared commit/
-      finalize tail.
+      activation uses. Also handles the case where the persisted
+      checkpoint predates a physical write that happened anyway
+      (Phase 5.26 live-caught): enter_quantity()'s own existing-value
+      guard means "write" a value the cell already holds is a read-
+      only re-confirmation, never a second keystroke -- see this
+      function's own on_physical_write wiring below.
+    * PAIR_MINUS_VERIFIED / PAIR_MINUS_WRITE_UNCERTAIN (Phase 5.26:
+      both mean the SAME thing for resume ROUTING -- minus was
+      written, confidence only affects the eventual per-task verdict,
+      never which branch resume takes): re-affirm minus read-only
+      (never rewritten -- see write_and_verify_existing_rr_pair_half_
+      quantity()'s own docstring for why the OTHER, already-written
+      side must never be touched again), then write ONLY the plus
+      side -- which safely discovers and reconciles an already-correct
+      physical plus quantity without rewriting it, via the same
+      existing-value guard.
+    * PAIR_PLUS_VERIFIED / PAIR_PLUS_WRITE_UNCERTAIN / PAIR_BOTH_
+      VERIFIED: both sides already have a real write/verify from a
+      prior attempt but the shared commit/task-persistence step never
+      completed -- re-affirm both read-only (no write at all) and go
+      straight to the shared commit/finalize tail.
 
     Any other persisted pair_state reaching this function (PAIR_
     ACTIVATED_PENDING_BINDING -- never itself persisted by this Stage,
@@ -1077,6 +1194,7 @@ def _resume_rr_pair(
     both member tasks terminal and therefore unreachable via the
     runner's own PENDING-task loop) is treated as unrecoverable
     physical-state uncertainty -- fails closed rather than guessing."""
+    _record_pair_lifecycle(adapter, pair, "PAIR_RESUME_STARTED", pair_state=pair.pair_state)
     plus_binding = pair.plus_binding or {}
     minus_binding = pair.minus_binding or {}
     category = plus_binding.get("category") or minus_binding.get("category")
@@ -1105,7 +1223,7 @@ def _resume_rr_pair(
             pair, remove_task, replace_task, pair_target, None, None, adapter, plan, project_dir, plan_path,
         )
 
-    if pair.pair_state == PAIR_MINUS_VERIFIED:
+    if pair.pair_state in (PAIR_MINUS_VERIFIED, PAIR_MINUS_WRITE_UNCERTAIN):
         affirm = adapter.verify_existing_rr_pair_half_quantity(
             category=category, selector=selector, description=description, activity="-",
             expected_quantity=pair.expected_minus_quantity,
@@ -1113,33 +1231,46 @@ def _resume_rr_pair(
         if affirm is None:
             _mark_pair_physical_state_uncertain(
                 pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
-                f"Coordinated pair {pair.pair_id!r}'s previously-verified minus half could not be "
+                f"Coordinated pair {pair.pair_id!r}'s previously-written minus half could not be "
                 f"re-identified on resume; refusing to guess at physical state.",
             )
             save_execution_plan(plan, project_dir, plan_path=plan_path)
             return True
+
+        def _checkpoint_resumed_plus_written() -> None:
+            if pair.plus_written:
+                return
+            pair.plus_written = True
+            save_execution_plan(plan, project_dir, plan_path=plan_path)
+            _record_pair_lifecycle(adapter, pair, "PAIR_PLUS_WRITTEN", resumed=True)
+
         try:
             plus_confirmation = adapter.write_and_verify_existing_rr_pair_half_quantity(
                 category=category, selector=selector, description=description, activity="+",
-                quantity=pair.expected_plus_quantity,
+                quantity=pair.expected_plus_quantity, on_physical_write=_checkpoint_resumed_plus_written,
             )
         except QuantityConfirmationError as exc:
             _mark_pair_task_local_review(
                 pair, remove_task, replace_task, STOP_REASON_QUANTITY_CONFIRMATION_FAILED, str(exc),
-                review_reason="Plus-side quantity entry failed while resuming a pair whose minus side was already verified.",
+                review_reason="Plus-side quantity entry failed while resuming a pair whose minus side was already written.",
             )
             save_execution_plan(plan, project_dir, plan_path=plan_path)
             return False
         pair.plus_written = True
-        pair.plus_verified_ok = plus_confirmation.confidence == "CONFIRMED"
-        pair.pair_state = PAIR_PLUS_VERIFIED
+        pair.pair_state, pair.plus_verified_ok = _pair_state_for_confirmation(
+            plus_confirmation, verified_name=PAIR_PLUS_VERIFIED, uncertain_name=PAIR_PLUS_WRITE_UNCERTAIN,
+        )
         save_execution_plan(plan, project_dir, plan_path=plan_path)
+        _record_pair_lifecycle(
+            adapter, pair, "PAIR_PLUS_VERIFICATION",
+            confidence=plus_confirmation.confidence, verified_ok=pair.plus_verified_ok, resumed=True,
+        )
         return _commit_and_finalize_rr_pair(
             pair, remove_task, replace_task, affirm, plus_confirmation, None, None, adapter, plan, project_dir,
             plan_path,
         )
 
-    if pair.pair_state in (PAIR_PLUS_VERIFIED, PAIR_BOTH_VERIFIED):
+    if pair.pair_state in (PAIR_PLUS_VERIFIED, PAIR_PLUS_WRITE_UNCERTAIN, PAIR_BOTH_VERIFIED):
         minus_affirm = adapter.verify_existing_rr_pair_half_quantity(
             category=category, selector=selector, description=description, activity="-",
             expected_quantity=pair.expected_minus_quantity,
@@ -1320,6 +1451,10 @@ def _run_coordinated_pair(
         # capture) -- this is the single physical activation Stage 4's
         # whole design guarantees.
         adapter.select_candidate(top.dropdown)
+        _record_pair_lifecycle(
+            adapter, pair, "PAIR_CANDIDATE_ACTIVATED",
+            category=top.dropdown.category, selector=top.dropdown.selector,
+        )
         pair_target = adapter.bind_rr_pair_after_activation(before_snapshot or [])
     except UnexpectedDialogError as exc:
         _mark_pair_physical_state_uncertain(
@@ -1351,6 +1486,9 @@ def _run_coordinated_pair(
     pair.plus_binding = _binding_dict(pair_target.plus_target.identity, "+")
     pair.pair_state = PAIR_BOTH_BOUND
     save_execution_plan(plan, project_dir, plan_path=plan_path)
+    _record_pair_lifecycle(
+        adapter, pair, "PAIR_BOUND", minus_binding=pair.minus_binding, plus_binding=pair.plus_binding,
+    )
 
     populated_unit = None  # No populated_fields OCR read is taken for the pair path (mirrors ordinary tasks' own deliberate omission before quantity entry).
     return _write_verify_and_finalize_rr_pair(
