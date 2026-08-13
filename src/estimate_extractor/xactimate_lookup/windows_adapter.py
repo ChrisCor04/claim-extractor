@@ -5547,7 +5547,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return [remove_indices[ordinal_index], plus_index]
 
     def snapshot_grid_identities_for_activation(self) -> list[tuple[str | None, str | None]]:
-        """Capture the activation baseline without changing viewport.
+        """Capture both pre-activation baselines from one physical frame.
 
         A 16-row Roof grid was reproducibly counted as 15 because the
         bottom row's narrow item-number crop sat at the viewport edge,
@@ -5557,12 +5557,43 @@ class WindowsXactimateAdapter(XactimateAdapter):
         the known one-row undercount plus one newly-created row.  This
         performs no scrolling and therefore cannot strand the
         following search on a displaced Price List screen.
+
+        The former implementation called ``_snapshot_activation_rows()``
+        and then ``_snapshot_commit_rows()`` back-to-back. Nothing mutated
+        the UI between those calls, yet both captured and OCR-read the same
+        pre-click grid. A rich commit row already contains every activation
+        field, so one rich same-image walk now supplies both baselines. The
+        activation-only edge probes remain exactly where they were; if one
+        finds a row outside the rich snapshot's established extent, the
+        identity lists deliberately differ and the rich commit baseline is
+        still discarded exactly as before.
         """
         self._pending_quantity_target = None
-        rows = self._snapshot_activation_rows()
-        self._last_activation_baseline_rows = list(rows)
-        identities = [(row.category, row.selector) for row in rows]
-        commit_rows = self._snapshot_commit_rows()
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd)
+        if offset is None:
+            activation_rows: list[ActivationRowSnapshot] = []
+            commit_rows: list[CommitRowSnapshot] = []
+        else:
+            commit_rows = self._commit_rows_from_same_image(image, offset)
+            activation_rows = [
+                ActivationRowSnapshot(
+                    row.category, row.selector, row.description, row.activity,
+                )
+                for row in commit_rows
+            ]
+            row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+            for _probe in range(2):
+                next_row_top = row_1_top + len(activation_rows) * _GRID_ROW_HEIGHT
+                if next_row_top < 0 or next_row_top + _GRID_ROW_HEIGHT > image.height:
+                    break
+                trailing = self._read_activation_row_at(image, offset, next_row_top)
+                if not all(str(value or "").strip() for value in (trailing.category, trailing.selector)):
+                    break
+                activation_rows.append(trailing)
+
+        self._last_activation_baseline_rows = list(activation_rows)
+        identities = [(row.category, row.selector) for row in activation_rows]
         self._last_commit_baseline_rows = (
             commit_rows
             if [(row.category, row.selector) for row in commit_rows] == identities

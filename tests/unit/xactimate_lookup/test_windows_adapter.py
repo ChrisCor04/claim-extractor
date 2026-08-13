@@ -3340,10 +3340,9 @@ def test_intentional_duplicate_blocked_for_a_different_group(monkeypatch):
 def test_activation_baseline_adds_one_readable_viewport_edge_row_without_scrolling(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
-    image = type("Image", (), {"height": 500})()
+    image = type("Image", (), {"height": 524})()
     monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: (image, (0, 0)))
     monkeypatch.setattr(adapter, "_shifted_anchor", lambda name, offset: (0, 100, 0, 0))
-    monkeypatch.setattr(adapter, "_last_row_geometry", lambda image, offset: (15, 100 + 14 * 25))
     reads = []
     monkeypatch.setattr(
         adapter, "_read_activation_row_at",
@@ -3351,17 +3350,18 @@ def test_activation_baseline_adds_one_readable_viewport_edge_row_without_scrolli
             "RFG", "STEEP", "Steep charge", "-"
         ),
     )
-    monkeypatch.setattr(adapter, "_snapshot_commit_rows", lambda: [
+    monkeypatch.setattr(adapter, "_commit_rows_from_same_image", lambda image, offset: [
         CommitRowSnapshot("RFG", "STEEP", "Steep charge", "-", 0.0, "SQ")
-        for _ in range(16)
+        for _ in range(15)
     ])
 
     baseline = adapter.snapshot_grid_identities_for_activation()
 
     assert len(baseline) == 16
     assert baseline[-1] == ("RFG", "STEEP")
-    assert reads == [100 + index * 25 for index in range(16)]
+    assert reads == [100 + 15 * 25]
     assert len(adapter._last_activation_baseline_rows) == 16
+    assert adapter._last_commit_baseline_rows is None
 
 
 def _activation_row(cat="RFG", sel="STEEP", desc="Steep charge", activity="-"):
@@ -6592,6 +6592,111 @@ def test_same_image_snapshots_preserve_empty_and_viewport_edge_rules(monkeypatch
     )
     assert len(adapter._snapshot_activation_rows()) == 2
     assert len(adapter._snapshot_commit_rows()) == 1
+
+
+def test_pre_activation_one_rich_capture_supplies_both_baselines(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {
+            "category": "RFG", "selector": "300S", "description": "Composition shingles",
+            "activity": "-", "quantity": 30.19, "unit": "SQ",
+        },
+        {
+            "category": "RFG", "selector": "300S", "description": "Composition shingles",
+            "activity": "+", "quantity": 33.33, "unit": "SQ",
+        },
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    captures = []
+    monkeypatch.setattr(
+        adapter, "_capture_and_locate",
+        lambda *args, **kwargs: (captures.append(1), (image, offset))[1],
+    )
+    monkeypatch.setattr(
+        adapter, "_snapshot_activation_rows",
+        lambda *args, **kwargs: pytest.fail("pre-activation must not take a second activation snapshot"),
+    )
+    monkeypatch.setattr(
+        adapter, "_snapshot_commit_rows",
+        lambda *args, **kwargs: pytest.fail("pre-activation must not take a second commit snapshot"),
+    )
+
+    identities = adapter.snapshot_grid_identities_for_activation()
+
+    assert captures == [1]
+    assert identities == [("RFG", "300S"), ("RFG", "300S")]
+    assert adapter._last_activation_baseline_rows == [
+        ActivationRowSnapshot("RFG", "300S", "Composition shingles", "-"),
+        ActivationRowSnapshot("RFG", "300S", "Composition shingles", "+"),
+    ]
+    assert adapter._last_commit_baseline_rows == [
+        CommitRowSnapshot("RFG", "300S", "Composition shingles", "-", 30.19, "SQ"),
+        CommitRowSnapshot("RFG", "300S", "Composition shingles", "+", 33.33, "SQ"),
+    ]
+
+
+def test_consolidated_pre_activation_preserves_empty_and_clipped_semantics(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+
+    empty_image, empty_offset = _wire_row_content(monkeypatch, adapter, [None, None])
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: (empty_image, empty_offset))
+    assert adapter.snapshot_grid_identities_for_activation() == []
+    assert adapter._last_activation_baseline_rows == []
+    assert adapter._last_commit_baseline_rows == []
+
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary repairs", "quantity": 6.0, "unit": "HR"},
+        {"category": "POL", "selector": "LAB", "description": "Pool labor", "quantity": 2.0, "unit": "HR"},
+        {"category": "RFG", "selector": "240", "description": "Viewport edge row", "quantity": 3.0, "unit": "SQ"},
+    ]
+    row_1_top = adapter._shifted_anchor("grid_row_1", (0, 0))[1]
+    edge_height = row_1_top + 3 * _GRID_ROW_HEIGHT + 5
+    edge_image, edge_offset = _wire_row_content(monkeypatch, adapter, rows, image_height=edge_height)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: (edge_image, edge_offset))
+
+    assert adapter.snapshot_grid_identities_for_activation() == [
+        ("TMP", "LAB"), ("POL", "LAB"), ("RFG", "240"),
+    ]
+    assert len(adapter._last_activation_baseline_rows) == 3
+    # The activation edge guard sees row 3 while the rich extent retains its
+    # established clipped-grid semantics; the mismatch remains fail-closed.
+    assert adapter._last_commit_baseline_rows is None
+
+
+def test_post_activation_delta_remains_an_independent_fresh_observation(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    before_image, before_offset = _wire_row_content(monkeypatch, adapter, [])
+    after_rows = [ActivationRowSnapshot("TMP", "LAB", "Temporary repairs", None)]
+    captures = [(before_image, before_offset)]
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: captures.pop(0))
+
+    before = adapter.snapshot_grid_identities_for_activation()
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: list(after_rows))
+
+    assert before == []
+    assert adapter.pending_item_created(before, timeout_s=0) is True
+    assert adapter._pending_quantity_target.identity == ("tmp", "lab", "temporary repairs")
+
+
+def test_consolidated_pre_activation_does_not_change_rr_pair_binding(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    empty_image, empty_offset = _wire_row_content(monkeypatch, adapter, [])
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: (empty_image, empty_offset))
+    before = adapter.snapshot_grid_identities_for_activation()
+    monkeypatch.setattr(
+        adapter, "_snapshot_activation_rows",
+        lambda: [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")],
+    )
+
+    pair = adapter.bind_rr_pair_after_activation(before, timeout_s=0)
+
+    assert pair.minus_target.activity == "-"
+    assert pair.plus_target.activity == "+"
+    assert pair.identity == ("rfg", "steep", "steep charge")
 
 
 def test_quantity_targeting_preserves_causal_ordinary_delta_without_count_reread(monkeypatch):
