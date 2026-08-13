@@ -6719,6 +6719,183 @@ def test_pair_target_does_not_affect_ordinary_single_row_reconciliation():
     assert legacy.activity is None
 
 
+# ---------------------------------------------------------------------
+# Phase 5.28: minus-glyph OCR tolerance ("-" misread as "to") -- the
+# exact mirror of the Phase 5.25 plus-glyph ("+"->"4") tests above,
+# live-caught across three independent fresh R&R activations (RFG/240
+# Roof, RFG/HIGH Roof, RFG/240 Shed) in one restricted-plan run, all
+# structurally clean two-row deltas that the strict path and the
+# plus-glyph fallback both correctly, safely refused to guess at.
+# ---------------------------------------------------------------------
+
+
+def test_pair_target_minus_ocr_confused_as_to_is_recognized():
+    """Phase 5.28: live-caught -- one row reads a clean "+", the other
+    (structurally complementary, same identity, from a clean 2-row
+    delta) reads "to" instead of "-". The scoped fallback must
+    recognize this and bind both halves correctly."""
+    before = []
+    after = [_rr_pair_row(activity="to"), _rr_pair_row(activity="+")]
+
+    pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert isinstance(pair, PendingRRPairTarget)
+    assert pair.minus_target.activity == "-"
+    assert pair.minus_target.after_index == 0
+    assert pair.plus_target.activity == "+"
+    assert pair.plus_target.after_index == 1
+    assert pair.identity == ("rfg", "steep", "steep charge")
+
+
+def test_pair_target_minus_ocr_confused_as_to_order_reversed():
+    """Order-independence must hold for the minus-tolerant fallback too."""
+    before = []
+    after = [_rr_pair_row(activity="+"), _rr_pair_row(activity="to")]
+
+    pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert pair.plus_target.after_index == 0
+    assert pair.minus_target.after_index == 1
+
+
+def test_arbitrary_to_outside_two_row_rr_context_is_not_treated_as_minus():
+    """An ordinary single-row delta with activity "to" must NOT be
+    specially recognized by anything -- the fallback never fires
+    outside a clean two-row R&R delta, and the legacy single-target
+    path's own activity handling (untouched) still only accepts a
+    real "+"/"-" glyph or leaves activity=None."""
+    before = []
+    after = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", "to")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+    legacy = WindowsXactimateAdapter._pending_quantity_target_from_delta(before, after)
+    assert legacy is not None
+    assert legacy.activity is None
+
+
+def test_two_row_delta_with_no_plus_and_a_to_still_fails_closed():
+    """The "+" half is never OCR-tolerant on this fallback -- a delta
+    with no literal "+" row at all must fail closed even when the
+    other row reads "to"."""
+    before = []
+    after = [_rr_pair_row(activity="to"), _rr_pair_row(activity="to")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_minus_glyph_tolerance_extra_row_still_fails_closed():
+    """An unrelated third row in the delta must still fail closed even
+    though the OTHER two rows would otherwise match the +/OCR-to shape."""
+    before = []
+    after = [
+        _rr_pair_row(activity="to"), _rr_pair_row(activity="+"),
+        ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None),
+    ]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_minus_glyph_tolerance_mismatched_candidate_identities_fail_closed():
+    """The "+" row and the "to"-glyph row belong to DIFFERENT catalog
+    identities -- never bound together despite each individually
+    looking plausible."""
+    before = []
+    after = [
+        _rr_pair_row(cat="RFG", sel="STEEP", desc="Steep charge", activity="to"),
+        _rr_pair_row(cat="RFG", sel="OTHER", desc="Other item", activity="+"),
+    ]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_minus_glyph_tolerance_never_fires_when_identity_already_exists():
+    """This fallback recognizes only a clean, from-nothing activation
+    -- a pre-existing row of the same identity (any activity) means
+    this is the legacy duplicate-identity shape, not this fallback's
+    business, and it must still fail closed."""
+    before = [_rr_pair_row(activity="+")]
+    after = before + [_rr_pair_row(activity="+"), _rr_pair_row(activity="to")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_minus_glyph_tolerance_never_reached_when_strict_path_already_succeeds():
+    """Direct proof the strict path is tried FIRST and unmodified: a
+    clean -/+ delta must bind via the strict path without ever
+    touching this fallback (spied here to confirm it is not called)."""
+    before = []
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    calls = []
+    original = WindowsXactimateAdapter._rr_pair_from_delta_with_minus_glyph_tolerance.__func__
+    def spy(cls, before_rows, after_rows):
+        calls.append(1)
+        return original(cls, before_rows, after_rows)
+
+    import unittest.mock
+    with unittest.mock.patch.object(
+        WindowsXactimateAdapter, "_rr_pair_from_delta_with_minus_glyph_tolerance", classmethod(spy),
+    ):
+        pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert pair is not None
+    assert calls == []
+
+
+def test_minus_glyph_tolerance_never_reached_when_plus_glyph_tolerance_already_succeeds():
+    """Fallback ordering: the plus-glyph fallback is tried BEFORE the
+    minus-glyph fallback -- a "-"/"4" delta (recognized entirely by
+    the plus-glyph fallback) must never reach this one."""
+    before = []
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="4")]
+    calls = []
+    original = WindowsXactimateAdapter._rr_pair_from_delta_with_minus_glyph_tolerance.__func__
+    def spy(cls, before_rows, after_rows):
+        calls.append(1)
+        return original(cls, before_rows, after_rows)
+
+    import unittest.mock
+    with unittest.mock.patch.object(
+        WindowsXactimateAdapter, "_rr_pair_from_delta_with_minus_glyph_tolerance", classmethod(spy),
+    ):
+        pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert pair is not None
+    assert calls == []
+
+
+def test_minus_glyph_tolerance_live_shape_with_larger_grid_baseline():
+    """Reproduces the exact live scenario at scale: an 11-row baseline
+    (a Roof group already carrying an earlier successfully-bound R&R
+    pair among unrelated rows) plus a fresh 2-row R&R delta where the
+    new "-" row reads "to". Proves the fallback is not merely a
+    two-row-total toy case -- it must still work with realistic
+    baseline noise, matching the live-caught before=11/after=13 shape."""
+    baseline = [
+        ActivationRowSnapshot("RFG", "IWS", "Ice & water barrier", "+"),
+        ActivationRowSnapshot("RFG", "DRIP", "Drip edge", "&"),
+        ActivationRowSnapshot("SFG", "GUTRS", "Gutter / downspout", "+"),
+        ActivationRowSnapshot("RFG", "FLCTR", "Counterflashing", "&"),
+        ActivationRowSnapshot("RFG", "VENTR", "Continuous ridge vent", "&"),
+        ActivationRowSnapshot("ELS", "DISHRS", "Digital satellite system", "+"),
+        ActivationRowSnapshot("RFG", "FLPIPE", "Flashing - pipe jack", "&"),
+        ActivationRowSnapshot("RFG", "VENTT", "Roof vent - turtle type", "&"),
+        ActivationRowSnapshot("RFG", "FELT15", "Roofing felt - 15 lb.", "+"),
+        _rr_pair_row(cat="RFG", sel="240", desc="3 tab roofing", activity="-"),
+        _rr_pair_row(cat="RFG", sel="240", desc="3 tab roofing", activity="+"),
+    ]
+    after = baseline + [
+        _rr_pair_row(cat="RFG", sel="HIGH", desc="Additional charge for high roof", activity="to"),
+        _rr_pair_row(cat="RFG", sel="HIGH", desc="Additional charge for high roof", activity="+"),
+    ]
+
+    pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(baseline, after)
+
+    assert isinstance(pair, PendingRRPairTarget)
+    assert pair.identity == ("rfg", "high", "additional charge for high roof")
+    assert pair.minus_target.after_index == 11
+    assert pair.plus_target.after_index == 12
+
+
 def test_pair_target_does_not_affect_legacy_single_plus_only_rr_target():
     """The pre-existing single-target R&R path (_pending_quantity_target_
     from_delta(), which discards the "-" side and keeps only "+") must

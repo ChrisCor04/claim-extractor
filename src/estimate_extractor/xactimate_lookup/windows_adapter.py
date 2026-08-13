@@ -411,6 +411,27 @@ _UNIT_OCR_CONFUSIONS = {"UF": "LF"}
 #: token()/_is_one_logical_rr_multiset_delta() are untouched).
 _ACTIVITY_PLUS_OCR_CONFUSIONS = frozenset({"4"})
 
+#: Phase 5.28: live-caught -- three independent R&R candidate
+#: activations (RFG/240 Roof, RFG/HIGH Roof, RFG/240 Shed), across two
+#: different groups and three different CAT/SEL pairs in one session,
+#: all produced a physical "-" row whose activity-cell OCR read "to"
+#: instead of the "-" glyph. _read_activation_activity_at()'s crop
+#: straddles the selector/activity boundary specifically because a
+#: bare "-" is a notoriously thin/small glyph for OCR at this crop
+#: size; when neither "-" nor "+" is found as a substring in either
+#: PSM read, the raw (garbage) text is returned as-is rather than
+#: None, and "to" was that garbage, stably, across all three
+#: instances. Scoped as narrowly as possible, exactly like
+#: _ACTIVITY_PLUS_OCR_CONFUSIONS above: this set is consulted ONLY by
+#: _rr_pair_from_delta_with_minus_glyph_tolerance() (windows_adapter.
+#: WindowsXactimateAdapter), and only after every other structural
+#: precondition (exactly one clean "+" row, exactly one complementary
+#: new row, matching identity, a strictly additive two-row delta)
+#: already holds -- "to" is NEVER globally treated as "-" anywhere
+#: else in this file (_activity_token()/_is_one_logical_rr_multiset_
+#: delta() are untouched).
+_ACTIVITY_MINUS_OCR_CONFUSIONS = frozenset({"to"})
+
 #: Unit-normalization synonym map (Phase 4.7 Stage 2) -- semantically
 #: identical spellings of the SAME unit, not OCR-noise correction and
 #: not a dimensional conversion (see `_VERIFIED_UNIT_CONVERSIONS` for
@@ -4134,18 +4155,24 @@ class WindowsXactimateAdapter(XactimateAdapter):
         after_rows: list[ActivationRowSnapshot],
     ) -> "PendingRRPairTarget | None":
         """Phase 6.3 (R&R Stage 3) / Phase 5.25 (live OCR-glyph
-        tolerance): tries the strict proof first
+        tolerance, "+" side) / Phase 5.28 (live OCR-glyph tolerance,
+        "-" side): tries the strict proof first
         (_rr_pair_from_delta_strict()); only if that finds nothing does
-        it try the narrowly-scoped OCR-tolerant fallback
-        (_rr_pair_from_delta_with_plus_glyph_tolerance()) -- see each
+        it try the narrowly-scoped OCR-tolerant fallbacks, in order --
+        _rr_pair_from_delta_with_plus_glyph_tolerance(), then
+        _rr_pair_from_delta_with_minus_glyph_tolerance() -- see each
         function's own docstring. The strict path is completely
-        unmodified by this addition; every delta it already recognized
-        it still recognizes identically, and the fallback is only ever
-        reached once the strict path has already returned None."""
+        unmodified by either addition; every delta it already
+        recognized it still recognizes identically, and each fallback
+        is only ever reached once every function tried before it has
+        already returned None."""
         pair = cls._rr_pair_from_delta_strict(before_rows, after_rows)
         if pair is not None:
             return pair
-        return cls._rr_pair_from_delta_with_plus_glyph_tolerance(before_rows, after_rows)
+        pair = cls._rr_pair_from_delta_with_plus_glyph_tolerance(before_rows, after_rows)
+        if pair is not None:
+            return pair
+        return cls._rr_pair_from_delta_with_minus_glyph_tolerance(before_rows, after_rows)
 
     @classmethod
     def _rr_pair_from_delta_strict(
@@ -4292,6 +4319,101 @@ class WindowsXactimateAdapter(XactimateAdapter):
         )
         plus_target = PendingQuantityTarget(
             identity=identity, activity="+", after_index=plus_index, activity_ordinal=1,
+            physical_row_delta=2, write_source_quantity_once=True,
+        )
+        return PendingRRPairTarget(minus_target=minus_target, plus_target=plus_target, identity=identity)
+
+    @classmethod
+    def _rr_pair_from_delta_with_minus_glyph_tolerance(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> "PendingRRPairTarget | None":
+        """Phase 5.28: live-caught -- three independent R&R candidate
+        activations (RFG/240 Roof, RFG/HIGH Roof, RFG/240 Shed), across
+        two different groups and three different CAT/SEL pairs in one
+        session, all produced a physical "-" row whose activity read
+        cleanly as OCR garbage "to" instead of "-", while the
+        structurally complementary new row read a clean literal "+".
+        The strict path and the Phase 5.25 plus-glyph-tolerance
+        fallback above both correctly refused to guess (neither is
+        ever touched by this function; reached ONLY after both have
+        already returned None), leaving these pairs PAIR_REVIEW_
+        REQUIRED even though their own activation delta already proves
+        one clean R&R pair landed. This is the exact minus-side mirror
+        of _rr_pair_from_delta_with_plus_glyph_tolerance() above --
+        same structural proof, roles swapped -- proving, independently
+        and without reusing or relaxing _is_one_logical_rr_multiset_
+        delta()/_activity_token() (both stay completely unmodified;
+        "to" is NEVER globally treated as "-" anywhere else in this
+        file), the exact same structural shape the strict path itself
+        requires:
+
+        1. Row count grew by EXACTLY 2 (cardinality unchanged).
+        2. Every pre-existing row is byte-identical in the after
+           snapshot (a Counter multiset diff, not a positional
+           comparison) -- if so much as one existing row's content
+           changed or disappeared, this returns None; only a truly
+           clean, additive delta is ever in scope.
+        3. The two NEW rows share exactly one CAT/SEL/description
+           identity (mismatched candidate identities fail closed).
+        4. That identity did not already exist anywhere in the before
+           snapshot -- this fallback recognizes only a clean, from-
+           nothing activation, never a pre-existing-duplicate shape.
+        5. Exactly one of the two new rows reads a LITERAL "+" (never
+           OCR-tolerant on this side -- one positively recognized "+"
+           half is a precondition, not something this fallback ever
+           guesses at).
+        6. The other (and, by point 1-4, ONLY other) new row for that
+           identity reads a value in the tightly scoped
+           _ACTIVITY_MINUS_OCR_CONFUSIONS set -- today just {"to"} --
+           never an arbitrary/unconstrained value.
+
+        Any failure of 1-6 returns None -- fails closed exactly like
+        the strict path, never a partially built pair, never a guess
+        from OCR text alone without this full structural corroboration."""
+        if len(after_rows) != len(before_rows) + 2:
+            return None
+        before_counter = Counter(before_rows)
+        after_counter = Counter(after_rows)
+        if before_counter - after_counter:
+            # A pre-existing row disappeared or its content changed --
+            # not a clean additive delta; refuse to guess.
+            return None
+        added = after_counter - before_counter
+        if sum(added.values()) != 2:
+            return None
+        added_rows = list(added.elements())
+        identities = {cls._activation_identity(row) for row in added_rows}
+        if len(identities) != 1:
+            return None
+        identity = next(iter(identities))
+        if not all(identity):
+            return None
+        if any(cls._activation_identity(row) == identity for row in before_counter):
+            return None
+
+        plus_indices = cls._activity_matching_indices(after_rows, identity, "+")
+        if len(plus_indices) != 1:
+            return None
+        all_identity_indices = [
+            index for index, row in enumerate(after_rows) if cls._activation_identity(row) == identity
+        ]
+        if len(all_identity_indices) != 2:
+            return None
+        remaining = [index for index in all_identity_indices if index not in plus_indices]
+        if len(remaining) != 1:
+            return None
+        minus_index = remaining[0]
+        if cls._activity_token(after_rows[minus_index]) not in _ACTIVITY_MINUS_OCR_CONFUSIONS:
+            return None
+
+        minus_target = PendingQuantityTarget(
+            identity=identity, activity="-", after_index=minus_index, activity_ordinal=1,
+            physical_row_delta=2, write_source_quantity_once=True,
+        )
+        plus_target = PendingQuantityTarget(
+            identity=identity, activity="+", after_index=plus_indices[0], activity_ordinal=1,
             physical_row_delta=2, write_source_quantity_once=True,
         )
         return PendingRRPairTarget(minus_target=minus_target, plus_target=plus_target, identity=identity)
