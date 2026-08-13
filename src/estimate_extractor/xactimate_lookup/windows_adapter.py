@@ -3261,6 +3261,59 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return "".join(expected_tokens[:-1]) == "".join(observed_tokens)
         return False
 
+    def _canonicalize_fresh_quantity_viewport(
+        self, hwnd: int, image, offset, target: "PendingQuantityTarget",
+        row_top: int, observed, scanned_row_count: int, scrolled: bool,
+    ):
+        """Live-caught (task_line_0015): before writing to a freshly,
+        positively-bound target, make sure the FULL row extent
+        `_quantity_target_candidates()` just established is safely
+        countable under the SAME strict `_row_is_visible()` margin
+        rule the post-write structural comparison (`_last_row_
+        geometry()`/`_count_grid_rows()`) uses. Without this,
+        `_quantity_target_candidates()`'s own trailing-row probe
+        (a looser `row_top + _GRID_ROW_HEIGHT > image.height` bound,
+        no margin) can retain a final row that the stricter post-Tab
+        recount would not -- a genuine 14-row grid read as 14 rows
+        before Tab and 13 after, purely from this rule mismatch, even
+        though the actual target (a different row entirely) was
+        correctly identified and written both times. The omitted row
+        was an unrelated trailing row, never the target.
+
+        If the known last row of the established extent already
+        satisfies `_row_is_visible()`, this is a no-op -- the existing
+        fast path for an ordinary small grid is untouched, no extra
+        scroll/capture. Otherwise, uses the EXISTING bounded scroll/
+        maximize machinery (`_ensure_last_row_visible()`) to bring
+        that last row into a safely countable position, then re-
+        captures and re-proves the target from scratch: unique
+        identity match, full row extent. Raises
+        QuantityNotConfirmedError if repositioning leaves the target
+        unresolvable to exactly one match (changed identity, vanished,
+        or now ambiguous/duplicate) -- fails closed exactly like every
+        other uniqueness check in this file, never guesses. Propagates
+        RowOffscreenError unchanged if safe geometry can never be
+        established within the existing bounded scroll/maximize
+        budget -- the existing offscreen/physical-state behavior,
+        never weakened."""
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        last_row_top = row_1_top + (scanned_row_count - 1) * _GRID_ROW_HEIGHT
+        if self._row_is_visible(image, last_row_top):
+            return image, offset, row_top, observed, scanned_row_count, scrolled
+        new_image, new_offset, _geom, _newly_scrolled = self._ensure_last_row_visible(
+            hwnd, image, offset, (scanned_row_count, last_row_top),
+        )
+        matches2, scanned_row_count2 = self._quantity_target_candidates(
+            new_image, new_offset, target, include_row_count=True,
+        )
+        if len(matches2) != 1:
+            raise QuantityNotConfirmedError(
+                "enter_quantity(): the pending target could not be uniquely re-proven after canonicalizing "
+                f"the viewport for safe row counting ({len(matches2)} match(es))."
+            )
+        _index2, new_row_top, new_observed = matches2[0]
+        return new_image, new_offset, new_row_top, new_observed, scanned_row_count2, True
+
     def _locate_pending_quantity_row(
         self,
         hwnd: int,
@@ -3320,6 +3373,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 elif len(matches) == 1:
                     _index, row_top, observed = matches[0]
                     if target.write_source_quantity_once:
+                        image, offset, row_top, observed, scanned_row_count, scrolled = (
+                            self._canonicalize_fresh_quantity_viewport(
+                                hwnd, image, offset, target, row_top, observed, scanned_row_count, scrolled,
+                            )
+                        )
                         return located(row_top, 1, observed)
                     if observed is None or abs(observed) <= 0.01:
                         return located(row_top, 1, observed)

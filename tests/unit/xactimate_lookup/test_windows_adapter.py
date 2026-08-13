@@ -5582,6 +5582,144 @@ def test_enter_quantity_confirms_quantity_before_returning(monkeypatch):
     assert adapter.last_quantity_confirmation.confidence == "CONFIRMED"
 
 
+# ---------------------------------------------------------------------
+# Viewport canonicalization before a fresh write (live-caught:
+# task_line_0015). A trailing row can satisfy _quantity_target_
+# candidates()'s own looser trailing-row probe (no visibility margin)
+# while failing the stricter _row_is_visible() margin rule the
+# post-write _last_row_geometry()/_count_grid_rows() recount uses --
+# producing a false "row count changed" (e.g. 14 -> 13) even though
+# nothing physically moved. _canonicalize_fresh_quantity_viewport()
+# must reposition (reusing the existing bounded scroll/maximize
+# machinery) and re-prove the target BEFORE any write occurs whenever
+# the established extent isn't already safely countable.
+# ---------------------------------------------------------------------
+
+
+def test_enter_quantity_canonicalizes_viewport_when_trailing_row_not_strictly_visible(monkeypatch):
+    """Core fix: row_top=990 satisfies the fixture's own (loose) match
+    condition but fails the REAL _row_is_visible() margin rule at
+    image_height=1023 (990 + 25 + 25 = 1040 > 1023). Canonicalization
+    must scroll to reveal it, re-prove the target, click the NEW
+    (safely visible) position -- never the stale, unsafely-countable one."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+    clicked_y = []
+    monkeypatch.setattr(adapter, "_click_client", lambda hwnd, x, y: clicked_y.append(y))
+
+    adapter.enter_quantity(1.0)
+
+    assert calls["scroll"] >= 1
+    assert clicked_y and clicked_y[0] != 990 + _GRID_ROW_HEIGHT // 2  # never clicked the unsafe position
+    assert adapter.last_quantity_confirmation.confidence == "SKIPPED"  # fresh write still succeeded
+
+
+def test_enter_quantity_fresh_fast_path_skips_canonicalization_when_already_safe(monkeypatch):
+    """An ordinary small grid, already strictly visible, must take the
+    existing fast path with zero extra scroll/capture -- the fix must
+    not slow down or destabilize the common case."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
+        freshly_created=True,
+    )
+    adapter.enter_quantity(1.0)
+    assert calls["scroll"] == 0
+
+
+def test_enter_quantity_post_write_row_count_comparison_stays_exact_after_canonicalization(monkeypatch):
+    """The whole point of the fix: pre-write and post-write row counts
+    must now be computed under compatible viewport geometry (14 -> 14),
+    never a false mismatch (14 -> 13), for the SAME physically
+    unchanged 14-row grid."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+    adapter.enter_quantity(1.0)  # must not raise "row count changed"
+    assert adapter.last_quantity_confirmation.confidence == "SKIPPED"
+
+
+def test_enter_quantity_canonicalization_fails_closed_when_target_vanishes(monkeypatch):
+    """If repositioning the viewport reveals the target is no longer
+    uniquely resolvable (vanished), this must fail closed, never guess
+    a stale position and write anyway."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+
+    call_count = {"n": 0}
+
+    def vanished_candidates(image, offset, target, *, include_row_count=False):
+        call_count["n"] += 1
+        # First call (the outer loop's initial scan, at the unsafe
+        # position) finds it normally; the re-check AFTER
+        # canonicalization repositions finds it gone.
+        if call_count["n"] == 1:
+            matches = [(target.after_index, state["row_top"], 0.0)]
+        else:
+            matches = []
+        return (matches, state["row_count"]) if include_row_count else matches
+
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", vanished_candidates)
+
+    with pytest.raises(QuantityNotConfirmedError):
+        adapter.enter_quantity(1.0)
+
+
+def test_enter_quantity_canonicalization_fails_closed_on_duplicate_after_reposition(monkeypatch):
+    """If repositioning reveals TWO matches (ambiguous/duplicate), this
+    must fail closed rather than guess which one is the real target."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+
+    call_count = {"n": 0}
+
+    def duplicate_candidates(image, offset, target, *, include_row_count=False):
+        call_count["n"] += 1
+        # First call (the outer loop's initial scan, at the unsafe
+        # position) finds it uniquely; the re-check AFTER
+        # canonicalization repositions finds a second, ambiguous match.
+        if call_count["n"] == 1:
+            matches = [(target.after_index, state["row_top"], 0.0)]
+        else:
+            matches = [
+                (target.after_index, state["row_top"], 0.0),
+                (target.after_index, state["row_top"] + _GRID_ROW_HEIGHT, 0.0),
+            ]
+        return (matches, state["row_count"]) if include_row_count else matches
+
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", duplicate_candidates)
+
+    with pytest.raises(QuantityNotConfirmedError):
+        adapter.enter_quantity(1.0)
+
+
+def test_enter_quantity_canonicalization_fails_closed_when_never_safely_visible(monkeypatch):
+    """Existing offscreen/physical-state behavior is preserved: if safe
+    geometry can never be established within the existing bounded
+    scroll/maximize budget, this must propagate RowOffscreenError, not
+    write to a guessed coordinate."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 990),  # never moves into safe visibility
+    )
+    monkeypatch.setattr(adapter, "_win32gui", lambda: (_ for _ in ()).throw(Exception("no win32gui in test")))
+
+    with pytest.raises(RowOffscreenError):
+        adapter.enter_quantity(1.0)
+
+
 def test_enter_quantity_records_review_when_stable_confirmation_mismatches(monkeypatch):
     """A stable same-cell OCR disagreement is advisory after the write.
 
