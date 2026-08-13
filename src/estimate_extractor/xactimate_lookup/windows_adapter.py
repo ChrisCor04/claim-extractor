@@ -3121,13 +3121,31 @@ class WindowsXactimateAdapter(XactimateAdapter):
             f"captured viewport."
         )
 
-    def _quantity_target_candidates(self, image, offset, target: PendingQuantityTarget):
-        """Read all currently visible rows matching the retained target."""
+    def _quantity_target_candidates(
+        self, image, offset, target: PendingQuantityTarget, *, include_row_count: bool = False,
+    ):
+        """Read all currently visible rows matching the retained target.
+
+        ``include_row_count`` is used only by a freshly activation-bound
+        quantity write.  The same row walk that proves the target identity
+        has already established the current row extent, so return that extent
+        with the matches instead of making ``enter_quantity()`` OCR-count the
+        same captured image again.  Existing/resumed callers keep the original
+        list-only return shape and initial-quantity inspection unchanged.
+
+        A fresh target's initial quantity is deliberately not OCR-read: its
+        causal activation binding authorizes one deterministic source-quantity
+        write regardless of Xactimate's default value.  Identity, activity,
+        uniqueness, and row extent remain mandatory before a match is returned.
+        """
+        def result(matches, row_count):
+            return (matches, row_count) if include_row_count else matches
+
         rows, row_1_top = self._activation_rows_from_same_image(image, offset)
         if not rows:
             # _last_row_geometry() previously returned None here before
             # either caller-specific trailing-row guard could run.
-            return []
+            return result([], 0)
         if target.allow_initial_quantity_overwrite:
             for _probe in range(2):
                 row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
@@ -3141,14 +3159,16 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 list(target.activation_baseline_rows), rows,
             )
             if target_index is None:
-                return []
+                return result([], len(rows))
             row_top = row_1_top + target_index * _GRID_ROW_HEIGHT
-            observed = self._read_quantity_at(image, offset, row_top)
-            if observed is None:
-                observed = self._read_quantity_at(
-                    image, offset, row_top, min_votes=1, enhance_contrast=True,
-                )
-            return [(target_index, row_top, observed)]
+            observed = None
+            if not target.write_source_quantity_once:
+                observed = self._read_quantity_at(image, offset, row_top)
+                if observed is None:
+                    observed = self._read_quantity_at(
+                        image, offset, row_top, min_votes=1, enhance_contrast=True,
+                    )
+            return result([(target_index, row_top, observed)], len(rows))
 
         matches = []
         # Retain the activation snapshot's two-row undercount guard.
@@ -3172,13 +3192,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
             # Tab); never make that noise load-bearing.
             if target.activity in ("-", "+") and self._activity_token(row) != target.activity:
                 continue
-            observed = self._read_quantity_at(image, offset, row_top)
-            if observed is None:
-                observed = self._read_quantity_at(
-                    image, offset, row_top, min_votes=1, enhance_contrast=True,
-                )
+            observed = None
+            if not target.write_source_quantity_once:
+                observed = self._read_quantity_at(image, offset, row_top)
+                if observed is None:
+                    observed = self._read_quantity_at(
+                        image, offset, row_top, min_votes=1, enhance_contrast=True,
+                    )
             matches.append((index, row_top, observed))
-        return matches
+        return result(matches, len(candidate_rows))
 
     @staticmethod
     def _quantity_identity_matches(
@@ -3251,14 +3273,27 @@ class WindowsXactimateAdapter(XactimateAdapter):
             image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
             last_height = getattr(image, "height", None)
             if offset is not None:
-                matches = self._quantity_target_candidates(image, offset, target)
+                scan = self._quantity_target_candidates(
+                    image, offset, target,
+                    include_row_count=target.write_source_quantity_once,
+                )
+                if target.write_source_quantity_once:
+                    matches, scanned_row_count = scan
+                else:
+                    matches = scan
+                    scanned_row_count = None
+
+                def located(row_top, ordinal, observed):
+                    base = (image, offset, row_top, ordinal, observed, scrolled)
+                    return base + ((scanned_row_count,) if target.write_source_quantity_once else ())
+
                 if confirmation_ordinal is not None:
                     if len(matches) == 1:
                         _index, row_top, observed = matches[0]
-                        return image, offset, row_top, 1, observed, scrolled
+                        return located(row_top, 1, observed)
                     if target.activity in ("-", "+") and 1 <= confirmation_ordinal <= len(matches):
                         _index, row_top, observed = matches[confirmation_ordinal - 1]
-                        return image, offset, row_top, confirmation_ordinal, observed, scrolled
+                        return located(row_top, confirmation_ordinal, observed)
                     if len(matches) > 1:
                         raise QuantityNotConfirmedError(
                             "enter_quantity(): multiple ordinary rows match the retained CAT/SEL/description "
@@ -3267,13 +3302,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 elif len(matches) == 1:
                     _index, row_top, observed = matches[0]
                     if target.write_source_quantity_once:
-                        return image, offset, row_top, 1, observed, scrolled
+                        return located(row_top, 1, observed)
                     if observed is None or abs(observed) <= 0.01:
-                        return image, offset, row_top, 1, observed, scrolled
+                        return located(row_top, 1, observed)
                     if expected_quantity is not None and abs(observed - expected_quantity) <= 0.01:
-                        return image, offset, row_top, 1, observed, scrolled
+                        return located(row_top, 1, observed)
                     if target.activity is None and target.allow_initial_quantity_overwrite:
-                        return image, offset, row_top, 1, observed, scrolled
+                        return located(row_top, 1, observed)
                     raise QuantityNotConfirmedError(
                         "enter_quantity(): the only identity-matched pending target already has a different non-zero "
                         f"quantity ({observed:g}, expected {expected_quantity!r}); refusing to overwrite it."
@@ -3285,14 +3320,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
                         and 1 <= target.activity_ordinal <= len(matches)
                     ):
                         chosen = matches[target.activity_ordinal - 1]
-                        return (
-                            image, offset, chosen[1], target.activity_ordinal, chosen[2], scrolled,
-                        )
+                        return located(chosen[1], target.activity_ordinal, chosen[2])
                     blank = [entry for entry in matches if entry[2] is None or abs(entry[2]) <= 0.01]
                     if len(blank) == 1:
                         chosen = blank[0]
                         ordinal = matches.index(chosen) + 1
-                        return image, offset, chosen[1], ordinal, chosen[2], scrolled
+                        return located(chosen[1], ordinal, chosen[2])
                     if target.activity in ("-", "+") and 1 <= target.activity_ordinal <= len(matches):
                         chosen = matches[target.activity_ordinal - 1]
                         observed = chosen[2]
@@ -3301,9 +3334,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                             and observed is not None
                             and abs(observed - expected_quantity) <= 0.01
                         ):
-                            return (
-                                image, offset, chosen[1], target.activity_ordinal, observed, scrolled,
-                            )
+                            return located(chosen[1], target.activity_ordinal, observed)
                         if observed is not None and abs(observed) > 0.01:
                             raise QuantityNotConfirmedError(
                                 "enter_quantity(): the retained R&R activity occurrence already has a different "
@@ -3531,20 +3562,20 @@ class WindowsXactimateAdapter(XactimateAdapter):
         propagates uncaught, exactly like record_physical_item_
         created()'s own callback contract elsewhere in this file.
 
-        Phase 5.29 (performance): for a freshly, positively-bound
-        target (`write_source_quantity_once=True` -- a candidate just
-        activated this call, never a resumed/legacy/pre-existing row),
-        only the FINAL numeric OCR read (`_read_quantity_at()`, a
-        3-scale vote) is skipped -- every structural drift check
+        Performance policy for a freshly, positively-bound target
+        (`write_source_quantity_once=True` -- a candidate just activated
+        this call, never a resumed/legacy/pre-existing row): numeric OCR is
+        skipped both for the irrelevant initial/default quantity and for the
+        final advisory read. Every structural drift check
         between the physical-write checkpoint and that read (dialog/
         dropdown appeared, grid anchor moved, row count changed, row
         geometry drifted) still runs unchanged; those are safety
         checks on the write action itself, not the numeric value, and
-        stay in place regardless of this quantity-OCR policy. Nothing
-        in production consumes the numeric OCR result for a fresh
-        write (Phase 5.27 made it advisory-only; Phase 5.28 proved
-        binding itself needs no quantity evidence), so reading it cost
-        real wall-clock time for a result nobody acted on.
+        stay in place regardless of this quantity-OCR policy. Nothing in
+        production consumes either numeric OCR result for a fresh write
+        (Phase 5.27 made confirmation advisory-only; Phase 5.28 proved
+        binding itself needs no quantity evidence), so reading either value
+        costs wall-clock time for a result nobody acts on.
         `last_quantity_confirmation` is still set, with
         `confidence="SKIPPED"` and `observed=None`, so callers/evidence
         never see a fabricated numeric read. Every OTHER path (a
@@ -3557,9 +3588,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # into the current item's post-commit outcome.
         self.last_quantity_confirmation = None
         hwnd = self._ensure_main_window()
-        image, offset, row_top, ordinal, before_quantity, scrolled = self._locate_pending_quantity_row(
-            hwnd, expected_quantity=quantity,
-        )
+        target = self._pending_quantity_target
+        fresh_target = bool(target and target.write_source_quantity_once)
+        located = self._locate_pending_quantity_row(hwnd, expected_quantity=quantity)
+        if fresh_target:
+            image, offset, row_top, ordinal, before_quantity, scrolled, row_count_before = located
+        else:
+            image, offset, row_top, ordinal, before_quantity, scrolled = located
 
         # Pre-existing/legacy retained targets may already contain the exact
         # requested quantity and can remain untouched. A freshly activated
@@ -3569,15 +3604,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # load-bearing.
         #
         # Some Xactimate items instantiate with a real default quantity
-        # (live: SFG/GSG appears as 1 EA). Identity has already been
-        # established by the retained CAT/SEL + normalized-description
-        # target (and activity occurrence for R&R) before this value is
-        # considered. An exact quantity match therefore needs no edit;
-        # avoiding the write also avoids disturbing an already-correct
-        # cell. A fresh, uniquely activation-bound ordinary or R&R target
-        # receives the source value; every legacy/pre-existing or ambiguous
-        # target retains the fail-closed rule above.
-        target = self._pending_quantity_target
+        # (live: SFG/GSG appears as 1 EA). A fresh target's identity has
+        # already been established by retained CAT/SEL + normalized description
+        # (and activity occurrence for R&R), so that default is neither read nor
+        # made load-bearing: the source value is written once. Every legacy/
+        # pre-existing or ambiguous target retains the exact-match/no-write and
+        # different-nonzero/fail-closed rules above.
         if (
             not (target and target.write_source_quantity_once)
             and before_quantity is not None
@@ -3598,12 +3630,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # geometry now; confirmation below must read this same structural
         # row, never reconstruct identity from repaint-sensitive CAT/SEL/
         # description/activity OCR and never substitute the last row.
-        geometry_before = self._last_row_geometry(image, offset)
-        if geometry_before is None:
-            raise QuantityNotConfirmedError(
-                "enter_quantity(): the identity-verified target disappeared before its quantity cell could be edited."
-            )
-        row_count_before, _last_row_top = geometry_before
+        if not fresh_target:
+            geometry_before = self._last_row_geometry(image, offset)
+            if geometry_before is None:
+                raise QuantityNotConfirmedError(
+                    "enter_quantity(): the identity-verified target disappeared before its quantity cell could be edited."
+                )
+            row_count_before, _last_row_top = geometry_before
         row_1_top_before = self._shifted_anchor("grid_row_1", offset)[1]
         row_delta = row_top - row_1_top_before
         if row_delta < 0 or row_delta % _GRID_ROW_HEIGHT != 0:

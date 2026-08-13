@@ -3440,7 +3440,7 @@ def test_selected_unique_ordinary_row_binds_regardless_of_initial_quantity(
     adapter.enter_quantity(4.0)
 
     assert state["typed"] is expect_write
-    assert set(reads) == {2}
+    assert reads == []
 
 
 def test_gcr300_default_one_ea_is_replaced_with_expected_four(monkeypatch):
@@ -5490,14 +5490,16 @@ def _mock_enter_quantity(
 
     monkeypatch.setattr(adapter, "_scroll_grid_body", fake_scroll)
 
-    def fake_candidates(image, offset, target):
+    def fake_candidates(image, offset, target, *, include_row_count=False):
         if state["row_top"] < 0 or state["row_top"] + _GRID_ROW_HEIGHT > image.height:
-            return []
+            matches = []
+            return (matches, state["row_count"]) if include_row_count else matches
         observed = (
             typed.get("value", 0.0) + confirmed_qty_offset
             if state["tabbed"] else existing_qty_at_target
         )
-        return [(target.after_index, state["row_top"], observed)]
+        matches = [(target.after_index, state["row_top"], observed)]
+        return (matches, state["row_count"]) if include_row_count else matches
 
     monkeypatch.setattr(adapter, "_quantity_target_candidates", fake_candidates)
     monkeypatch.setattr(
@@ -6118,7 +6120,7 @@ def test_quantity_identity_targets_normal_rr_plus_row(monkeypatch):
     assert set(reads) == {1}
 
 
-def test_quantity_identity_targets_blank_plus_in_regrouped_duplicate_rr(monkeypatch):
+def test_fresh_quantity_identity_targets_retained_plus_in_regrouped_duplicate_rr(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     before = [_activation_row(activity="-"), _activation_row(activity="+")]
     rows = [
@@ -6133,7 +6135,7 @@ def test_quantity_identity_targets_blank_plus_in_regrouped_duplicate_rr(monkeypa
     adapter.enter_quantity(35.67)
 
     assert state["clicked_index"] == 3
-    assert 2 in reads and 3 in reads
+    assert reads == []
 
 
 def test_fresh_rr_delta_writes_only_retained_new_plus_despite_initial_ocr(monkeypatch):
@@ -6155,7 +6157,7 @@ def test_fresh_rr_delta_writes_only_retained_new_plus_despite_initial_ocr(monkey
     adapter.enter_quantity(35.67)
 
     assert state["clicked_index"] == 3
-    assert 2 in reads and 3 in reads
+    assert reads == []
 
 
 # ---------------------------------------------------------------------
@@ -6613,6 +6615,132 @@ def test_quantity_targeting_preserves_causal_ordinary_delta_without_count_reread
     assert adapter._quantity_target_candidates(image, offset, target) == [
         (1, adapter._shifted_anchor("grid_row_1", offset)[1] + _GRID_ROW_HEIGHT, 1.0),
     ]
+
+
+def test_fresh_quantity_target_scan_exposes_extent_without_initial_quantity_ocr(monkeypatch):
+    """One fresh identity scan supplies both the safe row and its extent.
+
+    The newly bound row's default quantity is irrelevant to admission, so
+    neither a second count traversal nor an initial quantity read is allowed.
+    """
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        {"category": "TMP", "selector": "LAB", "description": "Temporary Repairs - per hour", "quantity": 1.0, "unit": "HR"},
+    ]
+    image, offset = _wire_row_content(monkeypatch, adapter, rows)
+    target = PendingQuantityTarget(
+        identity=("tmp", "lab", "temporary repairs per hour"), activity=None,
+        after_index=0, activity_ordinal=1, write_source_quantity_once=True,
+    )
+    monkeypatch.setattr(
+        adapter, "_count_grid_rows",
+        lambda *args, **kwargs: pytest.fail("fresh scan must not perform a separate row count"),
+    )
+
+    original_read_quantity = adapter._read_quantity_at
+    def reject_target_quantity_read(image, offset, row_top, **kwargs):
+        if row_top == adapter._shifted_anchor("grid_row_1", offset)[1]:
+            pytest.fail("fresh scan must not OCR the target's initial/default quantity")
+        return original_read_quantity(image, offset, row_top, **kwargs)
+    monkeypatch.setattr(adapter, "_read_quantity_at", reject_target_quantity_read)
+
+    matches, row_count = adapter._quantity_target_candidates(
+        image, offset, target, include_row_count=True,
+    )
+
+    assert row_count == 1
+    assert matches == [(0, adapter._shifted_anchor("grid_row_1", offset)[1], None)]
+
+
+def test_fresh_enter_quantity_reuses_scan_extent_and_keeps_postwrite_count(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("TMP", "LAB", "Temporary Repairs - per hour", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("tmp", "lab", "temporary repairs per hour"), None, 0, 1,
+        write_source_quantity_once=True,
+    )
+    state, reads, _clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [1.0], 6.0)
+    geometry = adapter._last_row_geometry
+    geometry_calls = []
+    monkeypatch.setattr(
+        adapter, "_last_row_geometry",
+        lambda image, offset: (geometry_calls.append(state["typed"]), geometry(image, offset))[1],
+    )
+
+    adapter.enter_quantity(6.0)
+
+    assert state["typed"] is True
+    assert reads == []  # no initial or post-write numeric OCR for a fresh deterministic write
+    assert geometry_calls == [True]  # only the independent post-Tab structural count remains
+
+
+def test_fresh_enter_quantity_still_rejects_ambiguous_identity_before_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [
+        ActivationRowSnapshot("TMP", "LAB", "Temporary Repairs - per hour", None),
+        ActivationRowSnapshot("TMP", "LAB", "Temporary Repairs - per hour", None),
+    ]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("tmp", "lab", "temporary repairs per hour"), None, 1, 1,
+        write_source_quantity_once=True,
+    )
+    state, _reads, clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0, 0.0], 6.0)
+
+    with pytest.raises(QuantityNotConfirmedError, match="identical target rows"):
+        adapter.enter_quantity(6.0)
+
+    assert state["typed"] is False
+    assert clicks == []
+
+
+def test_fresh_enter_quantity_still_rejects_wrong_identity_before_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("TMP", "LAB2", "Unrelated labor", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("tmp", "lab", "temporary repairs per hour"), None, 0, 1,
+        write_source_quantity_once=True,
+    )
+    state, _reads, clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 6.0)
+
+    with pytest.raises(RowOffscreenError):
+        adapter.enter_quantity(6.0)
+
+    assert state["typed"] is False
+    assert clicks == []
+
+
+def test_fresh_enter_quantity_postwrite_row_count_change_still_fails_closed(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("TMP", "LAB", "Temporary Repairs - per hour", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("tmp", "lab", "temporary repairs per hour"), None, 0, 1,
+        write_source_quantity_once=True,
+    )
+    _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 6.0, row_count_after=2)
+
+    with pytest.raises(QuantityNotConfirmedError, match="row count changed unexpectedly"):
+        adapter.enter_quantity(6.0)
+
+
+def test_legacy_enter_quantity_still_reads_initial_quantity_and_counts_before_and_after(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("TMP", "LAB", "Temporary Repairs - per hour", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("tmp", "lab", "temporary repairs per hour"), None, 0, 1,
+        write_source_quantity_once=False,
+    )
+    state, reads, _clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 6.0)
+    geometry = adapter._last_row_geometry
+    geometry_calls = []
+    monkeypatch.setattr(
+        adapter, "_last_row_geometry",
+        lambda image, offset: (geometry_calls.append(state["typed"]), geometry(image, offset))[1],
+    )
+
+    adapter.enter_quantity(6.0)
+
+    assert reads == [0, 0]
+    assert geometry_calls == [False, True]
 
 
 def test_last_row_geometry_targets_correct_index_for_quantity_entry(monkeypatch):
@@ -7433,16 +7561,10 @@ def test_write_and_verify_rr_pair_quantities_target_disappears_between_writes(mo
 
 
 def test_write_and_verify_rr_pair_quantities_fresh_writes_never_call_read_quantity_at_post_write(monkeypatch):
-    """Phase 5.29: for a fresh, positively-bound pair (write_source_
-    quantity_once=True on both halves -- exactly what every production
-    binder constructs), _read_quantity_at() is still called ONCE per
-    half by the pre-write locate (structural row binding -- untouched,
-    still needed for the existing-value guard), but must NEVER be
-    called a SECOND time afterward merely to reconfirm the numeric
-    value -- proven by an exact per-index call count. This directly
-    supersedes the pre-5.29 "an unreadable post-write OCR read
-    produces LOW_CONFIDENCE/review" test, which exercised a path that
-    is now unreachable for a fresh write; see
+    """Fresh pair halves use identity/activity binding, not quantity OCR.
+
+    Neither the irrelevant initial default nor a post-write advisory
+    confirmation is read for a fresh deterministic write. See
     test_write_and_verify_existing_rr_pair_half_quantity_still_
     confirms_via_ocr_for_a_legacy_target for the still-preserved
     legacy-target behavior."""
@@ -7462,10 +7584,7 @@ def test_write_and_verify_rr_pair_quantities_fresh_writes_never_call_read_quanti
     assert result.plus_confirmation.observed is None
     assert result.plus_confirmation.review_required is False
     assert typed_indices == {0, 1}
-    # Exactly one read per half (the pre-write locate) -- no second,
-    # post-write reconfirmation read.
-    assert reads.count(0) == 1
-    assert reads.count(1) == 1
+    assert reads == []
 
 
 def test_write_and_verify_rr_pair_quantities_does_not_change_ordinary_enter_quantity(monkeypatch):
@@ -7491,9 +7610,9 @@ def test_enter_quantity_fresh_ordinary_target_skips_post_write_numeric_ocr(monke
     quantity and Tab-commits it, but never re-reads the cell
     afterward merely to reconfirm the number -- that OCR result is
     advisory-only and nothing in production consumes it for a fresh
-    write (Phase 5.27/5.28). Exactly one read happens (the pre-write
-    locate, unaffected structural row binding), never a second,
-    post-write read."""
+    write (Phase 5.27/5.28). The initial default is equally irrelevant
+    after identity binding, so no numeric OCR read occurs at either
+    side of the deterministic write."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
     adapter._pending_quantity_target = PendingQuantityTarget(
@@ -7505,7 +7624,7 @@ def test_enter_quantity_fresh_ordinary_target_skips_post_write_numeric_ocr(monke
 
     assert state["typed"] is True
     assert clicks  # the physical click still happened
-    assert reads == [0]  # ONE read only -- the pre-write locate, no post-write reconfirmation
+    assert reads == []
     assert adapter.last_quantity_confirmation.confidence == "SKIPPED"
     assert adapter.last_quantity_confirmation.observed is None
     assert adapter.last_quantity_confirmation.expected == 1.0
