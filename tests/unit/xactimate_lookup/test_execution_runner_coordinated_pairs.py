@@ -365,6 +365,42 @@ def test_valid_pair_executes_one_search_and_one_activation(tmp_path, phrase_rule
     assert adapter.commit_item_calls == 1
 
 
+def test_render_grace_cannot_write_before_binding_and_does_not_reactivate(
+    tmp_path, phrase_rules, ranking_config,
+):
+    class RenderGraceFakeAdapter(RRPairFakeAdapter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.order = []
+
+        def bind_rr_pair_after_activation(self, before_snapshot):
+            self.bind_calls += 1
+            self.order.append("unreadable_complete_frame")
+            assert self.select_candidate_calls == 1
+            assert self.write_pair_calls == 0
+            self.order.append("readable_complete_frame")
+            assert self.select_candidate_calls == 1
+            assert self.write_pair_calls == 0
+            return _FakePendingRRPairTarget(_PAIR_IDENTITY)
+
+        def write_and_verify_rr_pair_quantities(self, *args, **kwargs):
+            self.order.append("quantity_write")
+            return super().write_and_verify_rr_pair_quantities(*args, **kwargs)
+
+    plan, _remove_task, _replace_task, _pair, _ = _plan_with_one_pair()
+    adapter = RenderGraceFakeAdapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.supports_live_execution = True
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert adapter.select_candidate_calls == 1
+    assert adapter.bind_calls == 1
+    assert adapter.write_pair_calls == 1
+    assert adapter.order == [
+        "unreadable_complete_frame", "readable_complete_frame", "quantity_write",
+    ]
+
+
 def test_remove_source_quantity_goes_to_minus(tmp_path, phrase_rules, ranking_config):
     plan, remove_task, replace_task, pair, _ = _plan_with_one_pair(minus_qty=7.0, plus_qty=9.0)
     adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())

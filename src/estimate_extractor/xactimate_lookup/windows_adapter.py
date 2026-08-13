@@ -4221,11 +4221,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
         snapshot/polling glue, never the quantity-entry logic itself,
         which is fully reused by write_and_verify_rr_pair_quantities()
         below via the exact same enter_quantity() every ordinary and
-        single-target R&R task already uses. Same immediate-decision-
-        per-poll timing model as pending_item_created() -- no implicit
-        "wait, maybe the second row hasn't rendered yet" grace period,
-        matching that function's own already-proven characteristic
-        rather than introducing new, live-unvalidated timing behavior.
+        single-target R&R task already uses. Once the complete two-row
+        delta first appears, activity-role rendering gets at most two
+        additional fresh observations (three complete frames total),
+        still inside this method's existing activation deadline. Every
+        observation must independently preserve the same unique
+        baseline-to-two-row identity delta; only the existing strict/
+        tolerant activity binder may assign the two roles.
 
         Callers decide WHETHER to call this instead of pending_item_
         created() -- e.g. a future Stage 4 runner, for a task known
@@ -4270,22 +4272,110 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 "R&R pair binding's rich baseline does not match the supplied physical-row baseline."
             )
         start = time.time()
+        complete_frame_observations = 0
+        unresolved_identity: tuple[str, str, str] | None = None
         while True:
             rows = self._snapshot_activation_rows()
             physical_delta = len(rows) - expected
-            if physical_delta == 2:
-                pair_target = self._pending_rr_pair_targets_from_delta(baseline_rows, rows)
+            if unresolved_identity is not None and physical_delta != 2:
                 self._persist_rr_binding_diagnostic(
-                    baseline_rows, rows, target=pair_target,
-                    final_outcome="bound" if pair_target is not None else "task_local_reconciliation",
-                    final_reason=(
-                        "authoritative_dispatch_returned_pair"
-                        if pair_target is not None
-                        else "authoritative_dispatch_returned_none"
-                    ),
+                    baseline_rows, rows, target=None,
+                    final_outcome="physical_state_uncertain",
+                    final_reason="physical_row_delta_changed_during_activity_role_grace",
+                    include_branch_results=False,
                 )
-                if pair_target is not None:
+                raise PhysicalStateUncertainError(
+                    "R&R pair activation changed while waiting for readable activity roles; refusing to "
+                    f"retain a stale pair binding (before={expected}, after={len(rows)})."
+                )
+            if physical_delta == 2:
+                complete_frame_observations += 1
+                pair_target = self._pending_rr_pair_targets_from_delta(baseline_rows, rows)
+                if unresolved_identity is None and pair_target is not None:
+                    self._persist_rr_binding_diagnostic(
+                        baseline_rows, rows, target=pair_target,
+                        final_outcome="bound",
+                        final_reason="authoritative_dispatch_returned_pair",
+                    )
                     return pair_target
+
+                current_identity = self._rr_identity_delta_without_new_roles(baseline_rows, rows)
+                if unresolved_identity is not None:
+                    if current_identity is None:
+                        self._persist_rr_binding_diagnostic(
+                            baseline_rows, rows, target=None,
+                            final_outcome="physical_state_uncertain",
+                            final_reason="baseline_no_longer_reconciles_during_activity_role_grace",
+                        )
+                        raise PhysicalStateUncertainError(
+                            "R&R pair structure changed while waiting for readable activity roles; refusing to "
+                            "retain a stale pair binding."
+                        )
+                    if current_identity != unresolved_identity:
+                        self._persist_rr_binding_diagnostic(
+                            baseline_rows, rows, target=None,
+                            final_outcome="physical_state_uncertain",
+                            final_reason="changed_identity_changed_during_activity_role_grace",
+                        )
+                        raise PhysicalStateUncertainError(
+                            "R&R pair identity changed while waiting for readable activity roles; refusing to "
+                            "bind either frame."
+                        )
+                    if self._unexpected_dialog_present():
+                        self._persist_rr_binding_diagnostic(
+                            baseline_rows, rows, target=None,
+                            final_outcome="physical_state_uncertain",
+                            final_reason="unexpected_dialog_during_activity_role_grace",
+                            include_branch_results=False,
+                        )
+                        raise PhysicalStateUncertainError(
+                            "An unexpected dialog appeared while waiting for readable R&R activity roles."
+                        )
+                if pair_target is not None:
+                    self._persist_rr_binding_diagnostic(
+                        baseline_rows, rows, target=pair_target,
+                        final_outcome="bound",
+                        final_reason="authoritative_dispatch_returned_pair",
+                    )
+                    return pair_target
+
+                if current_identity is None:
+                    self._persist_rr_binding_diagnostic(
+                        baseline_rows, rows, target=None,
+                        final_outcome="task_local_reconciliation",
+                        final_reason="two_row_delta_is_not_one_unique_structural_identity",
+                    )
+                    raise TaskLocalRowReconciliationError(
+                        "Candidate activation added two physical rows, but they did not reconcile as one uniquely "
+                        f"bound R&R -/+ pair (before={expected}, after={len(rows)})."
+                    )
+                unresolved_identity = current_identity
+
+                if self._unexpected_dialog_present():
+                    self._persist_rr_binding_diagnostic(
+                        baseline_rows, rows, target=None,
+                        final_outcome="physical_state_uncertain",
+                        final_reason="unexpected_dialog_during_activity_role_grace",
+                        include_branch_results=False,
+                    )
+                    raise PhysicalStateUncertainError(
+                        "An unexpected dialog appeared while waiting for readable R&R activity roles."
+                    )
+                deadline_expired = time.time() - start >= timeout_s
+                if complete_frame_observations < 3 and not deadline_expired:
+                    self._persist_rr_binding_diagnostic(
+                        baseline_rows, rows, target=None,
+                        final_outcome="activity_roles_pending",
+                        final_reason="unique_two_row_identity_delta_has_unresolved_activity_roles",
+                    )
+                    time.sleep(0.25)
+                    continue
+
+                self._persist_rr_binding_diagnostic(
+                    baseline_rows, rows, target=None,
+                    final_outcome="task_local_reconciliation",
+                    final_reason="activity_role_grace_exhausted",
+                )
                 # Task-local, not project-level: this task's own activation
                 # added two rows but they don't reconcile as one uniquely
                 # bound R&R -/+ pair -- ambiguity about which new rows are
@@ -4348,6 +4438,47 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     "Candidate selection created zero new physical rows within the activation window."
                 )
             time.sleep(0.25)
+
+    @classmethod
+    def _rr_identity_delta_without_new_roles(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> tuple[str, str, str] | None:
+        """Return the sole structural +2 identity without assigning roles.
+
+        This is the role-free portion of the existing strict multiset proof:
+        baseline activity still has to reconcile, every identity's
+        cardinality is preserved except one complete identity gaining two
+        rows, and exactly two surplus rows must remain.  The activity tokens
+        on only those two surplus rows are deliberately not interpreted.
+        """
+        if len(after_rows) != len(before_rows) + 2:
+            return None
+        before_groups = cls._rows_by_activation_identity(before_rows)
+        after_groups = cls._rows_by_activation_identity(after_rows)
+        if (before_rows and not before_groups) or not after_groups:
+            return None
+
+        changed_identity: tuple[str, str, str] | None = None
+        for identity in set(before_groups) | set(after_groups):
+            before_group = before_groups.get(identity, [])
+            after_group = after_groups.get(identity, [])
+            count_delta = len(after_group) - len(before_group)
+            if count_delta not in (0, 2):
+                return None
+            if count_delta == 2:
+                if changed_identity is not None:
+                    return None
+                changed_identity = identity
+            remainder = cls._activity_remainder(before_group, after_group)
+            if remainder is None:
+                return None
+            remaining, before_unknown = remainder
+            expected_remaining = before_unknown + count_delta
+            if sum(remaining.values()) != expected_remaining:
+                return None
+        return changed_identity
 
     @classmethod
     def _activation_identity(cls, row: ActivationRowSnapshot) -> tuple[str, str, str]:
