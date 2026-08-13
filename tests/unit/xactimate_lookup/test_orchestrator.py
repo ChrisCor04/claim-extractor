@@ -494,6 +494,48 @@ def test_execute_plan_resolves_a_newly_classified_trade_end_to_end(tmp_path, phr
         assert outcome.decision_diagnostics.tie_resolution.resolved is True
 
 
+def test_execute_plan_auto_selects_exterior_shutters_after_classification_fix(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.21: odom-insurance-v2 Rows 28/31's real, live-observed top
+    two candidates (SDG/SHTR exact match, SDG/SHTR< 'Small' size variant)
+    were previously capped to 0.45 by a false wrong_component conflict
+    from the old windows/window classification. With the corrected
+    siding/shutters classification, this reaches AUTO_SELECT through the
+    PRE-EXISTING 'insufficient_margin_exact_top_override' gate (Phase
+    5.15 Pass 2 -- a plain exact match beats a same-family size variant)
+    -- not a new mechanism, no threshold or margin changed. Also proves
+    candidate order doesn't affect the outcome."""
+    from estimate_extractor.mapping.pipeline import DEFAULT_CONFIG_DIR
+    from estimate_extractor.mapping.rules_config import load_normalization_rules
+    from estimate_extractor.mapping.trade_detector import detect_trade
+    from estimate_extractor.mapping.component_detector import detect_component
+
+    rules = load_normalization_rules(DEFAULT_CONFIG_DIR / "normalization_rules.yaml")
+    description = "R&R Shutters - simulated wood (polystyrene)"
+    trade, _ = detect_trade(description.lower(), rules.trade_component_rules)
+    component, _, _ = detect_component(description.lower(), rules.trade_component_rules)
+    assert trade.value == "siding"
+    assert component == "shutters"
+
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(
+        original_description=description, trade=trade.value, component=component,
+        material=None, action="remove_and_replace",
+    )
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    exact = _dropdown("Shutters - simulated wood (polystyrene)", cat="SDG", sel="SHTR", pos=0)
+    small = _dropdown("Shutters - simulated wood (polystyrene) - Small", cat="SDG", sel="SHTR<", pos=1)
+
+    for dropdowns in ([exact, small], [small, exact]):
+        adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: dropdowns})
+        outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+        assert outcome.decision == DECISION_AUTO_SELECT
+        assert outcome.selected.dropdown.category == "SDG"
+        assert outcome.selected.dropdown.selector == "SHTR"
+        assert outcome.decision_diagnostics.gate == "insufficient_margin_exact_top_override"
+        assert outcome.decision_diagnostics.top_has_hard_conflict is False
+
+
 def test_decision_diagnostics_still_reflects_original_auto_select_on_invalid_quantity_stop(tmp_path, phrase_rules, ranking_config):
     """`decision` on the returned outcome flips to REVIEW_REQUIRED for
     the quantity guard, but decision_diagnostics must still explain the

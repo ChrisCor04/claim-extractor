@@ -125,3 +125,157 @@ def test_trade_classification_is_independent_of_any_ranking_candidate_order():
     rules = _rules().trade_component_rules
     results = {detect_trade("ice & water barrier", rules) for _ in range(5)}
     assert results == {(TradeType.ROOFING, 0.9)}
+
+
+# ---------------------------------------------------------------------
+# Phase 5.21 (odom-insurance-v2 Rows 28/31 investigation): "R&R Shutters
+# - simulated wood (polystyrene)" was classifying as trade='windows',
+# component='window' -- this catalog's real SDG/SHTR entry is a
+# VERBATIM match for that source text, but ranking's component_ok check
+# (component_words={'window'} vs a candidate description that never
+# says "window") flagged a false wrong_component conflict, capping an
+# otherwise-perfect match at 0.45. The fix is narrowly scoped to
+# catalog-evidenced EXTERIOR-only shutter phrasings (material/style/
+# security qualifiers that only ever appear on this catalog's SDG
+# entries, never on its WDT "interior window shutters" family) --
+# bare/unqualified "shutters" wording is deliberately left unchanged,
+# since this catalog genuinely has both an SDG and a WDT family for it
+# with no material-based way to tell them apart (see SDG/SHTRRS and
+# WDT/SHTRRS, both literally "Shutters - Detach & reset").
+# ---------------------------------------------------------------------
+
+
+def test_simulated_wood_polystyrene_shutters_no_longer_classify_as_window():
+    """The exact live-caught case: must no longer produce
+    component='window' (the false-conflict trigger)."""
+    rules = _rules().trade_component_rules
+    trade, _ = detect_trade("r&r shutters - simulated wood (polystyrene)", rules)
+    component, _, _ = detect_component("r&r shutters - simulated wood (polystyrene)", rules)
+    assert trade == TradeType.SIDING
+    assert component == "shutters"
+
+
+def test_exterior_shutter_material_variants_classify_as_siding():
+    """Every catalog-evidenced exterior-only qualifier (aluminum, wood-
+    board-&-batten, wood-louvered, security, storm) must classify the
+    same way -- this is a generalized vocabulary fix, not one literal
+    string match."""
+    rules = _rules().trade_component_rules
+    cases = [
+        "shutters - aluminum",
+        "aluminum shutters",
+        "shutters - wood - board & batten",
+        "shutters - wood - louvered or paneled",
+        "security shutter - accordion or folding type",
+        "storm shutter - roll-up type",
+    ]
+    for description in cases:
+        trade, _ = detect_trade(description, rules)
+        component, _, _ = detect_component(description, rules)
+        assert trade == TradeType.SIDING, description
+        assert component == "shutters", description
+
+
+def test_interior_window_shutters_remain_classified_as_windows():
+    """The catalog's WDT 'Interior window shutters' family must remain
+    distinguishable -- none of the new exterior-only patterns match
+    this wording, so it correctly falls through to the pre-existing
+    windows/window rule, unchanged."""
+    rules = _rules().trade_component_rules
+    trade, _ = detect_trade("interior window shutters (set)", rules)
+    component, _, _ = detect_component("interior window shutters (set)", rules)
+    assert trade == TradeType.WINDOWS
+    assert component == "window"
+
+
+def test_ambiguous_bare_shutters_wording_remains_conservative():
+    """No material/security/storm qualifier at all -- this catalog has
+    BOTH an exterior (SDG) and interior (WDT) family for exactly this
+    bare wording ('Shutters - Detach & reset' exists identically under
+    both), so there is no source-side basis to prefer one. Must stay on
+    the existing, unchanged default rather than being force-classified
+    either way."""
+    rules = _rules().trade_component_rules
+    trade, _ = detect_trade("shutters - detach & reset", rules)
+    component, _, _ = detect_component("shutters - detach & reset", rules)
+    assert trade == TradeType.WINDOWS
+    assert component == "window"
+
+
+def test_painting_shutters_wording_unaffected():
+    """Real fixture example (Garrety): 'Seal & paint window shutters -
+    per set' explicitly says 'window' and matches no new exterior-only
+    pattern -- classification must be completely unchanged."""
+    rules = _rules().trade_component_rules
+    trade, _ = detect_trade("seal & paint window shutters - per set", rules)
+    component, _, _ = detect_component("seal & paint window shutters - per set", rules)
+    assert trade == TradeType.WINDOWS
+    assert component == "window"
+
+
+def test_unrelated_window_items_unchanged_by_shutter_fix():
+    rules = _rules().trade_component_rules
+    for description, expected_component in [
+        ("r&r window screen, 1 - 9 sf", "window_screen"),
+        ("wood window - double hung, 9-12 sf", "window"),
+    ]:
+        trade, _ = detect_trade(description, rules)
+        component, _, _ = detect_component(description, rules)
+        assert trade == TradeType.WINDOWS, description
+        assert component == expected_component, description
+
+
+def test_unrelated_siding_items_unchanged_by_shutter_fix():
+    rules = _rules().trade_component_rules
+    for description in ["r&r siding - vinyl", "metal or vinyl siding - detach & reset", "house wrap (air/moisture barrier)"]:
+        trade, _ = detect_trade(description, rules)
+        component, _, _ = detect_component(description, rules)
+        assert trade == TradeType.SIDING, description
+        assert component != "shutters", description
+
+
+def test_shutter_classification_independent_of_candidate_order():
+    """Same guard as the ice & water barrier test above, applied to the
+    new shutter rule -- classification runs purely off the source text,
+    repeatedly, before any search/ranking exists."""
+    rules = _rules().trade_component_rules
+    results = {detect_trade("shutters - simulated wood (polystyrene)", rules) for _ in range(5)}
+    assert results == {(TradeType.SIDING, 0.9)}
+
+
+def test_corrected_classification_removes_the_false_wrong_component_conflict():
+    """End-to-end proof at the ranking layer: scoring the REAL live-
+    observed top candidate (SDG/SHTR, verbatim catalog match) with the
+    OLD (windows/window) classification reproduces the false conflict
+    that capped it at 0.45; the NEW (siding/shutters) classification
+    removes it entirely, without touching any ranking threshold, cap
+    value, or hard-conflict rule -- only the input classification
+    changed."""
+    from estimate_extractor.xactimate_lookup import ranking, phrase_generator
+    from estimate_extractor.xactimate_lookup.models import DropdownResult
+
+    phrase_rules = phrase_generator.load_phrase_rules()
+    config = ranking.load_ranking_config()
+    source = "R&R Shutters - simulated wood (polystyrene)"
+    candidate = DropdownResult(
+        raw_text="Shutters - simulated wood (polystyrene)", row_position=0, category="SDG", selector="SHTR",
+        description="Shutters - simulated wood (polystyrene)", extraction_confidence=1.0,
+    )
+
+    before = ranking.score_dropdown_candidate(
+        original_description=source, trade="windows", component="window", material=None, action="remove_and_replace",
+        unit="EA", size_key=None, grade_key=None, dropdown=candidate, rules=phrase_rules, config=config,
+    )
+    assert before.has_hard_conflict is True
+    assert any("wrong_component" in r for r in before.conflict_reasons)
+    assert before.score == 0.45
+
+    trade, _ = detect_trade(source.lower(), _rules().trade_component_rules)
+    component, _, _ = detect_component(source.lower(), _rules().trade_component_rules)
+    after = ranking.score_dropdown_candidate(
+        original_description=source, trade=trade.value, component=component, material=None, action="remove_and_replace",
+        unit="EA", size_key=None, grade_key=None, dropdown=candidate, rules=phrase_rules, config=config,
+    )
+    assert after.has_hard_conflict is False
+    assert after.conflict_reasons == []
+    assert after.score == 1.0

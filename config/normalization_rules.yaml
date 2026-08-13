@@ -179,6 +179,33 @@ rules:
     component: "window_screen"
     material: null
 
+  # Phase 5.21 (live-caught): bare "shutters" is genuinely ambiguous --
+  # this catalog carries BOTH an SDG (exterior siding) shutter family and
+  # a WDT (interior window treatment) shutter family, and a source
+  # description without a material/security/storm qualifier gives no
+  # basis to prefer one over the other (confirmed: SDG/SHTRRS and
+  # WDT/SHTRRS are both literally "Shutters - Detach & reset" with no
+  # further distinguishing text). The generic ["window", "shutters"]
+  # rule below is kept for exactly that ambiguous case. These specific,
+  # catalog-evidenced material/style/security phrasings, though, exist
+  # ONLY as exterior siding-shutter entries in this catalog (no interior
+  # counterpart at any material/style variant sampled) -- listed first
+  # so the more specific match wins, same convention as the roofing-
+  # accessory rules above.
+  - patterns:
+      - "shutters - simulated wood"
+      - "simulated wood shutters"
+      - "polystyrene shutters"
+      - "shutters - aluminum"
+      - "aluminum shutters"
+      - "shutters - wood - board & batten"
+      - "shutters - wood - louvered"
+      - "security shutter"
+      - "storm shutter"
+    trade: "siding"
+    component: "shutters"
+    material: null
+
   - patterns: ["window", "shutters"]
     trade: "windows"
     component: "window"
