@@ -80,7 +80,10 @@ from estimate_extractor.xactimate_lookup.destructive_audit import (
     ProtectedRowLedger,
     ProtectedRowRecord,
 )
-from estimate_extractor.xactimate_lookup.execution_diagnostics import RowLifecycleLedger
+from estimate_extractor.xactimate_lookup.execution_diagnostics import (
+    RRBindingDiagnosticLedger,
+    RowLifecycleLedger,
+)
 from estimate_extractor.xactimate_lookup.models import DropdownResult, PopulatedFields
 
 #: Xactimate's HwndWrapper class names embed this literal substring for
@@ -1061,6 +1064,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # logical multiset rather than assume the old rows stay a prefix.
         self._last_activation_baseline_rows: list[ActivationRowSnapshot] | None = None
         self._last_commit_baseline_rows: list[CommitRowSnapshot] | None = None
+        # Exact immutable frame behind the most recent activation snapshot.
+        # Retained only long enough to persist diagnostic activity-cell crops;
+        # never read by binding or any other execution decision.
+        self._last_activation_snapshot_image = None
+        self._last_activation_snapshot_offset: tuple[int, int] | None = None
+        self._last_activation_snapshot_row_1_top: int | None = None
         self._pending_quantity_target: PendingQuantityTarget | None = None
         self.last_quantity_confirmation: QuantityEntryConfirmation | None = None
         self._current_query: str | None = None
@@ -1084,6 +1093,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         #: Phase 5.9: append-only per-task row lifecycle ledger -- see
         #: execution_diagnostics.py's module docstring.
         self._row_lifecycle_ledger = RowLifecycleLedger(self.evidence_dir / "row_lifecycle_ledger.jsonl")
+        self._rr_binding_diagnostic_ledger = RRBindingDiagnosticLedger(
+            self.evidence_dir / "rr_binding_diagnostics.jsonl",
+        )
 
         #: Phase 5.7B: names (normalized lowercase) of groups this
         #: adapter INSTANCE has already positively verified via a real
@@ -4231,11 +4243,23 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if baseline_rows is None:
             baseline_rows = [] if expected == 0 else None
         if baseline_rows is None or len(baseline_rows) != expected:
+            self._persist_rr_binding_diagnostic(
+                list(baseline_rows or []), [], target=None,
+                final_outcome="physical_state_uncertain",
+                final_reason="missing_or_wrong_length_rich_activation_baseline",
+                include_branch_results=False,
+            )
             raise PhysicalStateUncertainError(
                 "R&R pair binding has no matching rich activation baseline; refusing to infer a row delta."
             )
         baseline_identities = [(row.category, row.selector) for row in baseline_rows]
         if baseline_identities != list(before_snapshot):
+            self._persist_rr_binding_diagnostic(
+                baseline_rows, [], target=None,
+                final_outcome="physical_state_uncertain",
+                final_reason="rich_baseline_does_not_match_supplied_baseline",
+                include_branch_results=False,
+            )
             raise PhysicalStateUncertainError(
                 "R&R pair binding's rich baseline does not match the supplied physical-row baseline."
             )
@@ -4245,6 +4269,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
             physical_delta = len(rows) - expected
             if physical_delta == 2:
                 pair_target = self._pending_rr_pair_targets_from_delta(baseline_rows, rows)
+                self._persist_rr_binding_diagnostic(
+                    baseline_rows, rows, target=pair_target,
+                    final_outcome="bound" if pair_target is not None else "task_local_reconciliation",
+                    final_reason=(
+                        "authoritative_dispatch_returned_pair"
+                        if pair_target is not None
+                        else "authoritative_dispatch_returned_none"
+                    ),
+                )
                 if pair_target is not None:
                     return pair_target
                 # Task-local, not project-level: this task's own activation
@@ -4257,24 +4290,54 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     f"bound R&R -/+ pair (before={expected}, after={len(rows)})."
                 )
             if physical_delta == 1 or physical_delta > 2:
+                self._persist_rr_binding_diagnostic(
+                    baseline_rows, rows, target=None,
+                    final_outcome="physical_state_uncertain",
+                    final_reason="physical_row_delta_is_not_two",
+                    include_branch_results=False,
+                )
                 raise PhysicalStateUncertainError(
                     "R&R pair activation did not produce exactly two new physical rows; refusing to guess "
                     f"which rows belong to this pair (before={expected}, after={len(rows)})."
                 )
             if physical_delta < 0:
+                self._persist_rr_binding_diagnostic(
+                    baseline_rows, rows, target=None,
+                    final_outcome="physical_state_uncertain",
+                    final_reason="activation_removed_physical_rows",
+                    include_branch_results=False,
+                )
                 raise PhysicalStateUncertainError(
                     "Candidate activation removed physical rows; refusing to infer an R&R pair."
                 )
             if physical_delta == 0 and not self._baseline_rows_accounted(baseline_rows, rows):
+                self._persist_rr_binding_diagnostic(
+                    baseline_rows, rows, target=None,
+                    final_outcome="physical_state_uncertain",
+                    final_reason="unchanged_row_count_with_unreconciled_baseline",
+                    include_branch_results=False,
+                )
                 raise PhysicalStateUncertainError(
                     "Candidate activation left the row count unchanged but a prior physical row disappeared or "
                     "mutated beyond structural reconciliation."
                 )
             if self._unexpected_dialog_present():
+                self._persist_rr_binding_diagnostic(
+                    baseline_rows, rows, target=None,
+                    final_outcome="physical_state_uncertain",
+                    final_reason="unexpected_dialog_during_binding",
+                    include_branch_results=False,
+                )
                 raise PhysicalStateUncertainError(
                     "An unexpected dialog appeared while confirming R&R pair activation."
                 )
             if time.time() - start >= timeout_s:
+                self._persist_rr_binding_diagnostic(
+                    baseline_rows, rows, target=None,
+                    final_outcome="physical_state_uncertain",
+                    final_reason="activation_timeout_with_zero_new_rows",
+                    include_branch_results=False,
+                )
                 raise PhysicalStateUncertainError(
                     "Candidate selection created zero new physical rows within the activation window."
                 )
@@ -4292,6 +4355,277 @@ class WindowsXactimateAdapter(XactimateAdapter):
     def _activity_token(row: ActivationRowSnapshot) -> str | None:
         value = str(row.activity or "").strip()
         return value or None
+
+    @classmethod
+    def _rr_diagnostic_row(cls, row: ActivationRowSnapshot, index: int,
+                           rows: list[ActivationRowSnapshot]) -> dict:
+        identity = cls._activation_identity(row)
+        activity = cls._activity_token(row)
+        ordinal = sum(
+            1 for prior in rows[:index + 1]
+            if cls._activation_identity(prior) == identity and cls._activity_token(prior) == activity
+        )
+        if activity == "-":
+            activity_class = "literal_minus"
+        elif activity == "+":
+            activity_class = "literal_plus"
+        elif activity in _ACTIVITY_MINUS_OCR_CONFUSIONS:
+            activity_class = "accepted_noisy_minus"
+        elif activity in _ACTIVITY_PLUS_OCR_CONFUSIONS:
+            activity_class = "accepted_noisy_plus"
+        else:
+            activity_class = "unrecognized"
+        return {
+            "row_index": index,
+            "activity_ordinal": ordinal,
+            "binder_input": {
+                "category": row.category,
+                "selector": row.selector,
+                "description": row.description,
+                "activity": row.activity,
+            },
+            "normalized": {
+                "category": identity[0],
+                "selector": identity[1],
+                "description": identity[2],
+                "activity": activity,
+                "activity_class": activity_class,
+            },
+        }
+
+    @staticmethod
+    def _rr_activation_delta_indices(
+        before_rows: list[ActivationRowSnapshot], after_rows: list[ActivationRowSnapshot],
+    ) -> list[int]:
+        """Indices not consumed by an exact multiset copy of the baseline."""
+        remaining = Counter(before_rows)
+        delta: list[int] = []
+        for index, row in enumerate(after_rows):
+            if remaining[row] > 0:
+                remaining[row] -= 1
+            else:
+                delta.append(index)
+        return delta
+
+    @classmethod
+    def _rr_strict_branch_reason(
+        cls, before_rows: list[ActivationRowSnapshot], after_rows: list[ActivationRowSnapshot],
+    ) -> str:
+        if len(after_rows) != len(before_rows) + 2:
+            return "row_count_delta_is_not_two"
+        before_groups = cls._rows_by_activation_identity(before_rows)
+        after_groups = cls._rows_by_activation_identity(after_rows)
+        if before_rows and not before_groups:
+            return "baseline_contains_incomplete_identity"
+        if not after_groups:
+            return "after_snapshot_contains_incomplete_identity"
+        changed_identity = None
+        for identity in set(before_groups) | set(after_groups):
+            before_group = before_groups.get(identity, [])
+            after_group = after_groups.get(identity, [])
+            count_delta = len(after_group) - len(before_group)
+            if count_delta not in (0, 2):
+                return "identity_count_delta_is_not_zero_or_two"
+            if count_delta == 2:
+                if changed_identity is not None:
+                    return "more_than_one_identity_gained_two_rows"
+                changed_identity = identity
+            remainder = cls._activity_remainder(before_group, after_group)
+            if remainder is None:
+                return "baseline_activity_cannot_be_reconciled"
+            remaining, before_unknown = remainder
+            remaining_total = sum(remaining.values())
+            if count_delta == 0 and remaining_total != before_unknown:
+                return "unchanged_identity_has_unexplained_activity_rows"
+            if count_delta == 2:
+                if remaining_total != before_unknown + 2:
+                    return "changed_identity_activity_cardinality_is_not_two"
+                if remaining.get("-", 0) < 1 or remaining.get("+", 0) < 1:
+                    return "changed_identity_lacks_literal_minus_plus_roles"
+        if changed_identity is None:
+            return "no_identity_gained_two_rows"
+        minus_indices = cls._activity_matching_indices(after_rows, changed_identity, "-")
+        plus_indices = cls._activity_matching_indices(after_rows, changed_identity, "+")
+        if len(minus_indices) != 1 or len(plus_indices) != 1:
+            return "literal_role_ownership_is_not_unique"
+        return "passed"
+
+    @classmethod
+    def _rr_tolerant_branch_reason(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+        *,
+        clean_activity: str,
+        noisy_activity: str,
+        accepted_confusions: frozenset[str],
+    ) -> str:
+        if len(after_rows) != len(before_rows) + 2:
+            return "row_count_delta_is_not_two"
+        before_counter = Counter(before_rows)
+        after_counter = Counter(after_rows)
+        if before_counter - after_counter:
+            return "baseline_is_not_an_exact_preserved_multiset"
+        added = after_counter - before_counter
+        if sum(added.values()) != 2:
+            return "exact_additive_delta_does_not_contain_two_rows"
+        added_rows = list(added.elements())
+        identities = {cls._activation_identity(row) for row in added_rows}
+        if len(identities) != 1:
+            return "delta_rows_do_not_share_one_identity"
+        identity = next(iter(identities))
+        if not all(identity):
+            return "delta_identity_is_incomplete"
+        if any(cls._activation_identity(row) == identity for row in before_counter):
+            return "delta_identity_already_exists_in_baseline"
+        clean_indices = cls._activity_matching_indices(after_rows, identity, clean_activity)
+        if len(clean_indices) != 1:
+            return f"literal_{'minus' if clean_activity == '-' else 'plus'}_role_is_not_unique"
+        all_identity_indices = [
+            index for index, row in enumerate(after_rows) if cls._activation_identity(row) == identity
+        ]
+        if len(all_identity_indices) != 2:
+            return "identity_does_not_have_exactly_two_after_rows"
+        remaining = [index for index in all_identity_indices if index not in clean_indices]
+        if len(remaining) != 1:
+            return "complementary_role_row_is_not_unique"
+        token = cls._activity_token(after_rows[remaining[0]])
+        if token not in accepted_confusions:
+            role = "plus" if noisy_activity == "+" else "minus"
+            return f"complementary_activity_is_not_an_accepted_noisy_{role}_token"
+        return "passed"
+
+    @classmethod
+    def _rr_branch_diagnostics(
+        cls, before_rows: list[ActivationRowSnapshot], after_rows: list[ActivationRowSnapshot],
+    ) -> list[dict]:
+        strict_reason = cls._rr_strict_branch_reason(before_rows, after_rows)
+        plus_reason = cls._rr_tolerant_branch_reason(
+            before_rows, after_rows, clean_activity="-", noisy_activity="+",
+            accepted_confusions=_ACTIVITY_PLUS_OCR_CONFUSIONS,
+        )
+        minus_reason = cls._rr_tolerant_branch_reason(
+            before_rows, after_rows, clean_activity="+", noisy_activity="-",
+            accepted_confusions=_ACTIVITY_MINUS_OCR_CONFUSIONS,
+        )
+        strict_passed = strict_reason == "passed"
+        plus_reached = not strict_passed
+        plus_passed = plus_reason == "passed"
+        minus_reached = plus_reached and not plus_passed
+        return [
+            {
+                "branch": "strict_literal_minus_plus",
+                "authoritative_dispatch_reached": True,
+                "passed": strict_passed,
+                "reason": strict_reason,
+            },
+            {
+                "branch": "noisy_plus_fallback",
+                "authoritative_dispatch_reached": plus_reached,
+                "passed": plus_passed,
+                "reason": plus_reason,
+            },
+            {
+                "branch": "noisy_minus_fallback",
+                "authoritative_dispatch_reached": minus_reached,
+                "passed": minus_reason == "passed",
+                "reason": minus_reason,
+            },
+        ]
+
+    @staticmethod
+    def _rr_diagnostic_target(target: PendingRRPairTarget | None) -> dict | None:
+        if target is None:
+            return None
+        return {
+            "identity": list(target.identity),
+            "minus": {
+                "after_index": target.minus_target.after_index,
+                "activity": target.minus_target.activity,
+                "activity_ordinal": target.minus_target.activity_ordinal,
+            },
+            "plus": {
+                "after_index": target.plus_target.after_index,
+                "activity": target.plus_target.activity,
+                "activity_ordinal": target.plus_target.activity_ordinal,
+            },
+        }
+
+    def _persist_rr_binding_diagnostic(
+        self,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+        *,
+        target: PendingRRPairTarget | None,
+        final_outcome: str,
+        final_reason: str,
+        include_branch_results: bool = True,
+    ) -> None:
+        """Best-effort persistence that is never allowed to affect binding."""
+        try:
+            delta_indices = self._rr_activation_delta_indices(before_rows, after_rows)
+            crop_paths: dict[int, str] = {}
+            image = self._last_activation_snapshot_image
+            offset = self._last_activation_snapshot_offset
+            row_1_top = self._last_activation_snapshot_row_1_top
+            if image is not None and offset is not None and row_1_top is not None:
+                try:
+                    crop_dir = self.evidence_dir / "rr_binding_activity_crops"
+                    crop_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = time.time_ns()
+                    for index in delta_indices:
+                        row_top = row_1_top + index * _GRID_ROW_HEIGHT
+                        crop = self._activation_activity_crop(image, offset, row_top)
+                        path = crop_dir / f"rr_binding_{stamp}_row_{index}.png"
+                        crop.save(path)
+                        crop_paths[index] = str(path)
+                except Exception:
+                    # JSON row/branch evidence remains useful even when an
+                    # optional crop cannot be written.
+                    crop_paths = {}
+
+            context = self._execution_context
+            branch_results = (
+                self._rr_branch_diagnostics(before_rows, after_rows)
+                if include_branch_results
+                else [
+                    {
+                        "branch": name,
+                        "authoritative_dispatch_reached": False,
+                        "passed": False,
+                        "reason": "not_evaluated_for_this_physical_shape",
+                    }
+                    for name in (
+                        "strict_literal_minus_plus", "noisy_plus_fallback", "noisy_minus_fallback",
+                    )
+                ]
+            )
+            before = [self._rr_diagnostic_row(row, index, before_rows) for index, row in enumerate(before_rows)]
+            after = [self._rr_diagnostic_row(row, index, after_rows) for index, row in enumerate(after_rows)]
+            for row in after:
+                index = row["row_index"]
+                row["is_activation_delta"] = index in delta_indices
+                row["activity_crop_path"] = crop_paths.get(index)
+            self._rr_binding_diagnostic_ledger.record({
+                "run_id": context.run_id,
+                "task_id": context.task_id,
+                "source_row": context.source_row,
+                "group": context.group,
+                "before_row_count": len(before_rows),
+                "after_row_count": len(after_rows),
+                "physical_row_delta": len(after_rows) - len(before_rows),
+                "before_rows": before,
+                "after_rows": after,
+                "activation_delta_indices": delta_indices,
+                "activation_delta_method": "exact_snapshot_multiset_subtraction",
+                "branches": branch_results,
+                "final_result": self._rr_diagnostic_target(target),
+                "final_outcome": final_outcome,
+                "final_reason": final_reason,
+            })
+        except Exception:
+            # Diagnostic construction/persistence is observational only.
+            pass
 
     @classmethod
     def _pending_quantity_target_from_delta(
@@ -5606,12 +5940,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
+            self._last_activation_snapshot_image = None
+            self._last_activation_snapshot_offset = None
+            self._last_activation_snapshot_row_1_top = None
             if require_located:
                 raise AdapterError(
                     "Cannot positively locate the current Items grid for search-fallback state verification."
                 )
             return []
         rows, row_1_top = self._activation_rows_from_same_image(image, offset)
+        self._last_activation_snapshot_image = image
+        self._last_activation_snapshot_offset = offset
+        self._last_activation_snapshot_row_1_top = row_1_top
         for _probe in range(2):
             next_row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
             if next_row_top < 0 or next_row_top + _GRID_ROW_HEIGHT > image.height:
@@ -5642,6 +5982,16 @@ class WindowsXactimateAdapter(XactimateAdapter):
         boundary and corroborates two OCR segmentation modes.  It does
         not alter the shared grid columns used by quantity/commit logic.
         """
+        crop = self._activation_activity_crop(image, offset, row_top)
+        reads = [self._ocr_text(crop, psm=psm).strip() for psm in (6, 7)]
+        for expected in ("-", "+"):
+            if expected in reads:
+                return expected
+        return next((read for read in reads if read), None)
+
+    @staticmethod
+    def _activation_activity_crop(image, offset: tuple[int, int], row_top: int):
+        """Return the exact resized image supplied to activity OCR."""
         activity_left, _activity_right = _GRID_COLUMNS["activity"]
         dx = offset[0]
         crop = image.crop((
@@ -5650,12 +6000,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             activity_left + 12 + dx,
             row_top + _GRID_ROW_HEIGHT,
         ))
-        crop = crop.resize((crop.width * 4, crop.height * 4))
-        reads = [self._ocr_text(crop, psm=psm).strip() for psm in (6, 7)]
-        for expected in ("-", "+"):
-            if expected in reads:
-                return expected
-        return next((read for read in reads if read), None)
+        return crop.resize((crop.width * 4, crop.height * 4))
 
     def _read_description_at(self, image, offset: tuple[int, int], row_top: int) -> str | None:
         """Lighter-weight description-only read at an ARBITRARY

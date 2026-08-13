@@ -14,7 +14,9 @@ for why every OS-specific dependency is a lazy import.
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -7350,6 +7352,133 @@ def test_bind_rr_pair_after_activation_returns_dual_targets_for_clean_pair(monke
     # binding -- pending_item_created()'s own "+"-only retention path is
     # untouched and not exercised by this method at all.
     assert adapter._pending_quantity_target is None
+
+
+def test_rr_binding_diagnostic_persists_exact_inputs_delta_branches_and_result(tmp_path, monkeypatch):
+    adapter = WindowsXactimateAdapter(
+        expected_project_name="TEST", evidence_dir=tmp_path, window_finder=lambda: ([], []),
+    )
+    baseline = [ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None)]
+    after = baseline + [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    adapter._last_activation_baseline_rows = baseline
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    result = adapter.bind_rr_pair_after_activation([("SFG", "GUTA")], timeout_s=0)
+
+    expected = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(baseline, after)
+    assert result == expected
+    entry = adapter._rr_binding_diagnostic_ledger.entries[-1]
+    assert entry["before_row_count"] == 1
+    assert entry["after_row_count"] == 3
+    assert entry["activation_delta_indices"] == [1, 2]
+    assert entry["before_rows"][0]["binder_input"] == {
+        "category": "SFG", "selector": "GUTA", "description": "Aluminum gutter", "activity": None,
+    }
+    assert entry["after_rows"][1]["normalized"] == {
+        "category": "rfg", "selector": "steep", "description": "steep charge",
+        "activity": "-", "activity_class": "literal_minus",
+    }
+    assert entry["after_rows"][1]["row_index"] == 1
+    assert entry["after_rows"][1]["activity_ordinal"] == 1
+    assert entry["after_rows"][1]["is_activation_delta"] is True
+    assert entry["branches"][0] == {
+        "branch": "strict_literal_minus_plus", "authoritative_dispatch_reached": True,
+        "passed": True, "reason": "passed",
+    }
+    assert entry["branches"][1]["authoritative_dispatch_reached"] is False
+    assert entry["final_result"]["minus"]["after_index"] == 1
+    assert entry["final_result"]["plus"]["after_index"] == 2
+    persisted = [json.loads(line) for line in (tmp_path / "rr_binding_diagnostics.jsonl").read_text().splitlines()]
+    assert persisted[-1]["final_outcome"] == "bound"
+
+
+@pytest.mark.parametrize(
+    ("activities", "selected_branch"),
+    [
+        (("-", "4"), "noisy_plus_fallback"),
+        (("to", "+"), "noisy_minus_fallback"),
+    ],
+)
+def test_rr_binding_diagnostic_reports_existing_tolerant_branch_without_changing_result(
+    tmp_path, monkeypatch, activities, selected_branch,
+):
+    adapter = WindowsXactimateAdapter(
+        expected_project_name="TEST", evidence_dir=tmp_path, window_finder=lambda: ([], []),
+    )
+    after = [_rr_pair_row(activity=activity) for activity in activities]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    result = adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+    assert result == WindowsXactimateAdapter._pending_rr_pair_targets_from_delta([], after)
+    branches = adapter._rr_binding_diagnostic_ledger.entries[-1]["branches"]
+    selected = [branch["branch"] for branch in branches if branch["passed"] and branch["authoritative_dispatch_reached"]]
+    assert selected == [selected_branch]
+
+
+def test_rr_binding_diagnostic_explains_both_unreadable_roles_and_preserves_rejection(tmp_path, monkeypatch):
+    adapter = WindowsXactimateAdapter(
+        expected_project_name="TEST", evidence_dir=tmp_path, window_finder=lambda: ([], []),
+    )
+    after = [_rr_pair_row(activity="_L"), _rr_pair_row(activity="=")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta([], after) is None
+    with pytest.raises(AdapterError, match="uniquely bound R&R"):
+        adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+    entry = adapter._rr_binding_diagnostic_ledger.entries[-1]
+    assert entry["final_result"] is None
+    assert entry["final_outcome"] == "task_local_reconciliation"
+    assert [(branch["branch"], branch["reason"]) for branch in entry["branches"]] == [
+        ("strict_literal_minus_plus", "changed_identity_lacks_literal_minus_plus_roles"),
+        ("noisy_plus_fallback", "literal_minus_role_is_not_unique"),
+        ("noisy_minus_fallback", "literal_plus_role_is_not_unique"),
+    ]
+
+
+def test_rr_binding_diagnostic_saves_exact_frame_activity_crops_without_extra_ocr(tmp_path, monkeypatch):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(
+        expected_project_name="TEST", evidence_dir=tmp_path, window_finder=lambda: ([], []),
+    )
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    image = Image.new("RGB", (1920, 1021), "white")
+
+    def snapshot():
+        adapter._last_activation_snapshot_image = image
+        adapter._last_activation_snapshot_offset = (0, 0)
+        adapter._last_activation_snapshot_row_1_top = 650
+        return after
+
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", snapshot)
+    ocr_calls = []
+    monkeypatch.setattr(adapter, "_ocr_text", lambda *_args, **_kwargs: ocr_calls.append(1))
+
+    adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+    entry = adapter._rr_binding_diagnostic_ledger.entries[-1]
+    crop_paths = [row["activity_crop_path"] for row in entry["after_rows"]]
+    assert all(path is not None for path in crop_paths)
+    assert all(Path(path).exists() for path in crop_paths)
+    assert ocr_calls == []
+
+
+def test_rr_binding_diagnostic_failure_cannot_change_successful_binding(tmp_path, monkeypatch):
+    adapter = WindowsXactimateAdapter(
+        expected_project_name="TEST", evidence_dir=tmp_path, window_finder=lambda: ([], []),
+    )
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: after)
+    monkeypatch.setattr(
+        adapter._rr_binding_diagnostic_ledger, "record",
+        lambda _entry: (_ for _ in ()).throw(OSError("diagnostic disk unavailable")),
+    )
+
+    result = adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+    assert result == WindowsXactimateAdapter._pending_rr_pair_targets_from_delta([], after)
 
 
 def test_bind_rr_pair_after_activation_fails_closed_when_pair_is_ambiguous(monkeypatch):

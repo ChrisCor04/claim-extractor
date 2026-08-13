@@ -89,3 +89,30 @@ class RowLifecycleLedger:
     def last_event_for_task(self, task_id: str) -> dict | None:
         matches = self.events_for_task(task_id)
         return matches[-1] if matches else None
+
+
+class RRBindingDiagnosticLedger:
+    """Append-only evidence for coordinated R&R binding decisions.
+
+    Like :class:`RowLifecycleLedger`, this is strictly observational and
+    deliberately swallows persistence failures.  A diagnostic filesystem
+    problem must never change whether the adapter binds or rejects a physical
+    pair.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.entries: list[dict] = []
+
+    def record(self, entry: dict) -> None:
+        persisted = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            **entry,
+        }
+        self.entries.append(persisted)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(persisted, default=str) + "\n")
+        except Exception:
+            pass
