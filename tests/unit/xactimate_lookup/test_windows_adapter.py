@@ -7465,6 +7465,62 @@ def test_rr_binding_diagnostic_saves_exact_frame_activity_crops_without_extra_oc
     assert ocr_calls == []
 
 
+def test_rr_binding_diagnostic_records_existing_psm_outputs_without_extra_ocr_or_binder_change(
+    tmp_path, monkeypatch,
+):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(
+        expected_project_name="TEST", evidence_dir=tmp_path, window_finder=lambda: ([], []),
+    )
+    image = Image.new("RGB", (1920, 1021), "white")
+    row_1_top = 650
+    ocr_outputs = iter(["_L", "-", "+", "="])
+    ocr_calls = []
+    observed_rows = []
+
+    def ocr(_crop, psm):
+        ocr_calls.append(psm)
+        return next(ocr_outputs)
+
+    def rows_from_same_image(frame, offset):
+        rows = [
+            _rr_pair_row(activity=adapter._read_activation_activity_at(frame, offset, row_1_top)),
+            _rr_pair_row(
+                activity=adapter._read_activation_activity_at(
+                    frame, offset, row_1_top + _GRID_ROW_HEIGHT,
+                ),
+            ),
+        ]
+        observed_rows[:] = rows
+        return rows, row_1_top
+
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 1)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda _hwnd: (image, (0, 0)))
+    monkeypatch.setattr(adapter, "_activation_rows_from_same_image", rows_from_same_image)
+    monkeypatch.setattr(
+        adapter, "_read_activation_row_at",
+        lambda _image, _offset, _row_top: ActivationRowSnapshot(None, None, None, None),
+    )
+    monkeypatch.setattr(adapter, "_ocr_text", ocr)
+
+    result = adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+    assert result == WindowsXactimateAdapter._pending_rr_pair_targets_from_delta([], observed_rows)
+    assert ocr_calls == [6, 7, 6, 7]
+    entry = adapter._rr_binding_diagnostic_ledger.entries[-1]
+    assert entry["after_rows"][0]["activity_ocr"] == {
+        "psm_6_raw": "_L", "psm_7_raw": "-", "selected_raw": "-",
+    }
+    assert entry["after_rows"][1]["activity_ocr"] == {
+        "psm_6_raw": "+", "psm_7_raw": "=", "selected_raw": "+",
+    }
+    assert entry["after_rows"][0]["binder_input"]["activity"] == "-"
+    assert entry["after_rows"][0]["normalized"]["activity"] == "-"
+    assert entry["after_rows"][1]["binder_input"]["activity"] == "+"
+    assert entry["after_rows"][1]["normalized"]["activity"] == "+"
+
+
 def test_rr_binding_diagnostic_failure_cannot_change_successful_binding(tmp_path, monkeypatch):
     adapter = WindowsXactimateAdapter(
         expected_project_name="TEST", evidence_dir=tmp_path, window_finder=lambda: ([], []),

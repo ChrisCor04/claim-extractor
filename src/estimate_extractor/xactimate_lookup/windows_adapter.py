@@ -1070,6 +1070,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         self._last_activation_snapshot_image = None
         self._last_activation_snapshot_offset: tuple[int, int] | None = None
         self._last_activation_snapshot_row_1_top: int | None = None
+        # Diagnostic-only raw OCR outputs collected while the authoritative
+        # activation frame is read. The active accumulator is never consumed
+        # by binding; the completed copy is joined to persisted evidence by
+        # the same row geometry as the existing activity-cell crops.
+        self._active_activation_activity_ocr: dict[int, dict[str, str | None]] | None = None
+        self._last_activation_snapshot_activity_ocr: dict[int, dict[str, str | None]] = {}
         self._pending_quantity_target: PendingQuantityTarget | None = None
         self.last_quantity_confirmation: QuantityEntryConfirmation | None = None
         self._current_query: str | None = None
@@ -4606,6 +4612,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 index = row["row_index"]
                 row["is_activation_delta"] = index in delta_indices
                 row["activity_crop_path"] = crop_paths.get(index)
+                row_top = row_1_top + index * _GRID_ROW_HEIGHT if row_1_top is not None else None
+                observation = (
+                    self._last_activation_snapshot_activity_ocr.get(row_top)
+                    if row_top is not None
+                    else None
+                )
+                row["activity_ocr"] = dict(observation) if observation is not None else None
             self._rr_binding_diagnostic_ledger.record({
                 "run_id": context.run_id,
                 "task_id": context.task_id,
@@ -5943,23 +5956,30 @@ class WindowsXactimateAdapter(XactimateAdapter):
             self._last_activation_snapshot_image = None
             self._last_activation_snapshot_offset = None
             self._last_activation_snapshot_row_1_top = None
+            self._last_activation_snapshot_activity_ocr = {}
             if require_located:
                 raise AdapterError(
                     "Cannot positively locate the current Items grid for search-fallback state verification."
                 )
             return []
-        rows, row_1_top = self._activation_rows_from_same_image(image, offset)
-        self._last_activation_snapshot_image = image
-        self._last_activation_snapshot_offset = offset
-        self._last_activation_snapshot_row_1_top = row_1_top
-        for _probe in range(2):
-            next_row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
-            if next_row_top < 0 or next_row_top + _GRID_ROW_HEIGHT > image.height:
-                break
-            trailing = self._read_activation_row_at(image, offset, next_row_top)
-            if not all(str(value or "").strip() for value in (trailing.category, trailing.selector)):
-                break
-            rows.append(trailing)
+        activity_ocr: dict[int, dict[str, str | None]] = {}
+        self._active_activation_activity_ocr = activity_ocr
+        try:
+            rows, row_1_top = self._activation_rows_from_same_image(image, offset)
+            self._last_activation_snapshot_image = image
+            self._last_activation_snapshot_offset = offset
+            self._last_activation_snapshot_row_1_top = row_1_top
+            for _probe in range(2):
+                next_row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
+                if next_row_top < 0 or next_row_top + _GRID_ROW_HEIGHT > image.height:
+                    break
+                trailing = self._read_activation_row_at(image, offset, next_row_top)
+                if not all(str(value or "").strip() for value in (trailing.category, trailing.selector)):
+                    break
+                rows.append(trailing)
+        finally:
+            self._active_activation_activity_ocr = None
+        self._last_activation_snapshot_activity_ocr = activity_ocr
         return rows
 
     def _read_activation_row_at(self, image, offset: tuple[int, int], row_top: int) -> ActivationRowSnapshot:
@@ -5986,8 +6006,21 @@ class WindowsXactimateAdapter(XactimateAdapter):
         reads = [self._ocr_text(crop, psm=psm).strip() for psm in (6, 7)]
         for expected in ("-", "+"):
             if expected in reads:
+                if self._active_activation_activity_ocr is not None:
+                    self._active_activation_activity_ocr[row_top] = {
+                        "psm_6_raw": reads[0],
+                        "psm_7_raw": reads[1],
+                        "selected_raw": expected,
+                    }
                 return expected
-        return next((read for read in reads if read), None)
+        selected = next((read for read in reads if read), None)
+        if self._active_activation_activity_ocr is not None:
+            self._active_activation_activity_ocr[row_top] = {
+                "psm_6_raw": reads[0],
+                "psm_7_raw": reads[1],
+                "selected_raw": selected,
+            }
+        return selected
 
     @staticmethod
     def _activation_activity_crop(image, offset: tuple[int, int], row_top: int):
