@@ -293,16 +293,41 @@ def test_ranking_bounded_by_max_dropdown_candidates_considered(phrase_rules, ran
     assert len(candidates) == 2
 
 
-def test_does_not_automatically_choose_first_result_when_second_is_equally_strong(phrase_rules, ranking_config):
-    # Regression guard for "Do not automatically choose the first
-    # dropdown result": row_position=0 is NOT preferred when tied.
+def test_no_margin_based_first_result_preference_when_second_is_close_but_not_tied(phrase_rules, ranking_config):
+    """Regression guard for "Do not automatically choose the first
+    dropdown result": a NEAR-miss margin case (not a bitwise score tie)
+    must never be resolved by candidate order alone."""
+    # Neither candidate is a plain exact match to the source (both add a
+    # different unmentioned qualifier), so the Phase 5.15 exact-top
+    # override doesn't apply either -- isolates a genuine near-miss,
+    # non-tied margin case from both existing AUTO_SELECT mechanisms.
+    a = _dropdown("Drip edge - copper", sel="FIRST", pos=0)
+    b = _dropdown("Drip edge - PVC/TPO clad metal", sel="SECOND", pos=1)
+    candidates = ranking.rank_dropdown_results(
+        original_description="Drip edge", trade=None, component=None, material=None, action=None, unit=None,
+        size_key=None, grade_key=None, dropdowns=[a, b], rules=phrase_rules, config=ranking_config,
+    )
+    assert candidates[0].score != candidates[1].score
+    assert ranking.classify_decision(candidates, ranking_config) == DECISION_REVIEW_REQUIRED
+
+
+def test_genuine_exact_tie_now_uses_the_first_candidate_fallback(phrase_rules, ranking_config):
+    """Phase 5.22: the complement of the guard above -- when both
+    candidates are a genuine BITWISE score tie (not merely close), this
+    is exactly the shape the explicit, narrow first-candidate fallback
+    targets. Order is honestly reflected: FIRST wins because it's in
+    position 0, not because of any semantic preference."""
     a = _dropdown("Drip edge", sel="FIRST", pos=0)
     b = _dropdown("Drip edge", sel="SECOND", pos=1)
     candidates = ranking.rank_dropdown_results(
         original_description="Drip edge", trade=None, component=None, material=None, action=None, unit=None,
         size_key=None, grade_key=None, dropdowns=[a, b], rules=phrase_rules, config=ranking_config,
     )
-    assert ranking.classify_decision(candidates, ranking_config) == DECISION_REVIEW_REQUIRED
+    assert candidates[0].score == candidates[1].score
+    diag = ranking.classify_decision_with_diagnostics(candidates, ranking_config)
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
+    assert diag.top_selector == "FIRST"
 
 
 # ---------------------------------------------------------------------
@@ -330,15 +355,23 @@ def test_exact_top_beats_close_non_exact_runner_up_despite_thin_margin(ranking_c
     assert ranking.classify_decision([top, runner_up], ranking_config) == DECISION_AUTO_SELECT
 
 
-def test_exact_tie_between_two_perfect_scores_stays_review_required(ranking_config):
+def test_exact_tie_between_two_perfect_scores_does_not_use_the_margin_override(ranking_config):
     """Counterpart -- the negative-control guard: when the runner-up
     ALSO reaches exactly 1.0 (a genuine tie, e.g. the real 3-way
     'Lighting Installer - Electrician - per hour' tie against LIT/LAB,
-    ELE/LAB, LAB/ELE), the override must never fire. This is precisely
-    what stops the rule from being a disguised 'margin = 0'."""
+    ELE/LAB, LAB/ELE), the Phase 5.15 'insufficient_margin_exact_top_
+    override' must never fire -- that is precisely what stops that rule
+    from being a disguised 'margin = 0'. Phase 5.22's separate, later
+    first-candidate fallback (see below) now catches this same-category,
+    no-preferred-categories shape and AUTO_SELECTs anyway -- confirmed
+    here by gate, so this test still proves the ORIGINAL override
+    specifically declines, without being confused by the newer one."""
     top = _ranked(1.0, sel="LIT")
     tied = _ranked(1.0, sel="ELE")
-    assert ranking.classify_decision([top, tied], ranking_config) == DECISION_REVIEW_REQUIRED
+    diag = ranking.classify_decision_with_diagnostics([top, tied], ranking_config)
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
+    assert diag.selected_candidate is top
 
 
 def test_near_exact_top_below_threshold_does_not_trigger_override(ranking_config):
@@ -851,7 +884,13 @@ def test_exact_tie_resolved_by_strong_context_row7_shape(ranking_config):
     assert tr.resolved_selector == "DISHRS"
     assert tr.reason == "context_matched_one_candidate"
     assert tr.preferred_categories == ("ELE", "ELS")
-    assert ranking.classify_decision([els, rfg], ranking_config) == DECISION_REVIEW_REQUIRED  # no preferred_categories -> unresolved
+    # No preferred_categories -> context can't resolve it -> Phase 5.22's
+    # first-candidate fallback takes over instead of leaving this
+    # REVIEW_REQUIRED forever; see test_exact_tie_first_candidate_
+    # fallback_row11_shape below for the dedicated coverage.
+    no_context_diag = ranking.classify_decision_with_diagnostics([els, rfg], ranking_config)
+    assert no_context_diag.decision == DECISION_AUTO_SELECT
+    assert no_context_diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
 
 
 def test_exact_tie_resolved_by_strong_context_row18_shape(ranking_config):
@@ -865,15 +904,20 @@ def test_exact_tie_resolved_by_strong_context_row18_shape(ranking_config):
     assert diag.selected_candidate is sdg
 
 
-def test_exact_tie_without_category_evidence_stays_review_required_row11_shape(ranking_config):
+def test_exact_tie_context_declines_without_category_evidence_row11_shape(ranking_config):
     """Row 11: trade='unknown' yields no hint at all -- there is no
-    defensible signal to prefer RFG or SDG, so the tie must be left
-    exactly as REVIEW_REQUIRED, same as before this change existed."""
+    defensible signal for the CONTEXTUAL resolver to prefer RFG or SDG,
+    so `tie_resolution.resolved` stays False, exactly as before Phase
+    5.22 existed. The OVERALL decision, however, now AUTO_SELECTs via
+    the separate first-candidate fallback (see
+    test_exact_tie_first_candidate_fallback_row11_shape below) rather
+    than staying REVIEW_REQUIRED forever -- this test isolates and
+    proves only the context resolver's own half of that story."""
     rfg = _ranked(1.0, cat="RFG", sel="STEP", desc=_STEP_DESC, pos=0)
     sdg = _ranked(1.0, cat="SDG", sel="STEP", desc=_STEP_DESC, pos=1)
     diag = ranking.classify_decision_with_diagnostics([rfg, sdg], ranking_config, preferred_categories=())
-    assert diag.decision == DECISION_REVIEW_REQUIRED
-    assert diag.gate == "insufficient_margin"
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
     tr = diag.tie_resolution
     assert tr is not None
     assert tr.tie_detected is True
@@ -882,27 +926,32 @@ def test_exact_tie_without_category_evidence_stays_review_required_row11_shape(r
     assert tr.reason == "no_category_hint_available"
 
 
-def test_exact_tie_with_conflicting_category_evidence_stays_review_required(ranking_config):
-    """Both tied categories appear in the hint list -- the context does
-    not discriminate between them, so this must be treated the same as
-    no evidence at all: stay REVIEW_REQUIRED, never guess."""
+def test_exact_tie_context_declines_with_conflicting_category_evidence(ranking_config):
+    """Both tied categories appear in the hint list -- the CONTEXTUAL
+    resolver does not discriminate between them (conflicting evidence
+    is treated the same as no evidence, never a guess); the first-
+    candidate fallback still applies on top of that, same as any other
+    unresolved exact tie."""
     rfg = _ranked(1.0, cat="RFG", sel="STEP", desc=_STEP_DESC, pos=0)
     sdg = _ranked(1.0, cat="SDG", sel="STEP", desc=_STEP_DESC, pos=1)
     diag = ranking.classify_decision_with_diagnostics([rfg, sdg], ranking_config, preferred_categories=("RFG", "SDG"))
-    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
     tr = diag.tie_resolution
     assert tr.resolved is False
     assert tr.reason == "both_candidates_match_hint"
 
 
-def test_exact_tie_evidence_matching_neither_candidate_stays_review_required(ranking_config):
+def test_exact_tie_context_declines_when_evidence_matches_neither_candidate(ranking_config):
     """The hint list is non-empty but names a category that is neither
     of the two tied candidates -- also not defensible evidence for
-    either one specifically."""
+    either one specifically, so the contextual resolver still declines;
+    the first-candidate fallback applies on top of that."""
     rfg = _ranked(1.0, cat="RFG", sel="STEP", desc=_STEP_DESC, pos=0)
     sdg = _ranked(1.0, cat="SDG", sel="STEP", desc=_STEP_DESC, pos=1)
     diag = ranking.classify_decision_with_diagnostics([rfg, sdg], ranking_config, preferred_categories=("ELS",))
-    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
     tr = diag.tie_resolution
     assert tr.resolved is False
     assert tr.reason == "neither_candidate_matches_hint"
@@ -983,46 +1032,58 @@ def test_score_limited_row28_shape_never_reaches_tie_resolution(ranking_config):
     assert diag.tie_resolution is None
 
 
-def test_same_category_tie_is_not_resolved():
+def test_same_category_tie_context_does_not_resolve_it():
     """Two candidates tied in the SAME category (e.g. duplicate catalog
     rows) is a different problem than cross-category ambiguity -- a
     trade/component hint could never discriminate between them anyway,
-    and this function must not try."""
+    and the CONTEXTUAL resolver must not try. The first-candidate
+    fallback still applies on top, same as any other unresolved tie."""
     config = ranking.load_ranking_config()
     a = _ranked(1.0, cat="RFG", sel="A", desc="Drip edge", pos=0)
     b = _ranked(1.0, cat="RFG", sel="B", desc="Drip edge", pos=1)
     diag = ranking.classify_decision_with_diagnostics([a, b], config, preferred_categories=("RFG",))
-    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
     tr = diag.tie_resolution
     assert tr.resolved is False
     assert tr.reason == "same_category_tie"
 
 
-def test_score_tie_without_textual_equivalence_is_not_resolved():
-    """A numeric score tie alone is not sufficient -- this mechanism is
-    scoped to genuinely textually-equivalent candidates (the live-caught
-    shape), not any two candidates that happen to sum to the same
-    weighted score for unrelated reasons."""
+def test_score_tie_without_textual_equivalence_context_does_not_resolve_it():
+    """A numeric score tie alone is not sufficient for the CONTEXTUAL
+    resolver -- it's scoped to genuinely textually-equivalent candidates
+    (the live-caught shape), not any two candidates that happen to sum
+    to the same weighted score for unrelated reasons. The first-
+    candidate fallback still applies on top, same as any other
+    unresolved exact tie."""
     config = ranking.load_ranking_config()
     a = _ranked(1.0, cat="ELS", sel="A", desc="Digital satellite system", pos=0)
     b = _ranked(1.0, cat="RFG", sel="B", desc="Something completely different", pos=1)
     diag = ranking.classify_decision_with_diagnostics([a, b], config, preferred_categories=("ELS",))
-    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
     tr = diag.tie_resolution
     assert tr.resolved is False
     assert tr.reason == "not_textually_equivalent"
 
 
-def test_three_way_tie_is_not_resolved():
+def test_three_way_tie_context_does_not_resolve_it_but_fallback_still_picks_first():
     """A third candidate tied at the exact same score means this isn't a
-    clean pairwise ambiguity -- no defensible single winner, even when
-    the top two would otherwise resolve cleanly."""
+    clean pairwise ambiguity for the CONTEXTUAL resolver -- no
+    defensible single winner, even when the top two would otherwise
+    resolve cleanly. The first-candidate fallback is deliberately
+    broader than the contextual resolver (see its own docstring) and
+    still applies here, picking whichever candidate is in position 0 --
+    the least-defensible sub-case of an explicitly accepted, temporary
+    mechanism, not a claim that position 0 is semantically correct."""
     config = ranking.load_ranking_config()
     a = _ranked(1.0, cat="ELS", sel="A", desc=_SATELLITE_DESC, pos=0)
     b = _ranked(1.0, cat="RFG", sel="B", desc=_SATELLITE_DESC, pos=1)
     c = _ranked(1.0, cat="HVC", sel="C", desc=_SATELLITE_DESC, pos=2)
     diag = ranking.classify_decision_with_diagnostics([a, b, c], config, preferred_categories=("ELS",))
-    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
+    assert diag.selected_candidate is a
     tr = diag.tie_resolution
     assert tr.resolved is False
     assert tr.reason == "three_or_more_way_tie"
@@ -1036,7 +1097,9 @@ def test_classify_decision_plain_wrapper_reflects_tie_resolution_when_passed_thr
     config = ranking.load_ranking_config()
     els = _ranked(1.0, cat="ELS", sel="DISHRS", desc=_SATELLITE_DESC, pos=0)
     rfg = _ranked(1.0, cat="RFG", sel="DISHRS", desc=_SATELLITE_DESC, pos=1)
-    assert ranking.classify_decision([els, rfg], config) == DECISION_REVIEW_REQUIRED
+    # No preferred_categories -> context can't resolve it -> the
+    # first-candidate fallback AUTO_SELECTs position 0 (ELS) instead.
+    assert ranking.classify_decision([els, rfg], config) == DECISION_AUTO_SELECT
     diag = ranking.classify_decision_with_diagnostics([els, rfg], config, preferred_categories=("ELS",))
     assert diag.decision == DECISION_AUTO_SELECT
 
@@ -1079,3 +1142,104 @@ def test_below_floor_dominance_real_0016_shape_correctly_refuses_to_fire():
     top = _below_floor_ranked(0.7958, match_reasons=["action 'install' matches"], cat="RFG", sel="PAVCRS")
     runner_up = _below_floor_ranked(0.7403, cat="RFG", sel="PAVRS")
     assert ranking.classify_decision([top, runner_up], config) == DECISION_REVIEW_REQUIRED
+
+
+# ---------------------------------------------------------------------
+# Phase 5.22: narrow, explicit fallback for a genuine exact tie that the
+# contextual resolver (Phase 5.19) was given a real chance to break and
+# could not. Deliberately order-DEPENDENT (picks candidates[0]) -- an
+# accepted, temporary mechanism, not a claim of semantic preference.
+# Each test below maps directly to one required scenario.
+# ---------------------------------------------------------------------
+
+
+def test_fallback_1_unresolved_exact_tie_selects_first_candidate(ranking_config):
+    top = _ranked(1.0, cat="RFG", sel="A", desc="Step flashing", pos=0)
+    second = _ranked(1.0, cat="SDG", sel="B", desc="Step flashing", pos=1)
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_first_candidate_fallback"
+    assert diag.selected_candidate is top
+    assert diag.top_selector == "A"
+
+
+def test_fallback_2_reversing_order_reverses_selected_candidate(ranking_config):
+    a = _ranked(1.0, cat="RFG", sel="A", desc="Step flashing")
+    b = _ranked(1.0, cat="SDG", sel="B", desc="Step flashing")
+    forward = ranking.classify_decision_with_diagnostics([a, b], ranking_config)
+    reversed_ = ranking.classify_decision_with_diagnostics([b, a], ranking_config)
+    assert forward.gate == reversed_.gate == "exact_tie_resolved_by_first_candidate_fallback"
+    assert forward.top_selector == "A"
+    assert reversed_.top_selector == "B"
+    assert forward.selected_candidate is a
+    assert reversed_.selected_candidate is b
+
+
+def test_fallback_3_contextual_tie_resolution_still_takes_precedence(ranking_config):
+    """When the contextual resolver CAN establish a preferred candidate,
+    it wins -- the fallback never overrides a real signal, and the gate
+    proves which mechanism actually decided."""
+    els = _ranked(1.0, cat="ELS", sel="DISHRS", desc=_SATELLITE_DESC, pos=0)
+    rfg = _ranked(1.0, cat="RFG", sel="DISHRS", desc=_SATELLITE_DESC, pos=1)
+    diag = ranking.classify_decision_with_diagnostics([els, rfg], ranking_config, preferred_categories=("ELE", "ELS"))
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "exact_tie_resolved_by_context"
+    assert diag.gate != "exact_tie_resolved_by_first_candidate_fallback"
+    assert diag.selected_candidate is els
+
+
+def test_fallback_4_near_tie_is_unaffected(ranking_config):
+    """Not a bitwise score tie -- the fallback must never fire here,
+    only the ordinary insufficient_margin gate."""
+    top = _ranked(0.9006, cat="FCC", sel="PAD-")
+    second = _ranked(0.8485, cat="FCT", sel="B-")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "insufficient_margin"
+
+
+def test_fallback_5_below_threshold_exact_tie_is_unaffected(ranking_config):
+    """Both candidates tie exactly, but below auto_select_min -- the
+    fallback lives strictly inside the post-threshold margin branch and
+    must never fire here; below_auto_select_min still governs."""
+    top = _ranked(0.60, cat="RFG", sel="A")
+    second = _ranked(0.60, cat="SDG", sel="B")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "below_auto_select_min"
+    assert diag.tie_resolution is None
+
+
+def test_fallback_6_hard_conflict_exact_tie_is_unaffected(ranking_config):
+    """Top candidate ties the second candidate's score exactly, but has
+    a hard conflict -- the hard_conflict gate fires first and the
+    fallback must never override it."""
+    top = _ranked(1.0, cat="RFG", sel="A", conflict_reasons=["wrong_material: candidate states a different material"])
+    second = _ranked(1.0, cat="SDG", sel="B")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "hard_conflict"
+    assert diag.tie_resolution is None
+
+
+def test_fallback_7_low_extraction_confidence_exact_tie_is_unaffected(ranking_config):
+    """Top candidate ties the second candidate's score exactly, but its
+    own extraction confidence is below the minimum -- that gate fires
+    first and the fallback must never override it."""
+    top = _ranked(1.0, cat="RFG", sel="A", conf=0.5)
+    second = _ranked(1.0, cat="SDG", sel="B")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_REVIEW_REQUIRED
+    assert diag.gate == "low_extraction_confidence"
+    assert diag.tie_resolution is None
+
+
+def test_fallback_8_ordinary_clear_margin_behavior_is_unaffected(ranking_config):
+    """A normal, decisively-won AUTO_SELECT (no tie at all) must behave
+    identically to before this fallback existed."""
+    top = _ranked(1.0, cat="RFG", sel="A")
+    second = _ranked(0.5, cat="SDG", sel="B")
+    diag = ranking.classify_decision_with_diagnostics([top, second], ranking_config)
+    assert diag.decision == DECISION_AUTO_SELECT
+    assert diag.gate == "clear_margin"
+    assert diag.tie_resolution is None

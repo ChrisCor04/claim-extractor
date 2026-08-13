@@ -1298,7 +1298,14 @@ def test_full_description_failure_never_searches_an_alternative(tmp_path, phrase
     assert ("search_by_category_selector", ("RFG", "FELT15"), {}) not in adapter.log.calls
 
 
-def test_exact_description_review_required_is_terminal(tmp_path, phrase_rules, ranking_config):
+def test_exact_description_same_category_tie_resolves_via_first_candidate_fallback(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.22: a genuine same-category exact tie (two selectors,
+    identical description text, no discriminating context) used to stay
+    REVIEW_REQUIRED/ambiguous_candidates forever -- it now resolves via
+    the explicit first-candidate fallback and commits FELT15A (position
+    0). Still exactly one search attempt -- the fallback doesn't change
+    the bounded-attempt/no-needless-requery behavior this test also
+    guards."""
     plan = _plan_mapped_and_unmapped()
     tied = [
         DropdownResult(
@@ -1318,12 +1325,14 @@ def test_exact_description_review_required_is_terminal(tmp_path, phrase_rules, r
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
 
     task = result.task_by_id("task_unmapped")
-    assert task.state == TASK_REVIEW_REQUIRED
-    assert task.stop_reason == "ambiguous_candidates"
+    assert task.commit_state == "committed"
+    assert task.observed_category == "RFG"
+    assert task.observed_selector == "FELT15A"
     assert [call for call in adapter.log.calls if call[0] == "search_by_description"] == [
         ("search_by_description", (_FELT_FULL_DESCRIPTION,), {}),
     ]
     assert task.search_attempts[0]["advanced_to_next_attempt"] is False
+    assert task.search_attempts[0]["decision_diagnostics"]["gate"] == "exact_tie_resolved_by_first_candidate_fallback"
 
 
 def test_exact_description_hard_conflict_is_terminal(tmp_path, phrase_rules, ranking_config):

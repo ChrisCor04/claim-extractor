@@ -829,7 +829,8 @@ class DecisionDiagnostics:
     "below_auto_select_min", "below_floor_semantic_dominance_override",
     "hard_conflict", "low_extraction_confidence", "insufficient_margin",
     "insufficient_margin_exact_top_override",
-    "exact_tie_resolved_by_context", "clear_margin".
+    "exact_tie_resolved_by_context",
+    "exact_tie_resolved_by_first_candidate_fallback", "clear_margin".
 
     `selected_candidate` is the actual RankedCandidate the caller should
     treat as chosen whenever `decision == DECISION_AUTO_SELECT` -- None
@@ -995,6 +996,27 @@ def classify_decision_with_diagnostics(
                 return _build(
                     DECISION_AUTO_SELECT, "exact_tie_resolved_by_context",
                     top=winner, second=loser, margin=margin, tie_resolution=tie,
+                )
+            if tie is not None and tie.tie_detected:
+                # Phase 5.22: an explicit, temporary fallback for a
+                # genuine exact tie (top.score == second.score, both
+                # already cleared auto_select_min/hard-conflict/
+                # extraction-confidence above) that the contextual
+                # resolver above was given a real chance to break and
+                # could not -- for ANY reason it declines (no hint,
+                # conflicting hint, same-category tie, non-textually-
+                # equivalent tie, 3+-way tie). Rather than leave every
+                # such case REVIEW_REQUIRED indefinitely, deliberately
+                # AUTO_SELECTs `top`, which is always candidates[0] at
+                # this point -- i.e. the first candidate in whatever
+                # order the caller supplied them. This is knowingly
+                # order-DEPENDENT (unlike the context resolver above,
+                # which never is) -- an accepted, explicit limitation of
+                # a last-resort tie-break, not a claim that position 0
+                # is semantically preferred.
+                return _build(
+                    DECISION_AUTO_SELECT, "exact_tie_resolved_by_first_candidate_fallback",
+                    top=top, second=second, margin=margin, tie_resolution=tie,
                 )
             return _build(DECISION_REVIEW_REQUIRED, "insufficient_margin", top=top, second=second, margin=margin, tie_resolution=tie)
         return _build(DECISION_AUTO_SELECT, "insufficient_margin_exact_top_override", top=top, second=second, margin=margin)

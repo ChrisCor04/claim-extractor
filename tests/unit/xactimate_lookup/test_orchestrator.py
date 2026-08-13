@@ -440,7 +440,12 @@ def test_execute_plan_resolves_cross_category_tie_regardless_of_candidate_order(
     assert outcome.selected.dropdown.selector == "DISHRS"
 
 
-def test_execute_plan_leaves_cross_category_tie_unresolved_without_trade_signal_row11_shape(tmp_path, phrase_rules, ranking_config):
+def test_execute_plan_cross_category_tie_without_trade_signal_uses_first_candidate_fallback_row11_shape(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.22: the contextual resolver still correctly declines
+    (no defensible trade signal to prefer RFG or SDG -- unchanged from
+    Phase 5.19), but the overall decision now AUTO_SELECTs via the
+    separate, explicit first-candidate fallback rather than staying
+    REVIEW_REQUIRED forever."""
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item(
         original_description="Step flashing", trade="unknown", component="unknown", material=None, action="unknown",
@@ -451,7 +456,10 @@ def test_execute_plan_leaves_cross_category_tie_unresolved_without_trade_signal_
     sdg = _dropdown("Step flashing", cat="SDG", sel="STEP", pos=1)
     adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: [rfg, sdg]})
     outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
-    assert outcome.decision == DECISION_REVIEW_REQUIRED
+    assert outcome.decision == DECISION_AUTO_SELECT
+    assert outcome.decision_diagnostics.gate == "exact_tie_resolved_by_first_candidate_fallback"
+    assert outcome.selected.dropdown.category == "RFG"
+    assert outcome.selected.dropdown.selector == "STEP"
     assert outcome.decision_diagnostics.tie_resolution.resolved is False
     assert outcome.decision_diagnostics.tie_resolution.reason == "no_category_hint_available"
 
