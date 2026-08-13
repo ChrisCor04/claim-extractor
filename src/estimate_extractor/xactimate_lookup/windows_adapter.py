@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -396,6 +397,19 @@ _KNOWN_XACTIMATE_UNITS = frozenset({"LF", "SQ", "EA", "HR", "DA", "SF"})
 #: this cannot misfire against a genuinely different valid unit. See
 #: docs/xactimate-lookup.md Phase 4.7 Stage 6.
 _UNIT_OCR_CONFUSIONS = {"UF": "LF"}
+
+#: Phase 5.25: live-caught -- a real R&R candidate activation (RFG/240)
+#: produced a physical "+" row whose activity-cell OCR read the digit
+#: "4" instead of the "+" glyph, stable across the read. Scoped as
+#: narrowly as possible, exactly like _UNIT_OCR_CONFUSIONS above: this
+#: set is consulted ONLY by _rr_pair_from_delta_with_plus_glyph_
+#: tolerance() (windows_adapter.WindowsXactimateAdapter), and only
+#: after every other structural precondition (exactly one clean "-"
+#: row, exactly one complementary new row, matching identity, a
+#: strictly additive two-row delta) already holds -- "4" is NEVER
+#: globally treated as "+" anywhere else in this file (_activity_
+#: token()/_is_one_logical_rr_multiset_delta() are untouched).
+_ACTIVITY_PLUS_OCR_CONFUSIONS = frozenset({"4"})
 
 #: Unit-normalization synonym map (Phase 4.7 Stage 2) -- semantically
 #: identical spellings of the SAME unit, not OCR-noise correction and
@@ -4017,6 +4031,26 @@ class WindowsXactimateAdapter(XactimateAdapter):
         before_rows: list[ActivationRowSnapshot],
         after_rows: list[ActivationRowSnapshot],
     ) -> "PendingRRPairTarget | None":
+        """Phase 6.3 (R&R Stage 3) / Phase 5.25 (live OCR-glyph
+        tolerance): tries the strict proof first
+        (_rr_pair_from_delta_strict()); only if that finds nothing does
+        it try the narrowly-scoped OCR-tolerant fallback
+        (_rr_pair_from_delta_with_plus_glyph_tolerance()) -- see each
+        function's own docstring. The strict path is completely
+        unmodified by this addition; every delta it already recognized
+        it still recognizes identically, and the fallback is only ever
+        reached once the strict path has already returned None."""
+        pair = cls._rr_pair_from_delta_strict(before_rows, after_rows)
+        if pair is not None:
+            return pair
+        return cls._rr_pair_from_delta_with_plus_glyph_tolerance(before_rows, after_rows)
+
+    @classmethod
+    def _rr_pair_from_delta_strict(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> "PendingRRPairTarget | None":
         """Phase 6.3 (R&R Stage 3): the dual-target counterpart to
         _pending_quantity_target_from_delta()'s single "+"-only R&R
         target above -- reuses the SAME order-independent multiset
@@ -4063,6 +4097,99 @@ class WindowsXactimateAdapter(XactimateAdapter):
         )
         plus_target = PendingQuantityTarget(
             identity=identity, activity="+", after_index=plus_indices[0], activity_ordinal=1,
+            physical_row_delta=2, write_source_quantity_once=True,
+        )
+        return PendingRRPairTarget(minus_target=minus_target, plus_target=plus_target, identity=identity)
+
+    @classmethod
+    def _rr_pair_from_delta_with_plus_glyph_tolerance(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> "PendingRRPairTarget | None":
+        """Phase 5.25: live-caught -- a real R&R candidate activation
+        (RFG/240, 9 -> 11 rows) produced one row whose activity read
+        cleanly as "-" and a second, structurally complementary row
+        whose activity OCR'd as the digit "4" instead of "+". The
+        strict path above correctly refused to guess (its own
+        _is_one_logical_rr_multiset_delta() gate requires a LITERAL
+        "+" token and is never touched by this fallback), leaving the
+        pair PAIR_REVIEW_REQUIRED. This function is the smallest
+        scoped mechanism to recognize that SPECIFIC, evidenced glyph
+        confusion -- reached ONLY after the strict path has already
+        returned None -- while proving, independently and without
+        reusing or relaxing _is_one_logical_rr_multiset_delta()/
+        _activity_token() (both stay completely unmodified; "4" is
+        NEVER globally treated as "+" anywhere else in this file), the
+        exact same structural shape the strict path itself requires:
+
+        1. Row count grew by EXACTLY 2 (cardinality unchanged).
+        2. Every pre-existing row is byte-identical in the after
+           snapshot (a Counter multiset diff, not a positional
+           comparison) -- if so much as one existing row's content
+           changed or disappeared, this returns None; only a truly
+           clean, additive delta is ever in scope.
+        3. The two NEW rows share exactly one CAT/SEL/description
+           identity (mismatched candidate identities fail closed).
+        4. That identity did not already exist anywhere in the before
+           snapshot -- this fallback recognizes only a clean, from-
+           nothing activation, never a pre-existing-duplicate shape
+           (the strict path's own activity_ordinal tolerance already
+           owns that case).
+        5. Exactly one of the two new rows reads a LITERAL "-" (never
+           OCR-tolerant on this side -- one positively recognized "-"
+           half is a precondition, not something this fallback ever
+           guesses at).
+        6. The other (and, by point 1-4, ONLY other) new row for that
+           identity reads a value in the tightly scoped
+           _ACTIVITY_PLUS_OCR_CONFUSIONS set -- today just {"4"} --
+           never an arbitrary/unconstrained value.
+
+        Any failure of 1-6 returns None -- fails closed exactly like
+        the strict path, never a partially built pair, never a guess
+        from OCR text alone without this full structural corroboration."""
+        if len(after_rows) != len(before_rows) + 2:
+            return None
+        before_counter = Counter(before_rows)
+        after_counter = Counter(after_rows)
+        if before_counter - after_counter:
+            # A pre-existing row disappeared or its content changed --
+            # not a clean additive delta; refuse to guess.
+            return None
+        added = after_counter - before_counter
+        if sum(added.values()) != 2:
+            return None
+        added_rows = list(added.elements())
+        identities = {cls._activation_identity(row) for row in added_rows}
+        if len(identities) != 1:
+            return None
+        identity = next(iter(identities))
+        if not all(identity):
+            return None
+        if any(cls._activation_identity(row) == identity for row in before_counter):
+            return None
+
+        minus_indices = cls._activity_matching_indices(after_rows, identity, "-")
+        if len(minus_indices) != 1:
+            return None
+        all_identity_indices = [
+            index for index, row in enumerate(after_rows) if cls._activation_identity(row) == identity
+        ]
+        if len(all_identity_indices) != 2:
+            return None
+        remaining = [index for index in all_identity_indices if index not in minus_indices]
+        if len(remaining) != 1:
+            return None
+        plus_index = remaining[0]
+        if cls._activity_token(after_rows[plus_index]) not in _ACTIVITY_PLUS_OCR_CONFUSIONS:
+            return None
+
+        minus_target = PendingQuantityTarget(
+            identity=identity, activity="-", after_index=minus_indices[0], activity_ordinal=1,
+            physical_row_delta=2, write_source_quantity_once=True,
+        )
+        plus_target = PendingQuantityTarget(
+            identity=identity, activity="+", after_index=plus_index, activity_ordinal=1,
             physical_row_delta=2, write_source_quantity_once=True,
         )
         return PendingRRPairTarget(minus_target=minus_target, plus_target=plus_target, identity=identity)

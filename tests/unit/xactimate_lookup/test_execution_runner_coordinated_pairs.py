@@ -158,6 +158,25 @@ class RRPairFakeAdapter(FakeXactimateAdapter):
         self.locate_pair_outcome = "success"
         self.verify_half_outcome = {"-": "success", "+": "success"}
         self.write_half_outcome = {"-": "success", "+": "success"}
+        #: Phase 5.25: "success" (default) | "fail" -- once "fail",
+        #: focus_search() raises SearchFocusError on every call from
+        #: then on (live-caught: the failure was persistent, not a
+        #: one-shot blip); use focus_search_fail_once=True instead for
+        #: a single-shot failure.
+        self.focus_search_outcome = "success"
+        self.focus_search_fail_once = False
+        self.focus_search_calls = 0
+
+    def focus_search(self) -> None:
+        self.focus_search_calls += 1
+        if self.focus_search_outcome == "fail":
+            if self.focus_search_fail_once and self.focus_search_calls > 1:
+                super().focus_search()
+                return
+            from estimate_extractor.xactimate_lookup.windows_adapter import SearchFocusError
+            self.log.record("focus_search")
+            raise SearchFocusError("Could not positively locate the current Search field; refusing to click or type.")
+        super().focus_search()
 
     # -- group hooks (same shape as GroupAwareFakeAdapter) --------------
     def ensure_group(self, name: str, *, parent_group_name: str | None = None) -> str | None:
@@ -1127,3 +1146,153 @@ def test_unsafe_lookup_routing_from_description_first_branch_fails_both_tasks_no
     assert replace_task.state == TASK_FAILED
     assert adapter.select_candidate_calls == 0
     assert result_plan.run_state != RUN_STATE_PAUSED or result_plan.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP
+
+
+# ---------------------------------------------------------------------
+# Phase 5.25: SearchFocusError (or any AdapterError from focus_search()/
+# clear_search()/search_by_*()) must not crash the runner -- see
+# orchestrator._search_rank_and_decide()'s own fix. Covers the
+# coordinated-pair path here; test_orchestrator.py's own updated
+# test_failed_focus_never_clears_or_types() covers the pure decide-
+# level proof, and test_execution_runner.py's own pre-existing
+# ItemsTabFailureOnceFakeAdapter test covers the ordinary-task path
+# with a sibling AdapterError subclass.
+# ---------------------------------------------------------------------
+
+
+def test_search_focus_failure_before_activation_leaves_pair_unactivated(tmp_path, phrase_rules, ranking_config):
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.focus_search_outcome = "fail"
+
+    result_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    # No crash -- run_execution_plan() returned a real plan object.
+    assert result_plan is not None
+    assert adapter.select_candidate_calls == 0
+    assert adapter.bind_calls == 0
+    assert pair.pair_state == PAIR_UNACTIVATED
+    assert pair.minus_binding is None
+    assert pair.plus_binding is None
+    # No physical uncertainty was fabricated -- nothing physical ever happened.
+    assert remove_task.physical_state_uncertain is False
+    assert replace_task.physical_state_uncertain is False
+    assert remove_task.state == TASK_REVIEW_REQUIRED
+    assert replace_task.state == TASK_REVIEW_REQUIRED
+    assert "search focus" in (remove_task.stop_detail or "").lower() or "search field" in (remove_task.stop_detail or "").lower()
+    # Task-local -- never a project-level hard stop.
+    assert result_plan.run_state != RUN_STATE_PAUSED or result_plan.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP
+
+
+def test_search_focus_failure_restricted_plan_checkpoints_correctly(tmp_path, phrase_rules, ranking_config):
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    path = restricted_plan_path(tmp_path, "focus-failure-check")
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.focus_search_outcome = "fail"
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False, plan_path=path)
+
+    reloaded = load_execution_plan(tmp_path, plan_path=path)
+    assert reloaded is not None
+    reloaded_remove = reloaded.task_by_id("task_remove")
+    assert reloaded_remove.state == TASK_REVIEW_REQUIRED
+    reloaded_pair = reloaded.pair_by_id(pair.pair_id)
+    assert reloaded_pair.pair_state == PAIR_UNACTIVATED
+    assert load_execution_plan(tmp_path) is None  # canonical plan never created
+
+
+def test_search_focus_failure_subsequent_pairs_still_run(tmp_path, phrase_rules, ranking_config):
+    """The FIRST pair's search-focus failure is task-local -- the SECOND,
+    independent pair must still be attempted and can still succeed,
+    exactly like ordinary production continuation policy."""
+    remove1 = _task("task_remove1", "line_remove1", "Group A", "RFG", "REM1", 0, qty=5.0)
+    replace1 = _task("task_replace1", "line_replace1", "Group A", "RFG", "REM1", 1, qty=6.0)
+    pair1_id = "pair_1"
+    remove1.coordinated_pair_id = pair1_id
+    replace1.coordinated_pair_id = pair1_id
+    remove2 = _task("task_remove2", "line_remove2", "Group A", "RFG", "REM2", 2, qty=7.0)
+    replace2 = _task("task_replace2", "line_replace2", "Group A", "RFG", "REM2", 3, qty=8.0)
+    pair2_id = "pair_2"
+    remove2.coordinated_pair_id = pair2_id
+    replace2.coordinated_pair_id = pair2_id
+    group = GroupExecutionState(
+        group_id="Group A", area_name=None, section_name="Group A", xactimate_group_name="Group A",
+        group_name_reviewed=True, task_ids=["task_remove1", "task_replace1", "task_remove2", "task_replace2"],
+    )
+    plan = ExecutionPlan(
+        plan_id="p1", project_slug="test", source_filename=None, created_at="now",
+        groups=[group], tasks=[remove1, replace1, remove2, replace2],
+        coordinated_pairs=[
+            CoordinatedPair(
+                pair_id=pair1_id, remove_task_id="task_remove1", replace_task_id="task_replace1",
+                pair_state=PAIR_UNACTIVATED, activation_task_id="task_remove1",
+                expected_minus_quantity=5.0, expected_minus_unit="LF",
+                expected_plus_quantity=6.0, expected_plus_unit="LF",
+            ),
+            CoordinatedPair(
+                pair_id=pair2_id, remove_task_id="task_remove2", replace_task_id="task_replace2",
+                pair_state=PAIR_UNACTIVATED, activation_task_id="task_remove2",
+                expected_minus_quantity=7.0, expected_minus_unit="LF",
+                expected_plus_quantity=8.0, expected_plus_unit="LF",
+            ),
+        ],
+    )
+    adapter = _rr_adapter(dropdown_script={"RFG REM1": [], "RFG REM2": [_dropdown("RFG", "REM2")]})
+    adapter.focus_search_outcome = "fail"
+    adapter.focus_search_fail_once = True  # only the FIRST search (pair 1) fails
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert remove1.state == TASK_REVIEW_REQUIRED
+    assert replace1.state == TASK_REVIEW_REQUIRED
+    # Pair 2 was still attempted and succeeded normally.
+    assert remove2.state == TASK_COMPLETED
+    assert replace2.state == TASK_COMPLETED
+    assert adapter.select_candidate_calls == 1  # only pair 2 ever activated
+    assert adapter.bind_calls == 1
+
+
+def test_ordinary_task_search_focus_failure_gets_same_protection(tmp_path, phrase_rules, ranking_config):
+    """Ordinary (non-paired) task search-focus failures get the exact
+    same structured-outcome protection, via the same orchestrator fix
+    -- proven here through the coordinated-pair test file's own
+    adapter for consistency, exercising an UNPAIRED task."""
+    ordinary_task = _task("task_ordinary", "line_ordinary", "Dwelling Roof", "SFG", "GUTA", 0)
+    group = GroupExecutionState(
+        group_id="Dwelling Roof", area_name=None, section_name="Dwelling Roof",
+        xactimate_group_name="Dwelling Roof", group_name_reviewed=True, task_ids=["task_ordinary"],
+    )
+    plan = ExecutionPlan(
+        plan_id="p1", project_slug="test", source_filename=None, created_at="now",
+        groups=[group], tasks=[ordinary_task],
+    )
+    adapter = _rr_adapter(dropdown_script={"SFG GUTA": [_dropdown("SFG", "GUTA")]})
+    adapter.focus_search_outcome = "fail"
+
+    result_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert result_plan is not None  # no crash
+    assert ordinary_task.state in (TASK_REVIEW_REQUIRED, TASK_FAILED)
+    assert ordinary_task.physical_state_uncertain is False
+    assert adapter.select_candidate_calls == 0
+    assert result_plan.run_state != RUN_STATE_PAUSED or result_plan.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP
+
+
+def test_genuine_post_activation_uncertainty_still_hard_stops(tmp_path, phrase_rules, ranking_config):
+    """Regression lock: this fix only touches the PRE-search boundary
+    in orchestrator._search_rank_and_decide() -- a genuine structural/
+    post-activation PhysicalStateUncertainError (from bind_rr_pair_
+    after_activation(), reached only once a candidate really was
+    activated) must retain its existing project-level hard-stop
+    behavior, completely unchanged."""
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+    adapter.bind_outcome = "physical_uncertain"
+
+    result_plan = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert pair.pair_state == PAIR_PHYSICAL_STATE_UNCERTAIN
+    assert remove_task.physical_state_uncertain is True
+    assert replace_task.physical_state_uncertain is True
+    assert result_plan.run_state == RUN_STATE_PAUSED
+    assert result_plan.stop_reason_category == STOP_REASON_PROJECT_LEVEL_HARD_STOP

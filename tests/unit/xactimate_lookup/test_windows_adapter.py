@@ -6571,6 +6571,128 @@ def test_pair_target_duplicate_plus_ambiguity_fails_closed():
     assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
 
 
+def test_pair_target_plus_ocr_confused_as_4_is_recognized():
+    """Phase 5.25: live-caught -- one row reads a clean "-", the other
+    (structurally complementary, same identity, from a clean 2-row
+    delta) reads the digit "4" instead of "+". The scoped fallback
+    must recognize this and bind both halves correctly."""
+    before = []
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="4")]
+
+    pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert isinstance(pair, PendingRRPairTarget)
+    assert pair.minus_target.activity == "-"
+    assert pair.minus_target.after_index == 0
+    assert pair.plus_target.activity == "+"
+    assert pair.plus_target.after_index == 1
+    assert pair.identity == ("rfg", "steep", "steep charge")
+
+
+def test_pair_target_plus_ocr_confused_as_4_order_reversed():
+    """Order-independence must hold for the OCR-tolerant fallback too."""
+    before = []
+    after = [_rr_pair_row(activity="4"), _rr_pair_row(activity="-")]
+
+    pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert pair.minus_target.after_index == 1
+    assert pair.plus_target.after_index == 0
+
+
+def test_arbitrary_4_outside_two_row_rr_context_is_not_treated_as_plus():
+    """An ordinary single-row delta with activity "4" must NOT be
+    specially recognized by anything -- the fallback never fires
+    outside a clean two-row R&R delta, and the legacy single-target
+    path's own activity handling (untouched) still only accepts a
+    real "+"/"-" glyph or leaves activity=None."""
+    before = []
+    after = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", "4")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+    legacy = WindowsXactimateAdapter._pending_quantity_target_from_delta(before, after)
+    assert legacy is not None
+    # "4" is not a real R&R glyph -- the legacy single-row path's own
+    # existing rule (only "+"/"-" survive) must still apply unchanged.
+    assert legacy.activity is None
+
+
+def test_two_row_delta_with_no_minus_and_a_4_still_fails_closed():
+    """The "-" half is never OCR-tolerant -- a delta with no literal
+    "-" row at all must fail closed even when the other row reads "4"."""
+    before = []
+    after = [_rr_pair_row(activity="4"), _rr_pair_row(activity="4")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_two_row_delta_both_unreadable_still_fails_closed():
+    """Ambiguous/malformed two-row activation (neither row reads "-",
+    neither reads a recognized plus-confusion glyph) fails closed."""
+    before = []
+    after = [_rr_pair_row(activity="?"), _rr_pair_row(activity="&")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_plus_glyph_tolerance_extra_row_still_fails_closed():
+    """An unrelated third row in the delta must still fail closed even
+    though the OTHER two rows would otherwise match the -/OCR-4 shape."""
+    before = []
+    after = [
+        _rr_pair_row(activity="-"), _rr_pair_row(activity="4"),
+        ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None),
+    ]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_plus_glyph_tolerance_mismatched_candidate_identities_fail_closed():
+    """The "-" row and the "4"-glyph row belong to DIFFERENT catalog
+    identities -- never bound together despite each individually
+    looking plausible."""
+    before = []
+    after = [
+        _rr_pair_row(cat="RFG", sel="STEEP", desc="Steep charge", activity="-"),
+        _rr_pair_row(cat="RFG", sel="OTHER", desc="Other item", activity="4"),
+    ]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_plus_glyph_tolerance_never_fires_when_identity_already_exists():
+    """This fallback recognizes only a clean, from-nothing activation
+    -- a pre-existing row of the same identity (any activity) means
+    this is the legacy duplicate-identity shape, not this fallback's
+    business, and it must still fail closed."""
+    before = [_rr_pair_row(activity="-")]
+    after = before + [_rr_pair_row(activity="-"), _rr_pair_row(activity="4")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_plus_glyph_tolerance_never_reached_when_strict_path_already_succeeds():
+    """Direct proof the strict path is tried FIRST and unmodified: a
+    clean -/+ delta must bind via the strict path without ever
+    touching the fallback (spied here to confirm it is not called)."""
+    before = []
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    calls = []
+    original = WindowsXactimateAdapter._rr_pair_from_delta_with_plus_glyph_tolerance.__func__
+    def spy(cls, before_rows, after_rows):
+        calls.append(1)
+        return original(cls, before_rows, after_rows)
+
+    import unittest.mock
+    with unittest.mock.patch.object(
+        WindowsXactimateAdapter, "_rr_pair_from_delta_with_plus_glyph_tolerance", classmethod(spy),
+    ):
+        pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert pair is not None
+    assert calls == []
+
+
 def test_pair_target_does_not_affect_ordinary_single_row_reconciliation():
     """Existing row-count/R&R reconciliation stays green: an ordinary
     one-row delta is rejected by the pair constructor (wrong shape) but

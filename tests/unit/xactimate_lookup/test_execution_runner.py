@@ -330,7 +330,20 @@ def test_items_tab_verification_error_is_task_local_and_later_tasks_still_run(
     failed closed inside the adapter -- must remain task-local: the
     task itself fails, but the run continues and later tasks (same
     group and the next group) are still attempted, exactly like any
-    other task-level AdapterError. Not a project-level hard stop."""
+    other task-level AdapterError. Not a project-level hard stop.
+
+    Phase 5.25: focus_search() failures (this is an AdapterError
+    subclass) are now caught inside orchestrator._search_rank_and_
+    decide()'s own try/except -- the SAME boundary capture_dropdown()
+    failures already used -- producing a normal, structured
+    DECISION_REVIEW_REQUIRED/STOP_REASON_EXTRACTION_FAILED outcome
+    instead of escaping uncaught and landing in run_execution_plan()'s
+    own generic `except Exception` catch-all. The task therefore now
+    reaches TASK_REVIEW_REQUIRED (a real classified outcome, with
+    stop_reason/stop_detail populated) rather than the catch-all's
+    TASK_FAILED/`error=repr(exc)` -- task-local, continues, not a
+    hard stop, exactly as before; only the specific terminal state and
+    evidence trail improved."""
     plan = _plan_two_groups()
     adapter = ItemsTabFailureOnceFakeAdapter(dropdown_script=_dropdown_script(*plan.tasks))
     adapter.supports_live_execution = True
@@ -338,8 +351,9 @@ def test_items_tab_verification_error_is_task_local_and_later_tasks_still_run(
     result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
 
     first, second, third = result.tasks
-    assert first.state == TASK_FAILED
-    assert "Items tab" in (first.error or "")
+    assert first.state == TASK_REVIEW_REQUIRED
+    assert "Items tab" in (first.stop_detail or "")
+    assert first.physical_state_uncertain is False
     assert result.stop_reason_category != STOP_REASON_PROJECT_LEVEL_HARD_STOP
     # Later tasks were still attempted -- same group and the next group.
     assert second.attempts >= 1

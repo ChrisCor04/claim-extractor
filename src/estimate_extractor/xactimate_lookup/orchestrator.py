@@ -299,14 +299,32 @@ def _search_rank_and_decide(
         return _stop(item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_CONTEXT_UNVERIFIED, "Adapter could not verify the active Xactimate project/estimate context.")
 
     _record_lifecycle(adapter, "SEARCH_STARTED", search_input=plan.search_input, path=plan.path)
-    adapter.focus_search()
-    adapter.clear_search()
-    if plan.path == LOOKUP_PATH_TRUSTED:
-        adapter.search_by_category_selector(plan.trusted_mapping.category, plan.trusted_mapping.selector)
-    else:
-        adapter.search_by_description(plan.search_input)
-
+    # Phase 5.25: focus_search()/clear_search()/search_by_*() moved INTO
+    # this same try block -- live-caught, a real SearchFocusError from
+    # focus_search() (a failure to positively locate the Search field
+    # before anything else has happened; no candidate activation is
+    # anywhere near reachable yet) previously propagated completely
+    # unguarded, crashing run_execution_plan() with an uncaught
+    # exception instead of producing a structured, checkpointed task-
+    # local outcome. No candidate was ever selected at this point, so
+    # this can never be physical-state uncertainty -- it is exactly the
+    # same "could not even get a clean look at the search UI" shape
+    # capture_dropdown() failures already handle one line below via
+    # STOP_REASON_EXTRACTION_FAILED, just one step earlier in the same
+    # sequence. Reused verbatim, not a new stop reason: a caller
+    # (execution_runner.py) does not need to distinguish "the search
+    # field couldn't be focused" from "the dropdown couldn't be
+    # captured" -- both mean the same thing to it, retry-free task-local
+    # review. Applies uniformly to every caller of this function
+    # (ordinary trusted/description-first tasks and a coordinated pair's
+    # activation task alike) -- nothing here is R&R-specific.
     try:
+        adapter.focus_search()
+        adapter.clear_search()
+        if plan.path == LOOKUP_PATH_TRUSTED:
+            adapter.search_by_category_selector(plan.trusted_mapping.category, plan.trusted_mapping.selector)
+        else:
+            adapter.search_by_description(plan.search_input)
         raw = adapter.capture_dropdown()
         dropdowns = adapter.parse_dropdown(raw)
         _record_lifecycle(adapter, "POPUP_OBSERVED")

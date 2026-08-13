@@ -107,6 +107,14 @@ def test_description_zero_delta_never_searches_cat_sel_fallback(tmp_path, phrase
 
 
 def test_failed_focus_never_clears_or_types(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.25: live-caught -- a real SearchFocusError from
+    focus_search() previously propagated as an uncaught exception,
+    crashing the whole runner. focus_search()/clear_search()/search_by_
+    *() now share the same try/except capture_dropdown() already used,
+    so this becomes a normal, structured REVIEW_REQUIRED/EXTRACTION_
+    FAILED outcome -- never physical_state_uncertain (no candidate was
+    ever reachable) -- while still never proceeding to clear_search()/
+    search_by_description() once focus_search() itself has failed."""
     item = _item()
     conn = registry.create_database(tmp_path / "reg.db")
     plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
@@ -120,8 +128,14 @@ def test_failed_focus_never_clears_or_types(tmp_path, phrase_rules, ranking_conf
 
     adapter.focus_search = _fail_focus
 
-    with pytest.raises(AdapterError, match="search focus not verified"):
-        orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+    outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=False)
+
+    assert outcome.decision == DECISION_REVIEW_REQUIRED
+    assert outcome.stop_reason == STOP_REASON_EXTRACTION_FAILED
+    assert "search focus not verified" in outcome.stop_detail
+    assert outcome.physical_state_uncertain is False
+    assert outcome.committed is False
+    assert outcome.physical_item_created is False
 
     names = [name for name, _args, _kwargs in adapter.log.calls]
     assert "clear_search" not in names
