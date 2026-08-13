@@ -627,11 +627,19 @@ class QuantityEntryConfirmation:
     disappeared, dialog interrupted, grid anchor moved, etc.) is a
     different, still-fatal condition -- see enter_quantity()'s own
     QuantityNotConfirmedError raise sites, unaffected by this change.
+
+    Phase 5.29 (performance): since that same-cell OCR result already
+    could not affect production success, a freshly, positively-bound
+    write (`PendingQuantityTarget.write_source_quantity_once=True`)
+    now skips the read entirely rather than paying its wall-clock cost
+    for a result nothing consumes -- `confidence="SKIPPED"`,
+    `observed=None` in that case. Never claims a numeric read happened
+    when it did not.
     """
 
     expected: float
     observed: float | None
-    confidence: str  # "CONFIRMED" | "LOW_CONFIDENCE"
+    confidence: str  # "CONFIRMED" | "LOW_CONFIDENCE" | "SKIPPED"
     review_required: bool
     reason: str
 
@@ -3384,7 +3392,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         below just completed, or because the cell already held the
         exact value and no write was needed -- and BEFORE the
         (potentially slow, OCR-based) same-cell confirmation read that
-        follows. Live-caught: a real confirmation read hung for many
+        follows, when that read still happens at all (see Phase 5.29
+        below). Live-caught: a real confirmation read hung for many
         minutes with no bound at the time (see _ocr_text()'s own fix);
         a caller that only checkpoints AFTER this whole call returns
         has no way to durably record "the value was physically entered"
@@ -3394,7 +3403,30 @@ class WindowsXactimateAdapter(XactimateAdapter):
         an already-correct value) is a settled fact. Never raises on
         the caller's behalf; any exception from the callback itself
         propagates uncaught, exactly like record_physical_item_
-        created()'s own callback contract elsewhere in this file."""
+        created()'s own callback contract elsewhere in this file.
+
+        Phase 5.29 (performance): for a freshly, positively-bound
+        target (`write_source_quantity_once=True` -- a candidate just
+        activated this call, never a resumed/legacy/pre-existing row),
+        only the FINAL numeric OCR read (`_read_quantity_at()`, a
+        3-scale vote) is skipped -- every structural drift check
+        between the physical-write checkpoint and that read (dialog/
+        dropdown appeared, grid anchor moved, row count changed, row
+        geometry drifted) still runs unchanged; those are safety
+        checks on the write action itself, not the numeric value, and
+        stay in place regardless of this quantity-OCR policy. Nothing
+        in production consumes the numeric OCR result for a fresh
+        write (Phase 5.27 made it advisory-only; Phase 5.28 proved
+        binding itself needs no quantity evidence), so reading it cost
+        real wall-clock time for a result nobody acted on.
+        `last_quantity_confirmation` is still set, with
+        `confidence="SKIPPED"` and `observed=None`, so callers/evidence
+        never see a fabricated numeric read. Every OTHER path (a
+        resumed/legacy target reaching the real write below, or the
+        already-matching early-return above) is completely unaffected
+        and still gets its full OCR confirmation, exactly as before --
+        those are precisely the "trustworthy write provenance absent"
+        cases this skip must never touch."""
         # Per-task state: never let an advisory from an earlier item leak
         # into the current item's post-commit outcome.
         self.last_quantity_confirmation = None
@@ -3492,7 +3524,11 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # Structural drift is checked once before one ordinary same-cell
         # OCR read.  OCR disagreement alone cannot choose another row,
         # cause another write, or turn a physically created item into an
-        # unconfirmed failure.
+        # unconfirmed failure. This structural drift check (dialog/
+        # anchor/row-count/geometry) runs for EVERY write, fresh or
+        # resumed -- it is safety-relevant regardless of the quantity
+        # policy. Only the NUMERIC OCR read a few lines below is
+        # skipped for a fresh write; see Phase 5.29 there.
         after, after_offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
         if after_offset is None or self._items_search_pane_field(after) is None:
             raise QuantityNotConfirmedError(
@@ -3529,6 +3565,31 @@ class WindowsXactimateAdapter(XactimateAdapter):
             raise QuantityNotConfirmedError(
                 "enter_quantity(): the edited target row disappeared from the expected grid geometry."
             )
+
+        # Phase 5.29 (performance): a freshly, positively-bound target's
+        # numeric value is already authoritative (the physical-write
+        # checkpoint above fired on exactly that evidence) -- nothing
+        # in production consumes this OCR result for such a target
+        # (Phase 5.27 made it advisory-only; Phase 5.28 proved binding
+        # itself needs no quantity evidence), so skip the read (a
+        # 3-scale OCR vote in _read_quantity_at()) rather than pay its
+        # wall-clock cost for a result nobody acts on. A resumed/
+        # legacy target (write_source_quantity_once=False) -- exactly
+        # the "trustworthy write provenance absent" case that must
+        # keep this check -- still gets the full OCR confirmation below.
+        if target is not None and target.write_source_quantity_once:
+            self.last_quantity_confirmation = QuantityEntryConfirmation(
+                expected=quantity, observed=None, confidence="SKIPPED",
+                review_required=False,
+                reason=(
+                    "Positively-bound fresh write -- the deterministic typed value is authoritative; "
+                    "post-write numeric OCR confirmation was intentionally skipped (advisory-only, not "
+                    "required for success)."
+                ),
+            )
+            if scrolled:
+                self._reset_scroll_state()
+            return
 
         observed = self._read_quantity_at(after, after_offset, edited_row_top)
         if observed is not None and abs(observed - quantity) <= 0.01:

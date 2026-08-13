@@ -7089,12 +7089,17 @@ def test_write_and_verify_rr_pair_quantities_lands_different_quantities_on_corre
     result = adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
 
     assert isinstance(result, RRPairQuantityResult)
+    # Phase 5.29: a fresh, positively-bound write skips post-write
+    # numeric OCR entirely -- expected is still recorded, observed/
+    # confidence honestly reflect that the read never happened.
     assert result.minus_confirmation.expected == 10.0
-    assert result.minus_confirmation.observed == 10.0
-    assert result.minus_confirmation.confidence == "CONFIRMED"
+    assert result.minus_confirmation.observed is None
+    assert result.minus_confirmation.confidence == "SKIPPED"
     assert result.plus_confirmation.expected == 12.0
-    assert result.plus_confirmation.observed == 12.0
-    assert result.plus_confirmation.confidence == "CONFIRMED"
+    assert result.plus_confirmation.observed is None
+    assert result.plus_confirmation.confidence == "SKIPPED"
+    # The real proof each quantity landed on its correct half is the
+    # click/type record, not a (now-skipped) OCR readback.
     assert typed_indices == {0, 1}
     assert clicked_indices == [0, 1]
 
@@ -7143,8 +7148,11 @@ def test_write_and_verify_rr_pair_quantities_equal_quantities_still_write_both_h
 
     assert typed_indices == {0, 1}
     assert clicked_indices == [0, 1]
-    assert result.minus_confirmation.observed == 5.0
-    assert result.plus_confirmation.observed == 5.0
+    # Phase 5.29: fresh writes skip post-write OCR -- the two
+    # independent writes are proven by typed_indices/clicked_indices
+    # above, not by a (now-skipped) numeric readback.
+    assert result.minus_confirmation.confidence == "SKIPPED"
+    assert result.plus_confirmation.confidence == "SKIPPED"
 
 
 def test_write_and_verify_rr_pair_quantities_order_reversal_does_not_swap_ownership(monkeypatch):
@@ -7159,8 +7167,11 @@ def test_write_and_verify_rr_pair_quantities_order_reversal_does_not_swap_owners
 
     result = adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
 
-    assert result.minus_confirmation.observed == 10.0
-    assert result.plus_confirmation.observed == 12.0
+    # Phase 5.29: fresh writes skip post-write OCR -- ownership is
+    # proven by clicked_indices (each expected value clicked at its
+    # own bound row), not by a (now-skipped) numeric readback.
+    assert result.minus_confirmation.expected == 10.0
+    assert result.plus_confirmation.expected == 12.0
     assert clicked_indices == [1, 0]
 
 
@@ -7193,12 +7204,15 @@ def test_write_and_verify_rr_pair_quantities_plus_failure_preserves_minus_eviden
         adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
 
     assert excinfo.value.side == "plus"
-    # Evidence that minus was already written and confirmed must survive
-    # the plus-side failure -- never discarded.
+    # Evidence that minus was already written must survive the
+    # plus-side failure -- never discarded. Phase 5.29: a fresh
+    # minus write's confirmation is SKIPPED (advisory OCR not
+    # attempted), not CONFIRMED -- the checkpoint itself, not a
+    # numeric readback, is what "already written" means now.
     assert excinfo.value.minus_confirmation is not None
     assert excinfo.value.minus_confirmation.expected == 10.0
-    assert excinfo.value.minus_confirmation.observed == 10.0
-    assert excinfo.value.minus_confirmation.confidence == "CONFIRMED"
+    assert excinfo.value.minus_confirmation.observed is None
+    assert excinfo.value.minus_confirmation.confidence == "SKIPPED"
 
 
 def test_write_and_verify_rr_pair_quantities_target_disappears_between_writes(monkeypatch):
@@ -7218,30 +7232,47 @@ def test_write_and_verify_rr_pair_quantities_target_disappears_between_writes(mo
     assert excinfo.value.side == "plus"
     assert isinstance(excinfo.value.__cause__, RowOffscreenError)
     # Minus evidence still survives even though this is structural, not
-    # an OCR-confidence problem.
+    # an OCR-confidence problem. Phase 5.29: a fresh minus write's
+    # confirmation is SKIPPED (advisory OCR not attempted).
     assert excinfo.value.minus_confirmation is not None
-    assert excinfo.value.minus_confirmation.observed == 10.0
+    assert excinfo.value.minus_confirmation.expected == 10.0
+    assert excinfo.value.minus_confirmation.confidence == "SKIPPED"
 
 
-def test_write_and_verify_rr_pair_quantities_unreadable_quantity_is_review_not_guessed_success(monkeypatch):
-    """A known, stable row whose post-write OCR read is unreadable (None)
-    is advisory (LOW_CONFIDENCE/review_required), never an exception and
-    never a fabricated CONFIRMED result -- row identity is known, only
-    the quantity reading is uncertain."""
+def test_write_and_verify_rr_pair_quantities_fresh_writes_never_call_read_quantity_at_post_write(monkeypatch):
+    """Phase 5.29: for a fresh, positively-bound pair (write_source_
+    quantity_once=True on both halves -- exactly what every production
+    binder constructs), _read_quantity_at() is still called ONCE per
+    half by the pre-write locate (structural row binding -- untouched,
+    still needed for the existing-value guard), but must NEVER be
+    called a SECOND time afterward merely to reconfirm the numeric
+    value -- proven by an exact per-index call count. This directly
+    supersedes the pre-5.29 "an unreadable post-write OCR read
+    produces LOW_CONFIDENCE/review" test, which exercised a path that
+    is now unreachable for a fresh write; see
+    test_write_and_verify_existing_rr_pair_half_quantity_still_
+    confirms_via_ocr_for_a_legacy_target for the still-preserved
+    legacy-target behavior."""
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
     pair_target = _rr_pair_target()
-    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
-        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0}, confirmed_by_index={1: None},
+    reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0},
     )
 
     result = adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
 
-    assert result.minus_confirmation.confidence == "CONFIRMED"
-    assert result.plus_confirmation.confidence == "LOW_CONFIDENCE"
-    assert result.plus_confirmation.review_required is True
+    assert result.minus_confirmation.confidence == "SKIPPED"
+    assert result.minus_confirmation.observed is None
+    assert result.minus_confirmation.review_required is False
+    assert result.plus_confirmation.confidence == "SKIPPED"
     assert result.plus_confirmation.observed is None
-    assert result.plus_confirmation.expected == 12.0
+    assert result.plus_confirmation.review_required is False
+    assert typed_indices == {0, 1}
+    # Exactly one read per half (the pre-write locate) -- no second,
+    # post-write reconfirmation read.
+    assert reads.count(0) == 1
+    assert reads.count(1) == 1
 
 
 def test_write_and_verify_rr_pair_quantities_does_not_change_ordinary_enter_quantity(monkeypatch):
@@ -7258,6 +7289,110 @@ def test_write_and_verify_rr_pair_quantities_does_not_change_ordinary_enter_quan
     assert state["typed"] is True
     assert reads == [0, 0]
     assert adapter.last_quantity_confirmation.confidence == "CONFIRMED"
+
+
+def test_enter_quantity_fresh_ordinary_target_skips_post_write_numeric_ocr(monkeypatch):
+    """Phase 5.29 (performance): an ordinary, freshly activation-bound
+    target (write_source_quantity_once=True -- exactly what a just-
+    activated candidate's target carries) types the exact source
+    quantity and Tab-commits it, but never re-reads the cell
+    afterward merely to reconfirm the number -- that OCR result is
+    advisory-only and nothing in production consumes it for a fresh
+    write (Phase 5.27/5.28). Exactly one read happens (the pre-write
+    locate, unaffected structural row binding), never a second,
+    post-write read."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("sfg", "gsg", "gutter splash guard"), None, 0, 1, write_source_quantity_once=True,
+    )
+    state, reads, clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 1.0)
+
+    adapter.enter_quantity(1.0)
+
+    assert state["typed"] is True
+    assert clicks  # the physical click still happened
+    assert reads == [0]  # ONE read only -- the pre-write locate, no post-write reconfirmation
+    assert adapter.last_quantity_confirmation.confidence == "SKIPPED"
+    assert adapter.last_quantity_confirmation.observed is None
+    assert adapter.last_quantity_confirmation.expected == 1.0
+    assert adapter.last_quantity_confirmation.review_required is False
+
+
+def test_enter_quantity_fresh_target_checkpoint_still_fires_when_ocr_is_skipped(monkeypatch):
+    """The authoritative on_physical_write checkpoint is independent of
+    whether post-write OCR happens at all -- it must still fire for a
+    fresh write whose numeric confirmation is now skipped."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("sfg", "gsg", "gutter splash guard"), None, 0, 1, write_source_quantity_once=True,
+    )
+    _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 1.0)
+    calls = []
+
+    adapter.enter_quantity(1.0, on_physical_write=lambda: calls.append(1))
+
+    assert calls == [1]
+    assert adapter.last_quantity_confirmation.confidence == "SKIPPED"
+
+
+def test_enter_quantity_legacy_target_still_gets_full_post_write_ocr_confirmation(monkeypatch):
+    """Phase 5.29 must never touch the conservative resume/legacy path:
+    a target with write_source_quantity_once=False (trustworthy write
+    provenance genuinely absent) still gets the full post-write OCR
+    confirmation, including a LOW_CONFIDENCE/review_required result
+    when the readback disagrees -- exactly pre-5.29 behavior."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        ("sfg", "gsg", "gutter splash guard"), None, 0, 1, write_source_quantity_once=False,
+    )
+    _state, reads, _clicks = _wire_identity_quantity_flow(
+        monkeypatch, adapter, rows, [0.0], 5.0, confirmed_quantity=None,
+    )
+
+    adapter.enter_quantity(5.0)
+
+    # Two reads: the pre-write locate AND the post-write reconfirmation.
+    assert reads == [0, 0]
+    assert adapter.last_quantity_confirmation.confidence == "LOW_CONFIDENCE"
+    assert adapter.last_quantity_confirmation.review_required is True
+    assert adapter.last_quantity_confirmation.observed is None
+    assert adapter.last_quantity_confirmation.expected == 5.0
+
+
+def test_write_and_verify_existing_rr_pair_half_quantity_still_confirms_via_ocr_for_a_legacy_target(monkeypatch):
+    """Phase 5.29: resume/reconciliation writes (write_source_quantity_
+    once=False, via locate_existing_rr_pair_half()) are exactly the
+    "trustworthy write provenance absent" case that must keep full OCR
+    confirmation -- unchanged by the fresh-write skip. A disagreeing
+    post-write readback still produces LOW_CONFIDENCE/review_required,
+    never CONFIRMED and never SKIPPED."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    monkeypatch.setattr(
+        adapter, "locate_existing_rr_pair_half",
+        lambda *, category, selector, description, activity: (
+            PendingQuantityTarget(
+                identity=("rfg", "steep", "steep charge"), activity="+", after_index=1, activity_ordinal=1,
+                physical_row_delta=2, write_source_quantity_once=False,
+            ),
+            0.0,
+        ),
+    )
+    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {1: 12.0}, confirmed_by_index={1: None},
+    )
+
+    confirmation = adapter.write_and_verify_existing_rr_pair_half_quantity(
+        category="rfg", selector="steep", description="steep charge", activity="+", quantity=12.0,
+    )
+
+    assert typed_indices == {1}
+    assert confirmation.confidence == "LOW_CONFIDENCE"
+    assert confirmation.review_required is True
+    assert confirmation.observed is None
 
 
 def test_locate_existing_rr_pair_half_relocates_without_reactivation(monkeypatch):
@@ -7412,7 +7547,11 @@ def test_write_and_verify_rr_pair_quantities_calls_on_minus_verified_before_plus
     )
 
     assert len(seen) == 1
-    assert seen[0].observed == 10.0
+    # Phase 5.29: a fresh minus write's confirmation is SKIPPED
+    # (advisory OCR not attempted) -- the callback still fires with
+    # the (now-observed-less) confirmation at the correct point.
+    assert seen[0].confidence == "SKIPPED"
+    assert seen[0].observed is None
     assert seen[0] is result.minus_confirmation
 
 
@@ -7445,8 +7584,9 @@ def test_write_and_verify_rr_pair_quantities_without_callback_is_unchanged(monke
 
     result = adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
 
-    assert result.minus_confirmation.observed == 10.0
-    assert result.plus_confirmation.observed == 12.0
+    # Phase 5.29: fresh writes skip post-write OCR by default now.
+    assert result.minus_confirmation.confidence == "SKIPPED"
+    assert result.plus_confirmation.confidence == "SKIPPED"
 
 
 # --- Phase 5.23 (R&R Stage 4 integration): locate_existing_rr_pair()
