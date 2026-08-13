@@ -226,6 +226,13 @@ def _plan_with_one_coordinated_pair_and_one_ordinary_task():
 
 
 def test_coordinated_pair_members_never_reach_independent_execution(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.23 (R&R Stage 4): GroupAwareFakeAdapter does not
+    implement the Stage 3 R&R primitives (bind_rr_pair_after_
+    activation/write_and_verify_rr_pair_quantities/etc.), so a pair
+    reaching a run against it must still fail closed -- never a fake
+    success, never independent execution of either member -- exactly
+    like the Stage 1-2 guard did, just now scoped to "this adapter
+    can't do it" rather than "Stage 3 doesn't exist yet"."""
     plan, remove_task, replace_task, ordinary_task = _plan_with_one_coordinated_pair_and_one_ordinary_task()
     adapter = _adapter_with_test_project(dropdown_script=_dropdown_script(ordinary_task))
 
@@ -241,8 +248,10 @@ def test_coordinated_pair_members_never_reach_independent_execution(tmp_path, ph
     search_calls = [c for c in adapter.log.calls if c[0] in ("search_by_description", "search_by_category_selector")]
     assert search_calls == [("search_by_category_selector", ("SFG", "GUTA"), {})]
 
-    # The pair's own persisted state is untouched -- this guard never
-    # activates anything.
+    # The pair's own persisted state is untouched -- an adapter that
+    # can't do coordinated execution never creates a physical
+    # checkpoint, so a later run/reset with a capable adapter must
+    # still see this pair as untouched, not artificially "protected".
     pair = plan.coordinated_pairs[0]
     assert pair.pair_state == PAIR_UNACTIVATED
 

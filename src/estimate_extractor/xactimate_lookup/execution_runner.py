@@ -43,8 +43,17 @@ import json
 from pathlib import Path
 
 from estimate_extractor.xactimate_lookup import orchestrator
-from estimate_extractor.xactimate_lookup.adapter import AdapterError, ProtectedCommittedRowError, XactimateAdapter
+from estimate_extractor.xactimate_lookup.adapter import (
+    AdapterError,
+    PhysicalStateUncertainError,
+    ProtectedCommittedRowError,
+    QuantityConfirmationError,
+    TaskLocalRowReconciliationError,
+    UnexpectedDialogError,
+    XactimateAdapter,
+)
 from estimate_extractor.xactimate_lookup.execution_plan import (
+    CoordinatedPair,
     ExecutionPlan,
     ExecutionTask,
     GROUP_COMPLETED,
@@ -56,6 +65,13 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     GroupExecutionState,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
     LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+    PAIR_BOTH_BOUND,
+    PAIR_BOTH_VERIFIED,
+    PAIR_MINUS_VERIFIED,
+    PAIR_PHYSICAL_STATE_UNCERTAIN,
+    PAIR_PLUS_VERIFIED,
+    PAIR_REVIEW_REQUIRED,
+    PAIR_SATISFIED,
     RUN_STATE_COMPLETED,
     RUN_STATE_IN_PROGRESS,
     RUN_STATE_PAUSED,
@@ -78,6 +94,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TEST_ONLY_PROJECT_NAME,
     commit_state_from_trust_state,
     is_plan_stale,
+    pair_has_physical_activity,
     save_execution_plan,
     task_has_committed_row,
     utc_now_iso,
@@ -92,8 +109,12 @@ from estimate_extractor.xactimate_lookup.models import (
     LookupPlan,
     MAPPING_STATUS_APPROVED,
     RecommendationInput,
+    STOP_REASON_ADAPTER_ERROR,
     STOP_REASON_EXTRACTION_FAILED,
     STOP_REASON_NO_RESULTS,
+    STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
+    STOP_REASON_QUANTITY_CONFIRMATION_FAILED,
+    STOP_REASON_TASK_LOCAL_ROW_RECONCILIATION,
     STOP_REASON_UNEXPECTED_DIALOG,
 )
 from estimate_extractor.xactimate_lookup.phrase_generator import PhraseRules, generate_search_phrase
@@ -675,6 +696,584 @@ def _run_description_first_task(
     return outcome, actual_strategy, reason
 
 
+# ---------------------------------------------------------------------
+# Phase 5.23 (R&R Stage 4): coordinated remove/replace pair execution.
+#
+# Replaces the Stage 1-2 guard (STOP_REASON_COORDINATED_PAIR_EXECUTION_
+# NOT_IMPLEMENTED unconditionally, for every paired task) with real
+# execution: one search/rank/decide + one candidate activation for the
+# WHOLE pair, dual-target binding and dual quantity write/verify via
+# windows_adapter.py's Stage 3 primitives, then one shared commit_item()
+# + verify_commit() -- reusing orchestrator._search_rank_and_decide()
+# and every existing single-row adapter primitive (select_candidate,
+# snapshot_grid_identities_for_activation, record_protected_commit,
+# commit_item, verify_commit, capture_evidence) exactly as the ordinary
+# per-task path does. Never a second, forked search/ranking/candidate-
+# selection implementation -- see _run_coordinated_pair()'s own
+# docstring for the full flow and crash-safe resume shape.
+#
+# The constant is still named STOP_REASON_COORDINATED_PAIR_EXECUTION_
+# NOT_IMPLEMENTED (unchanged label) but is now produced only when THIS
+# adapter specifically cannot do coordinated execution (see _supports_
+# rr_pair_operations()) -- e.g. the plain FakeXactimateAdapter, or any
+# future adapter that hasn't implemented the Stage 3 primitives -- not
+# "Stage 3 doesn't exist yet" (it does now).
+# ---------------------------------------------------------------------
+
+
+def _supports_rr_pair_operations(adapter) -> bool:
+    return (
+        hasattr(adapter, "bind_rr_pair_after_activation")
+        and hasattr(adapter, "write_and_verify_rr_pair_quantities")
+        and hasattr(adapter, "locate_existing_rr_pair")
+        and hasattr(adapter, "verify_existing_rr_pair_half_quantity")
+        and hasattr(adapter, "write_and_verify_existing_rr_pair_half_quantity")
+    )
+
+
+def _mark_pair_members_pre_activation(
+    pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
+    decision: str, stop_reason: str | None, stop_detail: str | None, dry_run: bool,
+) -> None:
+    """Applies ONE shared search/rank/decide outcome to BOTH member
+    tasks identically -- mirrors _apply_outcome_to_task()'s own "not
+    committed" branch, generalized to two tasks sharing one decision.
+    Never touches pair.pair_state or any binding field: nothing
+    adapter-side has happened yet (no select_candidate() call), so
+    this is never a physical checkpoint -- see run_execution_plan()'s
+    own docstring requirement that pre-activation ambiguity must leave
+    NO physical checkpoint behind, exactly like an ordinary task that
+    never reaches activation."""
+    for task in (remove_task, replace_task):
+        task.attempts += 1
+        task.completed_at = utc_now_iso()
+        task.stop_reason = stop_reason
+        task.stop_detail = stop_detail
+        if dry_run:
+            continue
+        task.state = TASK_FAILED if decision == DECISION_NO_MATCH else TASK_REVIEW_REQUIRED
+        task.commit_state = TASK_COMMIT_STATE_NOT_COMMITTED
+
+
+def _mark_pair_physical_state_uncertain(
+    pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
+    stop_reason: str, detail: str,
+) -> None:
+    """Genuine project-level hard stop -- mirrors an ordinary task's
+    own outcome.physical_state_uncertain=True handling, applied to
+    BOTH member tasks so the EXISTING generic per-task/pre-loop resume
+    guards in run_execution_plan() (which key off task.physical_state_
+    uncertain, not anything pair-specific) protect this pair from ever
+    being silently retried -- no pair-aware resume special-casing
+    needed there at all."""
+    pair.pair_state = PAIR_PHYSICAL_STATE_UNCERTAIN
+    pair.uncertainty_reason = detail
+    for task in (remove_task, replace_task):
+        task.attempts += 1
+        task.completed_at = utc_now_iso()
+        task.physical_state_uncertain = True
+        task.state = TASK_REVIEW_REQUIRED
+        task.stop_reason = stop_reason
+        task.stop_detail = detail
+
+
+def _mark_pair_task_local_review(
+    pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
+    stop_reason: str, detail: str, *, review_reason: str | None = None,
+) -> None:
+    """Task-local failure -- deliberately never sets physical_state_
+    uncertain (mirrors TaskLocalRowReconciliationError/Quantity
+    ConfirmationError's own existing severity: confined to this pair's
+    own commit, never evidence the wider grid/group is unsafe). The
+    run continues with the next task/group afterward."""
+    pair.pair_state = PAIR_REVIEW_REQUIRED
+    pair.review_reason = review_reason or detail
+    for task in (remove_task, replace_task):
+        task.attempts += 1
+        task.completed_at = utc_now_iso()
+        task.state = TASK_REVIEW_REQUIRED
+        task.stop_reason = stop_reason
+        task.stop_detail = detail
+
+
+def _binding_dict(identity: tuple[str, str, str], activity: str) -> dict:
+    category, selector, description = identity
+    return {"category": category, "selector": selector, "description": description, "activity": activity}
+
+
+def _finalize_pair_task(
+    task: ExecutionTask, confirmation, structural_trust_state: str, expected_quantity: float | None,
+) -> None:
+    """Per-task terminal state from ITS OWN quantity confirmation plus
+    the ONE shared structural commit_verification -- mirrors _apply_
+    outcome_to_task()'s VERIFIED-trust_state bar (TASK_COMPLETED only
+    when both the shared structural check AND this task's own same-
+    cell confirmation are fully confirmed) so neither task is ever
+    reported committed merely because its partner's evidence looked
+    good; each task's own affirmative evidence is what is checked
+    here. Mirrors execute_plan()'s own "structural VERIFIED but the
+    same-cell OCR confirmation itself was uncertain -> QUANTITY_
+    MISMATCH" downgrade, evaluated independently per half."""
+    task.entered_quantity = expected_quantity
+    task.observed_quantity = getattr(confirmation, "observed", None)
+    task.commit_state = TASK_COMMIT_STATE_COMMITTED
+    confirmed = getattr(confirmation, "confidence", None) == "CONFIRMED"
+    if structural_trust_state == _VERIFIED_TRUST_STATE and confirmed:
+        task.trust_state = _VERIFIED_TRUST_STATE
+        task.state = TASK_COMPLETED
+        task.review_reason = None
+    else:
+        task.trust_state = "QUANTITY_MISMATCH" if structural_trust_state == _VERIFIED_TRUST_STATE else structural_trust_state
+        task.state = TASK_REVIEW_REQUIRED
+        task.review_reason = (
+            getattr(confirmation, "reason", None) if not confirmed
+            else f"Structural commit verification: {structural_trust_state}"
+        )
+
+
+def _write_verify_and_finalize_rr_pair(
+    pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
+    pair_target, before_snapshot, populated_unit: str | None,
+    adapter, plan: ExecutionPlan, project_dir: Path,
+) -> bool:
+    """Shared tail for EVERY path that reaches "both halves physically
+    bound, ready to write/verify quantities and finish" -- a fresh
+    activation, and every resume shape that still needs a real write.
+    Returns True on a genuine hard stop (structural VERIFICATION_
+    FAILED -- the commit could not be detected in the grid at all,
+    mirroring an ordinary task's own identical treatment), False
+    otherwise (satisfied or task-locally reviewed)."""
+    def _checkpoint_minus_verified(confirmation) -> None:
+        pair.minus_written = True
+        pair.minus_verified_ok = getattr(confirmation, "confidence", None) == "CONFIRMED"
+        pair.pair_state = PAIR_MINUS_VERIFIED
+        save_execution_plan(plan, project_dir)
+
+    try:
+        result = adapter.write_and_verify_rr_pair_quantities(
+            pair_target, pair.expected_minus_quantity, pair.expected_plus_quantity,
+            on_minus_verified=_checkpoint_minus_verified,
+        )
+    except QuantityConfirmationError as exc:
+        side = getattr(exc, "side", None)
+        minus_confirmation = getattr(exc, "minus_confirmation", None)
+        if side == "minus":
+            _mark_pair_task_local_review(
+                pair, remove_task, replace_task, STOP_REASON_QUANTITY_CONFIRMATION_FAILED, str(exc),
+            )
+        else:
+            # Plus failed after minus succeeded -- the evidence that
+            # minus was already verified was ALREADY persisted by
+            # _checkpoint_minus_verified() above (pair.pair_state ==
+            # PAIR_MINUS_VERIFIED, pair.minus_written/verified_ok set)
+            # before the plus write was even attempted; never lost,
+            # never re-derived from this exception. Neither task is
+            # marked COMPLETED here: commit_item() -- the one shared
+            # save for BOTH physical rows -- is never reached when the
+            # plus write fails, so nothing is actually saved yet.
+            detail = str(exc)
+            if minus_confirmation is not None:
+                detail += f" (minus side already verified: observed={getattr(minus_confirmation, 'observed', None)!r})."
+            _mark_pair_task_local_review(
+                pair, remove_task, replace_task, STOP_REASON_QUANTITY_CONFIRMATION_FAILED, detail,
+                review_reason="Plus-side quantity entry failed after the minus side was already verified.",
+            )
+        save_execution_plan(plan, project_dir)
+        return False
+
+    pair.minus_written = True
+    pair.plus_written = True
+    pair.minus_verified_ok = result.minus_confirmation.confidence == "CONFIRMED"
+    pair.plus_verified_ok = result.plus_confirmation.confidence == "CONFIRMED"
+    pair.pair_state = PAIR_PLUS_VERIFIED
+    save_execution_plan(plan, project_dir)
+
+    return _commit_and_finalize_rr_pair(
+        pair, remove_task, replace_task, result.minus_confirmation, result.plus_confirmation,
+        before_snapshot, populated_unit, adapter, plan, project_dir,
+    )
+
+
+def _commit_and_finalize_rr_pair(
+    pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
+    minus_confirmation, plus_confirmation, before_snapshot, populated_unit: str | None,
+    adapter, plan: ExecutionPlan, project_dir: Path,
+) -> bool:
+    """The ONE shared save (commit_item()) and ONE shared structural
+    reconciliation (verify_commit(), reused completely unmodified --
+    it already natively proves "one corroborated R&R -/+ pair", the
+    exact same primitive the legacy single-target R&R path has always
+    used) for the whole pair -- Xactimate saves both physical rows
+    together; there is no such thing as committing only one half.
+    Called both from a fresh write and from every resume path once
+    both halves are (re-)verified.
+
+    `before_snapshot` is None for every RESUME path (see _resume_rr_
+    pair()) -- deliberately, not an oversight: verify_commit()'s whole
+    mechanism is detecting a ROW-COUNT DELTA between a "before" and
+    "after" grid snapshot to prove exactly one new logical item
+    appeared. On a resume, the physical rows already exist from a
+    PRIOR session -- commit_item() here is a bare re-save, no new row
+    is expected to appear, so a delta-based check would see delta==0
+    and misreport a legitimate resume completion as trust_state==
+    "VERIFICATION_FAILED". The pair's own structural "exactly one
+    clean -/+ pair" proof already happened ONCE, at ORIGINAL bind time
+    (_pending_rr_pair_targets_from_delta()'s multiset proof, whether
+    that bind happened in this session or a prior one); a resume's own
+    confidence instead comes entirely from Stage 3's read-only re-
+    identification affirmations (verify_existing_rr_pair_half_
+    quantity()) already performed by the caller before this function
+    is ever reached. structural_trust_state therefore stays at its
+    _VERIFIED_TRUST_STATE default for every resume path -- each task's
+    OWN confirmation confidence (see _finalize_pair_task()) is still
+    independently what decides TASK_COMPLETED vs TASK_REVIEW_REQUIRED,
+    so this never fabricates success beyond what was actually
+    reaffirmed."""
+    plus_binding = pair.plus_binding or {}
+    category = plus_binding.get("category")
+    selector = plus_binding.get("selector")
+    description = plus_binding.get("description")
+
+    if hasattr(adapter, "record_protected_commit"):
+        try:
+            adapter.record_protected_commit(
+                category=category, selector=selector, description=description,
+                quantity=pair.expected_plus_quantity, unit=pair.expected_plus_unit,
+            )
+        except Exception:
+            pass
+
+    try:
+        adapter.commit_item()
+    except AdapterError as exc:
+        adapter.recover()
+        _mark_pair_task_local_review(pair, remove_task, replace_task, STOP_REASON_ADAPTER_ERROR, str(exc))
+        save_execution_plan(plan, project_dir)
+        return False
+
+    evidence_reference = adapter.capture_evidence() if hasattr(adapter, "capture_evidence") else None
+
+    structural_trust_state = _VERIFIED_TRUST_STATE
+    verification = None
+    if before_snapshot is not None and hasattr(adapter, "verify_commit"):
+        verification = adapter.verify_commit(
+            before_snapshot, category, selector, pair.expected_plus_quantity,
+            source_unit=pair.expected_plus_unit, expected_xactimate_unit=pair.expected_plus_unit,
+            populated_unit=populated_unit,
+        )
+        structural_trust_state = getattr(verification, "trust_state", None)
+
+    if structural_trust_state == "VERIFICATION_FAILED":
+        # Mirrors _apply_outcome_to_task()'s own identical special
+        # case: the adapter's own physical_item_created evidence is
+        # positive (both halves were bound and written), but the
+        # structural row-count delta was never independently detected
+        # -- genuine physical-state uncertainty, not a guess either way.
+        _mark_pair_physical_state_uncertain(
+            pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
+            f"Commit could not be independently verified in the grid: {getattr(verification, 'reason', None)!r}.",
+        )
+        save_execution_plan(plan, project_dir)
+        return True
+
+    remove_task.evidence_path = evidence_reference
+    replace_task.evidence_path = evidence_reference
+    remove_task.selected_category = category
+    remove_task.selected_selector = selector
+    remove_task.selected_description = description
+    replace_task.selected_category = category
+    replace_task.selected_selector = selector
+    replace_task.selected_description = description
+
+    _finalize_pair_task(remove_task, minus_confirmation, structural_trust_state, pair.expected_minus_quantity)
+    _finalize_pair_task(replace_task, plus_confirmation, structural_trust_state, pair.expected_plus_quantity)
+
+    pair.pair_state = (
+        PAIR_SATISFIED if remove_task.state == TASK_COMPLETED and replace_task.state == TASK_COMPLETED
+        else PAIR_BOTH_VERIFIED
+    )
+    save_execution_plan(plan, project_dir)
+    return False
+
+
+def _resume_rr_pair(
+    pair: CoordinatedPair, remove_task: ExecutionTask, replace_task: ExecutionTask,
+    adapter, plan: ExecutionPlan, project_dir: Path,
+) -> bool:
+    """Crash-safe resume -- NEVER re-searches, re-ranks, or re-
+    activates a candidate; only Stage 3's read-only re-identification
+    primitives are used to recover physical state. Dispatches purely
+    on pair.pair_state, the single source of truth for "how far did
+    the prior attempt get":
+
+    * PAIR_BOTH_BOUND: neither quantity verified yet -- re-identify
+      BOTH halves (locate_existing_rr_pair()) and write both, reusing
+      the exact same _write_verify_and_finalize_rr_pair() tail a fresh
+      activation uses.
+    * PAIR_MINUS_VERIFIED: re-affirm minus read-only (never rewritten
+      -- see write_and_verify_existing_rr_pair_half_quantity()'s own
+      docstring for why the OTHER, already-verified side must never be
+      touched again), then write ONLY the plus side.
+    * PAIR_PLUS_VERIFIED / PAIR_BOTH_VERIFIED: both sides already have
+      a real write/verify from a prior attempt but the shared commit/
+      task-persistence step never completed -- re-affirm both read-
+      only (no write at all) and go straight to the shared commit/
+      finalize tail.
+
+    Any other persisted pair_state reaching this function (PAIR_
+    ACTIVATED_PENDING_BINDING -- never itself persisted by this Stage,
+    kept only for schema completeness; or PAIR_SATISFIED/PAIR_REVIEW_
+    REQUIRED/PAIR_PHYSICAL_STATE_UNCERTAIN, which should already leave
+    both member tasks terminal and therefore unreachable via the
+    runner's own PENDING-task loop) is treated as unrecoverable
+    physical-state uncertainty -- fails closed rather than guessing."""
+    plus_binding = pair.plus_binding or {}
+    minus_binding = pair.minus_binding or {}
+    category = plus_binding.get("category") or minus_binding.get("category")
+    selector = plus_binding.get("selector") or minus_binding.get("selector")
+    description = plus_binding.get("description") or minus_binding.get("description")
+    if not (category and selector and description):
+        _mark_pair_physical_state_uncertain(
+            pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
+            f"Coordinated pair {pair.pair_id!r} has pair_state={pair.pair_state!r} but no usable persisted "
+            f"minus/plus binding identity -- refusing to guess at physical state on resume.",
+        )
+        save_execution_plan(plan, project_dir)
+        return True
+
+    if pair.pair_state == PAIR_BOTH_BOUND:
+        pair_target = adapter.locate_existing_rr_pair(category=category, selector=selector, description=description)
+        if pair_target is None:
+            _mark_pair_physical_state_uncertain(
+                pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
+                f"Coordinated pair {pair.pair_id!r} was previously bound but its physical -/+ rows could not "
+                f"be uniquely re-identified on resume; refusing to reactivate the candidate.",
+            )
+            save_execution_plan(plan, project_dir)
+            return True
+        return _write_verify_and_finalize_rr_pair(
+            pair, remove_task, replace_task, pair_target, None, None, adapter, plan, project_dir,
+        )
+
+    if pair.pair_state == PAIR_MINUS_VERIFIED:
+        affirm = adapter.verify_existing_rr_pair_half_quantity(
+            category=category, selector=selector, description=description, activity="-",
+            expected_quantity=pair.expected_minus_quantity,
+        )
+        if affirm is None:
+            _mark_pair_physical_state_uncertain(
+                pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
+                f"Coordinated pair {pair.pair_id!r}'s previously-verified minus half could not be "
+                f"re-identified on resume; refusing to guess at physical state.",
+            )
+            save_execution_plan(plan, project_dir)
+            return True
+        try:
+            plus_confirmation = adapter.write_and_verify_existing_rr_pair_half_quantity(
+                category=category, selector=selector, description=description, activity="+",
+                quantity=pair.expected_plus_quantity,
+            )
+        except QuantityConfirmationError as exc:
+            _mark_pair_task_local_review(
+                pair, remove_task, replace_task, STOP_REASON_QUANTITY_CONFIRMATION_FAILED, str(exc),
+                review_reason="Plus-side quantity entry failed while resuming a pair whose minus side was already verified.",
+            )
+            save_execution_plan(plan, project_dir)
+            return False
+        pair.plus_written = True
+        pair.plus_verified_ok = plus_confirmation.confidence == "CONFIRMED"
+        pair.pair_state = PAIR_PLUS_VERIFIED
+        save_execution_plan(plan, project_dir)
+        return _commit_and_finalize_rr_pair(
+            pair, remove_task, replace_task, affirm, plus_confirmation, None, None, adapter, plan, project_dir,
+        )
+
+    if pair.pair_state in (PAIR_PLUS_VERIFIED, PAIR_BOTH_VERIFIED):
+        minus_affirm = adapter.verify_existing_rr_pair_half_quantity(
+            category=category, selector=selector, description=description, activity="-",
+            expected_quantity=pair.expected_minus_quantity,
+        )
+        plus_affirm = adapter.verify_existing_rr_pair_half_quantity(
+            category=category, selector=selector, description=description, activity="+",
+            expected_quantity=pair.expected_plus_quantity,
+        )
+        if minus_affirm is None or plus_affirm is None:
+            _mark_pair_physical_state_uncertain(
+                pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
+                f"Coordinated pair {pair.pair_id!r}'s previously-verified halves could not be re-identified "
+                f"on resume; refusing to guess at physical state.",
+            )
+            save_execution_plan(plan, project_dir)
+            return True
+        return _commit_and_finalize_rr_pair(
+            pair, remove_task, replace_task, minus_affirm, plus_affirm, None, None, adapter, plan, project_dir,
+        )
+
+    _mark_pair_physical_state_uncertain(
+        pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN,
+        f"Coordinated pair {pair.pair_id!r} has an unrecoverable persisted pair_state={pair.pair_state!r} on "
+        f"resume; refusing to guess at physical state.",
+    )
+    save_execution_plan(plan, project_dir)
+    return True
+
+
+def _run_coordinated_pair(
+    pair: CoordinatedPair, plan: ExecutionPlan, adapter, ranking_config: RankingConfig,
+    phrase_rules: PhraseRules, project_dir: Path, dry_run: bool,
+) -> bool:
+    """Executes (or safely resumes) one coordinated remove/replace pair
+    as ONE atomic unit of work -- see run_execution_plan()'s own
+    coordinated-pair routing branch, which calls this for ANY task
+    carrying task.coordinated_pair_id instead of the ordinary per-task
+    path. Marks BOTH pair.remove_task_id/replace_task_id tasks
+    terminal in this one call (or leaves them PENDING for dry_run,
+    mirroring ordinary tasks) -- so the runner's per-task loop skips a
+    task whose state was already advanced by its OWN pair partner (see
+    the `if task.state != TASK_PENDING: continue` guard added there).
+
+    Returns True if the whole run must hard-stop (genuine project-
+    level physical-state uncertainty -- mirrors an ordinary task's own
+    physical_state_uncertain hard-stop), False otherwise (normal
+    continuation, whether satisfied or task-locally reviewed)."""
+    remove_task = plan.task_by_id(pair.remove_task_id)
+    replace_task = plan.task_by_id(pair.replace_task_id)
+    activation_task = plan.task_by_id(pair.activation_task_id) or remove_task
+
+    if not dry_run and not _supports_rr_pair_operations(adapter):
+        # Deliberately never touches pair.pair_state -- nothing adapter-
+        # side happens here at all (not even a search), so this must
+        # leave the pair exactly as re-runnable as ordinary pre-
+        # activation ambiguity does: a LATER run with a capable adapter
+        # (or, if the pair was already active from a prior session,
+        # this run simply defers to that later run) must not find this
+        # pair artificially "protected" by pair_has_physical_activity()
+        # from a genuine, deliberate reset.
+        detail = (
+            f"Adapter {type(adapter).__name__!r} does not support coordinated R&R pair execution (missing "
+            f"one or more Stage 3 primitives) -- refusing to execute pair {pair.pair_id!r}."
+        )
+        for task in (remove_task, replace_task):
+            task.attempts += 1
+            task.completed_at = utc_now_iso()
+            task.state = TASK_REVIEW_REQUIRED
+            task.stop_reason = STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED
+            task.stop_detail = detail
+        save_execution_plan(plan, project_dir)
+        return False
+
+    try:
+        lookup_plan, actual_strategy, reason = _task_to_lookup_plan(activation_task, phrase_rules)
+    except UnsafeLookupRouting as exc:
+        for task in (remove_task, replace_task):
+            task.attempts += 1
+            task.completed_at = utc_now_iso()
+            task.error = str(exc)
+            if not dry_run:
+                task.state = TASK_FAILED
+        if not dry_run:
+            save_execution_plan(plan, project_dir)
+        return False
+    activation_task.actual_lookup_strategy = actual_strategy
+    activation_task.lookup_strategy_reason = reason
+    item = _task_to_recommendation_input(activation_task)
+
+    resumed = pair_has_physical_activity(pair)
+
+    if hasattr(adapter, "set_execution_context"):
+        adapter.set_execution_context(task_id=activation_task.task_id, source_row=activation_task.row_label)
+    if hasattr(adapter, "record_lifecycle_event"):
+        # Phase 5.23 (R&R Stage 4): the one lifecycle event that names
+        # BOTH logical task IDs and the pair ID together -- everything
+        # after this point is recorded per-task exactly like an
+        # ordinary single task (PLANNED/CANDIDATE_SELECTED/QUANTITY_
+        # ENTERED/COMMIT_STARTED/COMMIT_RETURNED/VERIFIED/TERMINAL, via
+        # the SAME _record_lifecycle()-driven calls windows_adapter.py
+        # already makes from inside select_candidate()/commit_item()/
+        # etc. where it supports them), so the ledger can reconstruct
+        # "pair ID, both task IDs, one candidate activation, ...,
+        # whether execution was fresh or resumed" without any adapter-
+        # side R&R-specific ledger logic.
+        try:
+            adapter.record_lifecycle_event(
+                "COORDINATED_PAIR_STARTED", pair_id=pair.pair_id,
+                remove_task_id=pair.remove_task_id, replace_task_id=pair.replace_task_id,
+                resumed=resumed, pair_state=pair.pair_state,
+            )
+        except Exception:
+            pass
+
+    if resumed:
+        if dry_run:
+            # dry_run must NEVER cause a real adapter call, resumed pair
+            # or not -- mirrors ordinary tasks' own dry_run contract
+            # (preview only; task.state is left completely untouched).
+            return False
+        # A resumed pair must NEVER search/rank/decide/activate again
+        # -- the candidate already physically exists. Route straight
+        # to resume handling, entirely via Stage 3's read-only
+        # re-identification primitives.
+        return _resume_rr_pair(pair, remove_task, replace_task, adapter, plan, project_dir)
+
+    outcome = orchestrator._search_rank_and_decide(
+        lookup_plan, item, adapter, ranking_config, phrase_rules, dry_run=dry_run,
+    )
+    if dry_run or outcome.decision != DECISION_AUTO_SELECT:
+        _mark_pair_members_pre_activation(
+            pair, remove_task, replace_task, outcome.decision, outcome.stop_reason, outcome.stop_detail, dry_run,
+        )
+        if not dry_run:
+            save_execution_plan(plan, project_dir)
+        return False
+
+    top = outcome.selected
+    if hasattr(adapter, "snapshot_grid_identities_for_activation"):
+        before_snapshot = adapter.snapshot_grid_identities_for_activation()
+    elif hasattr(adapter, "snapshot_grid_identities"):
+        before_snapshot = adapter.snapshot_grid_identities()
+    else:
+        before_snapshot = None
+
+    try:
+        adapter.select_candidate(top.dropdown)
+        pair_target = adapter.bind_rr_pair_after_activation(before_snapshot or [])
+    except UnexpectedDialogError as exc:
+        _mark_pair_physical_state_uncertain(
+            pair, remove_task, replace_task, STOP_REASON_UNEXPECTED_DIALOG, str(exc),
+        )
+        save_execution_plan(plan, project_dir)
+        return True
+    except PhysicalStateUncertainError as exc:
+        _mark_pair_physical_state_uncertain(
+            pair, remove_task, replace_task, STOP_REASON_PHYSICAL_STATE_UNCERTAIN, str(exc),
+        )
+        save_execution_plan(plan, project_dir)
+        return True
+    except TaskLocalRowReconciliationError as exc:
+        adapter.recover()
+        _mark_pair_task_local_review(pair, remove_task, replace_task, STOP_REASON_TASK_LOCAL_ROW_RECONCILIATION, str(exc))
+        save_execution_plan(plan, project_dir)
+        return False
+    except AdapterError as exc:
+        adapter.recover()
+        _mark_pair_task_local_review(pair, remove_task, replace_task, STOP_REASON_ADAPTER_ERROR, str(exc))
+        save_execution_plan(plan, project_dir)
+        return False
+
+    # Bind checkpoint -- persisted BEFORE any quantity mutation, exactly
+    # once the physical -/+ pair is positively, uniquely proven (Stage 3
+    # binding is atomic: either fully bound or an exception above).
+    pair.minus_binding = _binding_dict(pair_target.minus_target.identity, "-")
+    pair.plus_binding = _binding_dict(pair_target.plus_target.identity, "+")
+    pair.pair_state = PAIR_BOTH_BOUND
+    save_execution_plan(plan, project_dir)
+
+    populated_unit = None  # No populated_fields OCR read is taken for the pair path (mirrors ordinary tasks' own deliberate omission before quantity entry).
+    return _write_verify_and_finalize_rr_pair(
+        pair, remove_task, replace_task, pair_target, before_snapshot, populated_unit, adapter, plan, project_dir,
+    )
+
+
 def run_execution_plan(
     plan: ExecutionPlan,
     adapter: XactimateAdapter,
@@ -802,6 +1401,17 @@ def run_execution_plan(
                 continue
 
         for task in pending_tasks:
+            # Phase 5.23 (R&R Stage 4): `pending_tasks` is a snapshot
+            # taken before this loop started. Processing a coordinated
+            # pair's FIRST member (below) also resolves its partner's
+            # state in the SAME call -- when the loop later reaches
+            # that partner via this same stale snapshot, it must be
+            # skipped outright rather than re-processed. Unreachable
+            # for every ordinary task, whose state only ever changes
+            # within its own iteration of this exact loop.
+            if task.state != TASK_PENDING:
+                continue
+
             # A crash can leave the immediate physical-created
             # checkpoint persisted while the task itself is still
             # PENDING.  Treat that resumed shape exactly like an
@@ -842,26 +1452,45 @@ def run_execution_plan(
                     save_execution_plan(plan, project_dir)
                 continue
 
-            # Phase 5.23 (R&R Stage 1-2): a task belonging to a
-            # coordinated remove/replace pair must NEVER fall through
-            # to the ordinary independent single-task path below --
-            # doing so could search/select/commit its own candidate
-            # while its partner is untouched, exactly the duplicate-
-            # activation risk coordinated pairs exist to prevent. Live
-            # coordinated activation/quantity/verification (Stage 3)
-            # does not exist yet, so every coordinated task reaching
-            # this point is explicitly, safely diverted -- never a
-            # fabricated success, never a silent independent execution.
+            # Phase 5.23 (R&R Stage 4): a task belonging to a
+            # coordinated remove/replace pair NEVER falls through to
+            # the ordinary independent single-task path below -- doing
+            # so could search/select/commit its own candidate while its
+            # partner is untouched, exactly the duplicate-activation
+            # risk coordinated pairs exist to prevent. _run_coordinated_
+            # pair() executes (or safely resumes) the WHOLE pair as one
+            # atomic unit and marks BOTH member tasks terminal itself
+            # (see the `task.state != TASK_PENDING` guard above, which
+            # is what lets the partner's own later loop iteration skip
+            # cleanly) -- never a fabricated success, never a silent
+            # independent execution of either member.
             if task.coordinated_pair_id:
-                task.state = TASK_REVIEW_REQUIRED
-                task.stop_reason = STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED
-                task.stop_detail = (
-                    f"Task belongs to coordinated pair {task.coordinated_pair_id!r} -- live coordinated "
-                    f"execution is not implemented yet (R&R Stage 3). Refusing to execute this task "
-                    f"independently of its partner."
-                )
-                task.completed_at = utc_now_iso()
-                _record_terminal(adapter, task)
+                pair = plan.pair_by_id(task.coordinated_pair_id)
+                if pair is None:
+                    # Structurally impossible in a well-formed plan --
+                    # fail this one task closed rather than guess.
+                    task.state = TASK_REVIEW_REQUIRED
+                    task.stop_reason = STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED
+                    task.stop_detail = f"coordinated_pair_id {task.coordinated_pair_id!r} has no matching CoordinatedPair record."
+                    task.completed_at = utc_now_iso()
+                    _record_terminal(adapter, task)
+                    if not dry_run:
+                        plan.resume_cursor = plan.tasks.index(task) + 1
+                        save_execution_plan(plan, project_dir)
+                    continue
+                hard_stop = _run_coordinated_pair(pair, plan, adapter, ranking_config, phrase_rules, project_dir, dry_run)
+                remove_task = plan.task_by_id(pair.remove_task_id)
+                replace_task = plan.task_by_id(pair.replace_task_id)
+                for member in (remove_task, replace_task):
+                    if member is not None:
+                        _record_terminal(adapter, member)
+                if hard_stop:
+                    plan.run_state = RUN_STATE_PAUSED
+                    plan.stop_reason_category = STOP_REASON_PROJECT_LEVEL_HARD_STOP
+                    plan.resume_cursor = plan.tasks.index(task)
+                    save_execution_plan(plan, project_dir)
+                    write_all_execution_reports(plan, project_dir)
+                    return plan
                 if not dry_run:
                     plan.resume_cursor = plan.tasks.index(task) + 1
                     save_execution_plan(plan, project_dir)

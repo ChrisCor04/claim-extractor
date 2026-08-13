@@ -257,39 +257,35 @@ def _stop_existing(outcome: LookupOutcome, reason: str, detail: str) -> LookupOu
     return outcome
 
 
-def execute_plan(
+def _search_rank_and_decide(
     plan: LookupPlan,
     item: RecommendationInput,
     adapter: XactimateAdapter,
     ranking_config: RankingConfig,
     phrase_rules: PhraseRules,
     *,
-    dry_run: bool = True,
+    dry_run: bool,
     force_auto_select_for_trusted_mapping: bool = False,
 ) -> LookupOutcome:
-    """`force_auto_select_for_trusted_mapping` (Phase 5.17, default
-    False -- every existing/production call site is unaffected): for a
-    LOOKUP_PATH_TRUSTED plan ONLY, treats the top candidate as
-    AUTO_SELECT once it's confirmed to be exactly the trusted mapping's
-    own category/selector with no hard conflict, bypassing classify_
-    decision()'s ordinary score/margin gates. Reserved for a human
-    reviewer's own explicit, one-time confirmation of a special/bid-
-    item mapping (a "LEARNED_SPECIAL_ITEM" teach-and-commit) -- NOT
-    wired into classify_decision() itself, which stays exactly as it
-    was before this phase. Live-caught: a genuine bid-item catalog
-    entry ("Light Fixtures (Bid Item)" for "String Light") scores only
-    ~0.70 on ordinary text-similarity dimensions despite being the
-    human-confirmed correct answer, because nothing about its terse
-    catalog description resembles the source wording -- exactly the
-    class of item classify_decision()'s ordinary gates are not equipped
-    to recognize, and exactly why a trusted mapping exists as a
-    separate path in the first place. An EARLIER attempt to fold this
-    into classify_decision() itself (treating ANY prior_verified_
-    mapping-backed candidate as AUTO_SELECT) was reverted after it
-    proved too broad: ordinary review-approved/pre-mapped tasks ALSO
-    route through LOOKUP_PATH_TRUSTED and legitimately need their own
-    ambiguous-candidate cases caught -- this parameter's caller-must-
-    opt-in shape is what keeps that regression from recurring."""
+    """Search, capture, rank, and decide -- everything execute_plan()
+    does BEFORE candidate activation. Extracted (Phase 5.23, R&R Stage
+    4) as the "smallest clean integration boundary" so a coordinated
+    R&R pair can reuse this EXACT decision-making sequence without a
+    second, forked search/ranking implementation: execute_plan() below
+    now calls this for its own ordinary single-row tail, and
+    execution_runner.py's coordinated-pair execution calls it too
+    (via the module reference, same convention as every other cross-
+    module call in this codebase), then diverges into its own Stage-3
+    dual-target activation/quantity path instead of this module's
+    ordinary select-candidate/enter-quantity/commit tail below.
+
+    Returns a LookupOutcome that is either already TERMINAL (dry_run,
+    NO_MATCH, REVIEW_REQUIRED, or an invalid quantity -- `committed`
+    stays False and no adapter selection/activation has happened) or
+    one DECISION_AUTO_SELECT outcome with `.selected` populated and
+    `.committed` still False, ready for a caller to activate exactly
+    once. Never calls select_candidate/enter_quantity/commit_item
+    itself -- activation is deliberately the caller's own next step."""
     if not dry_run and not adapter.supports_live_execution:
         return _stop(
             item.line_item_id, plan, DECISION_REVIEW_REQUIRED, STOP_REASON_UNSUPPORTED_ADAPTER,
@@ -412,6 +408,56 @@ def execute_plan(
     if dry_run:
         outcome.stop_detail = "dry_run: plan only, adapter selection/commit not executed."
         return outcome
+
+    return outcome
+
+
+def execute_plan(
+    plan: LookupPlan,
+    item: RecommendationInput,
+    adapter: XactimateAdapter,
+    ranking_config: RankingConfig,
+    phrase_rules: PhraseRules,
+    *,
+    dry_run: bool = True,
+    force_auto_select_for_trusted_mapping: bool = False,
+) -> LookupOutcome:
+    """`force_auto_select_for_trusted_mapping` (Phase 5.17, default
+    False -- every existing/production call site is unaffected): for a
+    LOOKUP_PATH_TRUSTED plan ONLY, treats the top candidate as
+    AUTO_SELECT once it's confirmed to be exactly the trusted mapping's
+    own category/selector with no hard conflict, bypassing classify_
+    decision()'s ordinary score/margin gates. Reserved for a human
+    reviewer's own explicit, one-time confirmation of a special/bid-
+    item mapping (a "LEARNED_SPECIAL_ITEM" teach-and-commit) -- NOT
+    wired into classify_decision() itself, which stays exactly as it
+    was before this phase. Live-caught: a genuine bid-item catalog
+    entry ("Light Fixtures (Bid Item)" for "String Light") scores only
+    ~0.70 on ordinary text-similarity dimensions despite being the
+    human-confirmed correct answer, because nothing about its terse
+    catalog description resembles the source wording -- exactly the
+    class of item classify_decision()'s ordinary gates are not equipped
+    to recognize, and exactly why a trusted mapping exists as a
+    separate path in the first place. An EARLIER attempt to fold this
+    into classify_decision() itself (treating ANY prior_verified_
+    mapping-backed candidate as AUTO_SELECT) was reverted after it
+    proved too broad: ordinary review-approved/pre-mapped tasks ALSO
+    route through LOOKUP_PATH_TRUSTED and legitimately need their own
+    ambiguous-candidate cases caught -- this parameter's caller-must-
+    opt-in shape is what keeps that regression from recurring.
+
+    Phase 5.23 (R&R Stage 4): the search/rank/decide sequence itself
+    now lives in _search_rank_and_decide() above, reused verbatim --
+    this function is unchanged in behavior, just its own former top
+    portion moved into a shared helper."""
+    outcome = _search_rank_and_decide(
+        plan, item, adapter, ranking_config, phrase_rules,
+        dry_run=dry_run, force_auto_select_for_trusted_mapping=force_auto_select_for_trusted_mapping,
+    )
+    if dry_run or outcome.decision != DECISION_AUTO_SELECT:
+        return outcome
+
+    top = outcome.selected
 
     # Phase 4.8: a before-commit grid snapshot must be taken BEFORE
     # select_candidate() -- the pending row is already present in the

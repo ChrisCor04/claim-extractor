@@ -60,6 +60,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from estimate_extractor.xactimate_lookup.adapter import (
     AdapterError,
@@ -3199,6 +3200,89 @@ class WindowsXactimateAdapter(XactimateAdapter):
             ),
         )
 
+    def locate_existing_rr_pair(
+        self, *, category: str, selector: str, description: str,
+    ) -> "PendingRRPairTarget | None":
+        """Phase 5.23 (R&R Stage 4 integration): the one Stage 3
+        primitive genuinely missing for a full-pair resume -- re-
+        identifies BOTH halves of an already-existing, persisted R&R
+        pair binding in one call, entirely read-only (never re-
+        activates a candidate), and returns them as the SAME
+        PendingRRPairTarget shape bind_rr_pair_after_activation()
+        returns on a fresh activation -- so a resuming caller can feed
+        the result straight into write_and_verify_rr_pair_quantities()
+        without a caller outside this module ever needing to import or
+        construct PendingRRPairTarget itself (this module stays the
+        only place that type is named, matching this whole package's
+        adapter-agnostic boundary -- see adapter.py's own module
+        docstring).
+
+        Built entirely from locate_existing_rr_pair_half(), called
+        twice (once per activity) -- no new matching/OCR logic.
+        Returns None -- never a partially-reconstructed pair -- if
+        EITHER half cannot be uniquely re-identified."""
+        minus = self.locate_existing_rr_pair_half(
+            category=category, selector=selector, description=description, activity="-",
+        )
+        if minus is None:
+            return None
+        plus = self.locate_existing_rr_pair_half(
+            category=category, selector=selector, description=description, activity="+",
+        )
+        if plus is None:
+            return None
+        minus_target, _minus_observed = minus
+        plus_target, _plus_observed = plus
+        return PendingRRPairTarget(minus_target=minus_target, plus_target=plus_target, identity=minus_target.identity)
+
+    def write_and_verify_existing_rr_pair_half_quantity(
+        self, *, category: str, selector: str, description: str, activity: str, quantity: float,
+    ) -> QuantityEntryConfirmation:
+        """Phase 5.23 (R&R Stage 4 integration): the WRITE counterpart
+        to verify_existing_rr_pair_half_quantity() -- re-identifies an
+        ALREADY-EXISTING physical R&R half from a persisted binding
+        (read-only, via locate_existing_rr_pair_half(), never re-
+        activating a candidate) and then writes+confirms `quantity` on
+        it via the exact same enter_quantity() every other quantity
+        write in this file uses. Needed for resuming a coordinated
+        pair whose minus side already verified in a PRIOR session --
+        only the plus side (or, symmetrically, only the minus side)
+        needs a real write now, and the other, already-verified side
+        must never be touched again; write_and_verify_rr_pair_
+        quantities() itself always writes BOTH, so it cannot be reused
+        for this one-sided resume shape.
+
+        Raises RRPairQuantityError(side=activity's own "minus"/"plus"
+        label) -- reusing the SAME failure type write_and_verify_rr_
+        pair_quantities() uses, so a caller that already knows how to
+        handle that shape needs no second failure type -- if the half
+        cannot be uniquely re-identified at all, or if the write/
+        confirm itself fails."""
+        side = "minus" if activity == "-" else "plus"
+        located = self.locate_existing_rr_pair_half(
+            category=category, selector=selector, description=description, activity=activity,
+        )
+        if located is None:
+            raise RRPairQuantityError(
+                f"R&R pair {activity!r}-side half could not be uniquely re-identified for a resumed write "
+                f"(category={category!r}, selector={selector!r}, description={description!r}).",
+                side=side,
+            )
+        target, _observed = located
+        self._pending_quantity_target = target
+        try:
+            self.enter_quantity(quantity)
+        except QuantityConfirmationError as exc:
+            raise RRPairQuantityError(
+                f"R&R pair {activity!r}-side resumed quantity entry failed: {exc}", side=side,
+            ) from exc
+        confirmation = self.last_quantity_confirmation
+        if confirmation is None:
+            raise RRPairQuantityError(
+                f"R&R pair {activity!r}-side resumed quantity entry produced no confirmation record.", side=side,
+            )
+        return confirmation
+
     def enter_quantity(self, quantity: float) -> None:
         # Per-task state: never let an advisory from an earlier item leak
         # into the current item's post-commit outcome.
@@ -3347,6 +3431,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def write_and_verify_rr_pair_quantities(
         self, pair_target: "PendingRRPairTarget", minus_quantity: float, plus_quantity: float,
+        *, on_minus_verified: Callable[["QuantityEntryConfirmation"], None] | None = None,
     ) -> "RRPairQuantityResult":
         """Phase 6.3 (R&R Stage 3): write and independently verify BOTH
         halves of one bound R&R pair -- the remove ("-") quantity and
@@ -3382,7 +3467,27 @@ class WindowsXactimateAdapter(XactimateAdapter):
         exactly like the existing single-target enter_quantity()
         contract, it is returned as part of a normal
         RRPairQuantityResult for the caller to route to review, not
-        silently upgraded to a guessed success."""
+        silently upgraded to a guessed success.
+
+        `on_minus_verified` (Phase 5.23, R&R Stage 4 addition -- the
+        one Stage 3 primitive integration revealed as genuinely
+        missing): an optional callback invoked with the minus-side
+        `QuantityEntryConfirmation` immediately after it is obtained,
+        BEFORE the plus-side write is even attempted. write_and_verify_
+        rr_pair_quantities() is one atomic call from Python's own point
+        of view, so a caller that needs a real crash-safe checkpoint
+        BETWEEN the two writes (e.g. a runner persisting "minus
+        verified" before risking the plus write) has no other point to
+        hook -- mirrors the existing adapter-agnostic set_physical_
+        item_created_callback()/record_physical_item_created() pattern
+        in spirit, but scoped to this one call instead of adapter-
+        lifetime state. Never called again for the plus side (that
+        evidence is simply the returned RRPairQuantityResult, or the
+        RRPairQuantityError.minus_confirmation on a plus-side failure).
+        A callback exception propagates uncaught -- exactly like
+        record_physical_item_created()'s own callback contract, this
+        is never swallowed, since a checkpoint that silently failed to
+        persist would be worse than a loud failure."""
         self._pending_quantity_target = pair_target.minus_target
         try:
             self.enter_quantity(minus_quantity)
@@ -3395,6 +3500,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
             raise RRPairQuantityError(
                 "R&R pair minus-side quantity entry produced no confirmation record.", side="minus",
             )
+        if on_minus_verified is not None:
+            on_minus_verified(minus_confirmation)
 
         self._pending_quantity_target = pair_target.plus_target
         try:

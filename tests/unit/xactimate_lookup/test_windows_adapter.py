@@ -7044,3 +7044,177 @@ def test_verify_existing_rr_pair_half_quantity_returns_none_when_unlocatable(mon
     )
 
     assert confirmation is None
+
+
+# --- Phase 5.23 (R&R Stage 4 integration): write_and_verify_rr_pair_
+# quantities()'s on_minus_verified checkpoint callback -- the one Stage
+# 3 primitive addition Stage 4 integration required, added and tested
+# here rather than forked into a second write path. ------------------
+
+
+def test_write_and_verify_rr_pair_quantities_calls_on_minus_verified_before_plus_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0},
+    )
+    seen = []
+
+    def on_minus_verified(confirmation):
+        seen.append(confirmation)
+        # Called strictly BETWEEN the two writes -- plus must not have
+        # started yet when this fires.
+        assert 1 not in typed_indices
+
+    result = adapter.write_and_verify_rr_pair_quantities(
+        pair_target, 10.0, 12.0, on_minus_verified=on_minus_verified,
+    )
+
+    assert len(seen) == 1
+    assert seen[0].observed == 10.0
+    assert seen[0] is result.minus_confirmation
+
+
+def test_write_and_verify_rr_pair_quantities_never_calls_on_minus_verified_when_minus_fails(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0}, dialog_after_index=0,
+    )
+    seen = []
+
+    with pytest.raises(RRPairQuantityError, match="minus-side"):
+        adapter.write_and_verify_rr_pair_quantities(
+            pair_target, 10.0, 12.0, on_minus_verified=lambda confirmation: seen.append(confirmation),
+        )
+
+    assert seen == []
+
+
+def test_write_and_verify_rr_pair_quantities_without_callback_is_unchanged(monkeypatch):
+    """Omitting on_minus_verified entirely (every existing caller)
+    behaves exactly as before this addition."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0},
+    )
+
+    result = adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
+
+    assert result.minus_confirmation.observed == 10.0
+    assert result.plus_confirmation.observed == 12.0
+
+
+# --- Phase 5.23 (R&R Stage 4 integration): locate_existing_rr_pair()
+# and write_and_verify_existing_rr_pair_half_quantity() -- the two
+# further Stage 3 primitives full-pair-resume and single-half-resume
+# integration required. -------------------------------------------
+
+
+def test_locate_existing_rr_pair_reconstructs_both_halves(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+
+    def fake_candidates(image, offset, target):
+        return [(1, 125, 33.66)] if target.activity == "-" else [(2, 150, 40.0)]
+
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", fake_candidates)
+
+    pair_target = adapter.locate_existing_rr_pair(category="RFG", selector="STEEP", description="Steep charge")
+
+    assert pair_target is not None
+    assert pair_target.minus_target.activity == "-"
+    assert pair_target.plus_target.activity == "+"
+    assert pair_target.identity == ("rfg", "steep", "steep charge")
+    # Resume targets must never be treated as freshly-created --
+    # enter_quantity() must keep its cautious legacy-target protections.
+    assert pair_target.minus_target.write_source_quantity_once is False
+    assert pair_target.plus_target.write_source_quantity_once is False
+
+
+def test_locate_existing_rr_pair_returns_none_when_minus_missing(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+    monkeypatch.setattr(
+        adapter, "_quantity_target_candidates",
+        lambda image, offset, target: [] if target.activity == "-" else [(2, 150, 40.0)],
+    )
+
+    assert adapter.locate_existing_rr_pair(category="rfg", selector="steep", description="steep charge") is None
+
+
+def test_locate_existing_rr_pair_returns_none_when_plus_missing(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+    monkeypatch.setattr(
+        adapter, "_quantity_target_candidates",
+        lambda image, offset, target: [(1, 125, 33.66)] if target.activity == "-" else [],
+    )
+
+    assert adapter.locate_existing_rr_pair(category="rfg", selector="steep", description="steep charge") is None
+
+
+def test_write_and_verify_existing_rr_pair_half_quantity_writes_and_confirms(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    monkeypatch.setattr(
+        adapter, "locate_existing_rr_pair_half",
+        lambda *, category, selector, description, activity: (
+            PendingQuantityTarget(
+                identity=("rfg", "steep", "steep charge"), activity="+", after_index=1, activity_ordinal=1,
+                physical_row_delta=2, write_source_quantity_once=False,
+            ),
+            0.0,
+        ),
+    )
+    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {1: 12.0},
+    )
+
+    confirmation = adapter.write_and_verify_existing_rr_pair_half_quantity(
+        category="rfg", selector="steep", description="steep charge", activity="+", quantity=12.0,
+    )
+
+    assert confirmation.observed == 12.0
+    assert confirmation.confidence == "CONFIRMED"
+    assert typed_indices == {1}
+
+
+def test_write_and_verify_existing_rr_pair_half_quantity_fails_closed_when_unlocatable(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(
+        adapter, "locate_existing_rr_pair_half",
+        lambda *, category, selector, description, activity: None,
+    )
+
+    with pytest.raises(RRPairQuantityError, match="could not be uniquely re-identified") as excinfo:
+        adapter.write_and_verify_existing_rr_pair_half_quantity(
+            category="rfg", selector="steep", description="steep charge", activity="+", quantity=12.0,
+        )
+
+    assert excinfo.value.side == "plus"
+
+
+def test_write_and_verify_existing_rr_pair_half_quantity_minus_side_label(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(
+        adapter, "locate_existing_rr_pair_half",
+        lambda *, category, selector, description, activity: None,
+    )
+
+    with pytest.raises(RRPairQuantityError) as excinfo:
+        adapter.write_and_verify_existing_rr_pair_half_quantity(
+            category="rfg", selector="steep", description="steep charge", activity="-", quantity=10.0,
+        )
+
+    assert excinfo.value.side == "minus"
