@@ -1969,6 +1969,26 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return None
         return self._locate_search_field(image)
 
+    def _items_grid_context_is_verified(
+        self, image, *, allow_search_controls_offscreen: bool = False,
+    ) -> bool:
+        """Verify the active Items grid, including its scrolled valid shape.
+
+        Normally the Search controls are part of the pane proof.  A bounded
+        fresh-target viewport canonicalization deliberately scrolls the whole
+        right content pane, however, so those controls can be off-screen while
+        the Items tab and grid remain valid.  Only that caller may use the
+        narrower proof: the freshly located Items tab must still be active.
+        The caller independently requires a live grid anchor, unchanged anchor
+        geometry, and an exact post-write row recount.
+        """
+        if self._items_search_pane_field(image) is not None:
+            return True
+        if not allow_search_controls_offscreen:
+            return False
+        items = self._locate_items_tab(image)
+        return items is not None and self._tab_is_active(image, items)
+
     def _components_pane_is_verified(self, image) -> bool:
         """Require a freshly located Components tab with its active underline."""
         components = self._locate_components_tab(image)
@@ -3765,7 +3785,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # policy. Only the NUMERIC OCR read a few lines below is
         # skipped for a fresh write; see Phase 5.29 there.
         after, after_offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
-        if after_offset is None or self._items_search_pane_field(after) is None:
+        allow_search_controls_offscreen = bool(
+            target is not None and target.write_source_quantity_once and scrolled
+        )
+        if after_offset is None or not self._items_grid_context_is_verified(
+            after, allow_search_controls_offscreen=allow_search_controls_offscreen,
+        ):
             raise QuantityNotConfirmedError(
                 "enter_quantity(): focus/navigation left the expected Items/Search grid during quantity editing."
             )

@@ -5644,6 +5644,129 @@ def test_enter_quantity_post_write_row_count_comparison_stays_exact_after_canoni
     assert adapter.last_quantity_confirmation.confidence == "SKIPPED"
 
 
+def test_canonicalized_fresh_write_accepts_active_items_grid_with_search_controls_offscreen(monkeypatch):
+    """Live task-0015 sequence: canonicalization scrolls the whole
+    Items pane, so Search is no longer visible after Tab.  A fresh
+    active-Items/grid proof must proceed to the independent recount."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+    recounts = {"post_tab": 0}
+    original_geometry = adapter._last_row_geometry
+
+    def tracked_geometry(image, offset):
+        if state["tabbed"]:
+            recounts["post_tab"] += 1
+        return original_geometry(image, offset)
+
+    monkeypatch.setattr(adapter, "_last_row_geometry", tracked_geometry)
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 80, 30))
+    monkeypatch.setattr(adapter, "_tab_is_active", lambda image, tab: True)
+
+    adapter.enter_quantity(532.45)
+
+    assert calls["scroll"] >= 1
+    assert recounts["post_tab"] == 1
+    assert adapter.last_quantity_confirmation.confidence == "SKIPPED"
+
+
+def test_canonicalized_fresh_write_still_rejects_navigation_away(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 80, 30))
+    monkeypatch.setattr(adapter, "_tab_is_active", lambda image, tab: False)
+
+    with pytest.raises(QuantityNotConfirmedError, match="focus/navigation"):
+        adapter.enter_quantity(532.45)
+
+
+def test_canonicalized_fresh_write_still_rejects_dialog(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 80, 30))
+    monkeypatch.setattr(adapter, "_tab_is_active", lambda image, tab: True)
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: state["tabbed"])
+
+    with pytest.raises(QuantityNotConfirmedError, match="dialog or dropdown"):
+        adapter.enter_quantity(532.45)
+
+
+def test_canonicalized_fresh_write_still_rejects_dropdown(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 80, 30))
+    monkeypatch.setattr(adapter, "_tab_is_active", lambda image, tab: True)
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: 555)
+
+    with pytest.raises(QuantityNotConfirmedError, match="dialog or dropdown"):
+        adapter.enter_quantity(532.45)
+
+
+def test_canonicalized_fresh_write_still_rejects_postwrite_row_count_change(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+    original_geometry = adapter._last_row_geometry
+
+    def changed_geometry(image, offset):
+        count, last_top = original_geometry(image, offset)
+        return (count - 1, last_top - _GRID_ROW_HEIGHT) if state["tabbed"] else (count, last_top)
+
+    monkeypatch.setattr(adapter, "_last_row_geometry", changed_geometry)
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 80, 30))
+    monkeypatch.setattr(adapter, "_tab_is_active", lambda image, tab: True)
+
+    with pytest.raises(QuantityNotConfirmedError, match="row count changed unexpectedly"):
+        adapter.enter_quantity(532.45)
+
+
+def test_fresh_noncanonicalized_write_still_requires_search_controls(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _state, _calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=1, row_top=650, image_height=1023,
+        freshly_created=True,
+    )
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 80, 30))
+    monkeypatch.setattr(adapter, "_tab_is_active", lambda image, tab: True)
+
+    with pytest.raises(QuantityNotConfirmedError, match="focus/navigation"):
+        adapter.enter_quantity(1.0)
+
+
+def test_legacy_scrolled_write_still_requires_search_controls(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=16, row_top=1050, image_height=1023,
+        freshly_created=False, scroll_effect=lambda n: (16, 500),
+    )
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+    monkeypatch.setattr(adapter, "_locate_items_tab", lambda image: (10, 10, 80, 30))
+    monkeypatch.setattr(adapter, "_tab_is_active", lambda image, tab: True)
+
+    with pytest.raises(QuantityNotConfirmedError, match="focus/navigation"):
+        adapter.enter_quantity(1.0)
+    assert calls["scroll"] >= 1
+
+
 def test_enter_quantity_canonicalization_fails_closed_when_target_vanishes(monkeypatch):
     """If repositioning the viewport reveals the target is no longer
     uniquely resolvable (vanished), this must fail closed, never guess
