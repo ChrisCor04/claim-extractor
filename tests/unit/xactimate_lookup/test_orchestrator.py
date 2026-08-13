@@ -456,6 +456,44 @@ def test_execute_plan_leaves_cross_category_tie_unresolved_without_trade_signal_
     assert outcome.decision_diagnostics.tie_resolution.reason == "no_category_hint_available"
 
 
+def test_execute_plan_resolves_a_newly_classified_trade_end_to_end(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.20: proves the config/normalization_rules.yaml vocabulary
+    fix (Ice & water barrier -> trade='roofing') flows all the way
+    through the REAL classification pipeline (mapping.trade_detector),
+    unchanged orchestrator/ranking code, and the Phase 5.19 tie-
+    resolution mechanism to a correct AUTO_SELECT -- not a hardcoded
+    trade string. Also proves classification itself doesn't depend on
+    candidate order: the same trade is derived before any dropdown is
+    ever seen."""
+    from estimate_extractor.mapping.pipeline import DEFAULT_CONFIG_DIR
+    from estimate_extractor.mapping.rules_config import load_normalization_rules
+    from estimate_extractor.mapping.trade_detector import detect_trade
+
+    rules = load_normalization_rules(DEFAULT_CONFIG_DIR / "normalization_rules.yaml")
+    trade, _ = detect_trade("ice & water barrier", rules.trade_component_rules)
+    assert trade.value == "roofing"
+
+    conn = registry.create_database(tmp_path / "reg.db")
+    item = _item(
+        original_description="Ice & water barrier", trade=trade.value, component="ice_water_barrier",
+        material=None, action=None,
+    )
+    plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
+    conn.close()
+    # A hypothetical (not real-catalog) cross-category tie, isolating
+    # the classification -> hint -> tie-resolution path from any actual
+    # RFG/some-other-category duplication in the real selector catalog.
+    rfg = _dropdown("Ice & water barrier", cat="RFG", sel="IWS", pos=0)
+    other = _dropdown("Ice & water barrier", cat="ZZZ", sel="IWS", pos=1)
+
+    for dropdowns in ([rfg, other], [other, rfg]):
+        adapter = FakeXactimateAdapter(dropdown_script={plan.search_input: dropdowns})
+        outcome = orchestrator.execute_plan(plan, item, adapter, ranking_config, phrase_rules, dry_run=True)
+        assert outcome.decision == DECISION_AUTO_SELECT
+        assert outcome.selected.dropdown.category == "RFG"
+        assert outcome.decision_diagnostics.tie_resolution.resolved is True
+
+
 def test_decision_diagnostics_still_reflects_original_auto_select_on_invalid_quantity_stop(tmp_path, phrase_rules, ranking_config):
     """`decision` on the returned outcome flips to REVIEW_REQUIRED for
     the quantity guard, but decision_diagnostics must still explain the

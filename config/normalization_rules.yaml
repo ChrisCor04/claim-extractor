@@ -92,6 +92,11 @@ rules:
     component: "valley_metal"
     material: "metal"
 
+  - patterns: ["ice & water barrier", "ice and water barrier", "ice and water shield", "ice & water shield"]
+    trade: "roofing"
+    component: "ice_water_barrier"
+    material: null
+
   - patterns:
       - "laminated - comp. shingle"
       - "laminated comp. shingle"
