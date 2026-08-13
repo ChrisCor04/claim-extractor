@@ -690,7 +690,17 @@ def test_verify_commit_called_on_live_commit_when_adapter_supports_it(tmp_path, 
     assert outcome.to_dict()["verification_trust_state"] == "VERIFIED"
 
 
-def test_stable_postwrite_ocr_disagreement_commits_once_and_routes_to_review(tmp_path, phrase_rules, ranking_config):
+def test_stable_postwrite_ocr_disagreement_does_not_block_a_fresh_bound_write(tmp_path, phrase_rules, ranking_config):
+    """Phase 5.27 (policy change, live-caught repeatedly): a fresh,
+    positively-bound write (a candidate was just activated, the exact
+    source quantity was typed and Tab-committed) is its own
+    authoritative evidence of success. adapter.last_quantity_
+    confirmation -- enter_quantity()'s own same-cell post-write OCR
+    readback -- is advisory diagnostics only and must never downgrade
+    an otherwise-VERIFIED structural commit to QUANTITY_MISMATCH, even
+    when that readback is a numerically DIFFERENT value (here: 66
+    instead of the exact 33.66 that was typed), exactly the live-
+    caught shape (30.19 misread as 19, 33.33 as 33, 9.36 as 6)."""
     conn = registry.create_database(tmp_path / "reg.db")
     item = _item()
     plan = orchestrator.build_lookup_plan(item, conn, phrase_rules)
@@ -717,8 +727,12 @@ def test_stable_postwrite_ocr_disagreement_commits_once_and_routes_to_review(tmp
     assert outcome.committed is True
     assert outcome.physical_item_created is True
     assert outcome.stop_reason is None
-    assert outcome.verification.trust_state == "QUANTITY_MISMATCH"
-    assert outcome.verification.reason == _Advisory.reason
+    # The deterministic write is authoritative -- the mismatching
+    # advisory OCR readback (still available on adapter.last_quantity_
+    # confirmation for diagnostics) never overrides it.
+    assert outcome.verification.trust_state == "VERIFIED"
+    assert adapter.last_quantity_confirmation.review_required is True
+    assert adapter.last_quantity_confirmation.reason == _Advisory.reason
     names = [name for name, _args, _kwargs in adapter.log.calls]
     assert names.count("enter_quantity") == 1
     assert names.count("commit_item") == 1

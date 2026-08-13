@@ -656,17 +656,21 @@ def test_plus_failure_preserves_verified_minus_checkpoint(tmp_path, phrase_rules
     assert remove_task.commit_state != "committed"
 
 
-def test_low_confidence_minus_confirmation_is_never_reported_as_verified(tmp_path, phrase_rules, ranking_config):
-    """Phase 5.26's core truthful-checkpoint requirement, proven
-    directly against the lifecycle ledger: a LOW_CONFIDENCE minus
-    confirmation (a real physical write, but an uncertain readback --
-    the live-caught shape) must emit its PAIR_MINUS_VERIFICATION event
-    with confidence=LOW_CONFIDENCE and verified_ok=False, and
-    pair.minus_verified_ok must land False even after the pair's
-    pipeline-position pair_state is later overwritten by the shared
-    commit/finalize tail (PAIR_SATISFIED/PAIR_BOTH_VERIFIED are
-    positions, not truth claims about either half -- see _commit_and_
-    finalize_rr_pair()'s own docstring)."""
+def test_low_confidence_minus_confirmation_is_recorded_advisory_but_does_not_block_completion(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """Phase 5.26's truthful-checkpoint requirement (a LOW_CONFIDENCE
+    minus confirmation -- a real physical write, but an uncertain
+    readback -- must never be reported as though positively verified)
+    still holds at the ADVISORY level: PAIR_MINUS_VERIFICATION still
+    fires with confidence=LOW_CONFIDENCE/verified_ok=False, and
+    pair.minus_verified_ok still lands False. Phase 5.27 (policy
+    change, live-caught repeatedly -- real, correctly-written
+    quantities were misread by OCR): that advisory uncertainty no
+    longer blocks task completion. A positively-bound, checkpointed
+    physical write plus a VERIFIED structural commit is its own
+    authoritative evidence; numeric OCR disagreement alone cannot push
+    a successfully written task into review_required."""
     class LedgerFakeAdapter(RRPairFakeAdapter):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -686,15 +690,18 @@ def test_low_confidence_minus_confirmation_is_never_reported_as_verified(tmp_pat
     assert len(minus_verification_events) == 1
     assert minus_verification_events[0]["confidence"] == "LOW_CONFIDENCE"
     assert minus_verification_events[0]["verified_ok"] is False
-    assert pair.minus_verified_ok is False
+    assert pair.minus_verified_ok is False  # advisory: OCR did not agree
     assert pair.plus_verified_ok is True
-    # The uncertain half is never silently upgraded to COMPLETED just
-    # because its partner's evidence looked good.
-    assert remove_task.state == TASK_REVIEW_REQUIRED
+    # But the task itself still completes -- the write was positively
+    # checkpointed and the structural commit was VERIFIED.
+    assert remove_task.state == TASK_COMPLETED
     assert replace_task.state == TASK_COMPLETED
+    assert pair.pair_state == PAIR_SATISFIED
 
 
-def test_low_confidence_plus_confirmation_is_never_reported_as_verified(tmp_path, phrase_rules, ranking_config):
+def test_low_confidence_plus_confirmation_is_recorded_advisory_but_does_not_block_completion(
+    tmp_path, phrase_rules, ranking_config,
+):
     """Symmetric counterpart for the plus side."""
     class LedgerFakeAdapter(RRPairFakeAdapter):
         def __init__(self, *args, **kwargs):
@@ -715,10 +722,11 @@ def test_low_confidence_plus_confirmation_is_never_reported_as_verified(tmp_path
     assert len(plus_verification_events) == 1
     assert plus_verification_events[0]["confidence"] == "LOW_CONFIDENCE"
     assert plus_verification_events[0]["verified_ok"] is False
-    assert pair.plus_verified_ok is False
+    assert pair.plus_verified_ok is False  # advisory: OCR did not agree
     assert pair.minus_verified_ok is True
     assert remove_task.state == TASK_COMPLETED
-    assert replace_task.state == TASK_REVIEW_REQUIRED
+    assert replace_task.state == TASK_COMPLETED
+    assert pair.pair_state == PAIR_SATISFIED
 
 
 def test_physical_write_lifecycle_events_precede_their_own_verification_event(tmp_path, phrase_rules, ranking_config):
@@ -889,6 +897,43 @@ def test_restart_after_physical_plus_write_predating_checkpoint_does_not_rewrite
     assert adapter.bind_calls == 0
     assert pair.plus_written is True
     assert pair.plus_verified_ok is True
+    assert remove_task.state == TASK_COMPLETED
+    assert replace_task.state == TASK_COMPLETED
+    assert pair.pair_state == PAIR_SATISFIED
+
+
+def test_resume_reaffirmation_low_confidence_does_not_gate_a_trusted_written_checkpoint(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """Phase 5.27 (policy change): pair.minus_written=True is a
+    TRUSTED persisted write checkpoint -- the exact source quantity
+    was physically entered into the positively bound target and
+    committed. Resume still re-identifies the row (a genuine
+    structural/identity gate, unchanged), but if that reaffirmation's
+    OWN quantity OCR disagrees (LOW_CONFIDENCE -- e.g. the same live
+    misread pattern: a correct value read back wrong), that must NOT
+    reintroduce a re-verification gate: the trusted write checkpoint
+    is the provenance, not this resume-time OCR re-read. The pair
+    still completes."""
+    plan, remove_task, replace_task, pair, _ = _plan_with_one_pair()
+    pair.pair_state = PAIR_MINUS_VERIFIED
+    pair.minus_binding = {"category": "RFG", "selector": "REM", "description": "RFG/REM description", "activity": "-"}
+    pair.plus_binding = {"category": "RFG", "selector": "REM", "description": "RFG/REM description", "activity": "+"}
+    pair.minus_written = True
+    pair.minus_verified_ok = True
+    save_execution_plan(plan, tmp_path)
+    adapter = _rr_adapter(dropdown_script=_dropdown_script_for_pair())
+    # The resumed minus reaffirmation's OWN OCR read disagrees -- the
+    # row IS uniquely re-identified (never None), just misread.
+    adapter.verify_half_outcome["-"] = "low_confidence"
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert adapter.select_candidate_calls == 0
+    assert adapter.bind_calls == 0
+    assert pair.plus_written is True
+    assert pair.plus_verified_ok is True
+    # The pair still completes despite the disagreeing re-affirmation.
     assert remove_task.state == TASK_COMPLETED
     assert replace_task.state == TASK_COMPLETED
     assert pair.pair_state == PAIR_SATISFIED

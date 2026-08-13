@@ -885,43 +885,63 @@ def _binding_dict(identity: tuple[str, str, str], activity: str) -> dict:
 def _finalize_pair_task(
     task: ExecutionTask, confirmation, structural_trust_state: str, expected_quantity: float | None,
 ) -> None:
-    """Per-task terminal state from ITS OWN quantity confirmation plus
-    the ONE shared structural commit_verification -- mirrors _apply_
-    outcome_to_task()'s VERIFIED-trust_state bar (TASK_COMPLETED only
-    when both the shared structural check AND this task's own same-
-    cell confirmation are fully confirmed) so neither task is ever
-    reported committed merely because its partner's evidence looked
-    good; each task's own affirmative evidence is what is checked
-    here. Mirrors execute_plan()'s own "structural VERIFIED but the
-    same-cell OCR confirmation itself was uncertain -> QUANTITY_
-    MISMATCH" downgrade, evaluated independently per half."""
+    """Per-task terminal state from the ONE shared structural commit_
+    verification -- mirrors _apply_outcome_to_task()'s VERIFIED-
+    trust_state bar (TASK_COMPLETED only when the shared structural
+    check is VERIFIED).
+
+    Phase 5.27 (policy change, live-caught repeatedly): this used to
+    ALSO require `confirmation.confidence == "CONFIRMED"` (this half's
+    own same-cell post-write OCR readback) before marking the task
+    COMPLETED, downgrading to a fabricated "QUANTITY_MISMATCH" whenever
+    that readback was LOW_CONFIDENCE -- even though the physical write
+    was already positively checkpointed (write_and_verify_rr_pair_
+    quantities()'s on_minus_write/on_plus_write callbacks, or the
+    resumed single-target write's on_physical_write) BEFORE this OCR
+    read was ever taken. Live TEST showed exactly-correct quantities
+    misread this way (9.36 read back as 6.0) turning a genuinely
+    successful pair into a false review state. `confirmation` (still
+    passed in, still recorded on `task.observed_quantity`) is now
+    advisory diagnostics only: it documents what OCR happened to read,
+    it no longer decides whether the task succeeded. The authoritative
+    evidence of a successful quantity write is the checkpointed
+    physical write itself plus this shared structural commit
+    verification (which independently proves exactly one expected
+    logical item/pair landed, unit-compatible, CAT/SEL uncontradicted --
+    see verify_commit()'s own docstring, itself no longer quantity-OCR-
+    gated as of this same phase)."""
     task.entered_quantity = expected_quantity
     task.observed_quantity = getattr(confirmation, "observed", None)
     task.commit_state = TASK_COMMIT_STATE_COMMITTED
-    confirmed = getattr(confirmation, "confidence", None) == "CONFIRMED"
-    if structural_trust_state == _VERIFIED_TRUST_STATE and confirmed:
+    if structural_trust_state == _VERIFIED_TRUST_STATE:
         task.trust_state = _VERIFIED_TRUST_STATE
         task.state = TASK_COMPLETED
         task.review_reason = None
     else:
-        task.trust_state = "QUANTITY_MISMATCH" if structural_trust_state == _VERIFIED_TRUST_STATE else structural_trust_state
+        task.trust_state = structural_trust_state
         task.state = TASK_REVIEW_REQUIRED
-        task.review_reason = (
-            getattr(confirmation, "reason", None) if not confirmed
-            else f"Structural commit verification: {structural_trust_state}"
-        )
+        task.review_reason = f"Structural commit verification: {structural_trust_state}"
 
 
 def _pair_state_for_confirmation(confirmation, *, verified_name: str, uncertain_name: str) -> tuple[str, bool]:
     """Phase 5.26: the ONE place that turns a QuantityEntryConfirmation
-    into a truthful pair_state -- never `verified_name` (a state
+    into a `pair_state` name -- never `verified_name` (a state
     literally named "*_verified") unless `confirmation.confidence ==
     "CONFIRMED"`; otherwise `uncertain_name`, preserving that a write
-    genuinely happened without claiming it was positively confirmed.
+    genuinely happened without claiming OCR positively agreed with it.
     Returns (state, verified_ok) so a caller sets both `pair.pair_
     state` and its sibling `pair.minus_verified_ok`/`plus_verified_ok`
     from the SAME single source of truth, never two separately-
-    computed values that could drift apart from each other again."""
+    computed values that could drift apart from each other again.
+
+    Phase 5.27: `verified_ok`/the resulting pair_state name are
+    ADVISORY diagnostics only -- documenting whether OCR happened to
+    agree with a write that was already positively checkpointed -- and
+    no longer gate task/pair success (see _finalize_pair_task()'s own
+    docstring for why: numeric OCR is not reliable enough to serve as
+    a production success gate). Kept for backward compatibility and as
+    genuinely useful evidence of OCR agreement/disagreement, never as
+    "authoritative verification" of the write itself."""
     verified_ok = getattr(confirmation, "confidence", None) == "CONFIRMED"
     return (verified_name if verified_ok else uncertain_name), verified_ok
 
@@ -1063,22 +1083,24 @@ def _commit_and_finalize_rr_pair(
     confidence instead comes entirely from Stage 3's read-only re-
     identification affirmations (verify_existing_rr_pair_half_
     quantity()) already performed by the caller before this function
-    is ever reached. structural_trust_state therefore stays at its
-    _VERIFIED_TRUST_STATE default for every resume path -- each task's
-    OWN confirmation confidence (see _finalize_pair_task()) is still
-    independently what decides TASK_COMPLETED vs TASK_REVIEW_REQUIRED,
-    so this never fabricates success beyond what was actually
-    reaffirmed.
+    is ever reached -- a genuine re-identification FAILURE (row not
+    uniquely found) still fails closed before this function is ever
+    reached; only the row's IDENTITY is load-bearing here. structural_
+    trust_state therefore stays at its _VERIFIED_TRUST_STATE default
+    for every resume path. Phase 5.27: `_finalize_pair_task()` no
+    longer additionally requires each task's OWN quantity-OCR
+    confirmation confidence -- a positively re-identified (or freshly,
+    deterministically written) half is its own authoritative evidence;
+    numeric OCR disagreement alone cannot turn that into TASK_REVIEW_
+    REQUIRED. See _finalize_pair_task()'s own docstring.
 
     Phase 5.26: PAIR_BOTH_VERIFIED (unchanged, not renamed) means "both
     halves reached this shared commit/finalize step" -- a PIPELINE
-    POSITION, same as it always was -- never "both were positively
-    confirmed" on its own; consult pair.minus_verified_ok/plus_
-    verified_ok and each task's own final state for that truth. Only
-    the MINUS/PLUS-specific checkpoints that used to conflate "wrote"
-    with "confirmed" (PAIR_MINUS_VERIFIED/PAIR_PLUS_VERIFIED, see
-    _write_verify_and_finalize_rr_pair()) needed a truthful sibling
-    state -- this shared final step was never the source of that bug."""
+    POSITION, same as it always was. Phase 5.27: pair.minus_verified_ok/
+    plus_verified_ok remain purely ADVISORY (whether OCR happened to
+    agree) and no longer gate task/pair success -- see _pair_state_for_
+    confirmation()'s and _finalize_pair_task()'s own docstrings for the
+    authoritative-write-vs-advisory-OCR distinction."""
     plus_binding = pair.plus_binding or {}
     category = plus_binding.get("category")
     selector = plus_binding.get("selector")
@@ -1173,8 +1195,9 @@ def _resume_rr_pair(
       function's own on_physical_write wiring below.
     * PAIR_MINUS_VERIFIED / PAIR_MINUS_WRITE_UNCERTAIN (Phase 5.26:
       both mean the SAME thing for resume ROUTING -- minus was
-      written, confidence only affects the eventual per-task verdict,
-      never which branch resume takes): re-affirm minus read-only
+      written, and as of Phase 5.27 confidence no longer affects the
+      eventual per-task verdict either, only whether the row can still
+      be positively re-identified): re-affirm minus read-only
       (never rewritten -- see write_and_verify_existing_rr_pair_half_
       quantity()'s own docstring for why the OTHER, already-written
       side must never be touched again), then write ONLY the plus

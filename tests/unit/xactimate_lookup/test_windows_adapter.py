@@ -2049,10 +2049,15 @@ def test_verify_commit_retained_target_confirms_row13_shape(monkeypatch):
     assert "already positively bound during activation" in result.reason
 
 
-def test_verify_commit_retained_target_wrong_quantity_does_not_verify(monkeypatch):
-    """Requirement 2: same shape, but the re-read quantity at the known
-    position does not match what was supposedly written -> must NOT
-    verify; falls back to the existing conservative failure."""
+def test_verify_commit_retained_target_wrong_quantity_still_verifies(monkeypatch):
+    """Phase 5.27 (policy change): the re-read quantity at the known
+    position disagreeing with what was supposedly written no longer
+    blocks verification here -- this retained target was already
+    positively bound (CAT/SEL/activity) before quantity was ever
+    entered, and quantity OCR at this zoom/DPI proved unreliable
+    enough (live: correct quantities misread) that it is now advisory
+    evidence only, recorded on the result, never a reason to report
+    VERIFICATION_FAILED for an otherwise fully-corroborated row."""
     adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
         row_sequence=[[("SFG", "GUTRS")]],
@@ -2067,7 +2072,9 @@ def test_verify_commit_retained_target_wrong_quantity_does_not_verify(monkeypatc
         source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0,
     )
 
-    assert result.trust_state == "VERIFICATION_FAILED"
+    assert result.trust_state == "VERIFIED"
+    assert result.quantity_observed == 999.0
+    assert result.quantity_matched is False
 
 
 def test_verify_commit_retained_target_wrong_identity_does_not_verify(monkeypatch):
@@ -2181,11 +2188,16 @@ def test_verify_commit_retained_target_skips_rr_shaped_binding(monkeypatch):
     assert result.trust_state == "VERIFICATION_FAILED"
 
 
-def test_verify_commit_quantity_mismatch_reported_distinctly(monkeypatch):
-    """Regression test (Phase 4.8): a quantity that was successfully
-    read but disagrees with what was entered is QUANTITY_MISMATCH, not
-    a generic failure -- the row is still structurally identified
-    (row_index set) so a caller can act on it."""
+def test_verify_commit_quantity_disagreement_recorded_advisory_not_gating(monkeypatch):
+    """Phase 5.27 (policy change, supersedes the old Phase 4.8
+    QUANTITY_MISMATCH regression test this replaces): a quantity that
+    was successfully read but disagrees with what was entered is no
+    longer a distinct hard trust_state -- verify_commit() no longer
+    requires numeric OCR agreement to report VERIFIED. The disagreement
+    is still recorded (quantity_observed/quantity_matched) as advisory
+    evidence, and the row is still structurally identified
+    (row_index set), but trust_state reflects the structural/unit
+    evidence only."""
     adapter = _adapter_with_fake_commit_grid(
         monkeypatch,
         row_sequence=[[("SFG", "GUTA")]],
@@ -2193,8 +2205,9 @@ def test_verify_commit_quantity_mismatch_reported_distinctly(monkeypatch):
         quantity_reads=[3.0],
     )
     result = adapter.verify_commit([], "SFG", "GUTA", 5.0, source_unit="LF", expected_xactimate_unit="LF", timeout_s=3.0)
-    assert result.trust_state == "QUANTITY_MISMATCH"
+    assert result.trust_state == "VERIFIED"
     assert result.row_index == 0
+    assert result.quantity_observed == 3.0
     assert result.quantity_matched is False
 
 
@@ -6907,6 +6920,34 @@ def test_write_and_verify_rr_pair_quantities_lands_different_quantities_on_corre
     assert result.plus_confirmation.confidence == "CONFIRMED"
     assert typed_indices == {0, 1}
     assert clicked_indices == [0, 1]
+
+
+def test_write_and_verify_rr_pair_quantities_types_the_exact_expected_source_quantity(monkeypatch):
+    """Phase 5.27: the whole authoritative-write policy rests on the
+    physical write itself being trustworthy -- proven directly against
+    the literal text passed to _type_keybdevent() for EACH half (not
+    merely row indices or a confirmation's own identically-sourced
+    `.expected`), so the minus/plus quantities really do land exactly
+    as typed and are never swapped, rounded, or truncated."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.19, 1: 12.47},
+    )
+    typed_text_by_index = {}
+    original_type = adapter._type_keybdevent
+
+    def capture(text):
+        typed_text_by_index[adapter._pending_quantity_target.after_index] = text
+        original_type(text)
+
+    monkeypatch.setattr(adapter, "_type_keybdevent", capture)
+
+    adapter.write_and_verify_rr_pair_quantities(pair_target, 10.19, 12.47)
+
+    assert typed_text_by_index == {0: "10.19", 1: "12.47"}
+    assert typed_indices == {0, 1}
 
 
 def test_write_and_verify_rr_pair_quantities_equal_quantities_still_write_both_halves(monkeypatch):

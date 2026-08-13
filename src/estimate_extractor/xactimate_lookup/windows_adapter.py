@@ -474,16 +474,21 @@ class CommitVerification:
     correct.
 
     `trust_state` is one of "VERIFIED", "REVIEW_REQUIRED",
-    "VERIFICATION_FAILED", "CONFLICTING_ROW", "UNIT_MISMATCH",
-    "QUANTITY_MISMATCH" -- see `verify_commit()`'s docstring for the
-    exact precedence rules. A quantity or unit conflict is always a
-    dedicated hard trust_state; it is never downgraded to
-    "supporting" evidence. `category_observed`/`selector_observed`/
-    `description_observed` are corroborating OCR reads at the
-    structurally-identified row ONLY -- they never decide row
-    identity, and an unreadable category/selector never blocks
-    "VERIFIED" when the structural and quantity/unit evidence agree.
-    `samples` holds one dict per polling attempt for diagnostics."""
+    "VERIFICATION_FAILED", "CONFLICTING_ROW", "UNIT_MISMATCH" -- see
+    `verify_commit()`'s docstring for the exact precedence rules. A
+    unit conflict is always a dedicated hard trust_state; it is never
+    downgraded to "supporting" evidence. Phase 5.27: "QUANTITY_
+    MISMATCH" is no longer produced by this method -- quantity OCR
+    proved unreliable enough at production zoom/DPI to serve as a
+    success gate (real, correctly-written quantities were repeatedly
+    misread), so `quantity_observed`/`quantity_matched` below are now
+    ADVISORY evidence only and never change `trust_state`.
+    `category_observed`/`selector_observed`/`description_observed` are
+    corroborating OCR reads at the structurally-identified row ONLY --
+    they never decide row identity, and an unreadable category/
+    selector never blocks "VERIFIED" when the structural and unit
+    evidence agree. `samples` holds one dict per polling attempt for
+    diagnostics."""
 
     trust_state: str
     reason: str
@@ -590,9 +595,17 @@ class QuantityEntryConfirmation:
     """Result of the single same-cell read immediately after entry.
 
     Identity is deliberately absent: it was proven before the write and
-    retained by :class:`PendingQuantityTarget`.  A low-confidence OCR read
-    is advisory only when the bound row/cell and surrounding grid structure
-    remain stable; callers still route the completed commit to review.
+    retained by :class:`PendingQuantityTarget`. Phase 5.27 (policy
+    change, live-caught repeatedly -- correct quantities were
+    misread): a low-confidence OCR read is ADVISORY diagnostics only.
+    When the bound row/cell and surrounding grid structure remain
+    stable, the deterministic write to that positively-identified
+    target is treated as authoritative on its own; callers no longer
+    route an otherwise-successful commit to review solely because this
+    confidence is LOW_CONFIDENCE. A genuinely FAILED write/edit (row
+    disappeared, dialog interrupted, grid anchor moved, etc.) is a
+    different, still-fatal condition -- see enter_quantity()'s own
+    QuantityNotConfirmedError raise sites, unaffected by this change.
     """
 
     expected: float
@@ -3555,8 +3568,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         stable) confirmation on either side is never an exception --
         exactly like the existing single-target enter_quantity()
         contract, it is returned as part of a normal
-        RRPairQuantityResult for the caller to route to review, not
-        silently upgraded to a guessed success.
+        RRPairQuantityResult, never silently upgraded to a guessed
+        CONFIRMED. Phase 5.27: the caller no longer routes an
+        otherwise-successful pair to review solely for this -- a
+        positively-bound, deterministic write is its own authoritative
+        evidence; LOW_CONFIDENCE remains available as advisory
+        diagnostics (see QuantityEntryConfirmation's own docstring).
 
         `on_minus_verified` (Phase 5.23, R&R Stage 4 addition -- the
         one Stage 3 primitive integration revealed as genuinely
@@ -5369,14 +5386,22 @@ class WindowsXactimateAdapter(XactimateAdapter):
            `trust_state="VERIFICATION_FAILED"` (commit not detected
            in the grid within the bounded window).
         6. Once the row is structurally identified, quantity and unit
-           are read AT THAT KNOWN POSITION and remain load-bearing,
-           exactly as in Phase 4.7 (a quantity match never overrides
-           a unit conflict): unreadable quantity or a unit state of
-           "review_required" -> `trust_state="REVIEW_REQUIRED"`; a
-           quantity that was read but disagrees ->
-           `trust_state="QUANTITY_MISMATCH"`; an incompatible unit ->
-           `trust_state="UNIT_MISMATCH"` (checked after quantity, but
-           neither ever downgrades to merely "supporting").
+           are read AT THAT KNOWN POSITION for the evidence record.
+           Phase 5.27 (live-caught, repeatedly): numeric quantity OCR
+           at this zoom/DPI is not reliable enough to gate success --
+           real, physically correct quantities were read back wrong
+           (30.19 misread as 19, 33.33 as 33, 9.36 as 6) and produced
+           false QUANTITY_MISMATCH outcomes for rows that were written
+           exactly as intended. `quantity_observed`/`quantity_matched`
+           are still recorded on the returned `CommitVerification` as
+           ADVISORY diagnostics/evidence, but no longer influence
+           `trust_state` -- a deterministic write to a structurally,
+           positively-identified row (this method's whole reason for
+           existing) is its own authoritative evidence of success. An
+           incompatible unit -> `trust_state="UNIT_MISMATCH"`; a unit
+           state of "review_required" -> `trust_state="REVIEW_REQUIRED"`
+           (unit compatibility is a genuinely separate signal from
+           quantity OCR and is unaffected by this change).
 
            Phase 5.6 Stage 4 (live-caught): a real committed row
            (line_0001, R&R Gutter, 200 LF, correct SFG/GUTA selection,
@@ -5410,9 +5435,10 @@ class WindowsXactimateAdapter(XactimateAdapter):
            not do.
         8. `trust_state="VERIFIED"` requires ALL of: one logical item
            appended (one row or one corroborated R&R pair),
-           pre-existing rows unchanged, quantity read and matched
-           exactly, unit compatible, and category/selector OCR either
-           agrees or is unreadable (never contradicts).
+           pre-existing rows unchanged, unit compatible, and
+           category/selector OCR either agrees or is unreadable
+           (never contradicts). Quantity OCR is NOT a requirement
+           (Phase 5.27) -- see point 6 above.
 
         `_unexpected_dialog_present()` at any point during polling ->
         `trust_state="VERIFICATION_FAILED"` (wrong context).
@@ -5624,13 +5650,14 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 cat_sel_agrees = (cat_observed == category and sel_observed == selector) if cat_sel_present else None
                 cat_sel_contradicts = cat_sel_present and not cat_sel_agrees
 
-                if quantity_observed is None:
-                    trust_state = "REVIEW_REQUIRED"
-                    reason = "quantity could not be read at the structurally-identified row"
-                elif not quantity_matched:
-                    trust_state = "QUANTITY_MISMATCH"
-                    reason = f"expected quantity {expected_quantity}, observed {quantity_observed!r} at the structurally-identified row"
-                elif compatibility == "hard_stop":
+                # Phase 5.27: quantity_observed/quantity_matched are
+                # recorded on the returned CommitVerification below as
+                # ADVISORY evidence only -- neither an unreadable nor a
+                # disagreeing quantity OCR read gates trust_state
+                # anymore (see this method's own docstring, point 6).
+                # Unit compatibility is a separate, still-authoritative
+                # signal (never derived from the quantity cell).
+                if compatibility == "hard_stop":
                     trust_state = "UNIT_MISMATCH"
                     reason = unit_result.unit_match_reason
                 elif compatibility == "review_required":
@@ -5639,13 +5666,23 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 elif cat_sel_contradicts:
                     trust_state = "REVIEW_REQUIRED"
                     reason = (
-                        f"structural evidence (row-count delta and unchanged pre-existing rows) and quantity/unit "
-                        f"both agree, but category/selector OCR at the committed row read "
+                        f"structural evidence (row-count delta and unchanged pre-existing rows) and unit "
+                        f"agree, but category/selector OCR at the committed row read "
                         f"{cat_observed}/{sel_observed}, which contradicts the expected {category}/{selector} "
                         f"-- a human should confirm"
                     )
                 else:
                     trust_state = "VERIFIED"
+                    if quantity_matched:
+                        quantity_note = "quantity matched"
+                    elif quantity_observed is None:
+                        quantity_note = "quantity OCR unreadable (advisory only, not gating)"
+                    else:
+                        quantity_note = (
+                            f"quantity OCR observed {quantity_observed!r} instead of {expected_quantity!r} "
+                            "(advisory only, not gating -- the deterministic write to this positively-identified "
+                            "row is treated as authoritative)"
+                        )
                     reason = (
                         ("one corroborated R&R -/+ logical item added" if logical_rr_pair
                          else (
@@ -5657,7 +5694,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                             if retained_rr_binding
                             else " by order-independent logical multiset delta, pre-existing rows unchanged, "
                         )
-                        + "quantity matched, unit compatible, and category/selector OCR "
+                        + quantity_note + ", unit compatible, and category/selector OCR "
                         + ("agrees" if cat_sel_agrees else "was unreadable (not treated as a conflict)")
                     )
 
@@ -5727,12 +5764,19 @@ class WindowsXactimateAdapter(XactimateAdapter):
         this exact row's identity/activity/position before quantity
         was ever entered. This re-confirms that SAME already-proven
         row -- it never searches for some other matching row, and it
-        is deliberately narrower than the normal structural path (which
-        can tolerate unreadable/non-contradicting OCR because it has a
-        structural delta backing it up): every check here must be
-        POSITIVELY read and POSITIVELY matching, or this returns None
-        and the caller falls through to the existing, unchanged
-        VERIFICATION_FAILED failure.
+        is deliberately narrower than the normal structural path: every
+        IDENTITY check here (category, selector, activity, unit
+        compatibility) must be POSITIVELY read and POSITIVELY
+        matching, or this returns None and the caller falls through to
+        the existing, unchanged VERIFICATION_FAILED failure. Phase
+        5.27: quantity is deliberately NOT one of those gating checks
+        (see verify_commit()'s own docstring, point 6) -- this target
+        was already positively bound at activation time, before
+        quantity was ever entered, so a disagreeing/unreadable
+        post-write quantity OCR read here is advisory evidence only,
+        recorded on the returned CommitVerification, never a reason to
+        report VERIFICATION_FAILED for a row whose identity and
+        deterministic write are otherwise fully corroborated.
 
         Deliberately restricted to physical_row_delta == 1 (an ordinary
         single-row binding) -- an R&R -/+ pair binding is never
@@ -5761,8 +5805,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         description_observed = self._read_description_at(image, offset, row_top)
         quantity_observed = self._read_quantity_at(image, offset, row_top)
         unit_raw, unit_normalized = self._read_unit_at(image, offset, row_top)
-        if quantity_observed is None or quantity_observed != expected_quantity:
-            return None
+        # Phase 5.27: quantity is advisory evidence here, not a gate --
+        # see this method's own docstring.
+        quantity_matched = quantity_observed is not None and quantity_observed == expected_quantity
 
         populated_unit_vocab = _resolve_observed_unit_vocab(populated_unit)
         unit_source = "populated_field" if populated_unit_vocab is not None else "post_commit_ocr"
@@ -5788,16 +5833,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
         return CommitVerification(
             trust_state="VERIFIED",
             reason=(
-                "row count did not change at commit, but the identity/activity/quantity already positively bound "
+                "row count did not change at commit, but the identity/activity already positively bound "
                 "during activation was re-confirmed at its known position -- commit_item() finalizes an "
-                "already-present row rather than inserting a new one, so no further row-count growth was expected"
+                "already-present row rather than inserting a new one, so no further row-count growth was expected "
+                "(quantity OCR is advisory only; the deterministic write to this positively-identified row is "
+                "treated as authoritative)"
             ),
             row_count_before=row_count_before, row_count_after=row_count_before, row_index=target.after_index,
             preexisting_rows_unchanged=True,
             category_expected=category, selector_expected=selector,
             category_observed=cat_observed, selector_observed=sel_observed, category_selector_ocr_agrees=True,
             description_observed=description_observed,
-            quantity_expected=expected_quantity, quantity_observed=quantity_observed, quantity_matched=True,
+            quantity_expected=expected_quantity, quantity_observed=quantity_observed, quantity_matched=quantity_matched,
             unit=unit_result, compatibility=compatibility, compatibility_reason=unit_result.unit_match_reason,
             attempts=attempts, elapsed_s=time.time() - start, samples=samples,
         )

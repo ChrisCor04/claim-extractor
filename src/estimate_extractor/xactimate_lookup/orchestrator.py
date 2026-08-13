@@ -627,16 +627,20 @@ def _activate_and_commit_ordinary_row(
             source_unit=item.source_unit, expected_xactimate_unit=item.source_unit,
             populated_unit=outcome.populated_fields.unit,
         )
-        quantity_confirmation = getattr(adapter, "last_quantity_confirmation", None)
-        if (
-            getattr(quantity_confirmation, "review_required", False)
-            and getattr(outcome.verification, "trust_state", None) == "VERIFIED"
-        ):
-            # The structural multiset verifier remains unchanged.  This
-            # merely preserves the earlier stable-cell OCR uncertainty in
-            # the closest existing durable state: committed + review_required.
-            outcome.verification.trust_state = "QUANTITY_MISMATCH"
-            if hasattr(outcome.verification, "reason"):
-                outcome.verification.reason = quantity_confirmation.reason
+        # Phase 5.27: `adapter.last_quantity_confirmation` (enter_
+        # quantity()'s own same-cell post-write OCR read) used to be
+        # able to downgrade an otherwise-VERIFIED structural outcome to
+        # QUANTITY_MISMATCH whenever it was LOW_CONFIDENCE/unreadable.
+        # Live TEST repeatedly showed exactly-correct quantities
+        # misread by OCR at this zoom/DPI (30.19 as 19, 33.33 as 33,
+        # 9.36 as 6), producing false QUANTITY_MISMATCH review states
+        # for rows written exactly as intended. This function only
+        # ever reaches here after a deterministic write to a row whose
+        # candidate was JUST activated (`pending_item_created` above) --
+        # a positively-bound target, the exact source quantity typed,
+        # Tab-committed -- which is now treated as its own authoritative
+        # evidence of success. `last_quantity_confirmation` remains
+        # available on the adapter as advisory diagnostics/evidence; it
+        # no longer overrides verify_commit()'s own structural result.
         _record_lifecycle(adapter, "VERIFIED", trust_state=getattr(outcome.verification, "trust_state", None))
     return outcome
