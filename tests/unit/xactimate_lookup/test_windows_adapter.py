@@ -27,12 +27,15 @@ from estimate_extractor.xactimate_lookup.windows_adapter import (
     EstimateBaseline,
     GroupRowSnapshot,
     PendingQuantityTarget,
+    PendingRRPairTarget,
     PopupCaptureFailedError,
     PopupNotFoundError,
     QuantityNotConfirmedError,
     QuantityVerificationResult,
     ReconciliationResult,
     RowOffscreenError,
+    RRPairQuantityError,
+    RRPairQuantityResult,
     SearchFocusError,
     StaleCandidateError,
     UnitVerificationResult,
@@ -6470,4 +6473,574 @@ def test_activation_delta_correct_with_row_number_ocr_unavailable(monkeypatch):
     assert adapter.pending_item_created(before_snapshot, timeout_s=0) is True
     assert adapter._pending_quantity_target.activity == "+"
     assert adapter._pending_quantity_target.after_index == 3
-    assert adapter._pending_quantity_target.physical_row_delta == 1
+
+
+# --- Phase 6.3 (R&R Stage 3): dual-target -/+ pair binding ------------------
+#
+# Covers PendingRRPairTarget/_pending_rr_pair_targets_from_delta() (pure,
+# offline reconciliation), bind_rr_pair_after_activation() (the live-style
+# activation entry point, mirroring pending_item_created()'s own tests),
+# write_and_verify_rr_pair_quantities() (the dual write/verify primitive,
+# reusing enter_quantity() twice), and the read-only resume primitives
+# locate_existing_rr_pair_half()/verify_existing_rr_pair_half_quantity().
+
+
+def _rr_pair_row(cat="RFG", sel="STEEP", desc="Steep charge", activity="-"):
+    return ActivationRowSnapshot(cat, sel, desc, activity)
+
+
+def test_pair_target_from_delta_builds_two_targets_from_exact_one_pair():
+    before = []
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+
+    pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert isinstance(pair, PendingRRPairTarget)
+    assert pair.identity == ("rfg", "steep", "steep charge")
+    assert pair.minus_target.after_index == 0
+    assert pair.plus_target.after_index == 1
+
+
+def test_pair_target_activities_correctly_assigned_not_inferred_from_position():
+    """The "-" row physically sits AFTER the "+" row here -- activities
+    must be assigned by their own real glyph, never by row order."""
+    before = []
+    after = [_rr_pair_row(activity="+"), _rr_pair_row(activity="-")]
+
+    pair = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after)
+
+    assert pair.minus_target.activity == "-"
+    assert pair.minus_target.after_index == 1
+    assert pair.plus_target.activity == "+"
+    assert pair.plus_target.after_index == 0
+
+
+def test_pair_target_candidate_order_reversal_does_not_swap_quantity_ownership():
+    before = [ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None)]
+    after_forward = before + [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    after_reversed = before + [_rr_pair_row(activity="+"), _rr_pair_row(activity="-")]
+
+    forward = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after_forward)
+    reversed_ = WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after_reversed)
+
+    assert forward.minus_target.after_index == 1
+    assert forward.plus_target.after_index == 2
+    assert reversed_.minus_target.after_index == 2
+    assert reversed_.plus_target.after_index == 1
+
+
+def test_pair_target_missing_minus_fails_closed():
+    before = []
+    after = [_rr_pair_row(activity="+"), _rr_pair_row(activity="+")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_pair_target_missing_plus_fails_closed():
+    before = []
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="-")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_pair_target_unexpected_third_row_fails_closed():
+    before = []
+    after = [
+        _rr_pair_row(activity="-"), _rr_pair_row(activity="+"),
+        ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None),
+    ]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_pair_target_duplicate_minus_ambiguity_fails_closed():
+    """A "-" row for this identity already exists in the baseline. The
+    activation's own two-row delta still proves one clean -/+ pair under
+    the general multiset rule, but three total "-" rows for one identity
+    can never be uniquely bound to one physical half -- fails closed."""
+    before = [_rr_pair_row(activity="-")]
+    after = before + [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_pair_target_duplicate_plus_ambiguity_fails_closed():
+    before = [_rr_pair_row(activity="+")]
+    after = before + [_rr_pair_row(activity="+"), _rr_pair_row(activity="-")]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+
+
+def test_pair_target_does_not_affect_ordinary_single_row_reconciliation():
+    """Existing row-count/R&R reconciliation stays green: an ordinary
+    one-row delta is rejected by the pair constructor (wrong shape) but
+    is completely unaffected in the pre-existing single-target path."""
+    before = []
+    after = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+
+    assert WindowsXactimateAdapter._pending_rr_pair_targets_from_delta(before, after) is None
+    legacy = WindowsXactimateAdapter._pending_quantity_target_from_delta(before, after)
+    assert legacy is not None
+    assert legacy.activity is None
+
+
+def test_pair_target_does_not_affect_legacy_single_plus_only_rr_target():
+    """The pre-existing single-target R&R path (_pending_quantity_target_
+    from_delta(), which discards the "-" side and keeps only "+") must
+    return byte-identical results after Stage 3 -- this is a direct,
+    explicit regression lock, not just an incidental side effect of the
+    full suite staying green."""
+    before = []
+    after = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+
+    legacy = WindowsXactimateAdapter._pending_quantity_target_from_delta(before, after)
+
+    assert legacy.activity == "+"
+    assert legacy.after_index == 1
+    assert legacy.physical_row_delta == 2
+
+
+def test_bind_rr_pair_after_activation_returns_dual_targets_for_clean_pair(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    pair = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: pair)
+
+    result = adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+    assert isinstance(result, PendingRRPairTarget)
+    assert result.minus_target.activity == "-"
+    assert result.plus_target.activity == "+"
+    # bind_rr_pair_after_activation() never retains a single-target
+    # binding -- pending_item_created()'s own "+"-only retention path is
+    # untouched and not exercised by this method at all.
+    assert adapter._pending_quantity_target is None
+
+
+def test_bind_rr_pair_after_activation_fails_closed_when_pair_is_ambiguous(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        _rr_pair_row(activity="+"), _rr_pair_row(activity="+"),
+    ])
+
+    with pytest.raises(AdapterError, match="uniquely bound R&R"):
+        adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+
+def test_bind_rr_pair_after_activation_fails_closed_for_unexpected_row_count(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        _rr_pair_row(activity="-"), _rr_pair_row(activity="+"),
+        ActivationRowSnapshot("SFG", "GUTA", "Aluminum gutter", None),
+    ])
+
+    with pytest.raises(AdapterError, match="exactly two new physical rows"):
+        adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+
+def test_bind_rr_pair_after_activation_zero_new_rows_is_physical_state_uncertain(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [])
+
+    with pytest.raises(AdapterError, match="zero new physical rows"):
+        adapter.bind_rr_pair_after_activation([], timeout_s=0)
+
+
+def test_bind_rr_pair_after_activation_never_reuses_single_target_retention(monkeypatch):
+    """Confirms bind_rr_pair_after_activation() and pending_item_created()
+    remain fully independent entry points into the same before/after rows
+    -- calling one does not leave state that would corrupt the other."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    pair = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: pair)
+
+    adapter.bind_rr_pair_after_activation([], timeout_s=0)
+    assert adapter._pending_quantity_target is None
+
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.activity == "+"
+    assert adapter._pending_quantity_target.after_index == 1
+
+
+def _wire_rr_pair_quantity_flow(
+    monkeypatch, adapter, rows, quantities_before, expected_by_index, *,
+    confirmed_by_index=None, disappear_index=None, dialog_after_index=None,
+):
+    """Dual-target counterpart to _wire_identity_quantity_flow(): tracks
+    per-row-index write state (a set of already-written indices), not one
+    shared before/after flag, so two SEQUENTIAL enter_quantity() calls
+    against DIFFERENT targets -- exactly what
+    write_and_verify_rr_pair_quantities() drives -- each see their own
+    accurate before/after quantity, independent of the other row's write.
+    Mocks the same low-level primitives _wire_identity_quantity_flow()
+    does (_read_activation_row_at/_read_quantity_at), so the real
+    _quantity_target_candidates()/_locate_pending_quantity_row() activity
+    disambiguation is exercised exactly as it is in production, not
+    stubbed out.
+
+    `disappear_index`, if given, simulates that physical row vanishing
+    the moment ANY OTHER index has already been written -- modeling "the
+    target disappeared between writes" as genuine structural uncertainty
+    (an unmatchable row), not an OCR-confidence problem.
+
+    `dialog_after_index`, if given, simulates an unexpected dialog
+    appearing the moment that index has been written -- modeling a hard
+    stop on the FIRST (minus) write that must prevent the second (plus)
+    write from ever being attempted.
+    """
+    image = _FakeImage(height=600)
+    row_1_top = 100
+    typed_indices: set[int] = set()
+    reads: list[int] = []
+    clicked_indices: list[int] = []
+
+    def effective_rows():
+        # Only vanish while the CURRENT target is the disappearing one --
+        # never mid-write for a different, unrelated target (whose own
+        # before/after geometry checks must stay internally consistent).
+        current = adapter._pending_quantity_target
+        if (
+            disappear_index is not None
+            and current is not None
+            and current.after_index == disappear_index
+            and (typed_indices - {disappear_index})
+        ):
+            return [row for i, row in enumerate(rows) if i != disappear_index]
+        return rows
+
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda *args, **kwargs: (image, (0, 0)))
+    monkeypatch.setattr(
+        adapter, "_last_row_geometry",
+        lambda image, offset: (
+            len(effective_rows()), row_1_top + (len(effective_rows()) - 1) * _GRID_ROW_HEIGHT,
+        ) if effective_rows() else None,
+    )
+    monkeypatch.setattr(adapter, "_shifted_anchor", lambda name, offset: (0, row_1_top, 0, 0))
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: (10, 10, 20, 20))
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: None)
+    monkeypatch.setattr(
+        adapter, "_unexpected_dialog_present",
+        lambda: dialog_after_index is not None and dialog_after_index in typed_indices,
+    )
+
+    def read_row(image, offset, row_top):
+        active = effective_rows()
+        index = (row_top - row_1_top) // _GRID_ROW_HEIGHT
+        return active[index] if 0 <= index < len(active) else ActivationRowSnapshot(None, None, None, None)
+
+    def read_quantity(image, offset, row_top, **kwargs):
+        index = (row_top - row_1_top) // _GRID_ROW_HEIGHT
+        reads.append(index)
+        if index in typed_indices:
+            if confirmed_by_index is not None and index in confirmed_by_index:
+                return confirmed_by_index[index]
+            return expected_by_index[index]
+        return quantities_before[index]
+
+    def click(hwnd, x, y):
+        clicked_indices.append((y - row_1_top) // _GRID_ROW_HEIGHT)
+
+    def type_value(text):
+        typed_indices.add(adapter._pending_quantity_target.after_index)
+
+    monkeypatch.setattr(adapter, "_read_activation_row_at", read_row)
+    monkeypatch.setattr(adapter, "_read_quantity_at", read_quantity)
+    monkeypatch.setattr(adapter, "_click_client", click)
+    monkeypatch.setattr(adapter, "_select_all_and_delete", lambda: None)
+    monkeypatch.setattr(adapter, "_type_keybdevent", type_value)
+    monkeypatch.setattr(adapter, "_press_key", lambda code: None)
+    monkeypatch.setattr(adapter, "_scroll_grid_body", lambda *args, **kwargs: None)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    return reads, typed_indices, clicked_indices
+
+
+def _rr_pair_target(minus_index=0, plus_index=1, identity=("rfg", "steep", "steep charge")):
+    minus_target = PendingQuantityTarget(
+        identity=identity, activity="-", after_index=minus_index, activity_ordinal=1,
+        physical_row_delta=2, write_source_quantity_once=True,
+    )
+    plus_target = PendingQuantityTarget(
+        identity=identity, activity="+", after_index=plus_index, activity_ordinal=1,
+        physical_row_delta=2, write_source_quantity_once=True,
+    )
+    return PendingRRPairTarget(minus_target=minus_target, plus_target=plus_target, identity=identity)
+
+
+def test_write_and_verify_rr_pair_quantities_lands_different_quantities_on_correct_halves(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _reads, typed_indices, clicked_indices = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0},
+    )
+
+    result = adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
+
+    assert isinstance(result, RRPairQuantityResult)
+    assert result.minus_confirmation.expected == 10.0
+    assert result.minus_confirmation.observed == 10.0
+    assert result.minus_confirmation.confidence == "CONFIRMED"
+    assert result.plus_confirmation.expected == 12.0
+    assert result.plus_confirmation.observed == 12.0
+    assert result.plus_confirmation.confidence == "CONFIRMED"
+    assert typed_indices == {0, 1}
+    assert clicked_indices == [0, 1]
+
+
+def test_write_and_verify_rr_pair_quantities_equal_quantities_still_write_both_halves(monkeypatch):
+    """Even though both halves want the SAME final value, and both
+    already read that value BEFORE any write, write_source_quantity_once
+    forces two independent writes/verifications -- never inferred from
+    one side alone."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _reads, typed_indices, clicked_indices = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [5.0, 5.0], {0: 5.0, 1: 5.0},
+    )
+
+    result = adapter.write_and_verify_rr_pair_quantities(pair_target, 5.0, 5.0)
+
+    assert typed_indices == {0, 1}
+    assert clicked_indices == [0, 1]
+    assert result.minus_confirmation.observed == 5.0
+    assert result.plus_confirmation.observed == 5.0
+
+
+def test_write_and_verify_rr_pair_quantities_order_reversal_does_not_swap_ownership(monkeypatch):
+    """The "-" target physically sits AFTER the "+" target here -- each
+    quantity must still land on its own bound row, not the other one."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="+"), _rr_pair_row(activity="-")]
+    pair_target = _rr_pair_target(minus_index=1, plus_index=0)
+    _reads, typed_indices, clicked_indices = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {1: 10.0, 0: 12.0},
+    )
+
+    result = adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
+
+    assert result.minus_confirmation.observed == 10.0
+    assert result.plus_confirmation.observed == 12.0
+    assert clicked_indices == [1, 0]
+
+
+def test_write_and_verify_rr_pair_quantities_minus_failure_prevents_plus_attempt(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0}, dialog_after_index=0,
+    )
+
+    with pytest.raises(RRPairQuantityError, match="minus-side") as excinfo:
+        adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
+
+    assert excinfo.value.side == "minus"
+    assert excinfo.value.minus_confirmation is None
+    # The plus side must never have been attempted at all.
+    assert 1 not in typed_indices
+
+
+def test_write_and_verify_rr_pair_quantities_plus_failure_preserves_minus_evidence(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0}, dialog_after_index=1,
+    )
+
+    with pytest.raises(RRPairQuantityError, match="plus-side") as excinfo:
+        adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
+
+    assert excinfo.value.side == "plus"
+    # Evidence that minus was already written and confirmed must survive
+    # the plus-side failure -- never discarded.
+    assert excinfo.value.minus_confirmation is not None
+    assert excinfo.value.minus_confirmation.expected == 10.0
+    assert excinfo.value.minus_confirmation.observed == 10.0
+    assert excinfo.value.minus_confirmation.confidence == "CONFIRMED"
+
+
+def test_write_and_verify_rr_pair_quantities_target_disappears_between_writes(monkeypatch):
+    """The plus row physically vanishes once the minus write completes --
+    genuine structural uncertainty (RowOffscreenError), never a guessed
+    success and never silently swallowed."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0}, disappear_index=1,
+    )
+
+    with pytest.raises(RRPairQuantityError, match="plus-side") as excinfo:
+        adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
+
+    assert excinfo.value.side == "plus"
+    assert isinstance(excinfo.value.__cause__, RowOffscreenError)
+    # Minus evidence still survives even though this is structural, not
+    # an OCR-confidence problem.
+    assert excinfo.value.minus_confirmation is not None
+    assert excinfo.value.minus_confirmation.observed == 10.0
+
+
+def test_write_and_verify_rr_pair_quantities_unreadable_quantity_is_review_not_guessed_success(monkeypatch):
+    """A known, stable row whose post-write OCR read is unreadable (None)
+    is advisory (LOW_CONFIDENCE/review_required), never an exception and
+    never a fabricated CONFIRMED result -- row identity is known, only
+    the quantity reading is uncertain."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [_rr_pair_row(activity="-"), _rr_pair_row(activity="+")]
+    pair_target = _rr_pair_target()
+    _reads, typed_indices, _clicked = _wire_rr_pair_quantity_flow(
+        monkeypatch, adapter, rows, [0.0, 0.0], {0: 10.0, 1: 12.0}, confirmed_by_index={1: None},
+    )
+
+    result = adapter.write_and_verify_rr_pair_quantities(pair_target, 10.0, 12.0)
+
+    assert result.minus_confirmation.confidence == "CONFIRMED"
+    assert result.plus_confirmation.confidence == "LOW_CONFIDENCE"
+    assert result.plus_confirmation.review_required is True
+    assert result.plus_confirmation.observed is None
+    assert result.plus_confirmation.expected == 12.0
+
+
+def test_write_and_verify_rr_pair_quantities_does_not_change_ordinary_enter_quantity(monkeypatch):
+    """Ordinary, non-R&R single-target quantity entry is driven by the
+    exact same, completely unmodified enter_quantity() -- confirmed here
+    by exercising it directly, untouched by anything Stage 3 added."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    rows = [ActivationRowSnapshot("SFG", "GSG", "Gutter splash guard", None)]
+    adapter._pending_quantity_target = PendingQuantityTarget(("sfg", "gsg", "gutter splash guard"), None, 0, 1)
+    state, reads, clicks = _wire_identity_quantity_flow(monkeypatch, adapter, rows, [0.0], 1.0)
+
+    adapter.enter_quantity(1.0)
+
+    assert state["typed"] is True
+    assert reads == [0, 0]
+    assert adapter.last_quantity_confirmation.confidence == "CONFIRMED"
+
+
+def test_locate_existing_rr_pair_half_relocates_without_reactivation(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+
+    captured = {}
+
+    def fake_candidates(image, offset, target):
+        captured["target"] = target
+        return [(1, 125, 33.66)]
+
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", fake_candidates)
+
+    result = adapter.locate_existing_rr_pair_half(
+        category="RFG", selector="STEEP", description="Steep charge", activity="+",
+    )
+
+    assert result is not None
+    target, observed = result
+    assert observed == 33.66
+    assert target.activity == "+"
+    assert target.write_source_quantity_once is False
+    assert captured["target"].identity == ("rfg", "steep", "steep charge")
+
+
+def test_locate_existing_rr_pair_half_never_activates_a_candidate(monkeypatch):
+    """Reusing _quantity_target_candidates() means only a capture/read
+    happens -- no click, no candidate selection, no quantity write."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", lambda image, offset, target: [(0, 100, 10.0)])
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("locate_existing_rr_pair_half() must never click or type.")
+
+    monkeypatch.setattr(adapter, "_click_client", fail_if_called)
+    monkeypatch.setattr(adapter, "_type_keybdevent", fail_if_called)
+
+    result = adapter.locate_existing_rr_pair_half(
+        category="rfg", selector="steep", description="steep charge", activity="-",
+    )
+
+    assert result is not None
+    assert result[1] == 10.0
+
+
+def test_locate_existing_rr_pair_half_fails_closed_when_missing(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", lambda image, offset, target: [])
+
+    result = adapter.locate_existing_rr_pair_half(
+        category="rfg", selector="steep", description="steep charge", activity="-",
+    )
+
+    assert result is None
+
+
+def test_locate_existing_rr_pair_half_fails_closed_when_ambiguous(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+    monkeypatch.setattr(
+        adapter, "_quantity_target_candidates",
+        lambda image, offset, target: [(0, 100, 10.0), (1, 125, 10.0)],
+    )
+
+    result = adapter.locate_existing_rr_pair_half(
+        category="rfg", selector="steep", description="steep charge", activity="-",
+    )
+
+    assert result is None
+
+
+def test_verify_existing_rr_pair_half_quantity_matches_expected_without_write(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", lambda image, offset, target: [(1, 125, 33.66)])
+
+    confirmation = adapter.verify_existing_rr_pair_half_quantity(
+        category="rfg", selector="steep", description="steep charge", activity="+", expected_quantity=33.66,
+    )
+
+    assert confirmation.confidence == "CONFIRMED"
+    assert confirmation.review_required is False
+    assert confirmation.observed == 33.66
+
+
+def test_verify_existing_rr_pair_half_quantity_flags_mismatch_for_review(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", lambda image, offset, target: [(1, 125, 10.0)])
+
+    confirmation = adapter.verify_existing_rr_pair_half_quantity(
+        category="rfg", selector="steep", description="steep charge", activity="+", expected_quantity=33.66,
+    )
+
+    assert confirmation.confidence == "LOW_CONFIDENCE"
+    assert confirmation.review_required is True
+    assert confirmation.observed == 10.0
+
+
+def test_verify_existing_rr_pair_half_quantity_returns_none_when_unlocatable(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    image = _FakeImage(height=600)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda hwnd: (image, (0, 0)))
+    monkeypatch.setattr(adapter, "_quantity_target_candidates", lambda image, offset, target: [])
+
+    confirmation = adapter.verify_existing_rr_pair_half_quantity(
+        category="rfg", selector="steep", description="steep charge", activity="+", expected_quantity=33.66,
+    )
+
+    assert confirmation is None

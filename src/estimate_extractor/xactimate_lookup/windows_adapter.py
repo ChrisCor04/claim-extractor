@@ -587,6 +587,71 @@ class QuantityEntryConfirmation:
     reason: str
 
 
+@dataclass(slots=True, frozen=True)
+class PendingRRPairTarget:
+    """Phase 6.3 (R&R Stage 3): one proven R&R activation's DUAL
+    physical-row binding -- both halves of a single logical remove-
+    and-replace item, built from the SAME one-time activation delta
+    (see WindowsXactimateAdapter._pending_rr_pair_targets_from_delta()).
+
+    Deliberately reuses PendingQuantityTarget TWICE rather than
+    introducing a second row-targeting system: minus_target/plus_target
+    are independently locatable through the exact same, already-proven
+    machinery a single-row target uses (_locate_pending_quantity_row()/
+    _quantity_target_candidates()), disambiguated by their own real
+    activity glyph ("-"/"+") -- never by row order or position.
+    __post_init__ enforces that invariant unconditionally, since a
+    PendingRRPairTarget with a data bug here is worse than raising
+    immediately."""
+
+    minus_target: PendingQuantityTarget
+    plus_target: PendingQuantityTarget
+    #: Shared identity both targets' own .identity already agree with --
+    #: retained separately purely as a convenience/assertion surface,
+    #: never independently re-derived.
+    identity: tuple[str, str, str]
+
+    def __post_init__(self) -> None:
+        if self.minus_target.activity != "-":
+            raise ValueError("PendingRRPairTarget: minus_target must carry activity '-'.")
+        if self.plus_target.activity != "+":
+            raise ValueError("PendingRRPairTarget: plus_target must carry activity '+'.")
+        if self.minus_target.identity != self.identity or self.plus_target.identity != self.identity:
+            raise ValueError("PendingRRPairTarget: minus_target/plus_target must share the pair's own identity.")
+
+
+@dataclass(slots=True, frozen=True)
+class RRPairQuantityResult:
+    """The complete, structured outcome of writing and verifying BOTH
+    halves of one R&R pair -- returned to the caller (a future Stage 4
+    runner) to persist as CoordinatedPair checkpoints. This module
+    never persists execution-plan state itself; see write_and_verify_
+    rr_pair_quantities()'s own docstring."""
+
+    minus_confirmation: QuantityEntryConfirmation
+    plus_confirmation: QuantityEntryConfirmation
+
+
+class RRPairQuantityError(QuantityNotConfirmedError):
+    """Phase 6.3 (R&R Stage 3): raised by write_and_verify_rr_pair_
+    quantities() when either half's write/verify fails. `side` names
+    which half failed ("minus" | "plus"). `minus_confirmation` is set
+    only when the minus side had ALREADY been positively written and
+    confirmed before a later failure on the plus side -- so a caller
+    can still persist that partial progress (e.g. minus_verified=True)
+    even though the pair call did not complete; never fabricated, and
+    always None when the minus side itself is what failed. A failure
+    on the minus side always prevents the plus side from being
+    attempted at all -- there is never a plus_confirmation on this
+    exception for that reason (a completed plus write is only ever
+    returned via RRPairQuantityResult, not raised)."""
+
+    def __init__(self, message: str, *, side: str, minus_confirmation: QuantityEntryConfirmation | None = None):
+        super().__init__(message)
+        self.side = side
+        self.minus_confirmation = minus_confirmation
+
+
 @dataclass(slots=True)
 class EstimateBaseline:
     """Phase 5.4: a full structural + financial snapshot of the
@@ -3043,6 +3108,97 @@ class WindowsXactimateAdapter(XactimateAdapter):
             f"(last client height={last_height!r}); refusing to click a guessed row."
         )
 
+    def locate_existing_rr_pair_half(
+        self, *, category: str, selector: str, description: str, activity: str,
+    ) -> tuple[PendingQuantityTarget, float | None] | None:
+        """Phase 6.3 (R&R Stage 3): READ-ONLY re-identification of an
+        ALREADY-EXISTING physical R&R half from a persisted
+        CoordinatedPair binding -- e.g. after a process restart, so a
+        future Stage 4 resume path can re-find the "-" or "+" row of a
+        pair that was activated in an earlier session, WITHOUT ever
+        re-clicking a candidate (which would create a duplicate
+        physical pair). Never activates anything, never selects a
+        candidate, never writes a quantity.
+
+        Reuses _quantity_target_candidates() -- the exact same
+        identity/activity matching a live write already uses -- so
+        "re-find" and "write" agree on what counts as a match by
+        construction, not by a second, parallel implementation.
+
+        The returned target carries write_source_quantity_once=False
+        (unlike a freshly bound activation target): a resumed target
+        must go through enter_quantity()'s cautious legacy-target
+        protections (skip only if already exactly matching; refuse to
+        overwrite a different non-zero value) rather than being treated
+        as fresh and force-written -- resume must never blindly rewrite
+        a cell that may already hold a correct value from a prior
+        session.
+
+        Returns None -- never a guessed/best-effort match -- whenever
+        the half cannot be uniquely, safely re-identified: zero matches
+        (row missing) or more than one match (duplicate/ambiguous).
+        Callers must treat None as structural uncertainty, never as a
+        signal to fall back to re-activation."""
+        if activity not in ("-", "+"):
+            raise ValueError("locate_existing_rr_pair_half(): activity must be '-' or '+'.")
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd)
+        if offset is None:
+            return None
+        # _quantity_target_candidates() always compares against a row's
+        # NORMALIZED identity (_activation_identity()); normalize here too
+        # so this matches regardless of whether the caller passes raw OCR
+        # text or an already-normalized identity tuple (e.g. one persisted
+        # straight from PendingRRPairTarget.identity) -- normalization is
+        # idempotent, so an already-normalized caller is unaffected.
+        identity = (
+            self._normalized_pair_text(category),
+            self._normalized_pair_text(selector),
+            self._normalized_pair_text(description),
+        )
+        probe_target = PendingQuantityTarget(
+            identity=identity, activity=activity, after_index=0, activity_ordinal=1,
+            physical_row_delta=2, write_source_quantity_once=False,
+        )
+        matches = self._quantity_target_candidates(image, offset, probe_target)
+        if len(matches) != 1:
+            return None
+        _index, _row_top, observed = matches[0]
+        return probe_target, observed
+
+    def verify_existing_rr_pair_half_quantity(
+        self, *, category: str, selector: str, description: str, activity: str, expected_quantity: float,
+    ) -> QuantityEntryConfirmation | None:
+        """Phase 6.3 (R&R Stage 3): READ-ONLY convenience wrapper over
+        locate_existing_rr_pair_half() that compares the observed
+        quantity against an expected value and returns a
+        QuantityEntryConfirmation-shaped result -- the same shape
+        write_and_verify_rr_pair_quantities() produces on a fresh
+        write -- so a resuming caller can treat "already written in a
+        prior session, re-verified now" and "just written this
+        session" uniformly. Returns None (never a fabricated
+        confirmation) when the half cannot be uniquely re-identified at
+        all -- see locate_existing_rr_pair_half()'s own docstring."""
+        located = self.locate_existing_rr_pair_half(
+            category=category, selector=selector, description=description, activity=activity,
+        )
+        if located is None:
+            return None
+        _target, observed = located
+        if observed is not None and abs(observed - expected_quantity) <= 0.01:
+            return QuantityEntryConfirmation(
+                expected=expected_quantity, observed=observed, confidence="CONFIRMED",
+                review_required=False,
+                reason="Read-only resume re-identification matched the expected quantity without any write.",
+            )
+        return QuantityEntryConfirmation(
+            expected=expected_quantity, observed=observed, confidence="LOW_CONFIDENCE", review_required=True,
+            reason=(
+                f"Read-only resume re-identification observed {observed!r}, expected {expected_quantity!r}; "
+                "no write was performed."
+            ),
+        )
+
     def enter_quantity(self, quantity: float) -> None:
         # Per-task state: never let an advisory from an earlier item leak
         # into the current item's post-commit outcome.
@@ -3188,6 +3344,74 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         if scrolled:
             self._reset_scroll_state()
+
+    def write_and_verify_rr_pair_quantities(
+        self, pair_target: "PendingRRPairTarget", minus_quantity: float, plus_quantity: float,
+    ) -> "RRPairQuantityResult":
+        """Phase 6.3 (R&R Stage 3): write and independently verify BOTH
+        halves of one bound R&R pair -- the remove ("-") quantity and
+        the replace ("+") quantity, which may differ.
+
+        Deliberately reuses enter_quantity() unmodified, called twice,
+        rather than any copy-pasted quantity-entry logic: binding
+        `self._pending_quantity_target` to pair_target.minus_target
+        (then .plus_target) and calling enter_quantity() is the exact
+        same mechanism every ordinary and single-target R&R task
+        already uses -- _locate_pending_quantity_row()/_quantity_
+        target_candidates() already disambiguate a "-" occurrence from
+        a "+" occurrence of the SAME identity generically, via
+        `target.activity`, with no changes needed here.
+
+        Both targets were built with write_source_quantity_once=True
+        (see _pending_rr_pair_targets_from_delta()), so enter_quantity()
+        never treats either side's initial/default on-screen quantity
+        as a conflict gate -- each freshly created physical half
+        receives its own source quantity authoritatively, exactly once,
+        regardless of whether minus_quantity == plus_quantity: equal
+        values still produce two independent writes and two independent
+        same-cell read-back confirmations, never inferred from one.
+
+        A minus-side failure (enter_quantity() raising) is re-raised as
+        RRPairQuantityError(side="minus") -- the plus side is NEVER
+        attempted, so no result can ever claim it succeeded. A plus-
+        side failure is re-raised as RRPairQuantityError(side="plus",
+        minus_confirmation=...), preserving the ALREADY-obtained minus
+        confirmation so a caller can still persist that partial
+        progress. A LOW_CONFIDENCE (OCR-uncertain but structurally
+        stable) confirmation on either side is never an exception --
+        exactly like the existing single-target enter_quantity()
+        contract, it is returned as part of a normal
+        RRPairQuantityResult for the caller to route to review, not
+        silently upgraded to a guessed success."""
+        self._pending_quantity_target = pair_target.minus_target
+        try:
+            self.enter_quantity(minus_quantity)
+        except QuantityConfirmationError as exc:
+            raise RRPairQuantityError(
+                f"R&R pair minus-side quantity entry failed: {exc}", side="minus",
+            ) from exc
+        minus_confirmation = self.last_quantity_confirmation
+        if minus_confirmation is None:
+            raise RRPairQuantityError(
+                "R&R pair minus-side quantity entry produced no confirmation record.", side="minus",
+            )
+
+        self._pending_quantity_target = pair_target.plus_target
+        try:
+            self.enter_quantity(plus_quantity)
+        except QuantityConfirmationError as exc:
+            raise RRPairQuantityError(
+                f"R&R pair plus-side quantity entry failed: {exc}", side="plus",
+                minus_confirmation=minus_confirmation,
+            ) from exc
+        plus_confirmation = self.last_quantity_confirmation
+        if plus_confirmation is None:
+            raise RRPairQuantityError(
+                "R&R pair plus-side quantity entry produced no confirmation record.", side="plus",
+                minus_confirmation=minus_confirmation,
+            )
+
+        return RRPairQuantityResult(minus_confirmation=minus_confirmation, plus_confirmation=plus_confirmation)
 
     def read_quantity(self) -> float | None:
         """Not part of the abstract XactimateAdapter contract -- an
@@ -3501,6 +3725,97 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 )
             time.sleep(0.25)
 
+    def bind_rr_pair_after_activation(
+        self, before_snapshot: list[tuple[str | None, str | None]], timeout_s: float = 8.0,
+    ) -> "PendingRRPairTarget":
+        """Phase 6.3 (R&R Stage 3): the coordinated-pair counterpart to
+        pending_item_created() above -- positively detects and binds
+        BOTH physical halves of one freshly activated R&R item, instead
+        of the single "+"-only target pending_item_created() retains.
+
+        Deliberately self-contained rather than refactored out of
+        pending_item_created() (which stays completely unmodified by
+        this phase): this duplicates a small amount of baseline-
+        snapshot/polling glue, never the quantity-entry logic itself,
+        which is fully reused by write_and_verify_rr_pair_quantities()
+        below via the exact same enter_quantity() every ordinary and
+        single-target R&R task already uses. Same immediate-decision-
+        per-poll timing model as pending_item_created() -- no implicit
+        "wait, maybe the second row hasn't rendered yet" grace period,
+        matching that function's own already-proven characteristic
+        rather than introducing new, live-unvalidated timing behavior.
+
+        Callers decide WHETHER to call this instead of pending_item_
+        created() -- e.g. a future Stage 4 runner, for a task known
+        (via CoordinatedPair) to be part of a coordinated pair. Never
+        called by any existing production path today; ordinary and
+        legacy R&R-"+"-only activation go through pending_item_
+        created() completely unaffected.
+
+        Raises PhysicalStateUncertainError for every shape this shares
+        with pending_item_created() (dialog appeared, timeout, more/
+        fewer rows than one logical pair, baseline mismatch) --
+        genuine structural/physical-state uncertainty, never a retry
+        trigger. Raises TaskLocalRowReconciliationError specifically
+        when exactly two rows landed but they don't reconcile as one
+        cleanly, uniquely bound -/+ pair (missing half, duplicate half,
+        wrong identity) -- confined to this one task, never evidence
+        the wider grid/group is unsafe."""
+        expected = len(before_snapshot)
+        self._pending_quantity_target = None
+        baseline_rows = self._last_activation_baseline_rows
+        if baseline_rows is None:
+            baseline_rows = [] if expected == 0 else None
+        if baseline_rows is None or len(baseline_rows) != expected:
+            raise PhysicalStateUncertainError(
+                "R&R pair binding has no matching rich activation baseline; refusing to infer a row delta."
+            )
+        baseline_identities = [(row.category, row.selector) for row in baseline_rows]
+        if baseline_identities != list(before_snapshot):
+            raise PhysicalStateUncertainError(
+                "R&R pair binding's rich baseline does not match the supplied physical-row baseline."
+            )
+        start = time.time()
+        while True:
+            rows = self._snapshot_activation_rows()
+            physical_delta = len(rows) - expected
+            if physical_delta == 2:
+                pair_target = self._pending_rr_pair_targets_from_delta(baseline_rows, rows)
+                if pair_target is not None:
+                    return pair_target
+                # Task-local, not project-level: this task's own activation
+                # added two rows but they don't reconcile as one uniquely
+                # bound R&R -/+ pair -- ambiguity about which new rows are
+                # THIS task's item, not evidence anything outside this task
+                # is unsafe. See TaskLocalRowReconciliationError's docstring.
+                raise TaskLocalRowReconciliationError(
+                    "Candidate activation added two physical rows, but they did not reconcile as one uniquely "
+                    f"bound R&R -/+ pair (before={expected}, after={len(rows)})."
+                )
+            if physical_delta == 1 or physical_delta > 2:
+                raise PhysicalStateUncertainError(
+                    "R&R pair activation did not produce exactly two new physical rows; refusing to guess "
+                    f"which rows belong to this pair (before={expected}, after={len(rows)})."
+                )
+            if physical_delta < 0:
+                raise PhysicalStateUncertainError(
+                    "Candidate activation removed physical rows; refusing to infer an R&R pair."
+                )
+            if physical_delta == 0 and not self._baseline_rows_accounted(baseline_rows, rows):
+                raise PhysicalStateUncertainError(
+                    "Candidate activation left the row count unchanged but a prior physical row disappeared or "
+                    "mutated beyond structural reconciliation."
+                )
+            if self._unexpected_dialog_present():
+                raise PhysicalStateUncertainError(
+                    "An unexpected dialog appeared while confirming R&R pair activation."
+                )
+            if time.time() - start >= timeout_s:
+                raise PhysicalStateUncertainError(
+                    "Candidate selection created zero new physical rows within the activation window."
+                )
+            time.sleep(0.25)
+
     @classmethod
     def _activation_identity(cls, row: ActivationRowSnapshot) -> tuple[str, str, str]:
         return (
@@ -3579,6 +3894,71 @@ class WindowsXactimateAdapter(XactimateAdapter):
             physical_row_delta=2 if is_rr else 1,
             write_source_quantity_once=True,
         )
+
+    @classmethod
+    def _activity_matching_indices(
+        cls, rows: list[ActivationRowSnapshot], identity: tuple[str, str, str], activity: str,
+    ) -> list[int]:
+        return [
+            index for index, row in enumerate(rows)
+            if cls._activation_identity(row) == identity and cls._activity_token(row) == activity
+        ]
+
+    @classmethod
+    def _pending_rr_pair_targets_from_delta(
+        cls,
+        before_rows: list[ActivationRowSnapshot],
+        after_rows: list[ActivationRowSnapshot],
+    ) -> "PendingRRPairTarget | None":
+        """Phase 6.3 (R&R Stage 3): the dual-target counterpart to
+        _pending_quantity_target_from_delta()'s single "+"-only R&R
+        target above -- reuses the SAME order-independent multiset
+        proof (_is_one_logical_rr_multiset_delta()) that one logical
+        R&R pair was created, then binds BOTH physical halves instead
+        of discarding the "-" side. Never touches, weakens, or is
+        called by the existing single-target function; ordinary and
+        legacy R&R-"+"-only activation are completely unaffected.
+
+        Deliberately STRICTER than the legacy single-target path's
+        ordinal-based multi-match tolerance (see
+        _locate_pending_quantity_row()'s own handling of `activity_
+        ordinal` for a pre-existing duplicate-identity row): requires
+        EXACTLY one "-" row and EXACTLY one "+" row bearing the one
+        changed identity, full stop. Returns None -- never a partially
+        built pair -- for every shape that isn't unambiguously one
+        clean R&R pair: a missing half, a duplicate minus or plus, both
+        halves sharing one activity, an unrelated third row changing
+        the physical delta, or any identity that can't be corroborated
+        (_rows_by_activation_identity() itself already refuses to
+        group anything when even one row's identity fields are
+        incomplete)."""
+        if not cls._is_one_logical_rr_multiset_delta(before_rows, after_rows):
+            return None
+
+        before_groups = cls._rows_by_activation_identity(before_rows)
+        after_groups = cls._rows_by_activation_identity(after_rows)
+        changed = [
+            identity for identity, group in after_groups.items()
+            if len(group) - len(before_groups.get(identity, [])) == 2
+        ]
+        if len(changed) != 1:
+            return None
+        identity = changed[0]
+
+        minus_indices = cls._activity_matching_indices(after_rows, identity, "-")
+        plus_indices = cls._activity_matching_indices(after_rows, identity, "+")
+        if len(minus_indices) != 1 or len(plus_indices) != 1:
+            return None
+
+        minus_target = PendingQuantityTarget(
+            identity=identity, activity="-", after_index=minus_indices[0], activity_ordinal=1,
+            physical_row_delta=2, write_source_quantity_once=True,
+        )
+        plus_target = PendingQuantityTarget(
+            identity=identity, activity="+", after_index=plus_indices[0], activity_ordinal=1,
+            physical_row_delta=2, write_source_quantity_once=True,
+        )
+        return PendingRRPairTarget(minus_target=minus_target, plus_target=plus_target, identity=identity)
 
     def _ordinary_single_row_target_from_selected_candidate(
         self,
