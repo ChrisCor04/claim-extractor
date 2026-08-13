@@ -66,6 +66,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     STOP_REASON_PROJECT_VERIFICATION_FAILURE,
     STOP_REASON_PROTECTED_ROW_REFUSAL,
     STOP_REASON_TASK_LEVEL_STOPS,
+    STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED,
     TASK_COMMIT_STATE_COMMITTED,
     TASK_COMMIT_STATE_NOT_COMMITTED,
     TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED,
@@ -833,6 +834,31 @@ def run_execution_plan(
                     "ALREADY_COMMITTED — RETRY BLOCKED: this task has evidence of a prior real commit "
                     "(commit_state/trust_state indicates a row landed) -- automatic retry refused. Reconcile "
                     "against the live Xactimate grid before ever re-executing this row."
+                )
+                task.completed_at = utc_now_iso()
+                _record_terminal(adapter, task)
+                if not dry_run:
+                    plan.resume_cursor = plan.tasks.index(task) + 1
+                    save_execution_plan(plan, project_dir)
+                continue
+
+            # Phase 5.23 (R&R Stage 1-2): a task belonging to a
+            # coordinated remove/replace pair must NEVER fall through
+            # to the ordinary independent single-task path below --
+            # doing so could search/select/commit its own candidate
+            # while its partner is untouched, exactly the duplicate-
+            # activation risk coordinated pairs exist to prevent. Live
+            # coordinated activation/quantity/verification (Stage 3)
+            # does not exist yet, so every coordinated task reaching
+            # this point is explicitly, safely diverted -- never a
+            # fabricated success, never a silent independent execution.
+            if task.coordinated_pair_id:
+                task.state = TASK_REVIEW_REQUIRED
+                task.stop_reason = STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED
+                task.stop_detail = (
+                    f"Task belongs to coordinated pair {task.coordinated_pair_id!r} -- live coordinated "
+                    f"execution is not implemented yet (R&R Stage 3). Refusing to execute this task "
+                    f"independently of its partner."
                 )
                 task.completed_at = utc_now_iso()
                 _record_terminal(adapter, task)

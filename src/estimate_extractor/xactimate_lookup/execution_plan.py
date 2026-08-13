@@ -32,6 +32,7 @@ from pathlib import Path
 from estimate_extractor.mapping.pipeline import DEFAULT_CONFIG_DIR
 from estimate_extractor.ui import group_name_service
 from estimate_extractor.ui.review_service import STATUS_APPROVED, STATUS_REJECTED, build_effective_rows
+from estimate_extractor.xactimate_lookup.coordinated_pairs import detect_coordinated_pairs, pair_id_for
 from estimate_extractor.xactimate_lookup.models import LOOKUP_PATH_DESCRIPTION_SEARCH, LOOKUP_PATH_TRUSTED
 
 DEFAULT_GROUP_NAMES_PATH = DEFAULT_CONFIG_DIR / "xactimate_group_names.yaml"
@@ -72,6 +73,36 @@ GROUP_VERIFIED = "verified"
 GROUP_IN_PROGRESS = "in_progress"
 GROUP_COMPLETED = "completed"
 GROUP_FAILED = "failed"
+
+# Coordinated-pair states (Phase 5.23, R&R Stage 1-2). A pair only ever
+# advances forward through this sequence during real Stage 3 (live)
+# execution, which does not exist yet as of Stage 1-2 -- every pair
+# detect_coordinated_pairs() produces starts and, in this phase, stays
+# at PAIR_UNACTIVATED. The remaining states are defined now so the
+# persisted schema is already correct for Stage 3 to fill in later,
+# and so reset/resume semantics can be implemented and tested against
+# them today (see reset_unfinished_tasks()).
+PAIR_UNACTIVATED = "unactivated"
+PAIR_ACTIVATED_PENDING_BINDING = "activated_pending_binding"
+PAIR_BOTH_BOUND = "both_bound"
+PAIR_MINUS_VERIFIED = "minus_verified"
+PAIR_PLUS_VERIFIED = "plus_verified"
+PAIR_BOTH_VERIFIED = "both_verified"
+PAIR_SATISFIED = "satisfied"
+PAIR_REVIEW_REQUIRED = "review_required"
+PAIR_PHYSICAL_STATE_UNCERTAIN = "physical_state_uncertain"
+VALID_PAIR_STATES = frozenset({
+    PAIR_UNACTIVATED, PAIR_ACTIVATED_PENDING_BINDING, PAIR_BOTH_BOUND,
+    PAIR_MINUS_VERIFIED, PAIR_PLUS_VERIFIED, PAIR_BOTH_VERIFIED,
+    PAIR_SATISFIED, PAIR_REVIEW_REQUIRED, PAIR_PHYSICAL_STATE_UNCERTAIN,
+})
+
+#: Task-level stop reason for a task that belongs to a coordinated pair
+#: but reached the ordinary per-task execution loop before Stage 3
+#: (live coordinated activation/quantity/verification) exists to
+#: safely handle it. Never a fabricated success -- see
+#: run_execution_plan()'s coordinated-pair guard.
+STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED = "coordinated_pair_execution_not_implemented"
 
 LOOKUP_STRATEGY_REVIEW_APPROVED = "review_approved_cat_sel"
 #: Phase 5.5: a row with no CAT/SEL yet (missing, not rejected) but a
@@ -241,6 +272,14 @@ class ExecutionTask:
     normalized_trade: str | None = None
     normalized_component: str | None = None
     normalized_material: str | None = None
+    #: Phase 5.23 (R&R Stage 1-2): set only when coordinated_pairs.
+    #: detect_coordinated_pairs() paired this task with a complementary
+    #: remove/replace partner -- see CoordinatedPair below. Once set,
+    #: run_execution_plan()'s per-task loop must never run this task
+    #: through the ordinary independent single-task path; see its own
+    #: coordinated-pair guard. None for every ordinary, unpaired task
+    #: -- completely inert/unchanged for the vast majority of tasks.
+    coordinated_pair_id: str | None = None
     #: Phase 5.5: OCR-observed values read back after a successful live
     #: commit of an originally-unmapped row (see execution_runner.py's
     #: _apply_outcome_to_task()). Corroborating/informational only --
@@ -371,6 +410,75 @@ class GroupExecutionState:
 
 
 @dataclass(slots=True)
+class CoordinatedPair:
+    """One complementary remove/replace source task pair (Phase 5.23,
+    R&R Stage 1-2) -- see coordinated_pairs.detect_coordinated_pairs()
+    for how remove_task_id/replace_task_id were identified.
+
+    Stage 1-2 only ever constructs and persists these at
+    PAIR_UNACTIVATED; every field past pair_state/the two task ids and
+    the expected quantities exists so Stage 3 (live coordinated
+    activation/quantity/verification, NOT implemented yet) has a
+    correct place to record its progress without a later schema
+    change. Binding/write/verification fields are deliberately
+    duck-typed dicts (not a windows_adapter type), matching this
+    module's existing convention of staying adapter-agnostic (see
+    LookupOutcome.verification in xactimate_lookup/models.py)."""
+
+    pair_id: str
+    remove_task_id: str
+    replace_task_id: str
+    pair_state: str = PAIR_UNACTIVATED
+    #: Source-derived, fixed at detection time -- the two INDEPENDENT
+    #: quantities this pair must eventually write to the "-" and "+"
+    #: physical rows respectively. Mirrors ExecutionTask's own
+    #: source_quantity: never overwritten in place.
+    expected_minus_quantity: float | None = None
+    expected_minus_unit: str | None = None
+    expected_plus_quantity: float | None = None
+    expected_plus_unit: str | None = None
+    #: Which task performs the single candidate-activation click. Set
+    #: explicitly (by convention, remove_task_id) rather than assumed
+    #: implicitly at every call site.
+    activation_task_id: str | None = None
+    #: Physical binding placeholders -- populated only once Stage 3
+    #: activation proves a real "-"/"+" pair landed. None until then.
+    minus_binding: dict | None = None
+    plus_binding: dict | None = None
+    minus_written: bool = False
+    plus_written: bool = False
+    minus_verified_ok: bool = False
+    plus_verified_ok: bool = False
+    #: Human-facing explanation when pair_state == PAIR_REVIEW_REQUIRED.
+    review_reason: str | None = None
+    #: Human-facing explanation when pair_state ==
+    #: PAIR_PHYSICAL_STATE_UNCERTAIN -- mirrors ExecutionTask.stop_
+    #: detail's role for physical_state_uncertain.
+    uncertainty_reason: str | None = None
+    #: coordinated_pairs.PairDetection.reason at detection time --
+    #: audit/debugging only, never consumed by execution logic.
+    detection_reason: str | None = None
+
+    def to_dict(self) -> dict:
+        return _dataclass_to_dict(self)
+
+    @staticmethod
+    def from_dict(data: dict) -> "CoordinatedPair":
+        known = {f.name for f in fields(CoordinatedPair)}
+        return CoordinatedPair(**{k: v for k, v in data.items() if k in known})
+
+
+def pair_has_physical_activity(pair: "CoordinatedPair") -> bool:
+    """True once a pair has left PAIR_UNACTIVATED -- i.e. a real
+    candidate activation has plausibly already happened on the live
+    grid. Mirrors task_has_committed_row()'s role at the pair level:
+    the single source of truth reset_unfinished_tasks() and any future
+    Stage 3 resume logic MUST use instead of comparing pair_state
+    directly, so this decision only ever lives in one place."""
+    return pair.pair_state != PAIR_UNACTIVATED
+
+
+@dataclass(slots=True)
 class ExecutionSummary:
     """Matches the exact reporting shape Phase 5.0 requires: a completed
     count, the labeled list of rows a human must look at, a skipped
@@ -475,6 +583,12 @@ class ExecutionPlan:
     created_at: str
     groups: list[GroupExecutionState] = field(default_factory=list)
     tasks: list[ExecutionTask] = field(default_factory=list)
+    #: Phase 5.23 (R&R Stage 1-2): every coordinated remove/replace pair
+    #: detect_coordinated_pairs() identified at plan-build time. Empty
+    #: for a plan with no such pairs (the ordinary case) and for every
+    #: plan persisted before this field existed -- see from_dict()'s
+    #: own default.
+    coordinated_pairs: list[CoordinatedPair] = field(default_factory=list)
     run_state: str = RUN_STATE_NOT_STARTED
     resume_cursor: int | None = None  # index into `tasks` (source order) of the next task to attempt
     updated_at: str = field(default_factory=utc_now_iso)
@@ -504,6 +618,9 @@ class ExecutionPlan:
     def group_by_id(self, group_id: str) -> GroupExecutionState | None:
         return next((g for g in self.groups if g.group_id == group_id), None)
 
+    def pair_by_id(self, pair_id: str) -> CoordinatedPair | None:
+        return next((p for p in self.coordinated_pairs if p.pair_id == pair_id), None)
+
     def tasks_in_group(self, group_id: str) -> list[ExecutionTask]:
         group = self.group_by_id(group_id)
         if group is None:
@@ -532,6 +649,7 @@ class ExecutionPlan:
             "created_at": self.created_at,
             "groups": [g.to_dict() for g in self.groups],
             "tasks": [t.to_dict() for t in self.tasks],
+            "coordinated_pairs": [p.to_dict() for p in self.coordinated_pairs],
             "run_state": self.run_state,
             "resume_cursor": self.resume_cursor,
             "updated_at": self.updated_at,
@@ -549,6 +667,7 @@ class ExecutionPlan:
             created_at=data["created_at"],
             groups=[GroupExecutionState.from_dict(g) for g in data.get("groups", [])],
             tasks=[ExecutionTask.from_dict(t) for t in data.get("tasks", [])],
+            coordinated_pairs=[CoordinatedPair.from_dict(p) for p in data.get("coordinated_pairs", [])],
             run_state=data.get("run_state", RUN_STATE_NOT_STARTED),
             resume_cursor=data.get("resume_cursor"),
             updated_at=data.get("updated_at", utc_now_iso()),
@@ -633,9 +752,47 @@ def reset_unfinished_tasks(plan: ExecutionPlan, project_dir: Path, *, full_reset
     reset must sanitize an already-pending task exactly like any other,
     or "start completely over" silently doesn't. `reset_count` still
     only counts actual state transitions (unchanged meaning/tests) --
-    an already-pending task is sanitized but not counted as "reset"."""
+    an already-pending task is sanitized but not counted as "reset".
+
+    Phase 5.23 (R&R Stage 1-2): a coordinated pair resets or stays
+    protected as ONE unit, never per-member -- otherwise a partial
+    reset could leave one member back at PENDING while its partner
+    (and the pair's own persisted binding/write/verification progress)
+    stays exactly where it was, which is precisely the "stale half"
+    this mechanism exists to prevent. `pair_has_physical_activity()` is
+    the single source of truth for pair-level protection (mirrors
+    `task_has_committed_row()` at the pair level) -- computed once,
+    BEFORE any pair's state is touched, so clearing an unprotected
+    pair's own state below can never corrupt this decision for itself
+    or any other pair."""
+    protected_pair_ids = {
+        pair.pair_id for pair in plan.coordinated_pairs
+        if not full_reset and pair_has_physical_activity(pair)
+    }
+    for pair in plan.coordinated_pairs:
+        if pair.pair_id in protected_pair_ids:
+            continue
+        pair.pair_state = PAIR_UNACTIVATED
+        pair.activation_task_id = None
+        pair.minus_binding = None
+        pair.plus_binding = None
+        pair.minus_written = False
+        pair.plus_written = False
+        pair.minus_verified_ok = False
+        pair.plus_verified_ok = False
+        pair.review_reason = None
+        pair.uncertainty_reason = None
+
     reset_count = 0
     for task in plan.tasks:
+        if task.coordinated_pair_id in protected_pair_ids:
+            # The whole pair is protected -- leave BOTH members exactly
+            # as they are, regardless of this task's own individual
+            # state (which may not itself carry commit evidence yet --
+            # Stage 3 doesn't exist -- the PAIR's activity is what
+            # matters). Mirrors task_has_committed_row()'s single-task
+            # protection, applied coherently to the pair as a unit.
+            continue
         if not full_reset and (task.state == TASK_COMPLETED or task_has_committed_row(task)):
             continue
         already_pending = task.state == TASK_PENDING
@@ -932,6 +1089,35 @@ def build_execution_plan(
         first_order.setdefault(gid, t.source_order)
     ordered_groups = sorted(groups.values(), key=lambda g: first_order.get(g.group_id, 10**9))
 
+    # Phase 5.23 (R&R Stage 1-2): pure, offline, read-only pairing pass
+    # over the tasks just built -- never talks to Xactimate, never
+    # affects which tasks/groups exist. See coordinated_pairs.py's own
+    # module docstring. Naturally scoped to began_unmapped tasks only:
+    # an approved (non-unmapped) task's normalized_* fields are always
+    # None above, so it can never match ACTION_REMOVE or an install-
+    # like action and is never considered a pairing candidate.
+    coordinated_pairs: list[CoordinatedPair] = []
+    tasks_by_id = {t.task_id: t for t in tasks}
+    for detection in detect_coordinated_pairs(tasks):
+        if not detection.paired:
+            continue
+        pid = pair_id_for(detection.remove_task_id, detection.replace_task_id)
+        remove_task = tasks_by_id[detection.remove_task_id]
+        replace_task = tasks_by_id[detection.replace_task_id]
+        remove_task.coordinated_pair_id = pid
+        replace_task.coordinated_pair_id = pid
+        coordinated_pairs.append(CoordinatedPair(
+            pair_id=pid,
+            remove_task_id=detection.remove_task_id,
+            replace_task_id=detection.replace_task_id,
+            activation_task_id=detection.remove_task_id,
+            expected_minus_quantity=remove_task.source_quantity,
+            expected_minus_unit=remove_task.source_unit,
+            expected_plus_quantity=replace_task.source_quantity,
+            expected_plus_unit=replace_task.source_unit,
+            detection_reason=detection.reason,
+        ))
+
     now = utc_now_iso()
     plan_id = f"plan_{project_slug}_{now.replace(':', '').replace('-', '').replace('.', '').replace('+', '')}"
     return ExecutionPlan(
@@ -941,5 +1127,6 @@ def build_execution_plan(
         created_at=now,
         groups=ordered_groups,
         tasks=tasks,
+        coordinated_pairs=coordinated_pairs,
         schema_version=CURRENT_SCHEMA_VERSION,
     )

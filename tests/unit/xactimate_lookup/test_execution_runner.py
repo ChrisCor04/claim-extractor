@@ -23,6 +23,7 @@ from estimate_extractor.xactimate_lookup.adapter import (
 )
 from estimate_extractor.xactimate_lookup.execution_plan import (
     CURRENT_SCHEMA_VERSION,
+    CoordinatedPair,
     ExecutionPlan,
     ExecutionTask,
     GROUP_COMPLETED,
@@ -32,9 +33,11 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     GroupExecutionState,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
     LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+    PAIR_UNACTIVATED,
     RUN_STATE_COMPLETED,
     RUN_STATE_PAUSED,
     STOP_REASON_NORMAL_COMPLETION,
+    STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED,
     STOP_REASON_GROUP_SETUP_BLOCKED,
     STOP_REASON_PROTECTED_ROW_REFUSAL,
     STOP_REASON_PROJECT_LEVEL_HARD_STOP,
@@ -186,6 +189,76 @@ def _dropdown(cat, sel):
 
 def _dropdown_script(*tasks):
     return {f"{t.category} {t.selector}": [_dropdown(t.category, t.selector)] for t in tasks}
+
+
+# ---------------------------------------------------------------------
+# Phase 5.23 (R&R Stage 1-2): the runner-side structural guard -- a
+# task belonging to a coordinated pair must never fall through to the
+# ordinary independent single-task path. Stage 3 (live coordinated
+# execution) does not exist yet, so every such task must be explicitly,
+# safely diverted -- never executed, never a fabricated success.
+# ---------------------------------------------------------------------
+
+
+def _plan_with_one_coordinated_pair_and_one_ordinary_task():
+    remove_task = _task("task_remove", "line_remove", "Dwelling Roof", "RFG", "REM", 0)
+    replace_task = _task("task_replace", "line_replace", "Dwelling Roof", "RFG", "REM", 1)
+    ordinary_task = _task("task_ordinary", "line_ordinary", "Dwelling Roof", "SFG", "GUTA", 2)
+    pair_id = "pair_task_remove_task_replace"
+    remove_task.coordinated_pair_id = pair_id
+    replace_task.coordinated_pair_id = pair_id
+    group = GroupExecutionState(
+        group_id="Dwelling Roof", area_name=None, section_name="Dwelling Roof",
+        xactimate_group_name="Dwelling Roof", group_name_reviewed=True,
+        task_ids=["task_remove", "task_replace", "task_ordinary"],
+    )
+    plan = ExecutionPlan(
+        plan_id="p1", project_slug="test", source_filename=None, created_at="now",
+        groups=[group], tasks=[remove_task, replace_task, ordinary_task],
+        coordinated_pairs=[CoordinatedPair(
+            pair_id=pair_id, remove_task_id="task_remove", replace_task_id="task_replace",
+            pair_state=PAIR_UNACTIVATED, activation_task_id="task_remove",
+            expected_minus_quantity=remove_task.source_quantity, expected_minus_unit=remove_task.source_unit,
+            expected_plus_quantity=replace_task.source_quantity, expected_plus_unit=replace_task.source_unit,
+        )],
+    )
+    return plan, remove_task, replace_task, ordinary_task
+
+
+def test_coordinated_pair_members_never_reach_independent_execution(tmp_path, phrase_rules, ranking_config):
+    plan, remove_task, replace_task, ordinary_task = _plan_with_one_coordinated_pair_and_one_ordinary_task()
+    adapter = _adapter_with_test_project(dropdown_script=_dropdown_script(ordinary_task))
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    for task in (remove_task, replace_task):
+        assert task.state == TASK_REVIEW_REQUIRED
+        assert task.stop_reason == STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED
+        assert "task_remove" in task.stop_detail or "pair_" in task.stop_detail
+
+    # Never a fake success, and never any adapter interaction at all
+    # for either paired task -- no search, no selection, no commit.
+    search_calls = [c for c in adapter.log.calls if c[0] in ("search_by_description", "search_by_category_selector")]
+    assert search_calls == [("search_by_category_selector", ("SFG", "GUTA"), {})]
+
+    # The pair's own persisted state is untouched -- this guard never
+    # activates anything.
+    pair = plan.coordinated_pairs[0]
+    assert pair.pair_state == PAIR_UNACTIVATED
+
+
+def test_ordinary_task_alongside_a_coordinated_pair_executes_normally(tmp_path, phrase_rules, ranking_config):
+    """The coordinated-pair guard must be completely scoped to paired
+    tasks -- an unrelated ordinary task in the SAME group/run must
+    execute exactly as it always has."""
+    plan, remove_task, replace_task, ordinary_task = _plan_with_one_coordinated_pair_and_one_ordinary_task()
+    adapter = _adapter_with_test_project(dropdown_script=_dropdown_script(ordinary_task))
+
+    run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    assert ordinary_task.state in (TASK_COMPLETED, TASK_REVIEW_REQUIRED)
+    assert ordinary_task.stop_reason != STOP_REASON_COORDINATED_PAIR_EXECUTION_NOT_IMPLEMENTED
+    assert ("search_by_category_selector", ("SFG", "GUTA"), {}) in adapter.log.calls
 
 
 class QuantityFailureFakeAdapter(GroupAwareFakeAdapter):

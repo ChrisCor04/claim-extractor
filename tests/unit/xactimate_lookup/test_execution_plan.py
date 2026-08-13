@@ -18,6 +18,8 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     GROUP_PENDING,
     LOOKUP_STRATEGY_REVIEW_APPROVED,
     LOOKUP_STRATEGY_TEST_DESCRIPTION_FIRST,
+    PAIR_ACTIVATED_PENDING_BINDING,
+    PAIR_UNACTIVATED,
     RUN_STATE_COMPLETED,
     TASK_COMMIT_STATE_COMMITTED,
     TASK_COMMIT_STATE_NOT_COMMITTED,
@@ -37,7 +39,10 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
 )
 
 
-def _normalized_item(line_item_id, description, area_name, section_name, quantity=10.0, unit="SQ"):
+def _normalized_item(
+    line_item_id, description, area_name, section_name, quantity=10.0, unit="SQ",
+    *, action="remove_and_replace", trade="roofing", component="shingles", material="laminated",
+):
     return {
         "line_item_id": line_item_id,
         "original": {
@@ -54,8 +59,8 @@ def _normalized_item(line_item_id, description, area_name, section_name, quantit
             "extraction_warnings": [],
         },
         "normalized": {
-            "action": "remove_and_replace", "trade": "roofing", "component": "shingles",
-            "material": "laminated", "attributes": {}, "quantity": quantity, "unit_of_measure": unit,
+            "action": action, "trade": trade, "component": component,
+            "material": material, "attributes": {}, "quantity": quantity, "unit_of_measure": unit,
         },
         "confidence": {"overall": 0.9, "action": 0.9, "trade": 0.9, "component": 0.9, "material": 0.9},
         "needs_review": False,
@@ -273,19 +278,24 @@ def test_execution_summary_matches_required_report_format():
 def _write_flexible_project(tmp_path, project_name, entries):
     """`entries`: list of dicts with keys line_item_id, description,
     area_name, section_name, quantity, unit, category, selector,
-    status ("approved"/"rejected"/omitted for unreviewed). Reuses
-    _normalized_item()/_mapped_item() above but allows each field to
-    vary per row, which the fixed-shape ITEMS/_write_project() above
-    does not."""
+    status ("approved"/"rejected"/omitted for unreviewed), and
+    optionally action/trade/component/material (each defaults to the
+    same fixed values _normalized_item() always used, so every
+    existing caller that never sets them is byte-for-byte unaffected).
+    Reuses _normalized_item()/_mapped_item() above but allows each
+    field to vary per row, which the fixed-shape ITEMS/_write_project()
+    above does not."""
     project_dir = tmp_path / project_name
     (project_dir / "mapping").mkdir(parents=True)
     (project_dir / "review").mkdir(parents=True)
 
+    normalized_kwargs = ("action", "trade", "component", "material")
     normalized = [
         _normalized_item(
             e["line_item_id"], e.get("description", "A real source description"),
             e.get("area_name"), e.get("section_name"),
             quantity=e.get("quantity", 10.0), unit=e.get("unit", "SQ"),
+            **{k: e[k] for k in normalized_kwargs if k in e},
         )
         for e in entries
     ]
@@ -883,3 +893,175 @@ def test_diagnose_run_reports_exact_counts_and_stop_reason(tmp_path):
     assert diagnostics.remaining_unattempted == 1
     assert diagnostics.stopped_after_row == "Row 3"  # t_failed, source_order=2 -> "Row 3"
     assert diagnostics.stop_reason_summary  # non-empty, never fabricated beyond what's known
+
+
+# ---------------------------------------------------------------------
+# Phase 5.23 (R&R Stage 1-2): CoordinatedPair integration through the
+# real build_execution_plan() -> save/load -> reset pipeline, using
+# actual project files (not the isolated fake-task unit tests in
+# test_coordinated_pairs.py). Reuses _write_flexible_project()'s new
+# optional action/trade/component/material overrides.
+# ---------------------------------------------------------------------
+
+_PAIR_TEST_ENTRIES = [
+    {"line_item_id": "line_remove", "area_name": "Dwelling", "section_name": "Dwelling Roof",
+     "description": "Remove 3 tab shingles", "quantity": 30.19, "unit": "SQ",
+     "action": "remove", "trade": "roofing", "component": "composition_shingles", "material": "3-tab"},
+    {"line_item_id": "line_replace", "area_name": "Dwelling", "section_name": "Dwelling Roof",
+     "description": "3 tab shingles", "quantity": 33.33, "unit": "SQ",
+     "action": "unknown", "trade": "roofing", "component": "composition_shingles", "material": "3-tab"},
+    {"line_item_id": "line_ordinary", "area_name": "Dwelling", "section_name": "Dwelling Roof",
+     "description": "Drip edge", "quantity": 100.0, "unit": "LF",
+     "action": "unknown", "trade": "roofing", "component": "drip_edge", "material": None},
+]
+
+
+def _build_pair_plan(tmp_path, entries=_PAIR_TEST_ENTRIES):
+    project_dir = _write_flexible_project(tmp_path, "pair-proj", entries)
+    return build_execution_plan(project_dir, "pair-proj", include_unmapped_rows=True, xactimate_project_name="TEST"), project_dir
+
+
+def test_build_execution_plan_detects_and_persists_a_coordinated_pair(tmp_path):
+    plan, _ = _build_pair_plan(tmp_path)
+
+    assert len(plan.coordinated_pairs) == 1
+    pair = plan.coordinated_pairs[0]
+    assert pair.remove_task_id == "task_line_remove"
+    assert pair.replace_task_id == "task_line_replace"
+    assert pair.pair_state == PAIR_UNACTIVATED
+    assert pair.activation_task_id == "task_line_remove"
+    assert pair.expected_minus_quantity == 30.19
+    assert pair.expected_minus_unit == "SQ"
+    assert pair.expected_plus_quantity == 33.33
+    assert pair.expected_plus_unit == "SQ"
+
+    remove_task = plan.task_by_id("task_line_remove")
+    replace_task = plan.task_by_id("task_line_replace")
+    ordinary_task = plan.task_by_id("task_line_ordinary")
+    assert remove_task.coordinated_pair_id == pair.pair_id
+    assert replace_task.coordinated_pair_id == pair.pair_id
+    assert ordinary_task.coordinated_pair_id is None
+
+
+def test_ordinary_unpaired_tasks_completely_unaffected_by_pair_detection(tmp_path):
+    """A project with no remove/install pairing shape at all must
+    produce zero coordinated pairs and leave every task's
+    coordinated_pair_id at its default None."""
+    entries = [e for e in _PAIR_TEST_ENTRIES if e["line_item_id"] != "line_remove"]
+    plan, _ = _build_pair_plan(tmp_path, entries)
+    assert plan.coordinated_pairs == []
+    assert all(t.coordinated_pair_id is None for t in plan.tasks)
+
+
+def test_coordinated_pair_survives_save_and_load(tmp_path):
+    plan, project_dir = _build_pair_plan(tmp_path)
+    pair = plan.coordinated_pairs[0]
+    pair.pair_state = PAIR_ACTIVATED_PENDING_BINDING
+    pair.minus_binding = {"category": "RFG", "selector": "240", "activity": "-"}
+    pair.plus_binding = {"category": "RFG", "selector": "240", "activity": "+"}
+    save_execution_plan(plan, project_dir)
+
+    reloaded = load_execution_plan(project_dir)
+    assert len(reloaded.coordinated_pairs) == 1
+    reloaded_pair = reloaded.coordinated_pairs[0]
+    assert reloaded_pair.pair_id == pair.pair_id
+    assert reloaded_pair.pair_state == PAIR_ACTIVATED_PENDING_BINDING
+    assert reloaded_pair.minus_binding == {"category": "RFG", "selector": "240", "activity": "-"}
+    assert reloaded_pair.plus_binding == {"category": "RFG", "selector": "240", "activity": "+"}
+    assert reloaded.task_by_id("task_line_remove").coordinated_pair_id == pair.pair_id
+
+
+def test_execution_plan_from_dict_without_coordinated_pairs_key_loads_cleanly():
+    """Backward compatibility: a plan persisted before this field
+    existed has no "coordinated_pairs" key in its JSON at all."""
+    data = {
+        "plan_id": "p1", "project_slug": "old-project", "source_filename": None,
+        "created_at": "2020-01-01T00:00:00+00:00", "groups": [], "tasks": [],
+    }
+    plan = ExecutionPlan.from_dict(data)
+    assert plan.coordinated_pairs == []
+
+
+def test_full_reset_clears_coordinated_pair_state_and_both_members(tmp_path):
+    plan, project_dir = _build_pair_plan(tmp_path)
+    pair = plan.coordinated_pairs[0]
+    pair.pair_state = PAIR_ACTIVATED_PENDING_BINDING
+    pair.activation_task_id = "task_line_remove"
+    pair.minus_binding = {"category": "RFG", "selector": "240", "activity": "-"}
+    pair.plus_binding = {"category": "RFG", "selector": "240", "activity": "+"}
+    pair.minus_written = True
+    pair.review_reason = "stale"
+    pair.uncertainty_reason = "stale"
+    remove_task = plan.task_by_id("task_line_remove")
+    replace_task = plan.task_by_id("task_line_replace")
+    remove_task.state = TASK_REVIEW_REQUIRED
+    replace_task.state = TASK_REVIEW_REQUIRED
+    save_execution_plan(plan, project_dir)
+
+    reset_count = reset_unfinished_tasks(plan, project_dir, full_reset=True)
+
+    assert reset_count >= 2
+    pair = plan.pair_by_id(pair.pair_id)
+    assert pair.pair_state == PAIR_UNACTIVATED
+    assert pair.activation_task_id is None
+    assert pair.minus_binding is None
+    assert pair.plus_binding is None
+    assert pair.minus_written is False
+    assert pair.review_reason is None
+    assert pair.uncertainty_reason is None
+    assert plan.task_by_id("task_line_remove").state == TASK_PENDING
+    assert plan.task_by_id("task_line_replace").state == TASK_PENDING
+
+
+def test_partial_reset_protects_both_members_of_an_activated_pair(tmp_path):
+    """An activated-but-incomplete pair (real physical activity already
+    plausibly happened) must be COMPLETELY protected from an ordinary
+    partial reset -- even though the individual task carries no commit_
+    state of its own yet (Stage 3 doesn't exist to set one). Only
+    full_reset=True may clear it -- see pair_has_physical_activity()."""
+    plan, project_dir = _build_pair_plan(tmp_path)
+    pair = plan.coordinated_pairs[0]
+    pair.pair_state = PAIR_ACTIVATED_PENDING_BINDING
+    remove_task = plan.task_by_id("task_line_remove")
+    remove_task.state = TASK_REVIEW_REQUIRED
+    remove_task.stop_detail = "some non-commit reason"
+    save_execution_plan(plan, project_dir)
+
+    reset_unfinished_tasks(plan, project_dir, full_reset=False)
+
+    pair = plan.pair_by_id(pair.pair_id)
+    assert pair.pair_state == PAIR_ACTIVATED_PENDING_BINDING  # untouched
+    assert plan.task_by_id("task_line_remove").state == TASK_REVIEW_REQUIRED  # untouched
+    assert plan.task_by_id("task_line_remove").stop_detail == "some non-commit reason"
+
+
+def test_resetting_one_paired_member_cannot_leave_the_other_stale(tmp_path):
+    """The pair is still unactivated (no physical activity at all), so
+    an ordinary partial reset applies -- but it must reset BOTH members
+    coherently, never just the one that happened to need it."""
+    plan, project_dir = _build_pair_plan(tmp_path)
+    remove_task = plan.task_by_id("task_line_remove")
+    replace_task = plan.task_by_id("task_line_replace")
+    remove_task.state = TASK_REVIEW_REQUIRED
+    remove_task.stop_reason = "some_prior_task_local_stop"
+    # replace_task is left at its default TASK_PENDING.
+    save_execution_plan(plan, project_dir)
+
+    reset_unfinished_tasks(plan, project_dir, full_reset=False)
+
+    assert plan.task_by_id("task_line_remove").state == TASK_PENDING
+    assert plan.task_by_id("task_line_replace").state == TASK_PENDING
+    assert plan.pair_by_id(plan.coordinated_pairs[0].pair_id).pair_state == PAIR_UNACTIVATED
+
+
+def test_pair_has_physical_activity_identifies_the_activation_boundary(tmp_path):
+    """The exact helper resume logic must use to know a pair already
+    crossed the activation boundary and must never be re-activated."""
+    from estimate_extractor.xactimate_lookup.execution_plan import pair_has_physical_activity
+
+    plan, _ = _build_pair_plan(tmp_path)
+    pair = plan.coordinated_pairs[0]
+    assert pair_has_physical_activity(pair) is False  # fresh, unactivated
+
+    pair.pair_state = PAIR_ACTIVATED_PENDING_BINDING
+    assert pair_has_physical_activity(pair) is True
