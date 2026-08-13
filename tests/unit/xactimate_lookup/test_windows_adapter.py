@@ -28,6 +28,7 @@ from estimate_extractor.xactimate_lookup.windows_adapter import (
     CommitVerification,
     EstimateBaseline,
     GroupRowSnapshot,
+    ItemsTabVerificationError,
     PendingQuantityTarget,
     PendingRRPairTarget,
     PopupCaptureFailedError,
@@ -5457,7 +5458,7 @@ def _mock_enter_quantity(
     UI. `confirmed_qty_offset` is added to the typed quantity for the
     post-type read-back, so a test can simulate a mismatch."""
     state = {"row_count": row_count, "row_top": row_top, "tabbed": False}
-    calls = {"scroll": 0, "reset_scroll": 0}
+    calls = {"scroll": 0, "reset_scroll": 0, "restore_canonicalized_top": 0}
     adapter._pending_quantity_target = PendingQuantityTarget(
         identity=("sfg", "gsg", "gutter splash guard"),
         activity=None,
@@ -5482,6 +5483,12 @@ def _mock_enter_quantity(
     monkeypatch.setattr(adapter, "_type_keybdevent", lambda value: typed.__setitem__("value", float(value)))
     monkeypatch.setattr(adapter, "_press_key", lambda code: state.__setitem__("tabbed", True))
     monkeypatch.setattr(adapter, "_reset_scroll_state", lambda: calls.__setitem__("reset_scroll", calls["reset_scroll"] + 1))
+    monkeypatch.setattr(
+        adapter, "_restore_canonicalized_items_pane_top",
+        lambda: calls.__setitem__(
+            "restore_canonicalized_top", calls["restore_canonicalized_top"] + 1,
+        ),
+    )
     monkeypatch.setattr(time, "sleep", lambda s: None)
 
     def fake_scroll(hwnd, notches=2):
@@ -5628,6 +5635,7 @@ def test_enter_quantity_fresh_fast_path_skips_canonicalization_when_already_safe
     )
     adapter.enter_quantity(1.0)
     assert calls["scroll"] == 0
+    assert calls["restore_canonicalized_top"] == 0
 
 
 def test_enter_quantity_post_write_row_count_comparison_stays_exact_after_canonicalization(monkeypatch):
@@ -5642,6 +5650,99 @@ def test_enter_quantity_post_write_row_count_comparison_stays_exact_after_canoni
     )
     adapter.enter_quantity(1.0)  # must not raise "row count changed"
     assert adapter.last_quantity_confirmation.confidence == "SKIPPED"
+
+
+def test_canonicalized_fresh_write_restores_top_after_verified_14_to_14_sequence(monkeypatch):
+    """Exact regression: canonicalize and rebind extent 14, write+Tab,
+    prove context and 14->14, then restore the top before returning."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    state, calls = _mock_enter_quantity(
+        monkeypatch, adapter, row_count=14, row_top=990, image_height=1023,
+        freshly_created=True, scroll_effect=lambda n: (14, 500),
+    )
+    restores = []
+    monkeypatch.setattr(
+        adapter, "_restore_canonicalized_items_pane_top",
+        lambda: restores.append((state["tabbed"], state["row_count"])),
+    )
+
+    adapter.enter_quantity(532.45)
+
+    assert calls["scroll"] >= 1
+    assert state["tabbed"] is True
+    assert restores == [(True, 14)]
+    assert adapter.last_quantity_confirmation.confidence == "SKIPPED"
+
+
+def _wire_canonicalized_top_restore(monkeypatch, adapter, frames):
+    state = {"index": 0}
+    scrolls = []
+
+    def capture(_hwnd, attempts=1, delay_s=0):
+        return frames[min(state["index"], len(frames) - 1)], (0, 0)
+
+    def scroll(_hwnd, notches=2):
+        scrolls.append(notches)
+        state["index"] += 1
+
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", capture)
+    monkeypatch.setattr(adapter, "_scroll_grid_body", scroll)
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: None)
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    return scrolls
+
+
+def test_canonicalized_top_restore_scrolls_up_until_search_is_positive(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    scrolls = _wire_canonicalized_top_restore(monkeypatch, adapter, ["scrolled", "scrolled", "top"])
+    monkeypatch.setattr(adapter, "_items_grid_context_is_verified", lambda image, **kwargs: True)
+    monkeypatch.setattr(
+        adapter, "_items_search_pane_field",
+        lambda image: (10, 10, 20, 20) if image == "top" else None,
+    )
+
+    adapter._restore_canonicalized_items_pane_top()
+
+    assert scrolls == [-2, -2]
+
+
+def test_canonicalized_top_restore_still_rejects_navigation_away(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    scrolls = _wire_canonicalized_top_restore(monkeypatch, adapter, ["wrong-pane"])
+    monkeypatch.setattr(adapter, "_items_grid_context_is_verified", lambda image, **kwargs: False)
+
+    with pytest.raises(ItemsTabVerificationError, match="lost the active Items grid"):
+        adapter._restore_canonicalized_items_pane_top()
+
+    assert scrolls == []
+
+
+def test_canonicalized_top_restore_exhaustion_still_fails_closed(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    scrolls = _wire_canonicalized_top_restore(monkeypatch, adapter, ["still-scrolled"])
+    monkeypatch.setattr(adapter, "_items_grid_context_is_verified", lambda image, **kwargs: True)
+    monkeypatch.setattr(adapter, "_items_search_pane_field", lambda image: None)
+
+    with pytest.raises(ItemsTabVerificationError, match="bounded upward-scroll budget"):
+        adapter._restore_canonicalized_items_pane_top()
+
+    assert scrolls == [-2] * adapter._SCROLL_INTO_VIEW_MAX_ATTEMPTS
+
+
+@pytest.mark.parametrize("obstruction", ["dialog", "dropdown"])
+def test_canonicalized_top_restore_still_rejects_dialog_or_dropdown(monkeypatch, obstruction):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    scrolls = _wire_canonicalized_top_restore(monkeypatch, adapter, ["scrolled"])
+    monkeypatch.setattr(adapter, "_items_grid_context_is_verified", lambda image, **kwargs: True)
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: 456 if obstruction == "dropdown" else None)
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: obstruction == "dialog")
+
+    with pytest.raises(ItemsTabVerificationError, match="dialog or dropdown"):
+        adapter._restore_canonicalized_items_pane_top()
+
+    assert scrolls == []
 
 
 def test_canonicalized_fresh_write_accepts_active_items_grid_with_search_controls_offscreen(monkeypatch):
@@ -5765,6 +5866,7 @@ def test_legacy_scrolled_write_still_requires_search_controls(monkeypatch):
     with pytest.raises(QuantityNotConfirmedError, match="focus/navigation"):
         adapter.enter_quantity(1.0)
     assert calls["scroll"] >= 1
+    assert calls["restore_canonicalized_top"] == 0
 
 
 def test_enter_quantity_canonicalization_fails_closed_when_target_vanishes(monkeypatch):

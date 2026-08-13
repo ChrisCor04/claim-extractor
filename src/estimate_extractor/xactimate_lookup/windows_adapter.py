@@ -2415,6 +2415,64 @@ class WindowsXactimateAdapter(XactimateAdapter):
             "refusing to continue."
         )
 
+    def _restore_canonicalized_items_pane_top(self) -> None:
+        """Restore the top of a deliberately canonicalized Items pane.
+
+        A fresh quantity write may scroll the whole right-side content pane
+        downward so every established physical row is strictly countable.
+        At the successful post-write boundary, the active Items tab, live grid
+        anchor, dialog/dropdown absence, and exact row-count equality have
+        already been independently proven.  Re-clicking that already-active
+        outer tab is not a deterministic inverse of the wheel scroll: live it
+        can be a no-op, leaving the top-only Search controls off-screen.
+
+        Use the same live-anchored wheel mechanism that performed the bounded
+        downward canonicalization, in the opposite direction.  Active Items
+        and a live grid anchor authorize each upward step, but are never the
+        success condition: this returns only after the normal, strict
+        Items+Search readiness predicate is positive.  Any navigation change,
+        dialog/dropdown, lost anchor, or exhausted bounded budget fails closed.
+        This method is intentionally called only for a freshly bound target
+        whose viewport was canonicalized; legacy/resume paths retain
+        ``_reset_scroll_state()`` unchanged.
+        """
+        hwnd = self._ensure_main_window()
+        for _attempt in range(self._SCROLL_INTO_VIEW_MAX_ATTEMPTS):
+            image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+            if (
+                offset is None
+                or not self._items_grid_context_is_verified(
+                    image, allow_search_controls_offscreen=True,
+                )
+            ):
+                raise ItemsTabVerificationError(
+                    "Canonicalized Items-pane reset lost the active Items grid; refusing to scroll or continue."
+                )
+            if self._find_dropdown_window() is not None or self._unexpected_dialog_present():
+                raise ItemsTabVerificationError(
+                    "Canonicalized Items-pane reset found a dialog or dropdown; refusing to scroll or continue."
+                )
+            if self._items_search_pane_field(image) is not None:
+                return
+            self._scroll_grid_body(hwnd, notches=-2)
+            time.sleep(0.5)
+
+        final_image, final_offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+        if (
+            final_offset is not None
+            and self._items_grid_context_is_verified(
+                final_image, allow_search_controls_offscreen=True,
+            )
+            and self._find_dropdown_window() is None
+            and not self._unexpected_dialog_present()
+            and self._items_search_pane_field(final_image) is not None
+        ):
+            return
+        raise ItemsTabVerificationError(
+            "Canonicalized Items pane did not return to a positively verified Items/Search top state "
+            "within the bounded upward-scroll budget; refusing to continue."
+        )
+
     def focus_search(self) -> None:
         """Live-caught (Phase 4.7): unlike the tab bar, the search box
         IS part of the scrollable grid content pane and DOES share its
@@ -3025,8 +3083,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     def _scroll_grid_body(self, hwnd: int, notches: int = 2) -> None:
         """Phase 6.2 (live-caught): scrolls the estimate items pane via
-        a simulated mouse wheel, always downward -- the only direction
-        ever needed, since a newly-added row is always the last one.
+        a simulated mouse wheel. Positive ``notches`` scroll downward
+        to a newly-added last row; the narrowly scoped canonicalized-pane
+        restoration uses negative ``notches`` to return toward the top.
         Live-confirmed this scrolls the WHOLE right-side content pane
         (search box, thumbnail gallery, and Quick Entry all shrink away
         first, before the grid itself gains visible rows), not a grid-
@@ -3848,7 +3907,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 ),
             )
             if scrolled:
-                self._reset_scroll_state()
+                self._restore_canonicalized_items_pane_top()
             return
 
         observed = self._read_quantity_at(after, after_offset, edited_row_top)
