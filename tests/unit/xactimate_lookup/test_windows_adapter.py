@@ -7887,3 +7887,147 @@ def test_ocr_call_timeout_bound_is_finite_and_reasonable():
     never unbounded (pytesseract's own default of timeout=0 means NO
     bound at all)."""
     assert 0 < WindowsXactimateAdapter._OCR_CALL_TIMEOUT_S <= 30
+
+
+# ---------------------------------------------------------------------
+# Phase 5.30: _type_keybdevent()'s per-character interval is now
+# configurable (char_interval_s), for a controlled live timing
+# validation pass -- these tests prove that knob changes ONLY timing,
+# never the VK scan, shift handling, or keybd_event call sequence
+# itself (the validated mechanism that triggers Xactimate's live-
+# search binding, untouched by this phase).
+# ---------------------------------------------------------------------
+
+
+class _FakeUser32Typing:
+    """Deterministic stand-in for ctypes.windll.user32, covering only
+    the two calls _type_keybdevent() makes: VkKeyScanW (character ->
+    (vk, shift-needed)) and keybd_event (records every press/release
+    in order, exactly as issued)."""
+
+    #: A tiny, deliberately mixed table: lowercase (no shift), an
+    #: uppercase letter and a shifted symbol (shift required), a
+    #: digit, and space/hyphen (no shift) -- enough to exercise every
+    #: branch of the shift-wrapping logic without needing a real
+    #: Windows keyboard layout.
+    _SHIFTED = set("R!")
+
+    def __init__(self):
+        self.calls: list[tuple[int, int]] = []  # (vk_or_shift, flags)
+
+    def VkKeyScanW(self, ord_ch: int) -> int:
+        ch = chr(ord_ch)
+        vk = ord(ch.upper())
+        return vk | 0x0100 if ch in self._SHIFTED else vk
+
+    def keybd_event(self, vk: int, _scan: int, flags: int, _extra: int) -> None:
+        self.calls.append((vk, flags))
+
+
+class _FakeWindllTyping:
+    def __init__(self, user32: _FakeUser32Typing):
+        self.user32 = user32
+
+
+class _FakeCtypesTyping:
+    def __init__(self, user32: _FakeUser32Typing):
+        self.windll = _FakeWindllTyping(user32)
+
+
+def _wire_typing(monkeypatch, adapter):
+    user32 = _FakeUser32Typing()
+    monkeypatch.setattr(adapter, "_win32", lambda: (_FakeCtypesTyping(user32), None))
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    return user32, sleeps
+
+
+def test_type_keybdevent_default_interval_is_the_class_constant(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _user32, sleeps = _wire_typing(monkeypatch, adapter)
+
+    adapter._type_keybdevent("ab")
+
+    # Two plain (no-shift) chars: each contributes a 0.02s key-down-to-
+    # up sleep plus one trailing per-character interval sleep.
+    assert sleeps == [0.02, WindowsXactimateAdapter._SEARCH_TYPE_CHAR_INTERVAL_S] * 2
+    # Phase 5.30: live-validated reliable down to 0.02s (see the
+    # constant's own docstring) -- the production default must stay
+    # within the validated range, never below the tested floor.
+    assert 0.02 <= WindowsXactimateAdapter._SEARCH_TYPE_CHAR_INTERVAL_S <= 0.1
+
+
+def test_type_keybdevent_interval_override_changes_only_timing_not_keys(monkeypatch):
+    """The exact requirement: changing char_interval_s must reproduce
+    the IDENTICAL key-event sequence (same VK codes, same shift
+    wrapping, same order) -- only the recorded sleep durations differ."""
+    text = "Ra 1!"  # mixes shifted ('R', '!') and unshifted chars, plus a space and a digit
+    adapter_a = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    user32_a, sleeps_a = _wire_typing(monkeypatch, adapter_a)
+    adapter_a._type_keybdevent(text, char_interval_s=0.1)
+
+    adapter_b = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    user32_b, sleeps_b = _wire_typing(monkeypatch, adapter_b)
+    adapter_b._type_keybdevent(text, char_interval_s=0.02)
+
+    assert user32_a.calls == user32_b.calls  # identical key sequence
+    assert len(user32_a.calls) > 0
+    assert sleeps_a != sleeps_b  # timing genuinely differs
+    assert sum(sleeps_a) > sum(sleeps_b)
+
+
+def test_type_keybdevent_faster_interval_reduces_total_wait_proportionally(monkeypatch):
+    text = "composition shingle roofing"  # 28 chars, representative ordinary-length search
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _user32, sleeps_default = _wire_typing(monkeypatch, adapter)
+    adapter._type_keybdevent(text)
+    default_total = sum(sleeps_default)
+
+    adapter2 = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    _user32_2, sleeps_fast = _wire_typing(monkeypatch, adapter2)
+    adapter2._type_keybdevent(text, char_interval_s=0.02)
+    fast_total = sum(sleeps_fast)
+
+    # Both totals are dominated by len(text) * interval; a faster
+    # interval must produce a materially, proportionally smaller total.
+    assert fast_total < default_total
+    expected_saving = len(text) * (WindowsXactimateAdapter._SEARCH_TYPE_CHAR_INTERVAL_S - 0.02)
+    assert abs((default_total - fast_total) - expected_saving) < 1e-9
+
+
+def test_type_keybdevent_shift_wrapping_unaffected_by_interval(monkeypatch):
+    """Shift press/release must still bracket exactly the shifted
+    character, in the same order, regardless of char_interval_s."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    user32, _sleeps = _wire_typing(monkeypatch, adapter)
+
+    adapter._type_keybdevent("R", char_interval_s=0.01)
+
+    KEYEVENTF_KEYUP = 0x0002
+    VK_SHIFT = 0x10
+    VK_R = ord("R")
+    assert user32.calls == [
+        (VK_SHIFT, 0),
+        (VK_R, 0),
+        (VK_R, KEYEVENTF_KEYUP),
+        (VK_SHIFT, KEYEVENTF_KEYUP),
+    ]
+
+
+def test_type_keybdevent_text_content_unaffected_by_interval(monkeypatch):
+    """The generated key sequence must decode back to the exact same
+    characters regardless of interval -- proven by mapping each
+    recorded keydown VK back to a character and reassembling the text
+    (ignoring the shift-key events themselves, which carry no
+    character)."""
+    text = "RFG 240-A!"
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    user32, _sleeps = _wire_typing(monkeypatch, adapter)
+
+    adapter._type_keybdevent(text, char_interval_s=0.03)
+
+    VK_SHIFT = 0x10
+    KEYEVENTF_KEYUP = 0x0002
+    keydowns = [vk for vk, flags in user32.calls if flags == 0 and vk != VK_SHIFT]
+    decoded = "".join(chr(vk) for vk in keydowns)
+    assert decoded == text.upper()

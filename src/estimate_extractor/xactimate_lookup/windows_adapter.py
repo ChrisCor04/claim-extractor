@@ -1436,11 +1436,48 @@ class WindowsXactimateAdapter(XactimateAdapter):
         time.sleep(0.05)
         user32.mouse_event(0x0004, 0, 0, 0, 0)
 
-    def _type_keybdevent(self, text: str) -> None:
+    #: Phase 5.30: per-character pacing for the validated keybd_event
+    #: typing mechanism below -- the ONLY free parameter in that
+    #: mechanism. How fast a character can follow the previous one
+    #: without Xactimate's live-search field dropping/corrupting a
+    #: keystroke is an empirical property of Xactimate's own event
+    #: handling, not of this codebase. Originally 0.1s (see docs/
+    #: xactimate-lookup.md Phase 4.2B for the 5/5-trial validation of
+    #: the MECHANISM itself, at that value). Live-validated down to
+    #: 0.02s (TEST project, two representative searches -- a 28-char
+    #: ordinary description and a 64-char R&R description -- 3/3
+    #: intervals {0.05, 0.03, 0.02} each: identical 10-row popup,
+    #: identical top-scoring (1.0) expected candidate, no truncation/
+    #: corruption at any tested speed). Set to 0.03s, a margin above
+    #: that 0.02s floor: this pass tested one trial per interval/
+    #: search, short of Phase 4.2B's own 5/5-trial bar for the
+    #: mechanism itself, and 0.03s already captures the large majority
+    #: of the available saving (~2s/ordinary, ~4.7s/long-R&R search
+    #: vs the original 0.1s). Kept as a class constant -- never a bare
+    #: literal inside the loop -- so a future controlled live timing
+    #: validation pass can override it per-call via `_type_keybdevent
+    #: (text, char_interval_s=...)` without touching the mechanism (VK
+    #: scan, shift handling, keybd_event sequence) at all. Production
+    #: code never passes an override.
+    _SEARCH_TYPE_CHAR_INTERVAL_S = 0.03
+
+    def _type_keybdevent(self, text: str, *, char_interval_s: float | None = None) -> None:
         """The validated trigger mechanism: SendInput-based typing
         (pywinauto's default) never triggers Xactimate's live-search
         binding; the legacy keybd_event API does, reliably (5/5 trials,
-        see docs/xactimate-lookup.md Phase 4.2B)."""
+        see docs/xactimate-lookup.md Phase 4.2B).
+
+        `char_interval_s` (Phase 5.30, default None -- every existing
+        caller unaffected, uses `_SEARCH_TYPE_CHAR_INTERVAL_S`):
+        overrides the per-character trailing pacing for this call
+        only. Exists solely for a controlled live timing validation
+        pass (finding the fastest interval Xactimate's live-search
+        field tolerates without dropping/corrupting keystrokes) --
+        never changes the VK scan, shift handling, or keybd_event
+        sequence itself, only how long this method waits between
+        characters. See `_SEARCH_TYPE_CHAR_INTERVAL_S`'s own
+        docstring."""
+        interval = self._SEARCH_TYPE_CHAR_INTERVAL_S if char_interval_s is None else char_interval_s
         ctypes, _ = self._win32()
         user32 = ctypes.windll.user32
         KEYEVENTF_KEYUP = 0x0002
@@ -1457,7 +1494,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
             if need_shift:
                 time.sleep(0.01)
                 user32.keybd_event(0x10, 0, KEYEVENTF_KEYUP, 0)
-            time.sleep(0.1)
+            time.sleep(interval)
 
     def _press_key(self, vk: int) -> None:
         ctypes, _ = self._win32()
