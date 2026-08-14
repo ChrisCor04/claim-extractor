@@ -3728,16 +3728,76 @@ def test_selected_ordinary_row_fails_closed_when_multiple_rows_are_plausible(mon
         adapter.pending_item_created([("RFG", "GCR300")], timeout_s=0)
 
 
-def test_selected_ordinary_row_binds_despite_noisy_post_click_cat_sel(monkeypatch):
+def test_selected_ordinary_row_rejects_readable_post_click_cat_sel_conflict(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected = _selected_ordinary()
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
         ActivationRowSnapshot("RFG", "GCR301", "Gable cornice return laminated", None),
     ])
 
+    with pytest.raises(AdapterError, match="not one safe ordinary row"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+def test_selected_iws_unique_delta_preserves_authoritative_selector_when_ocr_blank(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected = _selected_ordinary(
+        cat="RFG", sel="IWS", desc="Ice & water barrier",
+    )
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot("RFG", "", "Ice & water barrier", None),
+    ])
+
     assert adapter.pending_item_created([], timeout_s=0) is True
-    assert adapter._pending_quantity_target.after_index == 0
-    assert adapter._pending_quantity_target.allow_initial_quantity_overwrite is True
+    assert adapter._pending_quantity_target.identity == ("rfg", "iws", "ice water barrier")
+
+
+def test_blank_iws_activation_selector_reaches_zero_delta_reconciliation(monkeypatch):
+    row = CommitRowSnapshot("RFG", "IWS", "Ice & water barrier", None, 532.45, "SF")
+    adapter = _adapter_with_fake_commit_grid(
+        monkeypatch, row_sequence=[], commit_row_sequence=[[row]] * 10,
+        unit_reads=[("SF", "SF")], quantity_reads=[532.45],
+    )
+    adapter._last_selected = _selected_ordinary(cat="RFG", sel="IWS", desc="Ice & water barrier")
+    adapter._pending_quantity_target = adapter._ordinary_single_row_target_from_selected_candidate(
+        [], [ActivationRowSnapshot("RFG", "", "Ice & water barrier", None)],
+    )
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda *_args: None)
+
+    result = adapter.verify_commit(
+        [("RFG", "IWS")], "RFG", "IWS", 532.45,
+        source_unit="SF", expected_xactimate_unit="SF", timeout_s=0.1,
+    )
+
+    assert result.trust_state == "VERIFIED"
+    diagnostic = adapter._zero_delta_commit_diagnostic_ledger.entries[-1]
+    assert diagnostic["baseline_alignment_result"] is True
+    assert diagnostic["protected_multiset_reconciliation_result"] is True
+    assert diagnostic["first_rejection_reason"] is None
+
+
+def test_selected_iws_wrong_authoritative_selector_rejects_activation(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected = _selected_ordinary(
+        cat="RFG", sel="IWSHT", desc="Ice & water barrier high temp",
+    )
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot("RFG", "IWS", "Ice & water barrier", None),
+    ])
+
+    with pytest.raises(AdapterError, match="not one safe ordinary row"):
+        adapter.pending_item_created([], timeout_s=0)
+
+
+def test_selected_iws_activation_category_disagreement_rejects(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected = _selected_ordinary(cat="RFG", sel="IWS", desc="Ice & water barrier")
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot("SFG", "IWS", "Ice & water barrier", None),
+    ])
+
+    with pytest.raises(AdapterError, match="not one safe ordinary row"):
+        adapter.pending_item_created([], timeout_s=0)
 
 
 def test_selected_ordinary_row_binds_when_unique_delta_description_is_only_corroborating(monkeypatch):

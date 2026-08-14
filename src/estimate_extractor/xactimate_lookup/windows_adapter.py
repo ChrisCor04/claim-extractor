@@ -5158,8 +5158,26 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if target_index is None:
             return None
 
+        observed_identity = self._activation_identity(after_rows[target_index])
+        selected_identity = (
+            self._normalized_pair_text(selected.category),
+            self._normalized_pair_text(selected.selector),
+            self._normalized_pair_text(selected.description),
+        )
+        # The exact UIA-selected CAT/SEL is causal evidence for this one
+        # uniquely isolated activation delta. OCR may be blank, but a
+        # positively readable contradiction remains a hard rejection.
+        if observed_identity[0] and observed_identity[0] != selected_identity[0]:
+            return None
+        if observed_identity[1] and observed_identity[1] != selected_identity[1]:
+            return None
+        authoritative_identity = (
+            selected_identity[0], selected_identity[1],
+            observed_identity[2] or selected_identity[2],
+        )
+
         return PendingQuantityTarget(
-            identity=self._activation_identity(after_rows[target_index]),
+            identity=authoritative_identity,
             activity=None,
             after_index=target_index,
             activity_ordinal=1,
