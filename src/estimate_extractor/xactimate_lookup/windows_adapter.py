@@ -81,6 +81,7 @@ from estimate_extractor.xactimate_lookup.destructive_audit import (
     ProtectedRowRecord,
 )
 from estimate_extractor.xactimate_lookup.execution_diagnostics import (
+    ActivationReconciliationDiagnosticLedger,
     RRBindingDiagnosticLedger,
     RowLifecycleLedger,
     ZeroDeltaCommitDiagnosticLedger,
@@ -1114,6 +1115,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         )
         self._zero_delta_commit_diagnostic_ledger = ZeroDeltaCommitDiagnosticLedger(
             self.evidence_dir / "zero_delta_commit_diagnostics.jsonl",
+        )
+        self._activation_reconciliation_diagnostic_ledger = ActivationReconciliationDiagnosticLedger(
+            self.evidence_dir / "activation_reconciliation_diagnostics.jsonl",
         )
 
         #: Phase 5.7B: names (normalized lowercase) of groups this
@@ -4322,19 +4326,37 @@ class WindowsXactimateAdapter(XactimateAdapter):
             physical_delta = len(rows) - expected
             if physical_delta == 1:
                 legacy_target = self._pending_quantity_target_from_delta(baseline_rows, rows)
+                legacy_safe = self._is_one_safe_single_row_delta(baseline_rows, rows)
                 if (
                     legacy_target is not None
-                    and self._is_one_safe_single_row_delta(baseline_rows, rows)
+                    and legacy_safe
                     and (self._last_selected is None or legacy_target.activity == "+")
                 ):
+                    self._persist_one_row_activation_diagnostic(
+                        baseline_rows, rows, legacy_target=legacy_target,
+                        authoritative_target=None, final_result="legacy_target_accepted",
+                        first_rejection_reason=None,
+                    )
                     # Preserve the separately-proven one-row R&R form and
                     # compatibility for non-production fakes.
                     self._pending_quantity_target = legacy_target
                     return True
                 target = self._ordinary_single_row_target_from_selected_candidate(baseline_rows, rows)
                 if target is not None and target.allow_initial_quantity_overwrite:
+                    self._persist_one_row_activation_diagnostic(
+                        baseline_rows, rows, legacy_target=legacy_target,
+                        authoritative_target=target, final_result="authoritative_ordinary_accepted",
+                        first_rejection_reason=None,
+                    )
                     self._pending_quantity_target = target
                     return True
+                self._persist_one_row_activation_diagnostic(
+                    baseline_rows, rows, legacy_target=legacy_target,
+                    authoritative_target=target, final_result="rejected",
+                    first_rejection_reason=self._one_row_authoritative_rejection_reason(
+                        baseline_rows, rows,
+                    ),
+                )
                 # Task-local, not project-level: exactly one new row landed
                 # from this task's own activation, but it doesn't match a
                 # recognized single-row/R&R-+ shape -- reconciliation
@@ -4382,6 +4404,137 @@ class WindowsXactimateAdapter(XactimateAdapter):
                     "Candidate selection created zero new physical rows within the activation window."
                 )
             time.sleep(0.25)
+
+    @classmethod
+    def _one_row_plausible_delta_indices(
+        cls, before_rows: list[ActivationRowSnapshot], after_rows: list[ActivationRowSnapshot],
+    ) -> list[int]:
+        return [
+            index for index in range(len(after_rows))
+            if cls._baseline_rows_accounted(
+                before_rows, [row for row_index, row in enumerate(after_rows) if row_index != index],
+            )
+        ]
+
+    def _one_row_authoritative_rejection_reason(
+        self, before_rows: list[ActivationRowSnapshot], after_rows: list[ActivationRowSnapshot],
+    ) -> str:
+        selected = self._last_selected
+        if selected is None or not all((selected.category, selected.selector)):
+            return "selected_identity_missing"
+        target_index = self._unique_clean_ordinary_delta_index(before_rows, after_rows)
+        if target_index is None:
+            return "unique_clean_delta_not_exactly_one"
+        observed = self._activation_identity(after_rows[target_index])
+        if observed[0] and observed[0] != self._normalized_pair_text(selected.category):
+            return "observed_category_conflicts_with_selected"
+        if observed[1] and observed[1] != self._normalized_pair_text(selected.selector):
+            return "observed_selector_conflicts_with_selected"
+        return "authoritative_ordinary_rejected"
+
+    @staticmethod
+    def _activation_diagnostic_target(target: PendingQuantityTarget | None) -> dict | None:
+        if target is None:
+            return None
+        return {
+            "identity": list(target.identity), "activity": target.activity,
+            "after_index": target.after_index, "activity_ordinal": target.activity_ordinal,
+            "physical_row_delta": target.physical_row_delta,
+            "allow_initial_quantity_overwrite": target.allow_initial_quantity_overwrite,
+        }
+
+    def _one_row_legacy_rejection_reason(
+        self, before_rows: list[ActivationRowSnapshot], after_rows: list[ActivationRowSnapshot],
+        target: PendingQuantityTarget | None,
+    ) -> str | None:
+        if target is None or not self._is_one_safe_single_row_delta(before_rows, after_rows):
+            return "legacy_delta_not_safe"
+        if self._last_selected is not None and target.activity != "+":
+            return "legacy_target_not_quantity_bearing_rr_plus"
+        return None
+
+    def _activation_diagnostic_row(self, row: ActivationRowSnapshot) -> dict:
+        identity = self._activation_identity(row)
+        return {
+            "raw": {
+                "category": row.category, "selector": row.selector,
+                "description": row.description, "activity": row.activity,
+            },
+            "normalized": {
+                "category": identity[0], "selector": identity[1],
+                "description": identity[2], "activity": self._activity_token(row),
+            },
+        }
+
+    def _persist_one_row_activation_diagnostic(
+        self, before_rows: list[ActivationRowSnapshot], after_rows: list[ActivationRowSnapshot], *,
+        legacy_target: PendingQuantityTarget | None,
+        authoritative_target: PendingQuantityTarget | None,
+        final_result: str, first_rejection_reason: str | None,
+    ) -> None:
+        """Persist existing binder inputs/results without affecting its decision."""
+        try:
+            selected = self._last_selected
+            selected_raw = {
+                "category": getattr(selected, "category", None),
+                "selector": getattr(selected, "selector", None),
+                "description": getattr(selected, "description", None),
+            }
+            selected_normalized = {
+                key: self._normalized_pair_text(value) for key, value in selected_raw.items()
+            }
+            plausible = self._one_row_plausible_delta_indices(before_rows, after_rows)
+            unique_index = plausible[0] if len(plausible) == 1 else None
+            observed = after_rows[unique_index] if unique_index is not None else None
+            observed_identity = self._activation_identity(observed) if observed is not None else ("", "", "")
+            row_top = None
+            if unique_index is not None and self._last_activation_snapshot_row_1_top is not None:
+                row_top = self._last_activation_snapshot_row_1_top + unique_index * _GRID_ROW_HEIGHT
+            activity_ocr = (
+                self._last_activation_snapshot_activity_ocr.get(row_top, {}) if row_top is not None else {}
+            )
+            ctx = self._execution_context
+            self._activation_reconciliation_diagnostic_ledger.record({
+                "run_id": ctx.run_id, "task_id": ctx.task_id, "source_row": ctx.source_row,
+                "group": ctx.group,
+                "selected_candidate_raw": selected_raw,
+                "selected_candidate_normalized": selected_normalized,
+                "before_rows": [self._activation_diagnostic_row(row) for row in before_rows],
+                "after_rows": [self._activation_diagnostic_row(row) for row in after_rows],
+                "before_row_count": len(before_rows), "after_row_count": len(after_rows),
+                "physical_delta": len(after_rows) - len(before_rows),
+                "unique_clean_delta_index": unique_index,
+                "plausible_delta_indices": plausible,
+                "legacy_result": self._activation_diagnostic_target(legacy_target),
+                "legacy_rejection_reason": self._one_row_legacy_rejection_reason(
+                    before_rows, after_rows, legacy_target,
+                ),
+                "legacy_delta_safe": self._is_one_safe_single_row_delta(before_rows, after_rows),
+                "authoritative_ordinary_result": self._activation_diagnostic_target(authoritative_target),
+                "authoritative_ordinary_rejection_reason": (
+                    None if authoritative_target is not None
+                    else self._one_row_authoritative_rejection_reason(before_rows, after_rows)
+                ),
+                "observed_category_raw": getattr(observed, "category", None),
+                "observed_category_normalized": observed_identity[0],
+                "observed_selector_raw": getattr(observed, "selector", None),
+                "observed_selector_normalized": observed_identity[1],
+                "category_match": bool(observed is not None and (
+                    not observed_identity[0] or observed_identity[0] == selected_normalized["category"]
+                )),
+                "selector_match": bool(observed is not None and (
+                    not observed_identity[1] or observed_identity[1] == selected_normalized["selector"]
+                )),
+                "observed_description_raw": getattr(observed, "description", None),
+                "observed_description_normalized": observed_identity[2],
+                "observed_activity_raw": getattr(observed, "activity", None),
+                "observed_activity_normalized": self._activity_token(observed) if observed is not None else None,
+                "activity_ocr_modes": activity_ocr,
+                "first_rejection_reason": first_rejection_reason,
+                "final_reconciliation_result": final_result,
+            })
+        except Exception:
+            pass
 
     def bind_rr_pair_after_activation(
         self, before_snapshot: list[tuple[str | None, str | None]], timeout_s: float = 8.0,
