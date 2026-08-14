@@ -537,6 +537,15 @@ class CommitVerification:
     elapsed_s: float
     samples: list[dict] = field(default_factory=list)
     evidence_path: str | None = None
+    #: True only when commit returned and post-commit verification proved
+    #: protected-baseline cardinality/multiset, exactly one activation
+    #: delta, retained description/activity, and no duplicates/extras.
+    #: A later corroborating OCR failure may still leave trust_state as
+    #: VERIFICATION_FAILED, but the runner can safely treat the physical
+    #: item as already handled instead of retrying or pausing the project.
+    post_write_structural_proof: bool = False
+    verification_only_uncertainty: bool = False
+    verification_only_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -6918,6 +6927,30 @@ class WindowsXactimateAdapter(XactimateAdapter):
             self._persist_zero_delta_commit_diagnostic(diagnostic)
             return None
 
+        def verification_only_reject(
+            reason: str, *, row_index: int, row: CommitRowSnapshot,
+        ) -> CommitVerification:
+            """Persist rejection while retaining affirmative physical proof."""
+            diagnostic["first_rejection_reason"] = reason
+            diagnostic["final_zero_delta_reconciliation_result"] = "rejected"
+            self._persist_zero_delta_commit_diagnostic(diagnostic)
+            return CommitVerification(
+                trust_state="VERIFICATION_FAILED", reason=reason,
+                row_count_before=row_count_before, row_count_after=len(after_rows), row_index=row_index,
+                preexisting_rows_unchanged=True,
+                category_expected=category, selector_expected=selector,
+                category_observed=row.category, selector_observed=row.selector,
+                category_selector_ocr_agrees=False,
+                description_observed=row.description,
+                quantity_expected=expected_quantity, quantity_observed=row.quantity,
+                quantity_matched=row.quantity is not None and row.quantity == expected_quantity,
+                unit=None, compatibility="not_evaluated", compatibility_reason=reason,
+                attempts=attempts, elapsed_s=time.time() - start, samples=samples,
+                post_write_structural_proof=True,
+                verification_only_uncertainty=True,
+                verification_only_reason=reason,
+            )
+
         target = self._pending_quantity_target
         if target is None or target.physical_row_delta != 1:
             return reject("retained_target_missing_or_not_ordinary_single_row")
@@ -6978,13 +7011,20 @@ class WindowsXactimateAdapter(XactimateAdapter):
             delta_row.category, delta_row.selector,
             delta_row.description, delta_row.activity,
         )
-        identity_matches = self._activation_identity(delta_activation) == target.identity
+        delta_identity = self._activation_identity(delta_activation)
+        identity_matches = delta_identity == target.identity
+        description_matches = delta_identity[2] == target.identity[2]
         snapshot_activity = self._activity_token(delta_activation)
         activity_matches = target.activity is None or snapshot_activity == target.activity
         diagnostic["identity_activity_match_result"] = {
-            "identity_matches": identity_matches, "activity_matches": activity_matches,
+            "identity_matches": identity_matches, "description_matches": description_matches,
+            "activity_matches": activity_matches,
         }
         if not identity_matches:
+            if description_matches and activity_matches:
+                return verification_only_reject(
+                    "unique_delta_identity_mismatch", row_index=row_index, row=delta_row,
+                )
             return reject("unique_delta_identity_mismatch")
         if not activity_matches:
             return reject("unique_delta_activity_mismatch")
@@ -7002,7 +7042,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
             "unit_raw": None, "unit_normalized": None,
         }
         if cat_observed != category or sel_observed != selector:
-            return reject("final_fresh_cat_sel_mismatch")
+            return verification_only_reject(
+                "final_fresh_cat_sel_mismatch", row_index=row_index,
+                row=CommitRowSnapshot(
+                    cat_observed, sel_observed, delta_row.description,
+                    delta_row.activity, delta_row.quantity, delta_row.unit,
+                ),
+            )
 
         activity_observed = self._read_activation_activity_at(image, offset, row_top)
         diagnostic["final_fresh_reread"]["activity"] = activity_observed
@@ -7031,7 +7077,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
             unit_result.observed_xactimate_unit = unit_raw
         compatibility = self._UNIT_STATE_TO_COMPATIBILITY.get(unit_result.unit_match_state, "review_required")
         if compatibility == "hard_stop":
-            return reject("final_fresh_unit_hard_stop")
+            return verification_only_reject(
+                "final_fresh_unit_hard_stop", row_index=row_index,
+                row=CommitRowSnapshot(
+                    cat_observed, sel_observed, description_observed,
+                    activity_observed, quantity_observed, unit_normalized or unit_raw,
+                ),
+            )
 
         samples.append({
             "elapsed_s": round(time.time() - start, 3),

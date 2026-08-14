@@ -2245,7 +2245,7 @@ def test_verify_commit_unchanged_immediate_count_reconciles_unique_activation_de
     assert diagnostic["protected_multiset_reconciliation_result"] is True
     assert diagnostic["duplicate_extra_row_result"] == "none"
     assert diagnostic["identity_activity_match_result"] == {
-        "identity_matches": True, "activity_matches": True,
+        "identity_matches": True, "description_matches": True, "activity_matches": True,
     }
     assert diagnostic["final_fresh_reread"]["category"] == "RFG"
     assert diagnostic["final_zero_delta_reconciliation_result"] == "verified"
@@ -2392,6 +2392,34 @@ def test_verify_commit_unchanged_count_reconciliation_fails_closed(
     diagnostic = adapter._zero_delta_commit_diagnostic_ledger.entries[-1]
     assert diagnostic["first_rejection_reason"] == expected_reason
     assert diagnostic["final_zero_delta_reconciliation_result"] == "rejected"
+
+
+def test_unique_delta_cat_sel_ocr_mismatch_carries_verification_only_proof(monkeypatch):
+    protected = CommitRowSnapshot("SFG", "GUTRS", "Gutter", "+", None, None)
+    noisy_target = CommitRowSnapshot("RFC", "Sale", "Ice & water barrier", "+", None, "SF")
+    adapter = _adapter_with_fake_commit_grid(monkeypatch, row_sequence=[])
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        identity=("rfg", "iws", "ice water barrier"), activity=None,
+        after_index=1, activity_ordinal=1, physical_row_delta=1,
+        activation_baseline_rows=(ActivationRowSnapshot("SFG", "GUTRS", "Gutter", "+"),),
+    )
+
+    result = adapter._verify_via_retained_pending_target(
+        category="RFG", selector="IWS", expected_quantity=532.45,
+        source_unit="SF", expected_xactimate_unit="SF", populated_unit=None,
+        row_count_before=2, attempts=2, start=1000.0, samples=[],
+        baseline_rows=[protected], after_rows=[protected, noisy_target],
+    )
+
+    assert result is not None
+    assert result.trust_state == "VERIFICATION_FAILED"
+    assert result.post_write_structural_proof is True
+    assert result.verification_only_uncertainty is True
+    assert result.verification_only_reason == "unique_delta_identity_mismatch"
+    diagnostic = adapter._zero_delta_commit_diagnostic_ledger.entries[-1]
+    assert diagnostic["protected_multiset_reconciliation_result"] is True
+    assert diagnostic["duplicate_extra_row_result"] == "none"
+    assert diagnostic["first_rejection_reason"] == "unique_delta_identity_mismatch"
 
 
 def test_zero_delta_diagnostic_failure_cannot_flip_success(monkeypatch):

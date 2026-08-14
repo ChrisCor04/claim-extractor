@@ -45,6 +45,7 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
     TASK_FAILED,
     TASK_PENDING,
     TASK_REVIEW_REQUIRED,
+    TASK_COMMIT_STATE_COMMITTED,
     TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED,
     TASK_SKIPPED,
     is_plan_stale,
@@ -81,6 +82,8 @@ class _FakeCommitVerification:
     def __init__(
         self, trust_state, quantity_observed=None, unit_observed=None,
         category_observed=None, selector_observed=None, description_observed=None,
+        post_write_structural_proof=False, verification_only_uncertainty=False,
+        verification_only_reason=None,
     ):
         self.trust_state = trust_state
         self.quantity_observed = quantity_observed
@@ -88,6 +91,10 @@ class _FakeCommitVerification:
         self.category_observed = category_observed
         self.selector_observed = selector_observed
         self.description_observed = description_observed
+        self.reason = verification_only_reason or trust_state
+        self.post_write_structural_proof = post_write_structural_proof
+        self.verification_only_uncertainty = verification_only_uncertainty
+        self.verification_only_reason = verification_only_reason
 
 
 class _FakeUnitResult:
@@ -100,10 +107,15 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
     the existing FakeXactimateAdapter, with fully controllable behavior
     per test."""
 
-    def __init__(self, *args, verified_groups=None, trust_state="VERIFIED", raise_on_group=None, position_warnings=None, **kwargs):
+    def __init__(
+        self, *args, verified_groups=None, trust_state="VERIFIED",
+        verification_only_uncertainty=False, raise_on_group=None,
+        position_warnings=None, **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.verified_groups = verified_groups if verified_groups is not None else None  # None = verify everything
         self.trust_state = trust_state
+        self.verification_only_uncertainty = verification_only_uncertainty
         self.raise_on_group = raise_on_group or set()
         #: Phase 5.7: name -> GROUP_POSITION_WARNING string, simulating
         #: ensure_group() creating a group that lands at an unexpected
@@ -153,6 +165,11 @@ class GroupAwareFakeAdapter(FakeXactimateAdapter):
         return _FakeCommitVerification(
             self.trust_state, quantity_observed=expected_quantity, unit_observed=expected_xactimate_unit,
             category_observed=category, selector_observed=selector, description_observed=self._selected.description if self._selected else None,
+            post_write_structural_proof=self.verification_only_uncertainty,
+            verification_only_uncertainty=self.verification_only_uncertainty,
+            verification_only_reason=(
+                "final_fresh_cat_sel_mismatch" if self.verification_only_uncertainty else None
+            ),
         )
 
 
@@ -1141,6 +1158,80 @@ def test_verification_failed_preserves_physical_checkpoint_and_stops(tmp_path, p
     assert mapped.physical_state_uncertain is True
     assert mapped.state == TASK_REVIEW_REQUIRED
     assert unmapped.state == TASK_PENDING and unmapped.attempts == 0
+    assert result.run_state == RUN_STATE_PAUSED
+    assert result.stop_reason_category == STOP_REASON_PROJECT_LEVEL_HARD_STOP
+
+
+def test_post_write_verification_only_uncertainty_continues_and_cannot_retry(
+    tmp_path, phrase_rules, ranking_config,
+):
+    """A structurally proven physical commit with only advisory OCR
+    disagreement is terminal REVIEW_REQUIRED, not a project hard stop."""
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(
+        dropdown_script=_dropdown_script(*plan.tasks),
+        trust_state="VERIFICATION_FAILED", verification_only_uncertainty=True,
+    )
+    adapter.supports_live_execution = True
+
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    first, second, third = result.tasks
+    assert first.state == TASK_REVIEW_REQUIRED
+    assert first.review_reason == "final_fresh_cat_sel_mismatch"
+    assert first.commit_state == TASK_COMMIT_STATE_COMMITTED
+    assert first.physical_state_uncertain is False
+    assert second.attempts == 1
+    assert third.attempts == 1
+    assert adapter.ensure_group_calls == ["Dwelling Roof", "Fence"]
+    assert adapter.select_group_calls == ["Dwelling Roof", "Fence"]
+    assert result.run_state == RUN_STATE_COMPLETED
+    assert result.stop_reason_category == STOP_REASON_NORMAL_COMPLETION
+
+    attempts_before_resume = [task.attempts for task in result.tasks]
+    resume_adapter = GroupAwareFakeAdapter(dropdown_script={})
+    resume_adapter.supports_live_execution = True
+    resumed = run_execution_plan(
+        result, resume_adapter, ranking_config, phrase_rules, tmp_path, dry_run=False,
+    )
+    assert [task.attempts for task in resumed.tasks] == attempts_before_resume
+    assert not any(
+        call[0] in ("search_by_description", "search_by_category_selector", "select_candidate")
+        for call in resume_adapter.log.calls
+    )
+    assert resume_adapter.ensure_group_calls == []
+
+
+@pytest.mark.parametrize("structural_failure", [
+    "post_commit_row_count_not_protected_baseline_plus_one",
+    "protected_multiset_not_unchanged_plus_one_unique_delta",
+    "duplicate_or_extra_activation_delta",
+])
+def test_structural_post_commit_failure_still_hard_stops(
+    tmp_path, phrase_rules, ranking_config, structural_failure,
+):
+    plan = _plan_two_groups()
+    adapter = GroupAwareFakeAdapter(
+        dropdown_script=_dropdown_script(*plan.tasks), trust_state="VERIFICATION_FAILED",
+    )
+    adapter.supports_live_execution = True
+
+    original_verify = adapter.verify_commit
+
+    def verify_with_structural_failure(*args, **kwargs):
+        verification = original_verify(*args, **kwargs)
+        verification.reason = structural_failure
+        verification.verification_only_reason = structural_failure
+        return verification
+
+    adapter.verify_commit = verify_with_structural_failure
+    result = run_execution_plan(plan, adapter, ranking_config, phrase_rules, tmp_path, dry_run=False)
+
+    first, second, third = result.tasks
+    assert first.commit_state == TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
+    assert first.physical_state_uncertain is True
+    assert second.state == TASK_PENDING and second.attempts == 0
+    assert third.state == TASK_PENDING and third.attempts == 0
     assert result.run_state == RUN_STATE_PAUSED
     assert result.stop_reason_category == STOP_REASON_PROJECT_LEVEL_HARD_STOP
 

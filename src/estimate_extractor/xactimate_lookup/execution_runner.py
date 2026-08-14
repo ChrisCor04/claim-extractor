@@ -380,7 +380,21 @@ def _apply_outcome_to_task(task: ExecutionTask, outcome, dry_run: bool) -> None:
 
     task.trust_state = getattr(verification, "trust_state", None)
     task.commit_state = commit_state_from_trust_state(task.trust_state)
-    if task.trust_state == "VERIFICATION_FAILED" and getattr(outcome, "physical_item_created", False):
+    verification_only_uncertainty = bool(
+        task.trust_state == "VERIFICATION_FAILED"
+        and getattr(outcome, "physical_item_created", False)
+        and getattr(verification, "post_write_structural_proof", False)
+        and getattr(verification, "verification_only_uncertainty", False)
+    )
+    if verification_only_uncertainty:
+        # Commit returned and the adapter affirmatively reconciled the full
+        # protected structural multiset plus exactly one retained activation
+        # delta. A later OCR-only corroboration failure is review evidence,
+        # not an unknown write state. Mark committed so resume cannot execute
+        # it again, keep REVIEW_REQUIRED below, and allow later work to run.
+        task.commit_state = TASK_COMMIT_STATE_COMMITTED
+        task.physical_state_uncertain = False
+    elif task.trust_state == "VERIFICATION_FAILED" and getattr(outcome, "physical_item_created", False):
         task.commit_state = TASK_COMMIT_STATE_PHYSICAL_ITEM_CREATED_UNCONFIRMED
         task.physical_state_uncertain = True
     task.observed_quantity = getattr(verification, "quantity_observed", None)
