@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 ocr = ["pytesseract>=0.3.10", "Pillow>=10.0"]
 ui = ["streamlit>=1.30,<2", "pandas>=2.0,<3"]
+semantic = ["sentence-transformers>=3.0,<6", "numpy>=1.26,<3"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
