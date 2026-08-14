@@ -5321,11 +5321,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
     ) -> PendingQuantityTarget | None:
         """Bind one newly activated ordinary row without reading quantity.
 
-        The selected CAT/SEL comes from exact live UI Automation text. The
-        target row must uniquely match that code plus the existing normalized
-        description rule, must not carry a real R&R activity, and every
-        baseline row must remain structurally accountable after excluding the
-        target. Baseline descriptions are deliberately not re-litigated here:
+        The selected CAT/SEL comes from exact live UI Automation text. Once
+        exactly one post-click row can be causally isolated while every
+        baseline row remains structurally accountable, that selected CAT/SEL
+        is authoritative; repaint-sensitive OCR from the newly created row is
+        corroborating diagnostic evidence and cannot replace or veto it.
+        Baseline descriptions are deliberately not re-litigated here:
         the saved 0006 frames show an unchanged 300S row repainting ``rfg.``
         as ``rig.`` while its CAT/SEL/activity structure stayed fixed.
 
@@ -5347,13 +5348,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
             self._normalized_pair_text(selected.selector),
             self._normalized_pair_text(selected.description),
         )
-        # The exact UIA-selected CAT/SEL is causal evidence for this one
-        # uniquely isolated activation delta. OCR may be blank, but a
-        # positively readable contradiction remains a hard rejection.
-        if observed_identity[0] and observed_identity[0] != selected_identity[0]:
-            return None
-        if observed_identity[1] and observed_identity[1] != selected_identity[1]:
-            return None
+        # The exact UIA-selected CAT/SEL and the unique clean physical delta
+        # are the causal proof. Preserve those authoritative codes rather than
+        # degrading them with a noisy OCR reread of the row they just created.
         authoritative_identity = (
             selected_identity[0], selected_identity[1],
             observed_identity[2] or selected_identity[2],

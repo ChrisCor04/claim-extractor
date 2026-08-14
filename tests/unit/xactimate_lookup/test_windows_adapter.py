@@ -3909,47 +3909,52 @@ def test_selected_ordinary_row_fails_closed_when_multiple_rows_are_plausible(mon
         adapter.pending_item_created([("RFG", "GCR300")], timeout_s=0)
 
 
-def test_selected_ordinary_row_rejects_readable_post_click_cat_sel_conflict(monkeypatch):
+def test_selected_ordinary_row_preserves_authoritative_cat_sel_despite_noisy_ocr(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected = _selected_ordinary()
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
         ActivationRowSnapshot("RFG", "GCR301", "Gable cornice return laminated", None),
     ])
 
-    with pytest.raises(AdapterError, match="not one safe ordinary row"):
-        adapter.pending_item_created([], timeout_s=0)
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.identity == (
+        "rfg", "gcr300", "gable cornice return laminated",
+    )
 
 
-def test_one_row_activation_diagnostic_distinguishes_category_contradiction(monkeypatch):
+def test_one_row_activation_diagnostic_records_category_disagreement_without_veto(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected = _selected_ordinary(cat="SDG", sel="VINYL", desc="Siding - vinyl")
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
-        ActivationRowSnapshot("SOG", "VINYL", "Siding - vinyl", None),
+        ActivationRowSnapshot("sD¢", "VINYL", "Siding - vinyl D", "&"),
     ])
 
-    with pytest.raises(AdapterError, match="not one safe ordinary row"):
-        adapter.pending_item_created([], timeout_s=0)
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.identity == ("sdg", "vinyl", "siding vinyl d")
 
     entry = adapter._activation_reconciliation_diagnostic_ledger.entries[-1]
-    assert entry["first_rejection_reason"] == "observed_category_conflicts_with_selected"
+    assert entry["first_rejection_reason"] is None
+    assert entry["final_reconciliation_result"] == "authoritative_ordinary_accepted"
+    assert entry["observed_category_raw"] == "sD¢"
+    assert entry["observed_category_normalized"] == "sd"
     assert entry["category_match"] is False
     assert entry["selector_match"] is True
     assert entry["physical_delta"] == 1
     assert entry["plausible_delta_indices"] == [0]
 
 
-def test_one_row_activation_diagnostic_distinguishes_selector_contradiction(monkeypatch):
+def test_one_row_activation_diagnostic_records_selector_disagreement_without_veto(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected = _selected_ordinary(cat="SDG", sel="VINYL", desc="Siding - vinyl")
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
         ActivationRowSnapshot("SDG", "VINYLS", "Siding - vinyl", None),
     ])
 
-    with pytest.raises(AdapterError, match="not one safe ordinary row"):
-        adapter.pending_item_created([], timeout_s=0)
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.identity[:2] == ("sdg", "vinyl")
 
     entry = adapter._activation_reconciliation_diagnostic_ledger.entries[-1]
-    assert entry["first_rejection_reason"] == "observed_selector_conflicts_with_selected"
+    assert entry["first_rejection_reason"] is None
     assert entry["category_match"] is True
     assert entry["selector_match"] is False
 
@@ -3970,6 +3975,20 @@ def test_one_row_activation_diagnostic_preserves_blank_identity_success(monkeypa
     assert entry["selector_match"] is True
 
 
+def test_unique_causal_ordinary_activation_preserves_both_noisy_selected_codes(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._last_selected = _selected_ordinary(cat="SDG", sel="VINYL", desc="Siding - vinyl")
+    monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
+        ActivationRowSnapshot("SOG", "V1NYL", "Siding - vinyl", "noise"),
+    ])
+
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.identity == ("sdg", "vinyl", "siding vinyl")
+    entry = adapter._activation_reconciliation_diagnostic_ledger.entries[-1]
+    assert entry["category_match"] is False
+    assert entry["selector_match"] is False
+
+
 @pytest.mark.parametrize("raises", [False, True])
 def test_one_row_diagnostic_persistence_cannot_change_binding(monkeypatch, raises):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
@@ -3988,9 +4007,12 @@ def test_one_row_diagnostic_persistence_cannot_change_binding(monkeypatch, raise
 
 def test_one_row_diagnostic_persistence_cannot_change_rejection(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    baseline = ActivationRowSnapshot("SFG", "GUTA", "Gutter", None)
     adapter._last_selected = _selected_ordinary(cat="SDG", sel="VINYL", desc="Siding - vinyl")
+    adapter._last_activation_baseline_rows = [baseline]
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
-        ActivationRowSnapshot("SDG", "WRONG", "Siding - vinyl", None),
+        baseline,
+        baseline,
     ])
     monkeypatch.setattr(
         adapter._activation_reconciliation_diagnostic_ledger, "record",
@@ -3998,7 +4020,7 @@ def test_one_row_diagnostic_persistence_cannot_change_rejection(monkeypatch):
     )
 
     with pytest.raises(AdapterError, match="not one safe ordinary row"):
-        adapter.pending_item_created([], timeout_s=0)
+        adapter.pending_item_created([("SFG", "GUTA")], timeout_s=0)
 
 
 def test_two_row_rr_activation_does_not_enter_one_row_diagnostics(monkeypatch):
@@ -4048,7 +4070,7 @@ def test_blank_iws_activation_selector_reaches_zero_delta_reconciliation(monkeyp
     assert diagnostic["first_rejection_reason"] is None
 
 
-def test_selected_iws_wrong_authoritative_selector_rejects_activation(monkeypatch):
+def test_selected_iws_authoritative_selector_survives_conflicting_row_ocr(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected = _selected_ordinary(
         cat="RFG", sel="IWSHT", desc="Ice & water barrier high temp",
@@ -4057,19 +4079,19 @@ def test_selected_iws_wrong_authoritative_selector_rejects_activation(monkeypatc
         ActivationRowSnapshot("RFG", "IWS", "Ice & water barrier", None),
     ])
 
-    with pytest.raises(AdapterError, match="not one safe ordinary row"):
-        adapter.pending_item_created([], timeout_s=0)
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.identity[:2] == ("rfg", "iwsht")
 
 
-def test_selected_iws_activation_category_disagreement_rejects(monkeypatch):
+def test_selected_iws_authoritative_category_survives_conflicting_row_ocr(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     adapter._last_selected = _selected_ordinary(cat="RFG", sel="IWS", desc="Ice & water barrier")
     monkeypatch.setattr(adapter, "_snapshot_activation_rows", lambda: [
         ActivationRowSnapshot("SFG", "IWS", "Ice & water barrier", None),
     ])
 
-    with pytest.raises(AdapterError, match="not one safe ordinary row"):
-        adapter.pending_item_created([], timeout_s=0)
+    assert adapter.pending_item_created([], timeout_s=0) is True
+    assert adapter._pending_quantity_target.identity[:2] == ("rfg", "iws")
 
 
 def test_selected_ordinary_row_binds_when_unique_delta_description_is_only_corroborating(monkeypatch):
