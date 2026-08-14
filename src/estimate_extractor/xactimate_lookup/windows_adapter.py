@@ -3141,7 +3141,9 @@ class WindowsXactimateAdapter(XactimateAdapter):
         margin = self._ROW_VISIBILITY_MARGIN_ROWS * _GRID_ROW_HEIGHT
         return row_top >= 0 and row_top + _GRID_ROW_HEIGHT + margin <= image.height
 
-    def _ensure_last_row_visible(self, hwnd: int, image, offset, geom):
+    def _ensure_last_row_visible(
+        self, hwnd: int, image, offset, geom, *, required_row_count: int | None = None,
+    ):
         """Phase 6.3 (live-caught): shared scroll-into-view logic,
         extracted from enter_quantity() (Phase 6.2) so
         _read_populated_fields_once() can use the identical mechanism.
@@ -3165,6 +3167,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
         state. Raises RowOffscreenError if the row never becomes
         visible within the bounded budget."""
         row_count, last_row_top = geom
+        if required_row_count is not None:
+            row_count = max(row_count, required_row_count)
+            last_row_top = (
+                self._shifted_anchor("grid_row_1", offset)[1]
+                + (row_count - 1) * _GRID_ROW_HEIGHT
+            )
         if self._row_is_visible(image, last_row_top):
             return image, offset, geom, False
         for _attempt in range(self._SCROLL_INTO_VIEW_MAX_ATTEMPTS):
@@ -3176,7 +3184,13 @@ class WindowsXactimateAdapter(XactimateAdapter):
             geom2 = self._last_row_geometry(image, offset)
             if geom2 is None:
                 continue
-            if self._row_is_visible(image, geom2[1]):
+            required_last_top = geom2[1]
+            if required_row_count is not None:
+                required_last_top = (
+                    self._shifted_anchor("grid_row_1", offset)[1]
+                    + (max(geom2[0], required_row_count) - 1) * _GRID_ROW_HEIGHT
+                )
+            if self._row_is_visible(image, required_last_top):
                 return image, offset, geom2, True
 
         # Phase 6.3 (live-caught): scrolling alone has a real floor --
@@ -3210,8 +3224,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
                 image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
                 if offset is not None:
                     geom2 = self._last_row_geometry(image, offset)
-                    if geom2 is not None and self._row_is_visible(image, geom2[1]):
-                        return image, offset, geom2, True
+                    if geom2 is not None:
+                        required_last_top = geom2[1]
+                        if required_row_count is not None:
+                            required_last_top = (
+                                self._shifted_anchor("grid_row_1", offset)[1]
+                                + (max(geom2[0], required_row_count) - 1) * _GRID_ROW_HEIGHT
+                            )
+                        if self._row_is_visible(image, required_last_top):
+                            return image, offset, geom2, True
                 self._scroll_grid_body(hwnd, notches=2)
                 time.sleep(0.5)
 
@@ -5944,6 +5965,96 @@ class WindowsXactimateAdapter(XactimateAdapter):
             ))
         return rows
 
+    def _post_commit_rows_at_safe_extent(
+        self, after_rows: list[CommitRowSnapshot], *, expected_row_count: int,
+    ) -> list[CommitRowSnapshot]:
+        """Return a fresh, safely countable post-commit frame.
+
+        The ordinary retained-target path knows the exact physical extent from
+        the protected pre-activation baseline plus its unique one-row activation
+        delta.  If the ordinary snapshot is shorter, its bottom-margin scan may
+        merely be viewport-clipped.  Re-establish that known extent with the
+        same bounded scroll/maximize machinery used by fresh quantity entry,
+        while requiring active Items/grid context and no dialog/dropdown.
+
+        Two fully fitting positions beyond the strict-margin scan are probed so
+        an extra or duplicate row at the viewport edge is returned to the
+        unchanged exact-cardinality/multiset guards rather than hidden by the
+        normalization itself.  A frame that cannot positively expose the full
+        expected extent raises and therefore remains fail-closed.
+        """
+        if len(after_rows) >= expected_row_count:
+            return after_rows
+
+        hwnd = self._ensure_main_window()
+        image, offset = self._capture_and_locate(hwnd, attempts=1, delay_s=0)
+        if (
+            offset is None
+            or not self._items_grid_context_is_verified(
+                image, allow_search_controls_offscreen=True,
+            )
+            or self._find_dropdown_window() is not None
+            or self._unexpected_dialog_present()
+        ):
+            raise RowOffscreenError(
+                "post-commit viewport normalization could not positively prove the active Items grid "
+                "without a dialog/dropdown"
+            )
+
+        geom = self._last_row_geometry(image, offset)
+        if geom is None:
+            geom = (0, self._shifted_anchor("grid_row_1", offset)[1])
+        image, offset, _geom, _scrolled = self._ensure_last_row_visible(
+            hwnd, image, offset, geom, required_row_count=expected_row_count,
+        )
+        if (
+            not self._items_grid_context_is_verified(
+                image, allow_search_controls_offscreen=True,
+            )
+            or self._find_dropdown_window() is not None
+            or self._unexpected_dialog_present()
+        ):
+            raise RowOffscreenError(
+                "post-commit viewport normalization lost the active Items grid or found a dialog/dropdown"
+            )
+
+        rows = self._commit_rows_from_same_image(image, offset)
+        row_1_top = self._shifted_anchor("grid_row_1", offset)[1]
+        for _probe in range(2):
+            row_top = row_1_top + len(rows) * _GRID_ROW_HEIGHT
+            if row_top < 0 or row_top + _GRID_ROW_HEIGHT > image.height:
+                break
+            activation = self._read_activation_row_at(image, offset, row_top)
+            raw_unit, unit = self._read_unit_at(image, offset, row_top)
+            quantity = self._read_quantity_at(image, offset, row_top)
+            has_content = (
+                self._is_meaningful_ocr_text(
+                    activation.category, self._MEANINGFUL_TEXT_MIN_LEN["category"],
+                )
+                and self._is_meaningful_ocr_text(
+                    activation.selector, self._MEANINGFUL_TEXT_MIN_LEN["selector"],
+                )
+            ) or self._is_meaningful_ocr_text(
+                activation.description, self._MEANINGFUL_TEXT_MIN_LEN["description"],
+            ) or (
+                quantity is not None
+                and self._is_meaningful_ocr_text(raw_unit, self._MEANINGFUL_TEXT_MIN_LEN["unit"])
+            )
+            if not has_content:
+                break
+            rows.append(CommitRowSnapshot(
+                category=activation.category, selector=activation.selector,
+                description=activation.description, activity=activation.activity,
+                quantity=quantity, unit=unit,
+            ))
+
+        expected_last_top = row_1_top + (expected_row_count - 1) * _GRID_ROW_HEIGHT
+        if len(rows) < expected_row_count or not self._row_is_visible(image, expected_last_top):
+            raise RowOffscreenError(
+                "post-commit viewport normalization did not establish the full protected-baseline-plus-one extent"
+            )
+        return rows
+
     @classmethod
     def _commit_row_multiset_key(cls, row: CommitRowSnapshot):
         """Return a strict protected-row key, or None when unreadable."""
@@ -6808,6 +6919,15 @@ class WindowsXactimateAdapter(XactimateAdapter):
         if target.identity[:2] != expected_code:
             diagnostic["identity_activity_match_result"] = False
             return reject("retained_target_cat_sel_mismatch")
+
+        try:
+            after_rows = self._post_commit_rows_at_safe_extent(
+                after_rows, expected_row_count=len(baseline_rows) + 1,
+            )
+        except (AdapterError, RowOffscreenError):
+            return reject("post_commit_viewport_not_safely_countable")
+        diagnostic["row_count_after"] = len(after_rows)
+        diagnostic["fresh_post_commit_rows"] = self._safe_zero_delta_rows_diagnostic(after_rows)
 
         rich_activation_baseline = [
             ActivationRowSnapshot(row.category, row.selector, row.description, row.activity)

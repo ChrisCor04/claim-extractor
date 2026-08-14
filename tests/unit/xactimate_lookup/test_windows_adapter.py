@@ -1585,6 +1585,13 @@ def _adapter_with_fake_commit_grid(
         return [CommitRowSnapshot(cat, sel, "desc", None, 0.0, "EA") for cat, sel in state["grid"]]
 
     monkeypatch.setattr(adapter, "_snapshot_commit_rows", snapshot_commit_rows)
+    # The live viewport canonicalizer is covered independently below. Keep
+    # this pure commit-grid harness UI-free unless a test explicitly replaces
+    # the hook with a clipped-to-canonical frame transition.
+    monkeypatch.setattr(
+        adapter, "_post_commit_rows_at_safe_extent",
+        lambda rows, *, expected_row_count: list(rows),
+    )
 
     def last_row_geometry(image, offset):
         state["grid"] = next(grids, state["grid"])
@@ -2183,6 +2190,92 @@ def test_verify_commit_unchanged_immediate_count_reconciles_unique_activation_de
     assert diagnostic["final_fresh_reread"]["category"] == "RFG"
     assert diagnostic["final_zero_delta_reconciliation_result"] == "verified"
     assert diagnostic["first_rejection_reason"] is None
+
+
+def test_post_commit_clipped_snapshot_is_canonicalized_before_zero_delta_reconciliation(monkeypatch):
+    protected = [
+        CommitRowSnapshot("SFG", f"P{i}", f"protected {i}", None, float(i), "EA")
+        for i in range(13)
+    ]
+    target_row = CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF")
+    # Raw top-of-Items frame contains IWS but clips one trailing protected row.
+    clipped = protected[:-1] + [target_row]
+    canonical = protected + [target_row]
+    adapter = _adapter_with_fake_commit_grid(monkeypatch, row_sequence=[])
+    adapter._pending_quantity_target = PendingQuantityTarget(
+        identity=("rfg", "iws", "ice barrier"), activity=None,
+        after_index=13, activity_ordinal=1, physical_row_delta=1,
+        activation_baseline_rows=tuple(
+            ActivationRowSnapshot(row.category, row.selector, row.description, row.activity)
+            for row in protected
+        ),
+    )
+    normalization = []
+    monkeypatch.setattr(
+        adapter, "_post_commit_rows_at_safe_extent",
+        lambda rows, *, expected_row_count: (
+            normalization.append((len(rows), expected_row_count)) or list(canonical)
+        ),
+    )
+    monkeypatch.setattr(adapter, "_read_category_selector_for_verify_commit", lambda *_args: ("RFG", "IWS"))
+    monkeypatch.setattr(adapter, "_read_activation_activity_at", lambda *_args: None)
+    monkeypatch.setattr(adapter, "_read_description_at", lambda *_args: "ice barrier")
+    monkeypatch.setattr(adapter, "_read_quantity_at", lambda *_args: 532.45)
+    monkeypatch.setattr(adapter, "_read_unit_at", lambda *_args: ("SF", "SF"))
+
+    result = adapter._verify_via_retained_pending_target(
+        category="RFG", selector="IWS", expected_quantity=532.45,
+        source_unit="SF", expected_xactimate_unit="SF", populated_unit=None,
+        row_count_before=14, attempts=2, start=1000.0, samples=[],
+        baseline_rows=protected, after_rows=clipped,
+    )
+
+    assert normalization == [(13, 14)]
+    assert result is not None and result.trust_state == "VERIFIED"
+    assert result.row_count_after == 14
+
+
+def test_post_commit_safe_extent_reuses_bounded_viewport_canonicalization(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = type("Image", (), {"height": 1200})()
+    protected = CommitRowSnapshot("SFG", "P", "protected", None, 1.0, "EA")
+    target = CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF")
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+    monkeypatch.setattr(adapter, "_capture_and_locate", lambda *_args, **_kwargs: (image, (0, 0)))
+    monkeypatch.setattr(adapter, "_items_grid_context_is_verified", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(adapter, "_find_dropdown_window", lambda: None)
+    monkeypatch.setattr(adapter, "_unexpected_dialog_present", lambda: False)
+    monkeypatch.setattr(adapter, "_last_row_geometry", lambda *_args: (1, 100))
+    calls = []
+    monkeypatch.setattr(
+        adapter, "_ensure_last_row_visible",
+        lambda hwnd, img, offset, geom, *, required_row_count=None: (
+            calls.append(required_row_count) or (img, offset, (required_row_count, 200), True)
+        ),
+    )
+    monkeypatch.setattr(adapter, "_commit_rows_from_same_image", lambda *_args: [protected, target])
+    monkeypatch.setattr(adapter, "_shifted_anchor", lambda *_args: (0, 100, 0, 0))
+    monkeypatch.setattr(
+        adapter, "_read_activation_row_at",
+        lambda *_args: ActivationRowSnapshot(None, None, None, None),
+    )
+    monkeypatch.setattr(adapter, "_read_unit_at", lambda *_args: (None, None))
+    monkeypatch.setattr(adapter, "_read_quantity_at", lambda *_args: None)
+
+    rows = adapter._post_commit_rows_at_safe_extent([target], expected_row_count=2)
+
+    assert rows == [protected, target]
+    assert calls == [2]
+
+
+def test_post_commit_already_safe_small_grid_does_not_scroll(monkeypatch):
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    row = CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF")
+    monkeypatch.setattr(
+        adapter, "_ensure_last_row_visible",
+        lambda *_args, **_kwargs: pytest.fail("safe extent must not scroll"),
+    )
+    assert adapter._post_commit_rows_at_safe_extent([row], expected_row_count=1) == [row]
 
 
 @pytest.mark.parametrize(("bad_after", "expected_reason"), [
