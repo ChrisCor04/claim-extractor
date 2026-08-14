@@ -2010,7 +2010,7 @@ def test_verify_commit_accepts_ordinary_baseline_reordering(monkeypatch):
     assert result.row_index == 0
 
 
-def test_verify_commit_rejects_changed_baseline_quantity(monkeypatch):
+def test_verify_commit_treats_changed_baseline_quantity_as_advisory(monkeypatch):
     old = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 200.0, "LF")
     changed = CommitRowSnapshot("SFG", "GUTA", "Aluminum gutter", None, 199.0, "LF")
     new = CommitRowSnapshot("SFG", "GSG", "Gutter splash guard", None, 1.0, "EA")
@@ -2020,7 +2020,67 @@ def test_verify_commit_rejects_changed_baseline_quantity(monkeypatch):
 
     result = adapter.verify_commit([("SFG", "GUTA")], "SFG", "GSG", 1.0)
 
-    assert result.trust_state == "CONFLICTING_ROW"
+    assert result.trust_state != "CONFLICTING_ROW"
+    assert result.preexisting_rows_unchanged is True
+
+
+@pytest.mark.parametrize(("before_quantity", "before_unit", "after_quantity", "after_unit"), [
+    (None, None, None, None),
+    (200.0, "LF", None, None),
+    (None, None, 999.0, "garbage"),
+    (200.0, "LF", 1.07, "o7 oF"),
+])
+def test_protected_multiset_ignores_advisory_quantity_unit_ocr(
+    before_quantity, before_unit, after_quantity, after_unit,
+):
+    before = [CommitRowSnapshot(
+        "SFG", "GUTRS", "Gutter / downspout - Detach & reset", "+",
+        before_quantity, before_unit,
+    )]
+    after = [
+        CommitRowSnapshot(
+            "SFG", "GUTRS", "Gutter / downspout - Detach & reset", "+",
+            after_quantity, after_unit,
+        ),
+        CommitRowSnapshot("RFG", "IWS", "Ice & water barrier", None, 532.45, "SF"),
+    ]
+
+    unchanged, new_indices = WindowsXactimateAdapter._order_independent_commit_delta(before, after)
+
+    assert unchanged is True
+    assert new_indices == [1]
+
+
+@pytest.mark.parametrize("changed", [
+    CommitRowSnapshot("RFG", "GUTRS", "Gutter / downspout - Detach & reset", "+", None, None),
+    CommitRowSnapshot("SFG", "GUTA", "Gutter / downspout - Detach & reset", "+", None, None),
+    CommitRowSnapshot("SFG", "GUTRS", "Different description", "+", None, None),
+    CommitRowSnapshot("SFG", "GUTRS", "Gutter / downspout - Detach & reset", "-", None, None),
+])
+def test_protected_multiset_rejects_structural_identity_change(changed):
+    protected = CommitRowSnapshot(
+        "SFG", "GUTRS", "Gutter / downspout - Detach & reset", "+", None, None,
+    )
+    target = CommitRowSnapshot("RFG", "IWS", "Ice & water barrier", None, 532.45, "SF")
+
+    unchanged, new_indices = WindowsXactimateAdapter._order_independent_commit_delta(
+        [protected], [changed, target],
+    )
+
+    assert unchanged is False
+    assert len(new_indices) == 2
+
+
+def test_protected_multiset_duplicate_delta_remains_nonunique():
+    protected = CommitRowSnapshot("SFG", "GUTRS", "Gutter", None, None, None)
+    target = CommitRowSnapshot("RFG", "IWS", "Ice & water barrier", None, None, None)
+
+    unchanged, new_indices = WindowsXactimateAdapter._order_independent_commit_delta(
+        [protected], [protected, target, target],
+    )
+
+    assert unchanged is True
+    assert new_indices == [1, 2]
 
 
 def test_verify_commit_rejects_missing_baseline_row(monkeypatch):
@@ -2294,9 +2354,9 @@ def test_post_commit_already_safe_small_grid_does_not_scroll(monkeypatch):
         CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
         CommitRowSnapshot("RFG", "DRIP", "drip edge", None, 325.53, "LF"),
     ], "post_commit_row_count_not_protected_baseline_plus_one"),
-    # Protected row changed.
+    # Protected structural identity changed.
     ([
-        CommitRowSnapshot("SFG", "GUTA", "old", None, 199.0, "LF"),
+        CommitRowSnapshot("SFG", "GUTA", "different protected row", None, 199.0, "LF"),
         CommitRowSnapshot("RFG", "IWS", "ice barrier", None, 532.45, "SF"),
     ], "protected_multiset_not_unchanged_plus_one_unique_delta"),
     # Target identity has the wrong description.

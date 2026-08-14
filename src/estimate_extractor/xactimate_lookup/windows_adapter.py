@@ -5935,7 +5935,7 @@ class WindowsXactimateAdapter(XactimateAdapter):
         ]
 
     def _snapshot_commit_rows(self, row_top_nudge: int = 0) -> list[CommitRowSnapshot]:
-        """Capture identity plus protected quantity/unit for each row."""
+        """Capture structural identity plus advisory quantity/unit for each row."""
         hwnd = self._ensure_main_window()
         image, offset = self._capture_and_locate(hwnd)
         if offset is None:
@@ -6057,16 +6057,23 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
     @classmethod
     def _commit_row_multiset_key(cls, row: CommitRowSnapshot):
-        """Return a strict protected-row key, or None when unreadable."""
-        identity = cls._activation_identity(ActivationRowSnapshot(
+        """Return the authoritative structural protected-row key.
+
+        Quantity and unit remain on ``CommitRowSnapshot`` for diagnostics and
+        final committed-row review, but OCR of those cells is not causal
+        identity evidence.  Protected reconciliation therefore keys exact
+        normalized CAT/SEL/description plus the only authoritative activity
+        tokens (``-``/``+``).  Unreadable structural identity still fails
+        closed, and the consuming multiset retains exact multiplicity.
+        """
+        activation = ActivationRowSnapshot(
             row.category, row.selector, row.description, row.activity,
-        ))
-        if not all(identity) or row.quantity is None or not row.unit:
+        )
+        identity = cls._activation_identity(activation)
+        if not all(identity):
             return None
-        activity = cls._activity_token(ActivationRowSnapshot(
-            row.category, row.selector, row.description, row.activity,
-        ))
-        return (*identity, activity if activity in ("-", "+") else None, round(float(row.quantity), 4), row.unit)
+        activity = cls._activity_token(activation)
+        return (*identity, activity if activity in ("-", "+") else None)
 
     @classmethod
     def _order_independent_commit_delta(
@@ -6396,10 +6403,12 @@ class WindowsXactimateAdapter(XactimateAdapter):
 
         1. Poll (bounded by `timeout_s`) until the grid's row count
            differs from `len(before_snapshot)`.
-        2. Consume the rich pre-selection baseline (logical identity,
-           activity, quantity, and unit) from the post-commit rows as
-           an order-independent multiset. Every protected baseline row
-           must still exist with the same protected values.
+        2. Consume the rich pre-selection baseline (CAT, SEL,
+           description, and activity) from the post-commit rows as an
+           order-independent multiset. Every protected baseline row
+           must still exist with the same structural identity and exact
+           multiplicity. Quantity/unit OCR remains advisory evidence,
+           not protected-row identity.
         3. The unconsumed delta must be exactly one expected ordinary
            row, or one corroborated R&R -/+ pair. Its live row index is
            taken from that delta, never presumed to be last.
