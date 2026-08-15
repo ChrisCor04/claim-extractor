@@ -327,6 +327,28 @@ def confident_known_group_measurement(
             "confidence_state": state, "rejection_reason": rejection, "inventory": inventory}
 
 
+def _settled_group_column_inventory(adapter, hwnd, *, timeout_s: float = 5.0, poll_interval_s: float = 0.05) -> dict[str, Any]:
+    """_group_column_inventory(), retried across a bounded settle window.
+
+    Live-caught: immediately after a group-tree mutation (a just-created
+    row still settling into its selected/highlighted render), a single
+    header-locate attempt can transiently fail even though the identical
+    frame succeeds moments later -- the same class of repaint delay this
+    function's own row-confirmation polling below already accounts for.
+    Never unbounded; still fails closed by re-raising the underlying
+    locator error once the deadline passes without ever seeing a stable
+    frame -- this never loosens what counts as a valid header/boundary.
+    """
+    deadline = time.perf_counter() + timeout_s
+    while True:
+        try:
+            return _group_column_inventory(adapter, adapter._capture_client_image(hwnd))
+        except RuntimeError:
+            if time.perf_counter() >= deadline:
+                raise
+            time.sleep(poll_interval_s)
+
+
 def _create_one_calibration_group(adapter, profile: XactimateCalibration, name: str) -> dict[str, Any]:
     """Use the fast New Group primitives, always from the live root row."""
     # The group tree has its own independent scroll position that a busy
@@ -335,7 +357,8 @@ def _create_one_calibration_group(adapter, profile: XactimateCalibration, name: 
     # here for the same reason it is called at every other group-tree
     # entry point in windows_adapter.py: never assumed unnecessary.
     adapter._scroll_group_tree_to_top(adapter._ensure_main_window())
-    inventory = _group_column_inventory(adapter, adapter._capture_client_image(adapter._ensure_main_window()))
+    hwnd = adapter._ensure_main_window()
+    inventory = _settled_group_column_inventory(adapter, hwnd)
     root_rows = [row for row in inventory["rows"] if profile.window_title.casefold() in row["raw_text"].casefold()]
     if len(root_rows) != 1:
         raise RuntimeError("calibration could not uniquely locate the project root row")
@@ -343,7 +366,6 @@ def _create_one_calibration_group(adapter, profile: XactimateCalibration, name: 
     root_top_offset = round(root_rows[0]["top"] - header[1])
     adapter._GROUP_TREE_ROW_TEXT_TOP_DY = root_top_offset
     adapter._GROUP_TREE_CLICK_DY_OFFSET = max(2, round(root_rows[0]["center_y"] - root_rows[0]["top"]))
-    hwnd = adapter._ensure_main_window()
     items = adapter._open_group_tree_context_menu(hwnd, header, 0)
     adapter._click_group_menu_item(items, int(profile.geometry["group_context_menu_new_index"]))
     deadline = time.perf_counter() + 5
@@ -364,8 +386,8 @@ def _create_one_calibration_group(adapter, profile: XactimateCalibration, name: 
         raise RuntimeError("New Group dialog did not close")
     deadline = time.perf_counter() + 5
     while time.perf_counter() < deadline:
-        current = _group_column_inventory(adapter, adapter._capture_client_image(hwnd))
         try:
+            current = _group_column_inventory(adapter, adapter._capture_client_image(hwnd))
             _exact_calibration_row_map(current, (name,))
             return {"name": name, "state": "created_and_exactly_observed"}
         except RuntimeError:

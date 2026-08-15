@@ -946,6 +946,75 @@ def test_bootstrap_creation_reacquires_tree_between_rows_without_calibrated_pitc
     assert completed.validation_state == "ready_for_fast_execution"
 
 
+class _CaptureOnlyAdapter:
+    def _capture_client_image(self, hwnd): return ("image", hwnd)
+
+
+def test_settled_group_column_inventory_retries_transient_header_failure(monkeypatch):
+    # Proven live mechanism: immediately after a group-tree mutation, a
+    # single header-locate attempt can transiently fail even though the
+    # identical frame succeeds moments later. A bounded retry must recover
+    # without ever loosening what counts as valid header/boundary evidence.
+    calls = []
+    def flaky(_adapter, _image):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("Subtotal header fallback found 0 bounded candidate(s)")
+        return {"rows": ["settled"]}
+    monkeypatch.setattr(calibration, "_group_column_inventory", flaky)
+    result = calibration._settled_group_column_inventory(_CaptureOnlyAdapter(), 1, timeout_s=1.0, poll_interval_s=0.01)
+    assert result == {"rows": ["settled"]}
+    assert len(calls) == 2
+
+
+def test_settled_group_column_inventory_fails_closed_after_deadline(monkeypatch):
+    # A DURABLE failure (the header genuinely never resolves) must still
+    # raise -- the retry only covers transient repaint delay, it must
+    # never mask a real, persistent locator failure or hang indefinitely.
+    def always_fails(_adapter, _image):
+        raise RuntimeError("Subtotal header fallback found 0 bounded candidate(s)")
+    monkeypatch.setattr(calibration, "_group_column_inventory", always_fails)
+    with pytest.raises(RuntimeError, match="0 bounded candidate"):
+        calibration._settled_group_column_inventory(_CaptureOnlyAdapter(), 1, timeout_s=0.05, poll_interval_s=0.01)
+
+
+def test_transient_post_alpha_header_failure_does_not_abort_bravo_creation(monkeypatch, tmp_path):
+    # Reproduces the exact proven live sequence: ALPHA creation succeeds
+    # on a settled frame; BRAVO's own root-lookup (the first
+    # _group_column_inventory call reading the post-ALPHA-mutation frame)
+    # transiently fails once, then a moment later succeeds. Calibration
+    # must complete all three rows, not abort with CAL_ROW_ALPHA left
+    # stranded the way the live app-driven attempt did before this fix.
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["new_group_dialog_name_click"] = [185, 18]
+    candidate.geometry["new_group_dialog_attach_click"] = [305, 75]
+    candidate.geometry["group_row_height"] = None
+
+    adapter = _BootstrapCreationAdapter(root_center=100.0, pitch=20.0)
+    call_index = {"n": 0}
+    def fake_inventory(adapter_arg, _image):
+        call_index["n"] += 1
+        # The 4th call overall is BRAVO's first root-lookup attempt
+        # (after: complete_interactive's initial check, ALPHA's
+        # root-lookup, ALPHA's confirmation poll) -- fail it exactly
+        # once, simulating the live transient post-mutation frame.
+        if call_index["n"] == 4:
+            raise RuntimeError("Subtotal header fallback found 0 bounded candidate(s)")
+        rows = [("TEST", adapter_arg.root_center)]
+        for i, name in enumerate(adapter_arg.created_names, start=1):
+            rows.append((name, adapter_arg.root_center + i * adapter_arg.pitch))
+        return _inventory(*rows)
+    monkeypatch.setattr(calibration, "_group_column_inventory", fake_inventory)
+
+    completed, measurement = complete_interactive_group_row_calibration(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path / "evidence",
+    )
+    assert adapter.created_names == list(CALIBRATION_GROUP_NAMES)
+    assert measurement["chosen_pitch"] == 20.0
+    assert completed.validation_state == "ready_for_fast_execution"
+    assert call_index["n"] == 9  # the 8 calls the settled sequence needs, plus exactly one retry
+
+
 def test_ambiguous_project_root_prevents_any_mutation(monkeypatch, tmp_path):
     candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
     candidate.geometry["new_group_dialog_name_click"] = [185, 18]
