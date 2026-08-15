@@ -311,6 +311,129 @@ def test_bounded_subtotal_prefix_recovers_visible_misread_header():
     assert method == "bounded_header_prefix_ocr"
 
 
+class _HeaderFrameImage:
+    width, height = 1920, 1023
+    def crop(self, _rect): return self
+
+
+class _HeaderFrameAdapter:
+    """Replays the exact OCR shapes captured from a real, persisted, failed
+    live calibration frame (audit_frame.png / diag2_frame_after_scroll.png):
+    a live Xactimate Grouping panel where the Group column renders wide
+    enough that "Subtotal" is truncated down to an unreadable "Sul"
+    fragment. Both persisted frames produced byte-identical OCR boxes.
+    _locate_group_column_headers()'s bounded fallback always OCRs with
+    config="--psm 6"; _group_column_inventory()'s row read never passes a
+    config -- used here to serve each its own real, correctly-relative
+    captured data, exactly as the two real (differently cropped) OCR
+    passes would."""
+
+    def __init__(self, header_boxes, row_boxes=None):
+        self._header_boxes = header_boxes
+        self._row_boxes = row_boxes if row_boxes is not None else header_boxes
+    def _locate_group_tree_header(self, _image): return (270, 155, 302, 165)
+    def _locate_label(self, _image, _text, prefer=None): return None  # exact "Subtotal" is not legible live
+    def _ocr_data(self, _crop, config=None):
+        return self._header_boxes if config == "--psm 6" else self._row_boxes
+
+
+#: (text, top, left, width, height, conf) tuples, crop-relative to the
+#: (250,145)-(570,190) fallback crop -- the real OCR read from the
+#: persisted failure frames. "sul" is the truncated "Subtotal" remnant;
+#: "ome"/"sr" are unrelated right-pane breadcrumb bleed-through one row
+#: above the header (a different y-band).
+_REAL_TRUNCATED_SUBTOTAL_HEADER_BOXES = _ocr(
+    ("ome", 0, 262, 31, 9, 26), ("sr", 0, 301, 19, 9, 39),
+    ("Group", 10, 20, 32, 10, 87), ("sul", 10, 232, 14, 8, 94),
+)
+
+#: The same real frame's row-region OCR (relative to the Group-column
+#: region (270,155)-(482,1023) that the new boundary establishes): the
+#: single real root row, "Test".
+_REAL_ROOT_ONLY_ROW_BOXES = _ocr(("Test", 23, 45, 11, 8, 73))
+
+
+def test_truncated_subtotal_header_from_real_failed_frame_now_succeeds():
+    # 2: the exact captured failure shape ("Subtotal header fallback
+    # found 0 bounded candidate(s)") must now resolve, using the
+    # truncated fragment's position only -- not its (illegible) text.
+    adapter = _HeaderFrameAdapter(_REAL_TRUNCATED_SUBTOTAL_HEADER_BOXES)
+    group, boundary, method = calibration._locate_group_column_headers(adapter, _HeaderFrameImage())
+    assert group == (270, 155, 302, 165)
+    assert boundary == (482, 155, 496, 163)  # the real "sul" fragment's own position
+    assert method == "bounded_header_row_boundary"
+
+
+def test_truncated_subtotal_boundary_keeps_rows_cropped_to_group_column():
+    # 6 & 7: end to end through _group_column_inventory -- rows stay
+    # bounded to the Group column (never absorb Subtotal-column content),
+    # and a root-only live tree still correctly yields just "TEST".
+    adapter = _HeaderFrameAdapter(_REAL_TRUNCATED_SUBTOTAL_HEADER_BOXES, _REAL_ROOT_ONLY_ROW_BOXES)
+    inventory = calibration._group_column_inventory(adapter, _HeaderFrameImage())
+    assert inventory["boundary_method"] == "bounded_header_row_boundary"
+    assert inventory["source_region"][2] == 482  # right-bounded to the sul fragment's own left edge
+    assert [row["raw_text"] for row in inventory["rows"]] == ["Test"]
+
+
+def test_no_legible_subtotal_and_no_other_header_row_content_fails_closed():
+    # 3: with genuinely nothing else in the header row to anchor a
+    # boundary to (only out-of-band noise), calibration must still refuse
+    # rather than guess -- exactly the original "0 bounded candidate(s)"
+    # fail-closed behavior, now proven to still exist above the new tier.
+    class Adapter:
+        def _locate_group_tree_header(self, _image): return (270, 155, 302, 165)
+        def _locate_label(self, _image, _text, prefer=None): return None
+        def _ocr_data(self, _crop, config=None):
+            return _ocr(("Group", 10, 20, 32, 10))  # nothing at all to the right
+    with pytest.raises(RuntimeError, match="0 bounded candidate"):
+        calibration._locate_group_column_headers(Adapter(), _HeaderFrameImage())
+
+
+def test_wrong_row_band_noise_never_becomes_a_false_boundary():
+    # 4: unrelated text that sits to the right of Group but in a
+    # DIFFERENT header row/y-band (like the real "ome"/"sr" breadcrumb
+    # bleed-through, one row above the actual header) must never be
+    # mistaken for the column boundary.
+    class Adapter:
+        def _locate_group_tree_header(self, _image): return (270, 155, 302, 165)
+        def _locate_label(self, _image, _text, prefer=None): return None
+        def _ocr_data(self, _crop, config=None):
+            return _ocr(("Group", 10, 20, 32, 10), ("ome", 0, 262, 31, 9), ("sr", 0, 301, 19, 9))
+    with pytest.raises(RuntimeError, match="0 bounded candidate"):
+        calibration._locate_group_column_headers(Adapter(), _HeaderFrameImage())
+
+
+def test_multiple_ambiguous_subtotal_prefix_matches_fail_closed():
+    # 5: two independently legible "subtot..." candidates -- genuinely
+    # ambiguous, must refuse rather than pick either one.
+    class Image:
+        width, height = 900, 700
+        def crop(self, _rect): return self
+    class Adapter:
+        def _locate_group_tree_header(self, _image): return (270, 111, 301, 121)
+        def _locate_label(self, _image, _text, prefer=None): return None
+        def _ocr_data(self, _crop, config=None):
+            return _ocr(("Group", 10, 20, 32, 10), ("subtot!", 10, 212, 34, 8), ("subtotal", 10, 260, 40, 8))
+    with pytest.raises(RuntimeError, match="2 bounded candidate"):
+        calibration._locate_group_column_headers(Adapter(), Image())
+
+
+def test_exact_subtotal_label_still_preferred_when_legible():
+    # 1: the normal, fully-legible "Group / Subtotal / # Items" header
+    # (unaffected by any of the above) still resolves via the strongest
+    # tier, unchanged.
+    class Adapter:
+        def _locate_group_tree_header(self, _image): return (270, 155, 301, 165)
+        def _locate_label(self, _image, text, prefer=None):
+            return (394, 155, 437, 163) if text == "Subtotal" else None
+        def _ocr_data(self, _crop, config=None):
+            raise AssertionError("must not fall back when the exact label is found")
+    group, subtotal, method = calibration._locate_group_column_headers(Adapter(), _HeaderFrameImage())
+    assert group == (270, 155, 301, 165)
+    assert subtotal == (394, 155, 437, 163)
+    assert method == "exact_label"
+
+
 def test_read_only_existing_rows_recovery_makes_profile_executable_without_creation(monkeypatch, tmp_path):
     candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
     candidate.geometry["group_row_height"] = None

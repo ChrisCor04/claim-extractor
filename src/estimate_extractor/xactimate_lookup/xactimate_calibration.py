@@ -184,35 +184,72 @@ def measure_group_row_pitch(
     }
 
 
+#: How far (within the fallback crop) a candidate boundary box's vertical
+#: center may differ from Group's own vertical center and still count as
+#: the SAME header row -- separates a genuine next-column header fragment
+#: (however garbled) from unrelated text at a different y-band inside the
+#: same bounded crop (e.g. a breadcrumb bleeding in from the right pane).
+_HEADER_ROW_BAND_TOLERANCE_PX = 6.0
+
+
 def _locate_group_column_headers(adapter, image) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int], str]:
-    """Locate Group and Subtotal, tolerating only bounded Subtotal glyph noise."""
+    """Locate Group and the Group-name column's right boundary.
+
+    The boundary only needs the left edge of whatever renders next in the
+    same header row -- it does not require OCR to correctly transcribe the
+    literal word "Subtotal". Live-caught: the Group column can render
+    noticeably wider than its content needs (observed to persist across
+    project states, not just while a long name is present), pushing
+    "Subtotal" hard against the panel's own right edge so only 2-3 glyphs
+    of it ever render (e.g. "Sul"). A literal-word match then finds
+    nothing even though the column boundary is still perfectly well
+    defined by that same truncated fragment's position.
+    """
     group = adapter._locate_group_tree_header(image)
     if group is None:
         raise RuntimeError("Group header is unavailable")
     subtotal = adapter._locate_label(image, "Subtotal", prefer="topmost")
     if subtotal is not None and subtotal[0] > group[2]:
         return tuple(group), tuple(subtotal), "exact_label"
-    # Live-caught: the visible header rendered as `subtot!`. Restrict the
-    # fallback to the same 35px header band and require a normalized prefix;
-    # arbitrary body text and right-pane labels cannot establish this bound.
+    # Bound the search to the same 35px header band immediately right of
+    # Group -- never a broader guess. Two tiers within it, most specific
+    # first: a legible "subtot..." prefix, then (only if none is legible
+    # at all) any other header-row content immediately right of Group.
+    # The second tier's own text is never trusted as a row/group name --
+    # only its position is used, to set the column boundary.
     crop_left = max(0, group[0] - 20)
     crop_top = max(0, group[1] - 10)
     crop_right = min(image.width, group[0] + 300)
     crop_bottom = min(image.height, group[1] + 35)
     data = adapter._ocr_data(image.crop((crop_left, crop_top, crop_right, crop_bottom)), config="--psm 6")
-    matches = []
+    group_center_y = (group[1] + group[3]) / 2
+    prefix_matches: list[tuple[int, int, int, int]] = []
+    row_aligned_candidates: list[tuple[int, int, int, int]] = []
     for text, left, top, width, height in zip(
         data.get("text", []), data.get("left", []), data.get("top", []),
         data.get("width", []), data.get("height", []), strict=False,
     ):
         normalized = "".join(ch for ch in str(text).casefold() if ch.isalnum())
+        if not normalized:
+            continue
         rect = (crop_left + int(left), crop_top + int(top),
                 crop_left + int(left) + int(width), crop_top + int(top) + int(height))
-        if normalized.startswith("subtot") and rect[0] > group[2]:
-            matches.append(rect)
-    if len(matches) != 1:
-        raise RuntimeError(f"Subtotal header fallback found {len(matches)} bounded candidate(s)")
-    return tuple(group), tuple(matches[0]), "bounded_header_prefix_ocr"
+        if rect[0] <= group[2]:
+            continue
+        if normalized.startswith("subtot"):
+            prefix_matches.append(rect)
+        candidate_height = rect[3] - rect[1]
+        candidate_center_y = (rect[1] + rect[3]) / 2
+        if 4 <= candidate_height <= 24 and abs(candidate_center_y - group_center_y) <= _HEADER_ROW_BAND_TOLERANCE_PX:
+            row_aligned_candidates.append(rect)
+    if len(prefix_matches) == 1:
+        return tuple(group), tuple(prefix_matches[0]), "bounded_header_prefix_ocr"
+    if prefix_matches:
+        raise RuntimeError(f"Subtotal header fallback found {len(prefix_matches)} bounded candidate(s)")
+    if row_aligned_candidates:
+        boundary = min(row_aligned_candidates, key=lambda rect: rect[0])
+        return tuple(group), tuple(boundary), "bounded_header_row_boundary"
+    raise RuntimeError("Subtotal header fallback found 0 bounded candidate(s)")
 
 
 def _group_column_inventory(adapter, image) -> dict[str, Any]:
