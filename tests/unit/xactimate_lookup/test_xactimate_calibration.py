@@ -331,7 +331,11 @@ def test_read_only_existing_rows_recovery_makes_profile_executable_without_creat
     apply_fast_geometry(type("Adapter", (), {})(), recovered)
 
 
-def test_complete_existing_calibration_set_routes_to_read_only_recovery(monkeypatch, tmp_path):
+@pytest.mark.parametrize("allow_creation", [False, True])
+def test_complete_existing_calibration_set_routes_to_read_only_recovery(monkeypatch, tmp_path, allow_creation):
+    # Recovery is read-only and must run the same way whether creation
+    # permission (the checkbox) is off or on -- it is never a prerequisite
+    # for recovering rows that already, positively, all exist.
     candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
     inventory = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120),
                            ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
@@ -342,20 +346,67 @@ def test_complete_existing_calibration_set_routes_to_read_only_recovery(monkeypa
     monkeypatch.setattr(calibration, "complete_interactive_group_row_calibration",
                         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not create")))
     calibration._complete_or_recover_group_rows(
-        _InteractiveAdapter(), candidate, directory=tmp_path, evidence_dir=tmp_path,
+        _InteractiveAdapter(), candidate, directory=tmp_path, evidence_dir=tmp_path, allow_creation=allow_creation,
     )
     assert calls == ["recover"]
 
 
-def test_partial_existing_calibration_set_refuses_without_creation(monkeypatch, tmp_path):
+@pytest.mark.parametrize("allow_creation", [False, True])
+def test_partial_existing_calibration_set_refuses_without_creation(monkeypatch, tmp_path, allow_creation):
+    # Fails closed the same way regardless of creation permission -- a
+    # partial set is never safe to complete automatically either way.
     candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
     monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: _inventory(
         ("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140),
     ))
-    with pytest.raises(RuntimeError, match="partial calibration group set"):
+    monkeypatch.setattr(calibration, "complete_interactive_group_row_calibration",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not create")))
+    with pytest.raises(RuntimeError, match="partial calibration group set") as excinfo:
         calibration._complete_or_recover_group_rows(
-            _InteractiveAdapter(), candidate, directory=tmp_path, evidence_dir=tmp_path,
+            _InteractiveAdapter(), candidate, directory=tmp_path, evidence_dir=tmp_path, allow_creation=allow_creation,
         )
+    assert "present=['CAL_ROW_ALPHA', 'CAL_ROW_BRAVO']" in str(excinfo.value)
+    assert "missing=['CAL_ROW_CHARLIE']" in str(excinfo.value)
+
+
+def test_zero_of_three_without_creation_permission_reports_actionable_status(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    inventory_reads = []
+    def fake_inventory(adapter, _image):
+        inventory_reads.append(adapter.scrolled)
+        return _inventory(("TEST", 100))
+    monkeypatch.setattr(calibration, "_group_column_inventory", fake_inventory)
+    monkeypatch.setattr(calibration, "complete_interactive_group_row_calibration",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not create")))
+    adapter = _InteractiveAdapter()
+    with pytest.raises(RuntimeError, match="enable temporary calibration-group creation"):
+        calibration._complete_or_recover_group_rows(
+            adapter, candidate, directory=tmp_path, evidence_dir=tmp_path, allow_creation=False,
+        )
+    # the presence check ran (and scrolled first) before the permission refusal
+    assert inventory_reads == [True]
+    assert adapter.events[0] == ("scroll", 1)
+
+
+def test_zero_of_three_with_creation_permission_selects_bootstrap_creation(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    inventory_reads = []
+    def fake_inventory(adapter, _image):
+        inventory_reads.append(adapter.scrolled)
+        return _inventory(("TEST", 100))
+    monkeypatch.setattr(calibration, "_group_column_inventory", fake_inventory)
+    calls = []
+    monkeypatch.setattr(calibration, "complete_interactive_group_row_calibration",
+                        lambda *args, **kwargs: (candidate, calls.append("create") or {"mode": "create"}))
+    monkeypatch.setattr(calibration, "recover_existing_group_row_calibration",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not recover -- nothing exists")))
+    adapter = _InteractiveAdapter()
+    calibration._complete_or_recover_group_rows(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path, allow_creation=True,
+    )
+    # inventory (proving exact 0/3) happened, and happened before creation was selected
+    assert inventory_reads == [True]
+    assert calls == ["create"]
 
 
 def test_scrolled_away_calibration_rows_become_visible_after_scroll_and_route_to_recovery(monkeypatch, tmp_path):
@@ -551,13 +602,14 @@ def test_no_profile_sparse_tree_creates_and_measures_temporary_groups(monkeypatc
     assert profile.validation_state == "ready_for_fast_execution"
 
 
-def test_no_profile_existing_cal_row_trio_uses_read_only_recovery(monkeypatch, tmp_path):
+@pytest.mark.parametrize("allow_interactive_group_rows", [False, True])
+def test_no_profile_existing_cal_row_trio_uses_read_only_recovery(monkeypatch, tmp_path, allow_interactive_group_rows):
     # calibrate_xactimate's own generic full-tree precheck sees only the
     # root row (unresolved) -- distinct from the CAL_ROW_*-specific
     # inventory read below, exactly as they are two independent OCR passes
-    # in the real implementation. allow_interactive_group_rows=True (the
-    # caller consents to creation IF NEEDED) but creation must never run
-    # because all three calibration rows already exist.
+    # in the real implementation. Recovery must run and creation must never
+    # run, REGARDLESS of the creation-permission checkbox: the checkbox is
+    # not a calibration on/off switch.
     adapter = _FreshCalibrationAdapter(tree_ocr=_ocr(("Test", 22, 23, 43, 14, 0)))
     trio = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
     monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: trio)
@@ -566,12 +618,29 @@ def test_no_profile_existing_cal_row_trio_uses_read_only_recovery(monkeypatch, t
     path = profile_path(tmp_path, machine_identifier())
     assert not path.exists()
     profile, _path = calibrate_xactimate(
-        adapter, directory=tmp_path, allow_interactive_group_rows=True,
+        adapter, directory=tmp_path, allow_interactive_group_rows=allow_interactive_group_rows,
         evidence_dir=tmp_path / "evidence",
     )
     assert profile.geometry["group_row_pitch_state"] == "measured_confident"
     assert profile.validation_state == "ready_for_fast_execution"
     assert adapter.events[0] == ("scroll", 1)  # scroll-to-top ran before the presence check
+
+
+def test_no_profile_zero_of_three_checkbox_off_is_actionable_and_creates_nothing(monkeypatch, tmp_path):
+    adapter = _FreshCalibrationAdapter(tree_ocr=_ocr(("Test", 22, 23, 43, 14, 0)))
+    empty = _inventory(("TEST", 100))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: empty)
+    monkeypatch.setattr(calibration, "_create_one_calibration_group",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not create -- checkbox is off")))
+    path = profile_path(tmp_path, machine_identifier())
+    assert not path.exists()
+    with pytest.raises(RuntimeError, match="enable temporary calibration-group creation"):
+        calibrate_xactimate(
+            adapter, directory=tmp_path, allow_interactive_group_rows=False,
+            evidence_dir=tmp_path / "evidence",
+        )
+    assert adapter.events[0] == ("scroll", 1)  # the presence check still ran (and scrolled) before refusing
+    assert not path.exists()  # nothing masquerading as a saved profile is left behind
 
 
 def test_stale_prior_profile_values_do_not_influence_new_measurements(tmp_path):
@@ -629,3 +698,154 @@ def test_failed_calibration_does_not_leave_a_false_ready_profile(monkeypatch, tm
     assert not path.exists()  # no prior profile existed -- transaction rolls back to that, not a failed/false-ready one
     with pytest.raises(RuntimeError, match="No Xactimate calibration exists"):
         load_calibration(tmp_path)
+
+
+def test_failed_recalibration_preserves_a_prior_ready_profile(monkeypatch, tmp_path):
+    ready = replace(profile(), validation_state="ready_for_fast_execution")
+    save_calibration(ready, tmp_path)
+
+    adapter = _FreshCalibrationAdapter(tree_ocr=_ocr(("Test", 22, 23, 43, 14, 0)))
+    empty = _inventory(("TEST", 100))
+    inconsistent = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 167))
+    inventories = iter((empty, empty, inconsistent))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: next(inventories))
+    monkeypatch.setattr(calibration, "_create_one_calibration_group",
+                        lambda _adapter, _profile, name: {"name": name, "state": "created"})
+    with pytest.raises(RuntimeError, match="spacings disagree"):
+        calibrate_xactimate(
+            adapter, directory=tmp_path, allow_interactive_group_rows=True,
+            evidence_dir=tmp_path / "evidence",
+        )
+    reloaded = load_calibration(tmp_path)
+    assert reloaded == ready
+    assert reloaded.validation_state == "ready_for_fast_execution"
+
+
+class _BootstrapCreationAdapter:
+    """Drives the REAL _create_one_calibration_group() sequence (never a
+    mocked creator) against an in-memory tree that only grows when this
+    fake's own New-Group dialog sequence completes -- proving positive
+    root identification and tree reacquisition between ALPHA/BRAVO/CHARLIE
+    without a real Xactimate window and without any pre-calibrated pitch."""
+
+    def __init__(self, root_center=100.0, pitch=20.0):
+        self.root_center, self.pitch = root_center, pitch
+        self.created_names: list[str] = []
+        self.scroll_events: list[int] = []
+        self.context_menu_calls: list[int] = []
+        self._dialog_open = False
+        self._pending_name = None
+        self._click_count = 0
+
+    def _ensure_main_window(self): return 1
+    def _scroll_group_tree_to_top(self, hwnd): self.scroll_events.append(hwnd)
+    def _capture_client_image(self, hwnd): return _Image()
+    def _unexpected_dialog_present(self): return False
+    def _find_dropdown_window(self): return None
+    def _open_group_tree_context_menu(self, hwnd, header_pos, row_index):
+        self.context_menu_calls.append(row_index)
+        return ["item"] * 20
+    def _click_group_menu_item(self, items, index): self._dialog_open = True
+    def _find_window_by_title(self, title):
+        return 999 if (title == "New Group" and self._dialog_open) else None
+    def _click_client(self, hwnd, x, y):
+        self._click_count += 1
+        if self._click_count == 2:  # the Attach/OK click closes the dialog and commits the row
+            self._dialog_open = False
+            self.created_names.append(self._pending_name)
+            self._pending_name = None
+            self._click_count = 0
+    def _select_all_and_delete(self): pass
+    def _type_keybdevent(self, text, char_interval_s=None): self._pending_name = text
+
+
+def test_bootstrap_creation_reacquires_tree_between_rows_without_calibrated_pitch(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["new_group_dialog_name_click"] = [185, 18]
+    candidate.geometry["new_group_dialog_attach_click"] = [305, 75]
+    # No pre-calibrated row pitch/height is available going in -- proves
+    # creation does not depend on it (nothing here ever reads it).
+    candidate.geometry["group_row_height"] = None
+
+    adapter = _BootstrapCreationAdapter(root_center=100.0, pitch=20.0)
+    inventory_snapshots: list[tuple[str, ...]] = []
+    def fake_inventory(adapter_arg, _image):
+        rows = [("TEST", adapter_arg.root_center)]
+        for i, name in enumerate(adapter_arg.created_names, start=1):
+            rows.append((name, adapter_arg.root_center + i * adapter_arg.pitch))
+        inv = _inventory(*rows)
+        inventory_snapshots.append(tuple(row["raw_text"] for row in inv["rows"]))
+        return inv
+    monkeypatch.setattr(calibration, "_group_column_inventory", fake_inventory)
+
+    completed, measurement = complete_interactive_group_row_calibration(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path / "evidence",
+    )
+
+    # 8 inventory reads total: initial presence-check, then (pre-creation
+    # root-lookup + post-creation poll-confirm) per row, then one final
+    # verification read.
+    assert len(inventory_snapshots) == 8
+    initial, alpha_root_lookup, alpha_confirm, bravo_root_lookup, bravo_confirm, \
+        charlie_root_lookup, charlie_confirm, final = inventory_snapshots
+
+    # 5: ALPHA creation used positively identified project-root geometry
+    # (row_index=0, the root) with none of the three rows existing yet --
+    # no dependency on any pre-existing calibrated pitch.
+    assert initial == ("TEST",)
+    assert alpha_root_lookup == ("TEST",)
+    assert adapter.context_menu_calls[0] == 0
+
+    # 6: tree state was reacquired after ALPHA before BRAVO's own creation
+    # attempt -- BRAVO's pre-creation root-lookup sees ALPHA already there.
+    assert alpha_confirm == ("TEST", "CAL_ROW_ALPHA")
+    assert bravo_root_lookup == ("TEST", "CAL_ROW_ALPHA")
+    assert adapter.context_menu_calls[1] == 0
+
+    # 7: reacquired again after BRAVO before CHARLIE's creation attempt.
+    assert bravo_confirm == ("TEST", "CAL_ROW_ALPHA", "CAL_ROW_BRAVO")
+    assert charlie_root_lookup == ("TEST", "CAL_ROW_ALPHA", "CAL_ROW_BRAVO")
+    assert adapter.context_menu_calls[2] == 0
+
+    # 8: all three exact names positively verified (final full inventory
+    # read) before pitch measurement/promotion.
+    assert charlie_confirm == ("TEST", "CAL_ROW_ALPHA", "CAL_ROW_BRAVO", "CAL_ROW_CHARLIE")
+    assert final == ("TEST", "CAL_ROW_ALPHA", "CAL_ROW_BRAVO", "CAL_ROW_CHARLIE")
+    assert adapter.created_names == list(CALIBRATION_GROUP_NAMES)
+    assert len(adapter.scroll_events) == 3  # one scroll-to-top per creation call
+
+    # 9: measured ALPHA->BRAVO and BRAVO->CHARLIE spacings feed the
+    # existing tolerance-based confidence/pitch selection, unchanged.
+    assert measurement["measured_spacings"] == [20.0, 20.0]
+    assert measurement["chosen_pitch"] == 20.0
+    assert completed.geometry["group_row_pitch_state"] == "measured_confident"
+    assert completed.geometry["group_row_height"] == 20.0
+    assert completed.validation_state == "ready_for_fast_execution"
+
+
+def test_ambiguous_project_root_prevents_any_mutation(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["new_group_dialog_name_click"] = [185, 18]
+    candidate.geometry["new_group_dialog_attach_click"] = [305, 75]
+    # Two rows both containing the root's identity text -- root is not
+    # uniquely identifiable, so nothing may be clicked or typed.
+    ambiguous = _inventory(("TEST", 100), ("TEST Copy", 120))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: ambiguous)
+    adapter = _BootstrapCreationAdapter()
+    with pytest.raises(RuntimeError, match="could not uniquely locate the project root row"):
+        calibration._create_one_calibration_group(adapter, candidate, "CAL_ROW_ALPHA")
+    assert adapter.context_menu_calls == []  # no context menu, no click, no keystroke, no dialog
+    assert adapter.created_names == []
+
+
+def test_calibration_checkbox_wording_controls_creation_only():
+    from estimate_extractor.ui.components import quick_run_panel
+    label = quick_run_panel.CALIBRATION_CREATION_CHECKBOX_LABEL
+    help_text = quick_run_panel.CALIBRATION_CREATION_CHECKBOX_HELP
+    assert "creat" in label.casefold()
+    assert "temporary" in label.casefold()
+    # must not read as a general calibration on/off switch
+    assert "enable calibration" not in label.casefold()
+    assert "if needed" not in label.casefold()  # the old, ambiguous wording
+    assert "read-only" in help_text.casefold() or "always" in help_text.casefold()
+    assert "duplicate" in help_text.casefold()

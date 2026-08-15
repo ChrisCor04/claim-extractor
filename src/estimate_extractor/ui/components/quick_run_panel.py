@@ -187,14 +187,26 @@ def _render_saved_calibration_status() -> dict[str, object]:
     return status
 
 
+#: This only grants permission to CREATE the three temporary calibration
+#: rows when none exist yet. It must never read as "enable calibration" --
+#: read-only inspection and recovery of rows that already exist always run,
+#: regardless of this checkbox.
+CALIBRATION_CREATION_CHECKBOX_LABEL = "Allow creation of temporary calibration groups if none exist"
+CALIBRATION_CREATION_CHECKBOX_HELP = (
+    "Only controls creation. If CAL_ROW_ALPHA/BRAVO/CHARLIE already exist, calibration always "
+    "reads them read-only, whether this is checked or not, and never creates duplicates. "
+    "Creates them only when none exist and this is checked. No line items are entered."
+)
+
+
 def _render_fast_grouped_mode(project_dir: Path, project_name: str) -> None:
     st.warning("Experimental: one reviewed grouped plan is emitted through blind keyboard entry.")
     saved_calibration = _render_saved_calibration_status()
     calibration_project_name = project_name or str(saved_calibration.get("project_name") or "").strip()
     allow_interactive_calibration = st.checkbox(
-        "If needed, create three empty calibration groups to measure group-row geometry",
+        CALIBRATION_CREATION_CHECKBOX_LABEL,
         key="quick_fast_allow_interactive_calibration",
-        help="Creates CAL_ROW_ALPHA, CAL_ROW_BRAVO, and CAL_ROW_CHARLIE. No line items are entered.",
+        help=CALIBRATION_CREATION_CHECKBOX_HELP,
     )
     if st.button(
         "Calibrate Xactimate", key="quick_fast_calibrate_xactimate",

@@ -392,11 +392,25 @@ def complete_interactive_group_row_calibration(
     return completed, measurement
 
 
+#: Shown verbatim (via calibrate_xactimate()'s caller re-raising this
+#: message) when the group tree positively has none of the three
+#: calibration rows and the caller has not granted creation permission --
+#: actionable, and explicit that creation (not calibration itself) is
+#: what's gated, matching the checkbox's now-narrow meaning.
+CREATION_PERMISSION_REQUIRED_MESSAGE = (
+    "Group-row geometry unresolved — enable temporary calibration-group creation and run calibration again."
+)
+
+
 def _complete_or_recover_group_rows(
     adapter, profile: XactimateCalibration, *, directory: Path,
-    evidence_dir: Path | None,
+    evidence_dir: Path | None, allow_creation: bool = False,
 ) -> tuple[XactimateCalibration, dict[str, Any]]:
-    """Use existing complete calibration rows; create only from proven absence."""
+    """Inspect the live tree first, always -- never gated by creation
+    permission. Recovery only ever needs read access, so a caller with
+    creation permission OFF can still recover three already-existing
+    rows; permission is consulted only in the genuine 0/3 case, where it
+    decides between bootstrap creation and an actionable refusal."""
     # See _create_one_calibration_group()'s identical comment: the group
     # tree's scroll position is independent of everything else and a
     # busy project can easily drift the calibration rows out of the
@@ -422,6 +436,8 @@ def _complete_or_recover_group_rows(
             "interactive row calibration refused: partial calibration group set; "
             f"present={present}, missing={missing}"
         )
+    if not allow_creation:
+        raise RuntimeError(CREATION_PERMISSION_REQUIRED_MESSAGE)
     return complete_interactive_group_row_calibration(
         adapter, profile, directory=directory, evidence_dir=evidence_dir,
     )
@@ -618,22 +634,26 @@ def calibrate_xactimate(
         ) if value),
     )
     path = profile_path(directory, profile.machine_id)
-    if allow_interactive_group_rows and row_state != "measured_confident":
+    if row_state != "measured_confident":
+        # Presence-check/recovery must run unconditionally here -- it is
+        # read-only until 0/3 calibration rows are positively proven, and
+        # only THAT branch needs permission. allow_interactive_group_rows
+        # therefore means "permission to create", not "permission to look",
+        # and must never suppress recovering three rows that already exist.
         profile, _measurement = _profile_transaction(
             path,
             lambda: _complete_or_recover_group_rows(
                 adapter, profile, directory=directory, evidence_dir=evidence_dir,
+                allow_creation=allow_interactive_group_rows,
             ),
         )
     else:
         # Row pitch can already be confident here without ever touching
-        # CAL_ROW_* -- measured directly from real existing group rows
-        # (or the caller didn't opt into interactive completion at all).
+        # CAL_ROW_* -- measured directly from real existing group rows.
         # That is one of the two valid calibration end states, so it must
         # be marked ready the same way the interactive/recovery paths do,
         # not left stuck at the pre-row-measurement validation state.
-        if row_state == "measured_confident":
-            profile = replace(profile, validation_state="ready_for_fast_execution")
+        profile = replace(profile, validation_state="ready_for_fast_execution")
         save_calibration(profile, directory)
     return profile, path
 
