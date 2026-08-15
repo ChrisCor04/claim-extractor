@@ -7,7 +7,7 @@ import pytest
 from estimate_extractor.xactimate_lookup.fast_group_executor import (
     FAST_KEY_HOLD_SECONDS, compile_executable_group_plan, execute_group_first_plan,
     exact_planned_group_rows, normalize_planned_group_identity, reconcile_complete_group_inventory,
-    WindowsGroupBatchUI,
+    GroupInventory, GroupInventoryEntry, WindowsGroupBatchUI,
 )
 
 
@@ -42,7 +42,10 @@ class UI:
     def verify_project_and_no_modal(self, project):
         self.events.append(("preflight", project))
         if self.fail == "preflight": raise RuntimeError("modal")
-    def create_group(self, group): self.events.append(("create", group)); return "safe-create"
+    def prepare_group_creation(self, groups): self.events.append(("inventory-initial", tuple(groups))); return "initial"
+    def create_group(self, group):
+        self.events.append(("create", group))
+        return {"creation_state": "created", "verification_method": "bounded-new-row"}
     def verify_all_groups_created(self, groups):
         self.events.append(("verify-all", tuple(groups)))
         if self.fail == "verify-all": raise RuntimeError("group missing")
@@ -93,6 +96,8 @@ def test_all_groups_are_created_before_selection_and_hot_loop_is_keyboard_only()
         ("create", "A"), ("create", "B"), ("verify-all", ("A", "B")), ("select", "A"),
     ]
     assert architectural.index(("select", "B")) > architectural.index(("type", "IWS"))
+    assert ui.events.count(("inventory-initial", ("A", "B"))) == 1
+    assert ui.events.count(("verify-all", ("A", "B"))) == 1
 
 
 def test_preflight_failure_aborts_before_creation_or_input():
@@ -140,23 +145,74 @@ def test_complete_inventory_rejects_duplicate_rows_and_duplicate_planned_names()
         reconcile_complete_group_inventory(["P4A_0814"], ["P4A_0814", "p4a 0814"])
 
 
-def test_windows_creation_scopes_ensure_group_to_exact_planned_identity():
+def test_population_never_routes_biditem_through_normal_hot_loop():
+    ui = UI()
+    execute_group_first_plan(compile_executable_group_plan(_shadow()), ui, clock=Clock())
+    assert ("type", "DOR") not in ui.events and ("type", "BIDITM") not in ui.events
+
+
+def test_inventory_selection_uses_one_row_reread_not_full_tree_rescan():
     class Adapter:
-        def __init__(self):
-            self.rows = ["TEST", "P4A_0814"]
-            self.created = []
-
-        def _find_unique_group_row(self, rows, requested):
-            return 1  # reproduces the production fuzzy collision
-
-        def ensure_group(self, requested):
-            if self._find_unique_group_row(self.rows, requested) is None:
-                self.created.append(requested)
-                self.rows.append(requested)
+        expected_project_name = "TEST"
+        def verify_application(self): return True
+        def verify_project(self): return True
+        def _unexpected_dialog_present(self): return False
+        def _find_dropdown_window(self): return None
+        def _ensure_main_window(self): return 1
+        def _force_foreground(self, hwnd): return True
+        def _capture_client_image(self, hwnd): return object()
+        def _locate_group_tree_header(self, image): return (10, 20, 30, 40)
+        def _ocr_group_tree_row_text(self, image, header, index): return "P4B.0814"
+        def _click_client(self, hwnd, *xy): self.clicked = xy
+        def _group_tree_row_has_selection_boundary(self, image, header, index): return True
+        def _anchor_offset(self, image): return (0, 0)
+        def _items_search_pane_field(self, image): return (1, 1, 2, 2)
+        def _win32gui(self):
+            class W:
+                @staticmethod
+                def GetWindowRect(hwnd): return (0, 0, 100, 100)
+            return W
 
     facade = object.__new__(WindowsGroupBatchUI)
     facade.adapter = Adapter()
-    original = facade.adapter._find_unique_group_row
-    facade.create_group("P4B_0814")
-    assert facade.adapter.created == ["P4B_0814"]
-    assert facade.adapter._find_unique_group_row == original
+    facade._inventory = GroupInventory(
+        window_rect=(0, 0, 100, 100), header_rect=(10, 20, 30, 40),
+        entries=(GroupInventoryEntry("p4b0814", "P4B_0814", 2, (50, 70)),),
+    )
+    assert facade.select_group_lightweight("P4B_0814").startswith("verified_inventory_row")
+    assert facade.adapter.clicked == (50, 70)
+
+
+def test_inventory_geometry_invalidation_prevents_stale_click():
+    class Adapter:
+        expected_project_name = "TEST"
+        def verify_application(self): return True
+        def verify_project(self): return True
+        def _unexpected_dialog_present(self): return False
+        def _find_dropdown_window(self): return None
+        def _ensure_main_window(self): return 1
+        def _force_foreground(self, hwnd): return True
+        def _capture_client_image(self, hwnd): return object()
+        def _locate_group_tree_header(self, image): return (11, 20, 30, 40)
+        def _win32gui(self):
+            class W:
+                @staticmethod
+                def GetWindowRect(hwnd): return (0, 0, 100, 100)
+            return W
+    facade = object.__new__(WindowsGroupBatchUI); facade.adapter = Adapter()
+    facade._inventory = GroupInventory((0, 0, 100, 100), (10, 20, 30, 40), (
+        GroupInventoryEntry("p4a0814", "P4A_0814", 1, (50, 50)),
+    ))
+    with pytest.raises(RuntimeError, match="geometry was invalidated"):
+        facade.select_group_lightweight("P4A_0814")
+
+
+def test_bounded_new_row_proof_cannot_satisfy_a_different_planned_group():
+    class Adapter:
+        def _capture_client_image(self, hwnd): return object()
+        def _locate_group_tree_header(self, image): return (10, 20, 30, 40)
+        def _group_tree_row_has_selection_boundary(self, image, header, index): return index == 1
+        def _ocr_group_tree_row_text(self, image, header, index): return "P4A.0814"
+    facade = object.__new__(WindowsGroupBatchUI); facade.adapter = Adapter()
+    assert facade._selected_exact_row(1, "P4A_0814") == (1, "P4A.0814")
+    assert facade._selected_exact_row(1, "P4B_0814") is None

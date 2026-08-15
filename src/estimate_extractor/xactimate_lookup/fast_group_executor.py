@@ -101,6 +101,28 @@ class ExecutableGroupPlan:
     source_schema_version: str
 
 
+@dataclass(frozen=True, slots=True)
+class GroupInventoryEntry:
+    normalized_identity: str
+    displayed_name: str
+    physical_row: int
+    row_center: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class GroupInventory:
+    window_rect: tuple[int, int, int, int]
+    header_rect: tuple[int, int, int, int]
+    entries: tuple[GroupInventoryEntry, ...]
+
+    def entry(self, group: str) -> GroupInventoryEntry:
+        identity = normalize_planned_group_identity(group)
+        matches = [entry for entry in self.entries if entry.normalized_identity == identity]
+        if len(matches) != 1:
+            raise RuntimeError(f"verified inventory has {len(matches)} entries for {group!r}")
+        return matches[0]
+
+
 def compile_executable_group_plan(shadow: dict[str, Any]) -> ExecutableGroupPlan:
     """Freeze a shadow plan into ordered, mapper-free live payloads."""
     rows_by_id = {row["line_item_id"]: row for row in shadow["items"]}
@@ -148,7 +170,8 @@ def load_executable_group_plan(path: Path) -> ExecutableGroupPlan:
 class GroupBatchUI(Protocol):
     keyboard: KeyboardIO
     def verify_project_and_no_modal(self, project: str) -> None: ...
-    def create_group(self, group: str) -> str: ...
+    def prepare_group_creation(self, groups: Sequence[str]) -> str: ...
+    def create_group(self, group: str) -> dict[str, Any]: ...
     def verify_all_groups_created(self, groups: Sequence[str]) -> str: ...
     def select_group_lightweight(self, group: str) -> str: ...
     def focus_quick_entry_cat(self) -> str: ...
@@ -167,12 +190,18 @@ def execute_group_first_plan(
 ) -> dict[str, Any]:
     """Create all groups first, then unload each normal-item batch."""
     ui.verify_project_and_no_modal(plan.project)
+    planned_groups = [batch.group for batch in plan.groups]
+    started = clock()
+    initial_inventory_method = ui.prepare_group_creation(planned_groups)
+    initial_inventory_seconds = clock() - started
     creation = []
     for batch in plan.groups:
         started = clock()
-        method = ui.create_group(batch.group)
-        creation.append({"group": batch.group, "seconds": clock() - started, "verification_method": method})
-    all_groups_verification = ui.verify_all_groups_created([batch.group for batch in plan.groups])
+        detail = ui.create_group(batch.group)
+        creation.append({"group": batch.group, "seconds": clock() - started, **detail})
+    started = clock()
+    all_groups_verification = ui.verify_all_groups_created(planned_groups)
+    final_inventory_seconds = clock() - started
 
     group_reports = []
     all_item_seconds: list[float] = []
@@ -217,6 +246,9 @@ def execute_group_first_plan(
         "key_hold_seconds": FAST_KEY_HOLD_SECONDS,
         "group_creation": {
             "groups": creation, "all_groups_verification": all_groups_verification,
+            "initial_inventory_method": initial_inventory_method,
+            "initial_inventory_seconds": initial_inventory_seconds,
+            "final_inventory_seconds": final_inventory_seconds,
             **_seconds_summary([row["seconds"] for row in creation]),
         },
         "group_selection": _seconds_summary(selection_seconds),
@@ -234,6 +266,24 @@ class WindowsGroupBatchUI:
         from .windows_adapter import WindowsXactimateAdapter
         self.adapter = WindowsXactimateAdapter(project, evidence_dir=evidence_dir)
         self.keyboard = WindowsKeyboardIO(key_hold_seconds=FAST_KEY_HOLD_SECONDS)
+        self._initial_rows: list[str] | None = None
+        self._inventory: GroupInventory | None = None
+
+    def _window_rect(self, hwnd: int) -> tuple[int, int, int, int]:
+        rect = self.adapter._win32gui().GetWindowRect(hwnd)
+        return tuple(rect)
+
+    def prepare_group_creation(self, groups: Sequence[str]) -> str:
+        self.verify_project_and_no_modal(self.adapter.expected_project_name)
+        hwnd = self.adapter._ensure_main_window()
+        self.adapter._scroll_group_tree_to_top(hwnd)
+        self._initial_rows = self.adapter.snapshot_group_names()
+        # Duplicate planned identities are invalid even before mutation.
+        identities = [normalize_planned_group_identity(group) for group in groups]
+        if any(not identity for identity in identities) or len(set(identities)) != len(identities):
+            raise RuntimeError("fast group executor refused: planned group identities are empty or duplicate")
+        self._inventory = None
+        return "one_fresh_exact_pre_creation_inventory"
 
     def verify_project_and_no_modal(self, project: str) -> None:
         if project != self.adapter.expected_project_name or not self.adapter.verify_application() or not self.adapter.verify_project():
@@ -241,30 +291,101 @@ class WindowsGroupBatchUI:
         if self.adapter._unexpected_dialog_present() or self.adapter._find_dropdown_window() is not None:
             raise RuntimeError("fast group executor refused: blocking dialog/dropdown is present")
 
-    def create_group(self, group: str) -> str:
-        # Scope the production primitive to Phase 4's exact identity model.
-        # This changes neither its implementation nor global production
-        # behavior; every other creation safety check remains intact.
-        original = self.adapter._find_unique_group_row
+    @staticmethod
+    def _poll(predicate, *, timeout_s: float = 5.0, interval_s: float = 0.05):
+        deadline = time.perf_counter() + timeout_s
+        while True:
+            result = predicate()
+            if result:
+                return result
+            if time.perf_counter() >= deadline:
+                return None
+            time.sleep(interval_s)
 
-        def exact_unique(rows, requested):
-            matches = exact_planned_group_rows(rows, requested)
-            if len(matches) > 1:
-                raise RuntimeError(f"multiple exact rows match planned group {requested!r}")
-            return matches[0] if matches else None
+    def _selected_exact_row(self, hwnd: int, group: str):
+        image = self.adapter._capture_client_image(hwnd)
+        header = self.adapter._locate_group_tree_header(image)
+        if header is None:
+            return None
+        selected = [
+            index for index in range(1, 24)
+            if self.adapter._group_tree_row_has_selection_boundary(image, header, index)
+        ]
+        if len(selected) != 1:
+            return None
+        row = selected[0]
+        displayed = self.adapter._ocr_group_tree_row_text(image, header, row)
+        return (row, displayed) if exact_planned_group_rows([displayed], group) == [0] else None
 
-        self.adapter._find_unique_group_row = exact_unique
-        try:
-            self.adapter.ensure_group(group)
-        finally:
-            self.adapter._find_unique_group_row = original
-        return "existing_ensure_group_with_scoped_exact_planned_name_identity"
+    def create_group(self, group: str) -> dict[str, Any]:
+        if self._initial_rows is None:
+            raise RuntimeError("fast group creation refused: initial inventory was not established")
+        matches = exact_planned_group_rows(self._initial_rows, group)
+        if len(matches) > 1:
+            raise RuntimeError(f"fast group creation refused: duplicate exact rows already match {group!r}")
+        if matches:
+            return {"creation_state": "already_present_exact", "verification_method": "initial_exact_inventory"}
+
+        self._inventory = None  # any physical tree mutation invalidates reusable row coordinates
+        self.verify_project_and_no_modal(self.adapter.expected_project_name)
+        hwnd = self.adapter._ensure_main_window()
+        image = self.adapter._capture_client_image(hwnd)
+        header = self.adapter._locate_group_tree_header(image)
+        if header is None:
+            raise RuntimeError("fast group creation refused: group tree is unavailable")
+
+        command_started = time.perf_counter()
+        menu = self.adapter._open_group_tree_context_menu(hwnd, header, 0)
+        self.adapter._click_group_menu_item(menu, self.adapter._GROUP_MENU_NEW_INDEX)
+        dialog_hwnd = self._poll(lambda: self.adapter._find_window_by_title("New Group"))
+        command_seconds = time.perf_counter() - command_started
+        if dialog_hwnd is None:
+            raise RuntimeError("fast group creation refused: New Group dialog did not appear")
+
+        input_started = time.perf_counter()
+        self.adapter._click_client(dialog_hwnd, 185, 18)
+        self.adapter._select_all_and_delete()
+        self.adapter._type_keybdevent(group, char_interval_s=FAST_KEY_HOLD_SECONDS)
+        input_seconds = time.perf_counter() - input_started
+
+        attach_started = time.perf_counter()
+        self.adapter._click_client(dialog_hwnd, 305, 75)
+        closed = self._poll(lambda: self.adapter._find_window_by_title("New Group") is None)
+        attach_seconds = time.perf_counter() - attach_started
+        if not closed:
+            raise RuntimeError("fast group creation refused: New Group dialog did not close")
+
+        verify_started = time.perf_counter()
+        observed = self._poll(lambda: self._selected_exact_row(hwnd, group))
+        verify_seconds = time.perf_counter() - verify_started
+        if observed is None:
+            raise RuntimeError(f"fast group creation refused: newly selected row did not read exactly as {group!r}")
+        return {
+            "creation_state": "created", "verification_method": "dialog_close_then_selected_row_exact_ocr",
+            "new_group_command_seconds": command_seconds, "group_name_input_seconds": input_seconds,
+            "attach_to_dialog_close_seconds": attach_seconds,
+            "bounded_new_row_verification_seconds": verify_seconds,
+            "observed_row": observed[0], "observed_display_name": observed[1],
+        }
 
     def verify_all_groups_created(self, groups: Sequence[str]) -> str:
         """Prove the complete set exists before the first item is typed."""
         self.verify_project_and_no_modal(self.adapter.expected_project_name)
-        rows = self.adapter.snapshot_group_names()
-        reconcile_complete_group_inventory(rows, groups)
+        hwnd = self.adapter._ensure_main_window()
+        self.adapter._scroll_group_tree_to_top(hwnd)
+        image = self.adapter._capture_client_image(hwnd)
+        header = self.adapter._locate_group_tree_header(image)
+        if header is None:
+            raise RuntimeError("fast group executor refused: final group tree is unavailable")
+        rows = self.adapter._snapshot_group_names_from_image(image)
+        mapping = reconcile_complete_group_inventory(rows, groups)
+        entries = tuple(GroupInventoryEntry(
+            normalized_identity=normalize_planned_group_identity(group), displayed_name=rows[row],
+            physical_row=row, row_center=self.adapter._group_tree_row_xy(header, row),
+        ) for group, row in mapping.items())
+        self._inventory = GroupInventory(
+            window_rect=self._window_rect(hwnd), header_rect=tuple(header), entries=entries,
+        )
         return "one_fresh_complete_group_tree_snapshot_with_distinct_exact_planned_names"
 
     def select_group_lightweight(self, group: str) -> str:
@@ -272,20 +393,18 @@ class WindowsGroupBatchUI:
         self.verify_project_and_no_modal(self.adapter.expected_project_name)
         hwnd = self.adapter._ensure_main_window()
         self.adapter._force_foreground(hwnd)
-        self.adapter._scroll_group_tree_to_top(hwnd)
+        if self._inventory is None:
+            raise RuntimeError("fast group selection refused: verified reusable inventory is absent")
         before = self.adapter._capture_client_image(hwnd)
         header = self.adapter._locate_group_tree_header(before)
-        if header is None:
-            raise RuntimeError("fast group selection refused: group tree is unavailable")
-        rows = self.adapter._snapshot_group_names_from_image(before)
-        matches = exact_planned_group_rows(rows, group)
-        if len(matches) != 1:
-            raise RuntimeError("fast group selection refused: intended group is not uniquely established")
-        index = matches[0]
+        if header is None or tuple(header) != self._inventory.header_rect or self._window_rect(hwnd) != self._inventory.window_rect:
+            raise RuntimeError("fast group selection refused: reusable inventory geometry was invalidated")
+        entry = self._inventory.entry(group)
+        index = entry.physical_row
         reread = self.adapter._ocr_group_tree_row_text(before, header, index)
         if len(exact_planned_group_rows([reread], group)) != 1:
             raise RuntimeError("fast group selection refused: clicked row failed exact independent name reread")
-        self.adapter._click_client(hwnd, *self.adapter._group_tree_row_xy(header, index))
+        self.adapter._click_client(hwnd, *entry.row_center)
         after = self.adapter._capture_client_image(hwnd)
         if self.adapter._unexpected_dialog_present() or self.adapter._find_dropdown_window() is not None:
             raise RuntimeError("fast group selection refused: blocking UI appeared")
@@ -293,7 +412,7 @@ class WindowsGroupBatchUI:
             raise RuntimeError("fast group selection refused: fresh selection boundary is absent")
         if self.adapter._anchor_offset(after) is None or self.adapter._items_search_pane_field(after) is None:
             raise RuntimeError("fast group selection refused: selected Items/grid context is not established")
-        return "fresh_name_ocr_then_causal_click_and_selection_boundary"
+        return "verified_inventory_row_then_single_row_exact_ocr_and_selection_boundary"
 
     def focus_quick_entry_cat(self) -> str:
         focus = self.adapter._find_main_window()
@@ -302,10 +421,12 @@ class WindowsGroupBatchUI:
         hwnd, _title = focus
         image, offset = self.adapter._capture_and_locate(hwnd)
         if offset is None:
+            self._inventory = None
             raise RuntimeError("fast group executor refused: Quick Entry CAT geometry is unavailable")
         left, top, right, bottom = self.adapter._shifted_anchor("quick_entry_cat_value", offset)
         self.adapter._click_client(hwnd, (left + right) // 2, (top + bottom) // 2)
         if not self.adapter._force_foreground(hwnd):
+            self._inventory = None
             raise RuntimeError("fast group executor refused: CAT focus could not be retained")
         return "fresh_quick_entry_geometry_and_foreground_click"
 
