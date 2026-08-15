@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import pytest
 
+from estimate_extractor.xactimate_lookup import xactimate_calibration as calibration
 from estimate_extractor.xactimate_lookup.xactimate_calibration import (
-    SCHEMA_VERSION, XactimateCalibration, apply_fast_geometry, load_calibration,
-    machine_identifier, measure_group_row_pitch, save_calibration, validate_calibration,
+    CALIBRATION_GROUP_NAMES, SCHEMA_VERSION, XactimateCalibration, apply_fast_geometry,
+    complete_interactive_group_row_calibration, confident_known_group_measurement,
+    load_calibration, machine_identifier, measure_group_row_pitch, save_calibration,
+    validate_calibration,
 )
 
 
@@ -126,6 +129,16 @@ def test_unrelated_nearby_words_cannot_create_false_27_pitch():
     assert all(not box["accepted"] for box in result["candidate_ocr_boxes"] if box["text"] in {"Desc", "Calc", "Cov", "_I"})
 
 
+def test_root_glyph_only_three_pixels_below_header_is_a_row_candidate():
+    result = measure_group_row_pitch(
+        _ocr(("Group", 0, 0, 30, 10), ("Test", 13, 39, 27, 28), ("ap", 22, 1, 27, 14)),
+        region_width=182, header_bottom=10,
+    )
+    accepted = {box["text"] for box in result["candidate_ocr_boxes"] if box["accepted"]}
+    assert "Group" not in accepted
+    assert "Test" in accepted
+
+
 def test_duplicate_fragments_cluster_to_one_physical_row():
     data = _ocr(("Main", 23), ("Roof", 24, 55), ("Side", 43), ("Group", 44, 55),
                 ("Fence", 63), ("Rear", 83))
@@ -175,3 +188,94 @@ def test_single_spacing_is_low_confidence_and_fast_geometry_fails_closed():
         apply_fast_geometry(type("Adapter", (), {})(), candidate)
     validation = validate_calibration(FakeAdapter(), candidate)
     assert "Group-row geometry requires calibration" in validation["reasons"]
+
+
+def _inventory(*rows):
+    return {"header": [10, 10, 40, 20], "subtotal_header": [180, 10, 220, 20],
+            "source_region": [10, 10, 180, 300], "ocr_diagnostics": {},
+            "rows": [{"raw_text": name, "normalized_text": "".join(ch for ch in name.casefold() if ch.isalnum()),
+                      "center_y": center, "relative_center_y": center - 10, "top": center - 5}
+                     for name, center in rows]}
+
+
+def test_three_known_calibration_rows_produce_confident_pitch():
+    result = confident_known_group_measurement(_inventory(
+        ("CAL_ROW_ALPHA", 100), ("CAL_ROW_BRAVO", 122), ("CAL_ROW_CHARLIE", 144),
+    ))
+    assert result["measured_spacings"] == [22.0, 22.0]
+    assert result["chosen_pitch"] == 22
+    assert result["confidence_state"] == "measured_confident"
+
+
+def test_known_calibration_rows_with_inconsistent_spacing_fail_closed():
+    result = confident_known_group_measurement(_inventory(
+        ("CAL_ROW_ALPHA", 100), ("CAL_ROW_BRAVO", 120), ("CAL_ROW_CHARLIE", 147),
+    ))
+    assert result["confidence_state"] == "measured_low_confidence"
+    assert result["chosen_pitch"] is None
+
+
+class _Image:
+    def save(self, path): path.write_bytes(b"png")
+
+
+class _InteractiveAdapter:
+    def __init__(self): self.events = []
+    def _unexpected_dialog_present(self): return False
+    def _find_dropdown_window(self): return None
+    def _ensure_main_window(self): return 1
+    def _capture_client_image(self, hwnd): self.events.append(("capture", hwnd)); return _Image()
+
+
+@pytest.mark.parametrize("state", ["unresolved", "measured_low_confidence"])
+def test_incomplete_empty_one_or_two_row_profile_triggers_interactive_calibration(monkeypatch, tmp_path, state):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = state
+    candidate.geometry["group_row_height"] = None
+    before = _inventory(("TEST", 50))
+    after = _inventory(("TEST", 50), ("CAL_ROW_ALPHA", 70),
+                       ("CAL_ROW_BRAVO", 90), ("CAL_ROW_CHARLIE", 110))
+    inventories = iter((before, after))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: next(inventories))
+    adapter = _InteractiveAdapter(); created = []
+    completed, detail = complete_interactive_group_row_calibration(
+        adapter, candidate, directory=tmp_path,
+        evidence_dir=tmp_path / "evidence",
+        group_creator=lambda name: created.append(name) or {"name": name, "state": "created"},
+    )
+    assert created == list(CALIBRATION_GROUP_NAMES)
+    assert completed.geometry["group_row_pitch_state"] == "measured_confident"
+    assert completed.geometry["group_row_height"] == 20
+    assert detail["cleanup"].startswith("not_attempted")
+    assert load_calibration(tmp_path).geometry["group_row_pitch_state"] == "measured_confident"
+    assert all(event[0] == "capture" for event in adapter.events)  # no item population API was called
+
+
+def test_calibration_name_already_present_refuses_before_creation(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: _inventory(
+        ("TEST", 50), ("CAL_ROW_ALPHA", 70),
+    ))
+    created = []
+    with pytest.raises(RuntimeError, match="already exists"):
+        complete_interactive_group_row_calibration(
+            _InteractiveAdapter(), candidate, directory=tmp_path,
+            group_creator=lambda name: created.append(name),
+        )
+    assert created == []
+
+
+def test_interactive_inconsistent_spacing_persists_failure_and_refuses_execution(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    inventories = iter((_inventory(("TEST", 50)), _inventory(
+        ("TEST", 50), ("CAL_ROW_ALPHA", 70), ("CAL_ROW_BRAVO", 90), ("CAL_ROW_CHARLIE", 117),
+    )))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: next(inventories))
+    with pytest.raises(RuntimeError, match="spacings disagree"):
+        complete_interactive_group_row_calibration(
+            _InteractiveAdapter(), candidate, directory=tmp_path,
+            group_creator=lambda name: {"name": name},
+        )
+    saved = load_calibration(tmp_path)
+    assert saved.geometry["group_row_pitch_state"] == "measured_low_confidence"
+    with pytest.raises(RuntimeError, match="Group-row geometry requires calibration"):
+        apply_fast_geometry(type("Adapter", (), {})(), saved)

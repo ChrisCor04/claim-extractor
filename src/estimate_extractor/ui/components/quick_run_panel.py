@@ -142,15 +142,26 @@ def _render_plan_status(project_dir: Path) -> None:
 
 def _render_fast_grouped_mode(project_dir: Path, project_name: str) -> None:
     st.warning("Experimental: one reviewed grouped plan is emitted through blind keyboard entry.")
+    allow_interactive_calibration = st.checkbox(
+        "If needed, create three empty calibration groups to measure group-row geometry",
+        key="quick_fast_allow_interactive_calibration",
+        help="Creates CAL_ROW_ALPHA, CAL_ROW_BRAVO, and CAL_ROW_CHARLIE. No line items are entered.",
+    )
     if st.button(
         "Calibrate Xactimate", key="quick_fast_calibrate_xactimate",
         disabled=not project_name, width="stretch",
     ):
         try:
-            profile, path = calibrate_xactimate(_construct_adapter(project_name, project_dir))
-            st.success(
-                f"Calibration saved: {profile.client_width}×{profile.client_height} at {profile.dpi} DPI."
+            profile, path = calibrate_xactimate(
+                _construct_adapter(project_name, project_dir),
+                allow_interactive_group_rows=allow_interactive_calibration,
+                evidence_dir=project_dir / "execution" / "fast_grouped" / "calibration_evidence",
             )
+            if profile.geometry.get("group_row_pitch_state") == "measured_confident":
+                st.success("Calibration complete — Ready for Fast Execution")
+            else:
+                st.warning("Group-row geometry requires calibration")
+            st.caption(f"{profile.client_width}×{profile.client_height} at {profile.dpi} DPI")
             st.caption(f"Profile: {path}")
             if profile.unresolved:
                 st.warning("Needs future interactive calibration: " + "; ".join(profile.unresolved))
