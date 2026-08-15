@@ -17,7 +17,10 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any, Protocol, Sequence
 
-from .fast_quick_entry import FastEntryItem, KeyboardIO, WindowsKeyboardIO, execute_fast_items
+from .fast_quick_entry import (
+    FastBidItem, FastEntryItem, KeyboardIO, WindowsKeyboardIO,
+    execute_fast_bid_item, execute_fast_items,
+)
 
 
 FAST_KEY_HOLD_SECONDS = 0.005
@@ -176,6 +179,10 @@ class GroupBatchUI(Protocol):
     def select_group_lightweight(self, group: str) -> str: ...
     def focus_quick_entry_cat(self) -> str: ...
     def assert_batch_settled(self) -> None: ...
+    def capture_group_evidence(self, group: str) -> str: ...
+    def capture_final_evidence(self) -> str: ...
+    def accept_expected_biditem_duplicate(self) -> dict[str, float]: ...
+    def normalize_window(self) -> dict[str, Any]: ...
 
 
 def _seconds_summary(values: Sequence[float]) -> dict[str, float]:
@@ -189,7 +196,9 @@ def execute_group_first_plan(
     plan: ExecutableGroupPlan, ui: GroupBatchUI, *, clock=time.perf_counter,
 ) -> dict[str, Any]:
     """Create all groups first, then unload each normal-item batch."""
+    execution_started = clock()
     ui.verify_project_and_no_modal(plan.project)
+    window_profile = ui.normalize_window()
     planned_groups = [batch.group for batch in plan.groups]
     started = clock()
     initial_inventory_method = ui.prepare_group_creation(planned_groups)
@@ -220,30 +229,56 @@ def execute_group_first_plan(
         focus_seconds.append(focus_elapsed)
 
         normal = batch.normal_items
-        for item in normal:
+        for item in batch.items:
             if item.quantity is None:
-                raise RuntimeError(f"normal item {item.line_item_id!r} has no quantity; batch aborted before input")
-        item_timings = execute_fast_items(
-            ui.keyboard,
-            [FastEntryItem(item.category, item.selector, item.quantity, item.line_item_id) for item in normal],
-            clock=clock,
-        )
+                raise RuntimeError(f"item {item.line_item_id!r} has no quantity; batch aborted before input")
+        item_timings = []
+        emitted_identities: set[tuple[str, str]] = set()
+        duplicate_acceptances: list[dict[str, Any]] = []
+        for item in batch.items:
+            if item.is_normal:
+                item_timings.extend(execute_fast_items(
+                    ui.keyboard,
+                    [FastEntryItem(item.category, item.selector, item.quantity, item.line_item_id)],
+                    clock=clock,
+                ))
+            else:
+                item_timings.append(execute_fast_bid_item(
+                    ui.keyboard,
+                    FastBidItem(item.original_description, item.quantity, item.line_item_id),
+                    clock=clock,
+                ))
+                identity = (item.category, item.selector)
+                if identity == ("DOR", "BIDITM") and identity in emitted_identities:
+                    duplicate_acceptances.append({
+                        "line_item_id": item.line_item_id,
+                        **ui.accept_expected_biditem_duplicate(),
+                    })
+                emitted_identities.add(identity)
         ui.assert_batch_settled()
+        evidence_path = ui.capture_group_evidence(batch.group)
         item_seconds = [timing.total_item_seconds for timing in item_timings]
         all_item_seconds.extend(item_seconds)
         group_reports.append({
             "group": batch.group, "selection_method": selection_method,
             "selection_seconds": selection_elapsed, "focus_method": focus_method,
             "focus_seconds": focus_elapsed, "normal_item_count": len(normal),
-            "bid_items": [{**asdict(item), "execution_status": "requires_biditem_sequence"} for item in batch.bid_items],
-            "items": [asdict(timing) for timing in item_timings],
+            "bid_items": [{**asdict(item), "execution_status": "fast_biditem_executed"} for item in batch.bid_items],
+            "items": [
+                {**asdict(timing), "line_item_id": item.line_item_id, "execution_mode": item.execution_mode}
+                for item, timing in zip(batch.items, item_timings, strict=True)
+            ],
+            "evidence_path": evidence_path,
+            "expected_biditem_duplicate_acceptances": duplicate_acceptances,
             "batch": _seconds_summary(item_seconds), "total_group_seconds": clock() - group_started,
         })
     item_summary = _seconds_summary(all_item_seconds)
     item_summary["items_per_second"] = len(all_item_seconds) / sum(all_item_seconds) if all_item_seconds else 0.0
-    return {
+    final_evidence_path = ui.capture_final_evidence()
+    report = {
         "mode": "experimental_group_first_fast_quick_entry", "project": plan.project,
         "key_hold_seconds": FAST_KEY_HOLD_SECONDS,
+        "window_profile": window_profile,
         "group_creation": {
             "groups": creation, "all_groups_verification": all_groups_verification,
             "initial_inventory_method": initial_inventory_method,
@@ -256,15 +291,30 @@ def execute_group_first_plan(
         "item_batch": item_summary, "groups": group_reports,
         "normal_item_count": sum(len(batch.normal_items) for batch in plan.groups),
         "bid_item_count": sum(len(batch.bid_items) for batch in plan.groups),
+        "final_evidence_path": final_evidence_path,
+        "total_execution_seconds": clock() - execution_started,
     }
+    report["normal_item_timing"] = _seconds_summary([
+        item["total_item_seconds"] for group in group_reports for item in group["items"]
+        if item["execution_mode"] == "normal_quick_entry"
+    ])
+    report["biditem_timing"] = _seconds_summary([
+        item["total_item_seconds"] for group in group_reports for item in group["items"]
+        if item["execution_mode"] == "requires_biditem_sequence"
+    ])
+    return report
 
 
 class WindowsGroupBatchUI:
     """Windows facade using existing creation and a fresh lightweight selection proof."""
 
-    def __init__(self, project: str, evidence_dir: Path) -> None:
+    def __init__(self, project: str, evidence_dir: Path, *, calibration_dir: Path | None = None) -> None:
         from .windows_adapter import WindowsXactimateAdapter
+        from .xactimate_calibration import apply_fast_geometry, load_calibration
         self.adapter = WindowsXactimateAdapter(project, evidence_dir=evidence_dir)
+        self.calibration = load_calibration() if calibration_dir is None else load_calibration(calibration_dir)
+        apply_fast_geometry(self.adapter, self.calibration)
+        self.adapter._fast_group_tree_scroll_point = tuple(self.calibration.geometry["group_tree_scroll_point"])
         self.keyboard = WindowsKeyboardIO(key_hold_seconds=FAST_KEY_HOLD_SECONDS)
         self._initial_rows: list[str] | None = None
         self._inventory: GroupInventory | None = None
@@ -284,6 +334,10 @@ class WindowsGroupBatchUI:
             raise RuntimeError("fast group executor refused: planned group identities are empty or duplicate")
         self._inventory = None
         return "one_fresh_exact_pre_creation_inventory"
+
+    def normalize_window(self) -> dict[str, Any]:
+        from .window_normalization import normalize_xactimate_window
+        return normalize_xactimate_window(self.adapter, self.calibration)
 
     def verify_project_and_no_modal(self, project: str) -> None:
         if project != self.adapter.expected_project_name or not self.adapter.verify_application() or not self.adapter.verify_project():
@@ -343,13 +397,13 @@ class WindowsGroupBatchUI:
             raise RuntimeError("fast group creation refused: New Group dialog did not appear")
 
         input_started = time.perf_counter()
-        self.adapter._click_client(dialog_hwnd, 185, 18)
+        self.adapter._click_client(dialog_hwnd, *self.calibration.geometry["new_group_dialog_name_click"])
         self.adapter._select_all_and_delete()
         self.adapter._type_keybdevent(group, char_interval_s=FAST_KEY_HOLD_SECONDS)
         input_seconds = time.perf_counter() - input_started
 
         attach_started = time.perf_counter()
-        self.adapter._click_client(dialog_hwnd, 305, 75)
+        self.adapter._click_client(dialog_hwnd, *self.calibration.geometry["new_group_dialog_attach_click"])
         closed = self._poll(lambda: self.adapter._find_window_by_title("New Group") is None)
         attach_seconds = time.perf_counter() - attach_started
         if not closed:
@@ -428,11 +482,13 @@ class WindowsGroupBatchUI:
         if focus is None:
             raise RuntimeError("fast group executor refused: main window disappeared")
         hwnd, _title = focus
-        image, offset = self.adapter._capture_and_locate(hwnd)
-        if offset is None:
+        image = self.adapter._capture_client_image(hwnd)
+        grid_cat = self.adapter._locate_label(image, "Cat", prefer="bottommost")
+        if grid_cat is None:
             self._inventory = None
             raise RuntimeError("fast group executor refused: Quick Entry CAT geometry is unavailable")
-        left, top, right, bottom = self.adapter._shifted_anchor("quick_entry_cat_value", offset)
+        relation = self.calibration.geometry["grid_to_quick_cat"]
+        left, top, right, bottom = tuple(grid_cat[i] + relation[i] for i in range(4))
         self.adapter._click_client(hwnd, (left + right) // 2, (top + bottom) // 2)
         if not self.adapter._force_foreground(hwnd):
             self._inventory = None
@@ -442,3 +498,45 @@ class WindowsGroupBatchUI:
     def assert_batch_settled(self) -> None:
         if self.adapter._unexpected_dialog_present() or self.adapter._find_dropdown_window() is not None:
             raise RuntimeError("fast group batch stopped: blocking dialog/dropdown detected after batch")
+
+    def capture_group_evidence(self, group: str) -> str:
+        self.adapter.evidence_dir.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", group).strip("_") or "group"
+        path = self.adapter.evidence_dir / f"post_group_{safe}.png"
+        self.adapter._capture_client_image(self.adapter._ensure_main_window()).save(path)
+        return str(path)
+
+    def capture_final_evidence(self) -> str:
+        self.adapter.evidence_dir.mkdir(parents=True, exist_ok=True)
+        path = self.adapter.evidence_dir / "final_estimate.png"
+        self.adapter._capture_client_image(self.adapter._ensure_main_window()).save(path)
+        return str(path)
+
+    def accept_expected_biditem_duplicate(self) -> dict[str, float]:
+        """Accept only a caller-predicted repeated group-local BIDITM.
+
+        Window-title presence is a cheap non-OCR synchronization point. Live
+        calibration observed the dialog at 22.75 ms; 100 ms preserves a
+        bounded margin while the 5 ms poll avoids a fixed sleep.
+        """
+        started = time.perf_counter()
+        deadline = started + 0.1
+        while self.adapter._find_window_by_title(self.adapter._DUPLICATE_ITEM_DIALOG_TITLE) is None:
+            if time.perf_counter() >= deadline:
+                raise RuntimeError(
+                    "expected repeated group-local DOR/BIDITM did not present Duplicate Item(s) within 100 ms"
+                )
+            time.sleep(0.005)
+        appeared = time.perf_counter()
+        self.keyboard.press_tab()
+        self.keyboard.press_tab()
+        self.keyboard.press_enter()
+        close_deadline = time.perf_counter() + 0.1
+        while self.adapter._find_window_by_title(self.adapter._DUPLICATE_ITEM_DIALOG_TITLE) is not None:
+            if time.perf_counter() >= close_deadline:
+                raise RuntimeError("expected Duplicate Item(s) remained after Tab x2 -> Enter")
+            time.sleep(0.005)
+        return {
+            "appearance_wait_seconds": appeared - started,
+            "acceptance_seconds": time.perf_counter() - appeared,
+        }

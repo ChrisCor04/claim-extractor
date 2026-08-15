@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from estimate_extractor.xactimate_lookup.fast_quick_entry import (
-    FastEntryItem, WindowsFastQuickEntryBenchmark, execute_fast_items, summarize_timings,
+    FastBidItem, FastEntryItem, WindowsFastQuickEntryBenchmark,
+    execute_fast_bid_item, execute_fast_items, summarize_timings,
 )
 
 
@@ -12,6 +13,7 @@ class RecordingKeyboard:
         self.events = []
 
     def type_text(self, text): self.events.append(("type", text))
+    def replace_text(self, text): self.events.append(("replace", text))
     def press_tab(self): self.events.append(("tab",))
     def press_enter(self): self.events.append(("enter",))
 
@@ -43,6 +45,28 @@ def test_multiple_items_execute_back_to_back_and_report_timings():
     assert summary["item_count"] == 2
     assert summary["average_item_seconds"] > 0
     assert summary["median_item_seconds"] > 0
+
+
+def test_biditem_uses_calibrated_unresolved_only_sequence():
+    keyboard = RecordingKeyboard()
+    execute_fast_bid_item(
+        keyboard, FastBidItem("Chair - Pillow / Pad - Standard grade", 1.75), clock=Clock(),
+    )
+    assert keyboard.events == [
+        ("type", "DOR"), ("type", "BIDITM"), ("tab",),
+        ("replace", "Chair - Pillow / Pad - Standard grade"),
+        ("tab",), ("replace", "1.75"), ("enter",),
+    ]
+
+
+def test_normal_sequence_never_replaces_description():
+    keyboard = RecordingKeyboard()
+    execute_fast_items(keyboard, [FastEntryItem("RFG", "DRIP", 7.25)], clock=Clock())
+    assert keyboard.events == [
+        ("type", "RFG"), ("type", "DRIP"),
+        ("tab",), ("tab",), ("tab",), ("type", "7.25"), ("enter",),
+    ]
+    assert not any(event[0] == "replace" for event in keyboard.events)
 
 
 def test_fast_item_requires_real_normal_identity_shape():

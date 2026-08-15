@@ -90,7 +90,7 @@ def build_shadow_plan(project_dir: Path, mapper: OfflineCatalogMapper | None = N
             execution_selector = result.selector or ""
             execution_description = result.catalog_description or line["description"]
         elif result.resolution == "bid_item_fallback":
-            execution_state = "fast_bid_item_unsupported_tab_order_unknown"
+            execution_state = "fast_bid_item_ready"
             execution_category, execution_selector = "DOR", "BIDITM"
             execution_description = line["description"]
         else:
@@ -128,7 +128,7 @@ def build_shadow_plan(project_dir: Path, mapper: OfflineCatalogMapper | None = N
         "catalog": str(mapper.catalog.source_path),
         "catalog_row_count": len(mapper.catalog.records),
         "execution_mode": "offline_shadow_only",
-        "bid_item_fast_execution": "unsupported_until_description_quantity_price_tab_order_is_verified",
+        "bid_item_fast_execution": "DOR_BIDITM_Tab1_description_Tab1_quantity",
         "summary": {"total_items": len(items), **counts, "execution_bid_item_fallback": execution_fallbacks},
         "group_first_future_layout": [
             {"group": group, "line_item_ids": line_ids} for group, line_ids in grouped.items()

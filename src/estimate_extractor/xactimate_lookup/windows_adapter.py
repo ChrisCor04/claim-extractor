@@ -7769,7 +7769,8 @@ class WindowsXactimateAdapter(XactimateAdapter):
         # range is sufficient -- the wheel event targets whatever
         # control is under the cursor, not a click target needing
         # pixel precision.
-        user32.SetCursorPos(ox + 350, oy + 150)
+        scroll_x, scroll_y = getattr(self, "_fast_group_tree_scroll_point", (350, 150))
+        user32.SetCursorPos(ox + scroll_x, oy + scroll_y)
         time.sleep(0.05)
         MOUSEEVENTF_WHEEL = 0x0800
         WHEEL_DELTA = 120

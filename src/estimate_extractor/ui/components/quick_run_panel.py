@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import streamlit as st
 
@@ -23,6 +24,11 @@ from estimate_extractor.xactimate_lookup.execution_plan import (
 )
 from estimate_extractor.xactimate_lookup.execution_reports import build_review_queue
 from estimate_extractor.xactimate_lookup.execution_runner import run_execution_plan
+from estimate_extractor.xactimate_lookup.fast_grouped_service import (
+    execute_saved_fast_grouped_run, prepare_fast_grouped_run, review_rows,
+)
+from estimate_extractor.xactimate_lookup.window_normalization import normalize_xactimate_window
+from estimate_extractor.xactimate_lookup.xactimate_calibration import calibrate_xactimate, load_calibration
 
 
 def _construct_adapter(project_name: str, project_dir: Path):
@@ -134,6 +140,76 @@ def _render_plan_status(project_dir: Path) -> None:
             st.dataframe(queue, width="stretch", hide_index=True)
 
 
+def _render_fast_grouped_mode(project_dir: Path, project_name: str) -> None:
+    st.warning("Experimental: one reviewed grouped plan is emitted through blind keyboard entry.")
+    if st.button(
+        "Calibrate Xactimate", key="quick_fast_calibrate_xactimate",
+        disabled=not project_name, width="stretch",
+    ):
+        try:
+            profile, path = calibrate_xactimate(_construct_adapter(project_name, project_dir))
+            st.success(
+                f"Calibration saved: {profile.client_width}×{profile.client_height} at {profile.dpi} DPI."
+            )
+            st.caption(f"Profile: {path}")
+            if profile.unresolved:
+                st.warning("Needs future interactive calibration: " + "; ".join(profile.unresolved))
+        except Exception as exc:
+            st.error(f"Xactimate calibration failed: {exc}")
+    if st.button(
+        "Normalize Xactimate Window", key="quick_fast_normalize_window",
+        disabled=not project_name, width="stretch",
+    ):
+        try:
+            result = normalize_xactimate_window(
+                _construct_adapter(project_name, project_dir), load_calibration(),
+            )
+            st.success(
+                f"Window normalized: {result['client_width']}×{result['client_height']} at {result['dpi']} DPI."
+            )
+        except Exception as exc:
+            st.error(f"Window normalization failed: {exc}")
+    plan_path = project_dir / "execution" / "fast_grouped" / "shadow_quick_entry_plan.json"
+    if st.button("Generate / refresh fast grouped plan", key="quick_fast_prepare", width="stretch"):
+        prepared = prepare_fast_grouped_run(project_dir)
+        st.session_state["quick_fast_planning_seconds"] = prepared.planning_seconds
+        st.success(f"Plan prepared in {prepared.planning_seconds:.2f}s.")
+
+    if not plan_path.exists():
+        st.info("Generate the complete offline plan before approval or execution.")
+        return
+    shadow = json.loads(plan_path.read_text(encoding="utf-8"))
+    rows = review_rows(shadow)
+    resolved = sum(not row["BIDITM"] for row in rows)
+    biditems = len(rows) - resolved
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Lines", len(rows)); c2.metric("Resolved", resolved)
+    c3.metric("DOR/BIDITM", biditems); c4.metric("Groups", len(shadow["group_first_future_layout"]))
+    st.dataframe(rows, width="stretch", hide_index=True)
+    approved = st.checkbox(
+        "I reviewed and approve this complete fast grouped plan",
+        key="quick_fast_approved",
+    )
+    if st.button(
+        "Execute approved fast grouped plan",
+        type="primary", width="stretch", disabled=not approved or not project_name,
+        key="quick_fast_execute",
+    ):
+        try:
+            evidence = project_dir / "execution" / "fast_grouped" / "evidence"
+            with st.spinner("Creating all groups, then populating the approved plan …"):
+                report = execute_saved_fast_grouped_run(plan_path, project_name, evidence)
+            st.success(
+                f"Fast grouped pass complete: {report['normal_item_count']} normal and "
+                f"{report['bid_item_count']} BIDITM items in {report['total_execution_seconds']:.2f}s."
+            )
+            st.json(report)
+        except Exception as exc:
+            st.error(f"Fast grouped execution stopped at a group boundary: {exc}")
+            with st.expander("Technical details"):
+                st.exception(exc)
+
+
 def render_quick_run_panel(
     projects: ProjectService,
     config: Config,
@@ -198,6 +274,15 @@ def render_quick_run_panel(
         key="quick_xactimate_project_name",
     ).strip()
     st.caption("Leave Xactimate open on Estimate Items with no dialog or dropdown visible.")
+    execution_mode = st.radio(
+        "Execution mode",
+        ["Conservative verified execution", "Fast Grouped Xactimate Entry (experimental)"],
+        key="quick_execution_mode",
+    )
+    if execution_mode == "Fast Grouped Xactimate Entry (experimental)":
+        _render_fast_grouped_mode(project_dir, project_name)
+        return
+
     _render_plan_status(project_dir)
 
     if st.button(

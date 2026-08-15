@@ -22,6 +22,13 @@ class FastEntryItem:
     source_line_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class FastBidItem:
+    description: str
+    quantity: float
+    source_line_id: str | None = None
+
+
 @dataclass(slots=True)
 class FastEntryTiming:
     category: str
@@ -37,6 +44,7 @@ class FastEntryTiming:
 
 class KeyboardIO(Protocol):
     def type_text(self, text: str) -> None: ...
+    def replace_text(self, text: str) -> None: ...
     def press_tab(self) -> None: ...
     def press_enter(self) -> None: ...
 
@@ -62,6 +70,21 @@ class WindowsKeyboardIO:
             self.user32.keybd_event(vk, 0, key_up, 0)
             if modifiers & 1:
                 self.user32.keybd_event(0x10, 0, key_up, 0)
+
+    def replace_text(self, text: str) -> None:
+        """Replace the currently focused editor without inspecting its value."""
+        key_up = 0x0002
+        self.user32.keybd_event(0x11, 0, 0, 0)
+        self.user32.keybd_event(0x41, 0, 0, 0)
+        if self.key_hold_seconds:
+            time.sleep(self.key_hold_seconds)
+        self.user32.keybd_event(0x41, 0, key_up, 0)
+        self.user32.keybd_event(0x11, 0, key_up, 0)
+        self.user32.keybd_event(0x2E, 0, 0, 0)
+        if self.key_hold_seconds:
+            time.sleep(self.key_hold_seconds)
+        self.user32.keybd_event(0x2E, 0, key_up, 0)
+        self.type_text(text)
 
     def _press(self, vk: int) -> None:
         self.user32.keybd_event(vk, 0, 0, 0)
@@ -107,6 +130,29 @@ def execute_fast_items(
             submit=submit, ready_for_next=ready, total_item_seconds=ready - started,
         ))
     return timings
+
+
+def execute_fast_bid_item(
+    keyboard: KeyboardIO, item: FastBidItem, *, clock=time.perf_counter,
+) -> FastEntryTiming:
+    """Execute one unresolved DOR/BIDITM item with no retained mode state."""
+    started = clock()
+    keyboard.type_text("DOR")
+    sel_entry = clock()
+    keyboard.type_text("BIDITM")
+    keyboard.press_tab()  # BIDITM skips Act: selector -> Description.
+    keyboard.replace_text(item.description)
+    keyboard.press_tab()  # Description -> Quantity.
+    quantity_entry = clock()
+    keyboard.replace_text(format(item.quantity, "g"))
+    submit = clock()
+    keyboard.press_enter()
+    ready = clock()
+    return FastEntryTiming(
+        category="DOR", selector="BIDITM", quantity=item.quantity,
+        cat_start=started, sel_entry=sel_entry, quantity_entry=quantity_entry,
+        submit=submit, ready_for_next=ready, total_item_seconds=ready - started,
+    )
 
 
 def summarize_timings(timings: Sequence[FastEntryTiming]) -> dict[str, float | int]:

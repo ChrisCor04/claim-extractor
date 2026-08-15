@@ -42,6 +42,7 @@ class UI:
     def verify_project_and_no_modal(self, project):
         self.events.append(("preflight", project))
         if self.fail == "preflight": raise RuntimeError("modal")
+    def normalize_window(self): self.events.append(("normalize-window",)); return {"ok": True}
     def prepare_group_creation(self, groups): self.events.append(("inventory-initial", tuple(groups))); return "initial"
     def create_group(self, group):
         self.events.append(("create", group))
@@ -53,7 +54,13 @@ class UI:
     def select_group_lightweight(self, group): self.events.append(("select", group)); return "fresh-selection"
     def focus_quick_entry_cat(self): self.events.append(("focus",)); return "fresh-focus"
     def assert_batch_settled(self): self.events.append(("settled",))
+    def capture_group_evidence(self, group): self.events.append(("capture-group", group)); return f"{group}.png"
+    def capture_final_evidence(self): self.events.append(("capture-final",)); return "final.png"
+    def accept_expected_biditem_duplicate(self):
+        self.events.append(("duplicate-poll",)); self.press_tab(); self.press_tab(); self.press_enter()
+        return {"appearance_wait_seconds": .02, "acceptance_seconds": .02}
     def type_text(self, value): self.events.append(("type", value))
+    def replace_text(self, value): self.events.append(("replace", value))
     def press_tab(self): self.events.append(("tab",))
     def press_enter(self): self.events.append(("enter",))
 
@@ -89,7 +96,7 @@ def test_all_groups_are_created_before_selection_and_hot_loop_is_keyboard_only()
         ("type", "RFG"), ("type", "DRIP"), ("tab",), ("tab",), ("tab",), ("type", "1"), ("enter",),
     ]
     assert report["normal_item_count"] == 3 and report["bid_item_count"] == 1
-    assert report["groups"][1]["bid_items"][0]["execution_status"] == "requires_biditem_sequence"
+    assert report["groups"][1]["bid_items"][0]["execution_status"] == "fast_biditem_executed"
     assert FAST_KEY_HOLD_SECONDS == .005
     architectural = [event for event in ui.events if event[0] in {"create", "verify-all", "select", "type"}]
     assert architectural[:4] == [
@@ -145,10 +152,70 @@ def test_complete_inventory_rejects_duplicate_rows_and_duplicate_planned_names()
         reconcile_complete_group_inventory(["P4A_0814"], ["P4A_0814", "p4a 0814"])
 
 
-def test_population_never_routes_biditem_through_normal_hot_loop():
+def test_population_routes_biditem_through_its_own_hot_loop():
     ui = UI()
     execute_group_first_plan(compile_executable_group_plan(_shadow()), ui, clock=Clock())
-    assert ("type", "DOR") not in ui.events and ("type", "BIDITM") not in ui.events
+    bid = ui.events.index(("type", "DOR"))
+    assert ui.events[bid:bid + 7] == [
+        ("type", "DOR"), ("type", "BIDITM"), ("tab",),
+        ("replace", "b2"), ("tab",), ("replace", "1"), ("enter",),
+    ]
+
+
+def test_biditem_then_multiple_normals_do_not_leak_navigation_mode():
+    shadow = _shadow()
+    shadow["group_first_future_layout"] = [{"group": "A", "line_item_ids": ["b2", "a1", "a2"]}]
+    shadow["items"] = [shadow["items"][3], shadow["items"][0], shadow["items"][1]]
+    for row in shadow["items"]: row["group"] = "A"
+    ui = UI(); execute_group_first_plan(compile_executable_group_plan(shadow), ui, clock=Clock())
+    start = ui.events.index(("type", "DOR"))
+    assert ui.events[start:start + 14] == [
+        ("type", "DOR"), ("type", "BIDITM"), ("tab",), ("replace", "b2"),
+        ("tab",), ("replace", "1"), ("enter",),
+        ("type", "RFG"), ("type", "DRIP"), ("tab",), ("tab",), ("tab",),
+        ("type", "1"), ("enter",),
+    ]
+    assert ui.events[start + 14:start + 21] == [
+        ("type", "RFG"), ("type", "IWS"), ("tab",), ("tab",), ("tab",),
+        ("type", "1"), ("enter",),
+    ]
+
+
+def test_expected_biditem_duplicate_tracking_is_group_local_and_biditem_only():
+    shadow = _shadow()
+    bid_template = shadow["items"][3]
+    bids = []
+    for line_id, group in (("b1", "A"), ("b2", "A"), ("b3", "A"), ("b4", "B")):
+        row = dict(bid_template); row.update(line_item_id=line_id, group=group, original_description=line_id)
+        bids.append(row)
+    normal1 = dict(shadow["items"][0]); normal1.update(line_item_id="n1", group="B")
+    normal2 = dict(shadow["items"][0]); normal2.update(line_item_id="n2", group="B")
+    shadow["items"] = [*bids, normal1, normal2]
+    shadow["group_first_future_layout"] = [
+        {"group": "A", "line_item_ids": ["b1", "b2", "b3"]},
+        {"group": "B", "line_item_ids": ["b4", "n1", "n2"]},
+    ]
+    ui = UI(); report = execute_group_first_plan(compile_executable_group_plan(shadow), ui, clock=Clock())
+    assert ui.events.count(("duplicate-poll",)) == 2
+    assert len(report["groups"][0]["expected_biditem_duplicate_acceptances"]) == 2
+    assert report["groups"][1]["expected_biditem_duplicate_acceptances"] == []
+    second = [i for i, event in enumerate(ui.events) if event == ("type", "DOR")][1]
+    assert ui.events[second:second + 11] == [
+        ("type", "DOR"), ("type", "BIDITM"), ("tab",), ("replace", "b2"),
+        ("tab",), ("replace", "1"), ("enter",), ("duplicate-poll",),
+        ("tab",), ("tab",), ("enter",),
+    ]
+    # The first BIDITM in B and repeated ordinary RFG/DRIP rows never invoke it.
+    b_select = ui.events.index(("select", "B"))
+    assert ("duplicate-poll",) not in ui.events[b_select:]
+
+
+def test_biditem_payload_preserves_source_and_nullable_price():
+    bid = compile_executable_group_plan(_shadow()).groups[1].bid_items[0]
+    assert (bid.category, bid.selector) == ("DOR", "BIDITM")
+    assert bid.original_description == "b2" and bid.quantity == 1 and bid.unit == "EA" and bid.price == 2.5
+    shadow = _shadow(); shadow["items"][3]["source_pricing"] = {}
+    assert compile_executable_group_plan(shadow).groups[1].bid_items[0].price is None
 
 
 def test_inventory_selection_uses_one_row_reread_not_full_tree_rescan():

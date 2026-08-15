@@ -32,7 +32,7 @@ def test_real_estimate_builds_complete_group_first_shadow_plan():
             assert item["execution_description"] == item["original_description"]
         else:
             assert (item["category"], item["selector"]) == ("DOR", "BIDITM")
-            assert item["execution_state"] == "fast_bid_item_unsupported_tab_order_unknown"
+            assert item["execution_state"] == "fast_bid_item_ready"
             assert (item["execution_category"], item["execution_selector"]) == ("DOR", "BIDITM")
             assert item["quantity"] is not None and item["unit"]
 
