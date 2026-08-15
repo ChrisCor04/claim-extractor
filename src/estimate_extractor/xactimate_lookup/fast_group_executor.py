@@ -397,7 +397,16 @@ class WindowsGroupBatchUI:
             raise RuntimeError("fast group selection refused: verified reusable inventory is absent")
         before = self.adapter._capture_client_image(hwnd)
         header = self.adapter._locate_group_tree_header(before)
-        if header is None or tuple(header) != self._inventory.header_rect or self._window_rect(hwnd) != self._inventory.window_rect:
+        # OCR's word box can vary by a pixel at its right/bottom edge as
+        # antialiasing changes after a subtotal repaint. Row coordinates are
+        # derived only from the header origin. Preserve exact window and
+        # origin equality; do not mistake advisory glyph-box width for a
+        # physical layout change.
+        if (
+            header is None
+            or tuple(header[:2]) != self._inventory.header_rect[:2]
+            or self._window_rect(hwnd) != self._inventory.window_rect
+        ):
             raise RuntimeError("fast group selection refused: reusable inventory geometry was invalidated")
         entry = self._inventory.entry(group)
         index = entry.physical_row

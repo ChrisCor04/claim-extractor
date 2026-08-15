@@ -207,6 +207,34 @@ def test_inventory_geometry_invalidation_prevents_stale_click():
         facade.select_group_lightweight("P4A_0814")
 
 
+def test_inventory_accepts_advisory_header_width_jitter_with_exact_origin():
+    class Adapter:
+        expected_project_name = "TEST"
+        def verify_application(self): return True
+        def verify_project(self): return True
+        def _unexpected_dialog_present(self): return False
+        def _find_dropdown_window(self): return None
+        def _ensure_main_window(self): return 1
+        def _force_foreground(self, hwnd): return True
+        def _capture_client_image(self, hwnd): return object()
+        def _locate_group_tree_header(self, image): return (270, 155, 301, 165)
+        def _ocr_group_tree_row_text(self, image, header, index): return "ORBIT_ROOF_C"
+        def _click_client(self, hwnd, *xy): pass
+        def _group_tree_row_has_selection_boundary(self, image, header, index): return True
+        def _anchor_offset(self, image): return (0, 0)
+        def _items_search_pane_field(self, image): return (1, 1, 2, 2)
+        def _win32gui(self):
+            class W:
+                @staticmethod
+                def GetWindowRect(hwnd): return (0, 0, 1920, 1023)
+            return W
+    facade = object.__new__(WindowsGroupBatchUI); facade.adapter = Adapter()
+    facade._inventory = GroupInventory((0, 0, 1920, 1023), (270, 155, 302, 165), (
+        GroupInventoryEntry("orbitroofc", "ORBIT_ROOF_C", 1, (349, 206)),
+    ))
+    assert facade.select_group_lightweight("ORBIT_ROOF_C").startswith("verified_inventory_row")
+
+
 def test_bounded_new_row_proof_cannot_satisfy_a_different_planned_group():
     class Adapter:
         def _capture_client_image(self, hwnd): return object()
