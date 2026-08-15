@@ -169,14 +169,42 @@ def measure_group_row_pitch(
     }
 
 
+def _locate_group_column_headers(adapter, image) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int], str]:
+    """Locate Group and Subtotal, tolerating only bounded Subtotal glyph noise."""
+    group = adapter._locate_group_tree_header(image)
+    if group is None:
+        raise RuntimeError("Group header is unavailable")
+    subtotal = adapter._locate_label(image, "Subtotal", prefer="topmost")
+    if subtotal is not None and subtotal[0] > group[2]:
+        return tuple(group), tuple(subtotal), "exact_label"
+    # Live-caught: the visible header rendered as `subtot!`. Restrict the
+    # fallback to the same 35px header band and require a normalized prefix;
+    # arbitrary body text and right-pane labels cannot establish this bound.
+    crop_left = max(0, group[0] - 20)
+    crop_top = max(0, group[1] - 10)
+    crop_right = min(image.width, group[0] + 300)
+    crop_bottom = min(image.height, group[1] + 35)
+    data = adapter._ocr_data(image.crop((crop_left, crop_top, crop_right, crop_bottom)), config="--psm 6")
+    matches = []
+    for text, left, top, width, height in zip(
+        data.get("text", []), data.get("left", []), data.get("top", []),
+        data.get("width", []), data.get("height", []), strict=False,
+    ):
+        normalized = "".join(ch for ch in str(text).casefold() if ch.isalnum())
+        rect = (crop_left + int(left), crop_top + int(top),
+                crop_left + int(left) + int(width), crop_top + int(top) + int(height))
+        if normalized.startswith("subtot") and rect[0] > group[2]:
+            matches.append(rect)
+    if len(matches) != 1:
+        raise RuntimeError(f"Subtotal header fallback found {len(matches)} bounded candidate(s)")
+    return tuple(group), tuple(matches[0]), "bounded_header_prefix_ocr"
+
+
 def _group_column_inventory(adapter, image) -> dict[str, Any]:
     """Read physical group-name rows from the independently bounded column."""
     from .fast_group_executor import normalize_planned_group_identity
 
-    group = adapter._locate_group_tree_header(image)
-    subtotal = adapter._locate_label(image, "Subtotal", prefer="topmost")
-    if group is None or subtotal is None or subtotal[0] <= group[2]:
-        raise RuntimeError("Group/Subtotal headers do not bound the group-name column")
+    group, subtotal, boundary_method = _locate_group_column_headers(adapter, image)
     region = (group[0], group[1], subtotal[0], image.height)
     data = adapter._ocr_data(image.crop(region))
     measured = measure_group_row_pitch(
@@ -199,7 +227,8 @@ def _group_column_inventory(adapter, image) -> dict[str, Any]:
         rows.append({"raw_text": text, "normalized_text": normalize_planned_group_identity(text),
                      "center_y": region[1] + center, "relative_center_y": center,
                      "top": region[1] + min(box["top"] for box in cluster)})
-    return {"header": list(group), "subtotal_header": list(subtotal), "source_region": list(region),
+    return {"header": list(group), "subtotal_header": list(subtotal), "boundary_method": boundary_method,
+            "source_region": list(region),
             "ocr_diagnostics": measured, "rows": rows}
 
 
@@ -340,6 +369,70 @@ def complete_interactive_group_row_calibration(
                         validation_state="ready_for_fast_execution")
     save_calibration(completed, directory)
     return completed, measurement
+
+
+def recover_existing_group_row_calibration(
+    adapter, profile: XactimateCalibration, *, directory: Path = DEFAULT_CALIBRATION_DIR,
+    evidence_dir: Path | None = None,
+) -> tuple[XactimateCalibration, dict[str, Any]]:
+    """Read-only recovery using three already-existing calibration rows."""
+    if adapter._unexpected_dialog_present() or adapter._find_dropdown_window() is not None:
+        raise RuntimeError("row calibration recovery refused: blocking dialog/dropdown is present")
+    image = adapter._capture_client_image(adapter._ensure_main_window())
+    inventory = _group_column_inventory(adapter, image)
+    measurement = confident_known_group_measurement(inventory)
+    evidence_root = evidence_dir or directory / "evidence"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    screenshot = evidence_root / f"{profile.profile_id}-existing-group-rows.png"
+    image.save(screenshot)
+    measurement.update({"triggered": True, "mode": "read_only_existing_rows", "creation": [],
+                        "screenshot": str(screenshot), "cleanup": "not_requested"})
+    if measurement["confidence_state"] != "measured_confident":
+        failed = dict(profile.geometry)
+        failed.update({"group_row_height": None, "group_row_pitch_state": measurement["confidence_state"],
+                       "group_row_diagnostics": measurement})
+        save_calibration(replace(profile, geometry=failed), directory)
+        raise RuntimeError("Group-row geometry requires calibration: " + str(measurement["rejection_reason"]))
+    mapping = _exact_calibration_row_map(inventory)
+    root_identity = "".join(ch for ch in profile.window_title.casefold() if ch.isalnum())
+    root_matches = [row for row in inventory["rows"] if root_identity and root_identity in row["normalized_text"]]
+    if len(root_matches) != 1:
+        raise RuntimeError("Group-row geometry requires calibration: project root row is not unique")
+    click_offsets = [mapping[name]["center_y"] - mapping[name]["top"] for name in CALIBRATION_GROUP_NAMES]
+    geometry = dict(profile.geometry)
+    geometry.update({"group_row_height": measurement["chosen_pitch"], "group_row_pitch_state": "measured_confident",
+                     "group_row_text_top_offset": root_matches[0]["top"] - inventory["header"][1],
+                     "group_click_y_offset": round(sum(click_offsets) / len(click_offsets)),
+                     "group_row_diagnostics": measurement})
+    confidence = dict(profile.confidence); confidence["group_row_height"] = "measured_confident"
+    unresolved = tuple(value for value in profile.unresolved if value != "Group-row geometry requires calibration")
+    # Group creation can repaint/canonicalize the content pane, moving the
+    # Group and grid anchors together. Refresh the same read-only landmarks
+    # from this measurement frame so the saved profile describes the frame it
+    # actually measured rather than a pre-creation scroll position.
+    group = tuple(inventory["header"])
+    grid_cat = adapter._locate_label(image, "Cat", prefer="bottommost")
+    items = adapter._locate_items_tab(image)
+    search = adapter._items_search_pane_field(image)
+    if grid_cat is None or items is None or search is None:
+        raise RuntimeError("Group-row geometry requires calibration: core Items/grid landmarks are unavailable")
+    offset = (grid_cat[0] - adapter._shifted_anchor("grid_header_cat_label", (0, 0))[0],
+              grid_cat[1] - adapter._shifted_anchor("grid_header_cat_label", (0, 0))[1])
+    quick_cat = adapter._shifted_anchor("quick_entry_cat_value", offset)
+    grid_header = adapter._shifted_anchor("grid_header", offset)
+    grid_row_1 = adapter._shifted_anchor("grid_row_1", offset)
+    landmarks = dict(profile.landmarks)
+    landmarks.update({"group_tree_header": list(group), "grid_header_cat": list(grid_cat),
+                      "items_tab": list(items), "items_search": list(search),
+                      "quick_entry_cat": list(quick_cat), "grid_header": list(grid_header),
+                      "grid_row_1": list(grid_row_1)})
+    geometry["group_tree_bounds"] = [max(0, group[0] - 4), group[3], inventory["subtotal_header"][0], image.height]
+    geometry["items_grid_bounds"] = [grid_header[0], items[3], grid_header[2], image.height]
+    recovered = replace(profile, geometry=geometry, landmarks=landmarks,
+                        confidence=confidence, unresolved=unresolved,
+                        validation_state="ready_for_fast_execution")
+    save_calibration(recovered, directory)
+    return recovered, measurement
 
 
 def calibrate_xactimate(

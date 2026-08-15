@@ -7,7 +7,7 @@ from estimate_extractor.xactimate_lookup.xactimate_calibration import (
     CALIBRATION_GROUP_NAMES, SCHEMA_VERSION, XactimateCalibration, apply_fast_geometry,
     complete_interactive_group_row_calibration, confident_known_group_measurement,
     load_calibration, machine_identifier, measure_group_row_pitch, save_calibration,
-    validate_calibration,
+    recover_existing_group_row_calibration, validate_calibration,
 )
 
 
@@ -216,6 +216,7 @@ def test_known_calibration_rows_with_inconsistent_spacing_fail_closed():
 
 
 class _Image:
+    width, height = 1920, 1023
     def save(self, path): path.write_bytes(b"png")
 
 
@@ -225,6 +226,15 @@ class _InteractiveAdapter:
     def _find_dropdown_window(self): return None
     def _ensure_main_window(self): return 1
     def _capture_client_image(self, hwnd): self.events.append(("capture", hwnd)); return _Image()
+    def _locate_label(self, _image, text, prefer=None): return (540, 630, 561, 643)
+    def _locate_items_tab(self, _image): return (296, 78, 342, 98)
+    def _items_search_pane_field(self, _image): return (508, 165, 826, 186)
+    def _shifted_anchor(self, name, offset):
+        anchors = {"grid_header_cat_label": (540, 630, 561, 643),
+                   "quick_entry_cat_value": (563, 459, 608, 477),
+                   "grid_header": (506, 628, 1894, 645), "grid_row_1": (506, 654, 1894, 671)}
+        l, t, r, b = anchors[name]; dx, dy = offset
+        return l + dx, t + dy, r + dx, b + dy
 
 
 @pytest.mark.parametrize("state", ["unresolved", "measured_low_confidence"])
@@ -279,3 +289,39 @@ def test_interactive_inconsistent_spacing_persists_failure_and_refuses_execution
     assert saved.geometry["group_row_pitch_state"] == "measured_low_confidence"
     with pytest.raises(RuntimeError, match="Group-row geometry requires calibration"):
         apply_fast_geometry(type("Adapter", (), {})(), saved)
+
+
+def test_bounded_subtotal_prefix_recovers_visible_misread_header():
+    class Image:
+        width, height = 900, 700
+        def crop(self, _rect): return self
+    class Adapter:
+        def _locate_group_tree_header(self, _image): return (270, 111, 301, 121)
+        def _locate_label(self, _image, _text, prefer=None): return None
+        def _ocr_data(self, _crop, config=None):
+            return _ocr(("Group", 10, 20, 32, 10), ("subtot!", 10, 212, 34, 8),
+                        ("unrelated", 200, 250, 50, 9))
+    group, subtotal, method = calibration._locate_group_column_headers(Adapter(), Image())
+    assert group == (270, 111, 301, 121)
+    assert subtotal[0] == 462
+    assert method == "bounded_header_prefix_ocr"
+
+
+def test_read_only_existing_rows_recovery_makes_profile_executable_without_creation(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["group_row_height"] = None
+    inventory = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120),
+                           ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
+    inventory["boundary_method"] = "bounded_header_prefix_ocr"
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: inventory)
+    adapter = _InteractiveAdapter()
+    recovered, detail = recover_existing_group_row_calibration(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path / "evidence",
+    )
+    assert detail["creation"] == []
+    assert detail["detected_row_centers"] == {
+        "CAL_ROW_ALPHA": 120.0, "CAL_ROW_BRAVO": 140.0, "CAL_ROW_CHARLIE": 160.0,
+    }
+    assert recovered.geometry["group_row_height"] == 20
+    assert recovered.geometry["group_row_pitch_state"] == "measured_confident"
+    apply_fast_geometry(type("Adapter", (), {})(), recovered)
