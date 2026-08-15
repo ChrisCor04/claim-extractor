@@ -85,6 +85,21 @@ def save_calibration(profile: XactimateCalibration, directory: Path = DEFAULT_CA
     return path
 
 
+def _profile_transaction(path: Path, operation):
+    """Restore the exact prior profile bytes if recalibration fails."""
+    previous = path.read_bytes() if path.exists() else None
+    try:
+        return operation()
+    except Exception:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            temporary = path.with_suffix(".restore.tmp")
+            temporary.write_bytes(previous)
+            temporary.replace(path)
+        raise
+
+
 def load_calibration(directory: Path = DEFAULT_CALIBRATION_DIR) -> XactimateCalibration:
     path = profile_path(directory)
     if not path.exists():
@@ -277,6 +292,12 @@ def confident_known_group_measurement(
 
 def _create_one_calibration_group(adapter, profile: XactimateCalibration, name: str) -> dict[str, Any]:
     """Use the fast New Group primitives, always from the live root row."""
+    # The group tree has its own independent scroll position that a busy
+    # project can easily drift past the root row -- see
+    # _scroll_group_tree_to_top()'s own docstring. Called defensively
+    # here for the same reason it is called at every other group-tree
+    # entry point in windows_adapter.py: never assumed unnecessary.
+    adapter._scroll_group_tree_to_top(adapter._ensure_main_window())
     inventory = _group_column_inventory(adapter, adapter._capture_client_image(adapter._ensure_main_window()))
     root_rows = [row for row in inventory["rows"] if profile.window_title.casefold() in row["raw_text"].casefold()]
     if len(root_rows) != 1:
@@ -371,6 +392,41 @@ def complete_interactive_group_row_calibration(
     return completed, measurement
 
 
+def _complete_or_recover_group_rows(
+    adapter, profile: XactimateCalibration, *, directory: Path,
+    evidence_dir: Path | None,
+) -> tuple[XactimateCalibration, dict[str, Any]]:
+    """Use existing complete calibration rows; create only from proven absence."""
+    # See _create_one_calibration_group()'s identical comment: the group
+    # tree's scroll position is independent of everything else and a
+    # busy project can easily drift the calibration rows out of the
+    # captured client area, which would otherwise misreport them as
+    # absent and route into (redundant, failure-prone) creation.
+    adapter._scroll_group_tree_to_top(adapter._ensure_main_window())
+    inventory = _group_column_inventory(adapter, adapter._capture_client_image(adapter._ensure_main_window()))
+    present = []
+    for name in CALIBRATION_GROUP_NAMES:
+        try:
+            _exact_calibration_row_map(inventory, (name,))
+            present.append(name)
+        except RuntimeError as exc:
+            if "0 exact" not in str(exc):
+                raise
+    if len(present) == len(CALIBRATION_GROUP_NAMES):
+        return recover_existing_group_row_calibration(
+            adapter, profile, directory=directory, evidence_dir=evidence_dir,
+        )
+    if present:
+        missing = [name for name in CALIBRATION_GROUP_NAMES if name not in present]
+        raise RuntimeError(
+            "interactive row calibration refused: partial calibration group set; "
+            f"present={present}, missing={missing}"
+        )
+    return complete_interactive_group_row_calibration(
+        adapter, profile, directory=directory, evidence_dir=evidence_dir,
+    )
+
+
 def recover_existing_group_row_calibration(
     adapter, profile: XactimateCalibration, *, directory: Path = DEFAULT_CALIBRATION_DIR,
     evidence_dir: Path | None = None,
@@ -378,6 +434,10 @@ def recover_existing_group_row_calibration(
     """Read-only recovery using three already-existing calibration rows."""
     if adapter._unexpected_dialog_present() or adapter._find_dropdown_window() is not None:
         raise RuntimeError("row calibration recovery refused: blocking dialog/dropdown is present")
+    # See _create_one_calibration_group()'s identical comment: the root
+    # row this function looks up below can be scrolled out of the
+    # captured client area in a busy project.
+    adapter._scroll_group_tree_to_top(adapter._ensure_main_window())
     image = adapter._capture_client_image(adapter._ensure_main_window())
     inventory = _group_column_inventory(adapter, image)
     measurement = confident_known_group_measurement(inventory)
@@ -557,11 +617,24 @@ def calibrate_xactimate(
             "New Group dialog controls require a bounded interactive calibration",
         ) if value),
     )
-    path = save_calibration(profile, directory)
+    path = profile_path(directory, profile.machine_id)
     if allow_interactive_group_rows and row_state != "measured_confident":
-        profile, _measurement = complete_interactive_group_row_calibration(
-            adapter, profile, directory=directory, evidence_dir=evidence_dir,
+        profile, _measurement = _profile_transaction(
+            path,
+            lambda: _complete_or_recover_group_rows(
+                adapter, profile, directory=directory, evidence_dir=evidence_dir,
+            ),
         )
+    else:
+        # Row pitch can already be confident here without ever touching
+        # CAL_ROW_* -- measured directly from real existing group rows
+        # (or the caller didn't opt into interactive completion at all).
+        # That is one of the two valid calibration end states, so it must
+        # be marked ready the same way the interactive/recovery paths do,
+        # not left stuck at the pre-row-measurement validation state.
+        if row_state == "measured_confident":
+            profile = replace(profile, validation_state="ready_for_fast_execution")
+        save_calibration(profile, directory)
     return profile, path
 
 

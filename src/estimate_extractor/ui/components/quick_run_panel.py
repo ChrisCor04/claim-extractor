@@ -28,7 +28,9 @@ from estimate_extractor.xactimate_lookup.fast_grouped_service import (
     execute_saved_fast_grouped_run, prepare_fast_grouped_run, review_rows,
 )
 from estimate_extractor.xactimate_lookup.window_normalization import normalize_xactimate_window
-from estimate_extractor.xactimate_lookup.xactimate_calibration import calibrate_xactimate, load_calibration
+from estimate_extractor.xactimate_lookup.xactimate_calibration import (
+    calibrate_xactimate, load_calibration, profile_path,
+)
 
 
 def _construct_adapter(project_name: str, project_dir: Path):
@@ -140,8 +142,55 @@ def _render_plan_status(project_dir: Path) -> None:
             st.dataframe(queue, width="stretch", hide_index=True)
 
 
+def _saved_calibration_status(*, loader=None, path=None) -> dict[str, object]:
+    """Read saved machine state only; never inspect or manipulate Xactimate."""
+    calibration_path = path or profile_path()
+    if not calibration_path.exists():
+        return {"status": "Not calibrated", "client_size": "—", "dpi": "—",
+                "group_row_pitch_state": "—", "chosen_row_pitch": "—", "project_name": ""}
+    try:
+        profile = (loader or load_calibration)()
+    except Exception as exc:
+        return {"status": "Needs calibration", "client_size": "—", "dpi": "—",
+                "group_row_pitch_state": "invalid_profile", "chosen_row_pitch": "—",
+                "project_name": "", "detail": str(exc)}
+    pitch_state = profile.geometry.get("group_row_pitch_state") or "unresolved"
+    pitch = profile.geometry.get("group_row_height")
+    ready = (
+        profile.validation_state == "ready_for_fast_execution"
+        and pitch_state == "measured_confident" and pitch is not None
+    )
+    return {
+        "status": "Ready" if ready else "Needs calibration",
+        "client_size": f"{profile.client_width} × {profile.client_height}",
+        "dpi": profile.dpi, "group_row_pitch_state": pitch_state,
+        "chosen_row_pitch": f"{pitch:g} px" if isinstance(pitch, (int, float)) else "—",
+        "project_name": profile.window_title,
+    }
+
+
+def _render_saved_calibration_status() -> dict[str, object]:
+    status = _saved_calibration_status()
+    with st.container(border=True):
+        st.markdown("**Saved Xactimate calibration**")
+        if status["status"] == "Ready":
+            st.success("Status: Ready")
+        elif status["status"] == "Not calibrated":
+            st.info("Status: Not calibrated")
+        else:
+            st.warning("Status: Needs calibration")
+        columns = st.columns(4)
+        columns[0].metric("Client size", status["client_size"])
+        columns[1].metric("DPI", status["dpi"])
+        columns[2].metric("Group-row pitch state", status["group_row_pitch_state"])
+        columns[3].metric("Chosen row pitch", status["chosen_row_pitch"])
+    return status
+
+
 def _render_fast_grouped_mode(project_dir: Path, project_name: str) -> None:
     st.warning("Experimental: one reviewed grouped plan is emitted through blind keyboard entry.")
+    saved_calibration = _render_saved_calibration_status()
+    calibration_project_name = project_name or str(saved_calibration.get("project_name") or "").strip()
     allow_interactive_calibration = st.checkbox(
         "If needed, create three empty calibration groups to measure group-row geometry",
         key="quick_fast_allow_interactive_calibration",
@@ -149,11 +198,11 @@ def _render_fast_grouped_mode(project_dir: Path, project_name: str) -> None:
     )
     if st.button(
         "Calibrate Xactimate", key="quick_fast_calibrate_xactimate",
-        disabled=not project_name, width="stretch",
+        disabled=not calibration_project_name, width="stretch",
     ):
         try:
             profile, path = calibrate_xactimate(
-                _construct_adapter(project_name, project_dir),
+                _construct_adapter(calibration_project_name, project_dir),
                 allow_interactive_group_rows=allow_interactive_calibration,
                 evidence_dir=project_dir / "execution" / "fast_grouped" / "calibration_evidence",
             )

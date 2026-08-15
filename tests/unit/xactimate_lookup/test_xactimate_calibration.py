@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from estimate_extractor.xactimate_lookup import xactimate_calibration as calibration
 from estimate_extractor.xactimate_lookup.xactimate_calibration import (
     CALIBRATION_GROUP_NAMES, SCHEMA_VERSION, XactimateCalibration, apply_fast_geometry,
-    complete_interactive_group_row_calibration, confident_known_group_measurement,
-    load_calibration, machine_identifier, measure_group_row_pitch, save_calibration,
+    calibrate_xactimate, complete_interactive_group_row_calibration, confident_known_group_measurement,
+    load_calibration, machine_identifier, measure_group_row_pitch, profile_path, save_calibration,
     recover_existing_group_row_calibration, validate_calibration,
 )
 
@@ -54,6 +56,7 @@ class FakeAdapter:
     def _locate_label(self, _i, _s, prefer=None): return None if self.missing == "grid" else (540 + self.moved, 630, 561, 643)
     def _locate_items_tab(self, _i): return None if self.missing == "items" else (296 + self.moved, 78, 342, 98)
     def _items_search_pane_field(self, _i): return None if self.missing == "search" else (508, 165, 826, 186)
+    def _scroll_group_tree_to_top(self, _hwnd): pass
 
 
 @pytest.mark.parametrize("candidate", [profile(), profile(width=1900, height=970, monitor=(0, 0, 1920, 1080)),
@@ -221,10 +224,11 @@ class _Image:
 
 
 class _InteractiveAdapter:
-    def __init__(self): self.events = []
+    def __init__(self): self.events = []; self.scrolled = False
     def _unexpected_dialog_present(self): return False
     def _find_dropdown_window(self): return None
     def _ensure_main_window(self): return 1
+    def _scroll_group_tree_to_top(self, hwnd): self.events.append(("scroll", hwnd)); self.scrolled = True
     def _capture_client_image(self, hwnd): self.events.append(("capture", hwnd)); return _Image()
     def _locate_label(self, _image, text, prefer=None): return (540, 630, 561, 643)
     def _locate_items_tab(self, _image): return (296, 78, 342, 98)
@@ -325,3 +329,303 @@ def test_read_only_existing_rows_recovery_makes_profile_executable_without_creat
     assert recovered.geometry["group_row_height"] == 20
     assert recovered.geometry["group_row_pitch_state"] == "measured_confident"
     apply_fast_geometry(type("Adapter", (), {})(), recovered)
+
+
+def test_complete_existing_calibration_set_routes_to_read_only_recovery(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    inventory = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120),
+                           ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: inventory)
+    calls = []
+    monkeypatch.setattr(calibration, "recover_existing_group_row_calibration",
+                        lambda *args, **kwargs: (candidate, calls.append("recover") or {"mode": "recovery"}))
+    monkeypatch.setattr(calibration, "complete_interactive_group_row_calibration",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not create")))
+    calibration._complete_or_recover_group_rows(
+        _InteractiveAdapter(), candidate, directory=tmp_path, evidence_dir=tmp_path,
+    )
+    assert calls == ["recover"]
+
+
+def test_partial_existing_calibration_set_refuses_without_creation(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: _inventory(
+        ("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140),
+    ))
+    with pytest.raises(RuntimeError, match="partial calibration group set"):
+        calibration._complete_or_recover_group_rows(
+            _InteractiveAdapter(), candidate, directory=tmp_path, evidence_dir=tmp_path,
+        )
+
+
+def test_scrolled_away_calibration_rows_become_visible_after_scroll_and_route_to_recovery(monkeypatch, tmp_path):
+    # Simulates a busy project where the group tree had scrolled the three
+    # calibration rows out of the captured client area: before the scroll,
+    # inventory reads only see the root row; after _scroll_group_tree_to_top
+    # runs, all three become visible and this must route to read-only
+    # recovery, never to (redundant, failure-prone) creation.
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    scrolled_away = _inventory(("TEST", 100))
+    visible = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120),
+                         ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
+    def fake_inventory(adapter, _image):
+        return visible if adapter.scrolled else scrolled_away
+    monkeypatch.setattr(calibration, "_group_column_inventory", fake_inventory)
+    monkeypatch.setattr(calibration, "complete_interactive_group_row_calibration",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not create")))
+    adapter = _InteractiveAdapter()
+    recovered, detail = calibration._complete_or_recover_group_rows(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path,
+    )
+    assert detail["creation"] == []
+    assert recovered.geometry["group_row_pitch_state"] == "measured_confident"
+    assert adapter.events[0] == ("scroll", 1)
+
+
+def test_direct_recovery_scrolls_before_inventory_and_root_lookup(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    inventory = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120),
+                           ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
+    def fake_inventory(adapter, _image):
+        assert adapter.scrolled, "inventory/root lookup must happen after scroll-to-top"
+        return inventory
+    monkeypatch.setattr(calibration, "_group_column_inventory", fake_inventory)
+    adapter = _InteractiveAdapter()
+    recovered, detail = recover_existing_group_row_calibration(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path,
+    )
+    assert adapter.events[0] == ("scroll", 1)
+    assert recovered.geometry["group_row_pitch_state"] == "measured_confident"
+
+
+def test_failed_recalibration_restores_exact_previous_profile_bytes(tmp_path):
+    path = tmp_path / "profile.json"
+    path.write_bytes(b'{"known":"good"}\n')
+    def fail():
+        path.write_bytes(b'{"state":"unresolved"}')
+        raise RuntimeError("calibration failed")
+    with pytest.raises(RuntimeError, match="calibration failed"):
+        calibration._profile_transaction(path, fail)
+    assert path.read_bytes() == b'{"known":"good"}\n'
+
+
+# -- calibrate_xactimate() end-to-end: brand-new-device contract -----------
+#
+# These simulate a live Xactimate window from scratch (no saved profile,
+# real ctypes.Structure/sizeof/byref plumbing for the DPI/monitor lookup,
+# fake-only at the Win32 DLL-call boundary) to prove calibrate_xactimate()
+# never needs, and is never influenced by, a previously saved profile.
+
+import ctypes as _real_ctypes
+from ctypes import wintypes as _real_wintypes
+
+
+class _FakeUser32ForCalibration:
+    def __init__(self, dpi, monitor_rect, work_rect):
+        self.dpi, self.monitor_rect, self.work_rect = dpi, monitor_rect, work_rect
+    def GetDpiForWindow(self, _hwnd): return self.dpi
+    def MonitorFromWindow(self, _hwnd, _flags): return 1
+    def GetMonitorInfoW(self, _hmonitor, info_ref):
+        info = info_ref._obj
+        info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom = self.monitor_rect
+        info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom = self.work_rect
+        return 1
+    def IsZoomed(self, _hwnd): return False
+    def IsIconic(self, _hwnd): return False
+
+
+class _FakeCtypesForCalibration:
+    """Real ctypes.Structure/sizeof/byref; only the DLL call layer is fake."""
+    Structure = _real_ctypes.Structure
+    sizeof = staticmethod(_real_ctypes.sizeof)
+    byref = staticmethod(_real_ctypes.byref)
+    def __init__(self, user32): self.windll = type("Windll", (), {"user32": user32})()
+
+
+class _FreshImage:
+    def __init__(self, width=1920, height=1023): self.width, self.height = width, height
+    def crop(self, _rect): return self
+    def save(self, path): path.write_bytes(b"png")
+
+
+class _FreshWin32Gui:
+    def __init__(self, window_rect, client_rect): self._window_rect, self._client_rect = window_rect, client_rect
+    def GetWindowRect(self, _hwnd): return self._window_rect
+    def GetClientRect(self, _hwnd): return self._client_rect
+    def GetClassName(self, _hwnd): return "Xactimate"
+
+
+class _FreshCalibrationAdapter:
+    """A live Xactimate window with fully controllable, fresh geometry --
+    never backed by, or seeded from, any previously saved calibration."""
+
+    _GROUP_TREE_CLICK_DX = 79
+    _GROUP_TREE_CLICK_DY_OFFSET = 8
+    _GROUP_TREE_TEXT_DX = 35
+    _GROUP_TREE_TEXT_WIDTH = 245
+    _GROUP_TREE_ROW_CROP_MARGIN_TOP = 3
+    _GROUP_TREE_ROW_CROP_HEIGHT = 18
+    _GROUP_TREE_SELECTION_MIN_OVERLAP_RUN = 32
+    _GROUP_MENU_NEW_INDEX = 15
+
+    def __init__(self, *, title="TEST", width=1920, height=1023, dpi=96,
+                 monitor_rect=(0, 0, 1920, 1080), work_rect=(0, 0, 1920, 1040), tree_ocr=None):
+        self.title = title
+        self.width, self.height, self.dpi = width, height, dpi
+        self._window_rect = (0, 0, width, height + 40)
+        self._client_rect = (0, 0, width, height)
+        self._ctypes_ns = _FakeCtypesForCalibration(_FakeUser32ForCalibration(dpi, monitor_rect, work_rect))
+        self._tree_ocr = tree_ocr if tree_ocr is not None else _ocr(("Test", 22, 23, 43, 14, 0))
+        self.events, self.scrolled = [], False
+
+    def verify_application(self): return True
+    def verify_project(self): return True
+    def _unexpected_dialog_present(self): return False
+    def _find_dropdown_window(self): return None
+    def _find_main_window(self): return (1, self.title)
+    def _ensure_main_window(self): return 1
+    def _win32gui(self): return _FreshWin32Gui(self._window_rect, self._client_rect)
+    def _get_client_origin(self, _hwnd): return (0, 40)
+    def _win32(self): return self._ctypes_ns, _real_wintypes
+    def _capture_client_image(self, _hwnd): return _FreshImage(self.width, self.height)
+    def _locate_group_tree_header(self, _image): return (270, 155, 301, 165)
+    def _locate_label(self, _image, text, prefer=None):
+        if text == "Cat": return (540, 630, 561, 643)
+        if text == "Subtotal": return (394, 155, 437, 163)
+        raise AssertionError(f"unexpected label lookup: {text!r}")
+    def _locate_items_tab(self, _image): return (296, 78, 342, 98)
+    def _items_search_pane_field(self, _image): return (508, 165, 826, 186)
+    def _tab_is_active(self, _image, _tab): return True
+    def _shifted_anchor(self, name, offset):
+        anchors = {"grid_header_cat_label": (540, 630, 561, 643),
+                   "quick_entry_cat_value": (563, 459, 608, 477),
+                   "grid_header": (506, 628, 1894, 645), "grid_row_1": (506, 654, 1894, 671)}
+        l, t, r, b = anchors[name]; dx, dy = offset
+        return l + dx, t + dy, r + dx, b + dy
+    def _ocr_data(self, _crop, config=None): return self._tree_ocr
+    def _scroll_group_tree_to_top(self, hwnd): self.events.append(("scroll", hwnd)); self.scrolled = True
+
+
+def test_no_profile_empty_tree_full_calibration_can_proceed(monkeypatch, tmp_path):
+    adapter = _FreshCalibrationAdapter(tree_ocr=_ocr(("Test", 22, 23, 43, 14, 0)))
+    empty = _inventory(("TEST", 100))
+    full = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
+    inventories = iter((empty, empty, full))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: next(inventories))
+    created = []
+    monkeypatch.setattr(calibration, "_create_one_calibration_group",
+                        lambda _adapter, _profile, name: created.append(name) or {"name": name, "state": "created"})
+    path = profile_path(tmp_path, machine_identifier())
+    assert not path.exists()
+    profile, returned_path = calibrate_xactimate(
+        adapter, directory=tmp_path, allow_interactive_group_rows=True,
+        evidence_dir=tmp_path / "evidence",
+    )
+    assert returned_path == path
+    assert created == list(CALIBRATION_GROUP_NAMES)
+    assert profile.geometry["group_row_pitch_state"] == "measured_confident"
+    assert profile.validation_state == "ready_for_fast_execution"
+    assert load_calibration(tmp_path).validation_state == "ready_for_fast_execution"
+
+
+def test_no_profile_sparse_tree_creates_and_measures_temporary_groups(monkeypatch, tmp_path):
+    # Two real rows: enough live content to be a "sparse" (not empty) tree,
+    # but not enough physical rows for the generic pitch measurement to be
+    # confident (needs >= 3 clusters) -- must still fall through to
+    # temporary calibration-row creation.
+    adapter = _FreshCalibrationAdapter(tree_ocr=_ocr(("Test", 22, 23, 43, 14, 0), ("Roof", 45, 23, 43, 14, 0)))
+    sparse = _inventory(("TEST", 100), ("Roof", 123))
+    full = _inventory(("TEST", 100), ("Roof", 123), ("CAL_ROW_ALPHA", 146),
+                      ("CAL_ROW_BRAVO", 168), ("CAL_ROW_CHARLIE", 190))
+    inventories = iter((sparse, sparse, full))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: next(inventories))
+    created = []
+    monkeypatch.setattr(calibration, "_create_one_calibration_group",
+                        lambda _adapter, _profile, name: created.append(name) or {"name": name, "state": "created"})
+    profile, path = calibrate_xactimate(
+        adapter, directory=tmp_path, allow_interactive_group_rows=True,
+        evidence_dir=tmp_path / "evidence",
+    )
+    assert created == list(CALIBRATION_GROUP_NAMES)
+    assert profile.geometry["group_row_pitch_state"] == "measured_confident"
+    assert profile.validation_state == "ready_for_fast_execution"
+
+
+def test_no_profile_existing_cal_row_trio_uses_read_only_recovery(monkeypatch, tmp_path):
+    # calibrate_xactimate's own generic full-tree precheck sees only the
+    # root row (unresolved) -- distinct from the CAL_ROW_*-specific
+    # inventory read below, exactly as they are two independent OCR passes
+    # in the real implementation. allow_interactive_group_rows=True (the
+    # caller consents to creation IF NEEDED) but creation must never run
+    # because all three calibration rows already exist.
+    adapter = _FreshCalibrationAdapter(tree_ocr=_ocr(("Test", 22, 23, 43, 14, 0)))
+    trio = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: trio)
+    monkeypatch.setattr(calibration, "complete_interactive_group_row_calibration",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not create -- rows already exist")))
+    path = profile_path(tmp_path, machine_identifier())
+    assert not path.exists()
+    profile, _path = calibrate_xactimate(
+        adapter, directory=tmp_path, allow_interactive_group_rows=True,
+        evidence_dir=tmp_path / "evidence",
+    )
+    assert profile.geometry["group_row_pitch_state"] == "measured_confident"
+    assert profile.validation_state == "ready_for_fast_execution"
+    assert adapter.events[0] == ("scroll", 1)  # scroll-to-top ran before the presence check
+
+
+def test_stale_prior_profile_values_do_not_influence_new_measurements(tmp_path):
+    stale = replace(profile(width=1600, height=900, dpi=120), validation_state="ready_for_fast_execution")
+    save_calibration(stale, tmp_path)
+    assert load_calibration(tmp_path).client_width == 1600  # sanity: stale really is on disk
+
+    # Fresh live geometry disagrees with the stale profile on every axis
+    # that must never be inherited: client size, DPI, and (via real-row
+    # OCR) row pitch.
+    fresh_tree_ocr = _ocr(("Test", 22), ("Roof", 43), ("Siding", 63), ("Fence", 83))
+    adapter = _FreshCalibrationAdapter(width=1920, height=1023, dpi=96, tree_ocr=fresh_tree_ocr)
+    profile_out, _path = calibrate_xactimate(
+        adapter, directory=tmp_path, allow_interactive_group_rows=False,
+    )
+    assert (profile_out.client_width, profile_out.client_height) == (1920, 1023)
+    assert profile_out.dpi == 96
+    # measured live from the fresh 1920x1023 window, not the stale 1600x900 profile's stored value
+    assert profile_out.geometry["group_row_height"] == pytest.approx(20, abs=0.5)
+    assert profile_out.validation_state == "ready_for_fast_execution"
+    assert load_calibration(tmp_path).client_width == 1920  # the stale profile was overwritten, not merged into
+
+
+def test_successful_fresh_calibration_produces_a_complete_ready_profile(tmp_path):
+    fresh_tree_ocr = _ocr(("Test", 22), ("Roof", 43), ("Siding", 63), ("Fence", 83))
+    adapter = _FreshCalibrationAdapter(tree_ocr=fresh_tree_ocr)
+    path = profile_path(tmp_path, machine_identifier())
+    assert not path.exists()
+    profile_out, returned_path = calibrate_xactimate(adapter, directory=tmp_path)
+    assert returned_path == path and path.exists()
+    assert profile_out.validation_state == "ready_for_fast_execution"
+    assert profile_out.geometry["group_row_pitch_state"] == "measured_confident"
+    assert profile_out.geometry["group_row_height"] is not None
+    for landmark in ("group_tree_header", "grid_header_cat", "items_tab", "items_search"):
+        assert profile_out.landmarks[landmark]
+    reloaded = load_calibration(tmp_path)
+    assert reloaded == profile_out
+
+
+def test_failed_calibration_does_not_leave_a_false_ready_profile(monkeypatch, tmp_path):
+    adapter = _FreshCalibrationAdapter(tree_ocr=_ocr(("Test", 22, 23, 43, 14, 0)))
+    empty = _inventory(("TEST", 100))
+    inconsistent = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140), ("CAL_ROW_CHARLIE", 167))
+    inventories = iter((empty, empty, inconsistent))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: next(inventories))
+    monkeypatch.setattr(calibration, "_create_one_calibration_group",
+                        lambda _adapter, _profile, name: {"name": name, "state": "created"})
+    path = profile_path(tmp_path, machine_identifier())
+    assert not path.exists()
+    with pytest.raises(RuntimeError, match="spacings disagree"):
+        calibrate_xactimate(
+            adapter, directory=tmp_path, allow_interactive_group_rows=True,
+            evidence_dir=tmp_path / "evidence",
+        )
+    assert not path.exists()  # no prior profile existed -- transaction rolls back to that, not a failed/false-ready one
+    with pytest.raises(RuntimeError, match="No Xactimate calibration exists"):
+        load_calibration(tmp_path)
