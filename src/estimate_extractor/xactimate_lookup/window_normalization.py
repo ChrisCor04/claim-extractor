@@ -63,7 +63,7 @@ def normalize_xactimate_window(adapter, profile: XactimateCalibration) -> dict[s
     if not adapter._force_foreground(hwnd):
         raise RuntimeError("window normalization refused: Xactimate could not be foregrounded")
 
-    validation = validate_calibration(adapter, profile)
+    validation = validate_calibration(adapter, profile, require_safe_group_rows=False)
     if not validation["ok"]:
         raise RuntimeError(f"{LAYOUT_ERROR}: " + "; ".join(validation["reasons"]))
     win32gui = adapter._win32gui()

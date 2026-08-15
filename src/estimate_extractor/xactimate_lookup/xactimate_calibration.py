@@ -11,14 +11,13 @@ import json
 import os
 import platform
 import socket
-from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 DEFAULT_CALIBRATION_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ClaimExtractor" / "xactimate_calibrations"
 LAYOUT_ERROR = "Xactimate layout differs from saved calibration — recalibrate"
 
@@ -97,25 +96,70 @@ def _rect(value) -> tuple[int, int, int, int]:
     return tuple(int(part) for part in value)
 
 
-def measured_group_rows(ocr_data: dict[str, list[Any]], header_top: int) -> tuple[int, int] | None:
-    """Return (first-row top offset, pitch) from clustered OCR baselines."""
-    tops = sorted({
-        int(top) for text, top, confidence in zip(
-            ocr_data.get("text", []), ocr_data.get("top", []), ocr_data.get("conf", []), strict=False,
-        )
-        if str(text).strip() and float(confidence) >= 35 and header_top + 8 <= int(top) <= header_top + 600
-    })
-    clusters: list[int] = []
-    for top in tops:
-        if not clusters or top - clusters[-1] > 3:
-            clusters.append(top)
-    if len(clusters) < 2:
-        return None
-    pitches = [b - a for a, b in zip(clusters, clusters[1:]) if 14 <= b - a <= 40]
-    if not pitches:
-        return None
-    pitch = Counter(pitches).most_common(1)[0][0]
-    return clusters[0] - header_top, pitch
+def measure_group_row_pitch(
+    ocr_data: dict[str, list[Any]], *, region_width: int, header_bottom: int = 0,
+) -> dict[str, Any]:
+    """Measure pitch only from plausible text in the Group name column.
+
+    Confidence requires at least three physical row clusters and two mutually
+    consistent consecutive spacings. A lone gap is retained diagnostically but
+    can never authorize fast group selection.
+    """
+    boxes: list[dict[str, Any]] = []
+    for values in zip(
+        ocr_data.get("text", []), ocr_data.get("conf", []), ocr_data.get("left", []),
+        ocr_data.get("top", []), ocr_data.get("width", []), ocr_data.get("height", []), strict=False,
+    ):
+        text, conf, left, top, width, height = values
+        raw = {"text": str(text), "confidence": float(conf), "left": int(left), "top": int(top),
+               "width": int(width), "height": int(height)}
+        raw["center_y"] = raw["top"] + raw["height"] / 2
+        alphanumeric = "".join(ch for ch in raw["text"] if ch.isalnum())
+        reasons = []
+        if len(alphanumeric) < 2: reasons.append("not_meaningful_text")
+        if raw["height"] < 5: reasons.append("glyph_height_too_small")
+        if raw["top"] < header_bottom + 5: reasons.append("not_below_header")
+        if raw["left"] < 0 or raw["left"] + raw["width"] > region_width: reasons.append("outside_group_name_column")
+        raw["accepted"] = not reasons
+        raw["rejection_reasons"] = reasons
+        boxes.append(raw)
+
+    accepted = sorted((box for box in boxes if box["accepted"]), key=lambda box: box["center_y"])
+    clusters: list[list[dict[str, Any]]] = []
+    for box in accepted:
+        center = box["center_y"]
+        if not clusters or center - sum(item["center_y"] for item in clusters[-1]) / len(clusters[-1]) > 5:
+            clusters.append([box])
+        else:
+            clusters[-1].append(box)
+    centers = [sum(box["center_y"] for box in cluster) / len(cluster) for cluster in clusters]
+    row_tops = [min(box["top"] for box in cluster) for cluster in clusters]
+    spacings = [b - a for a, b in zip(centers, centers[1:])]
+    plausible = [spacing for spacing in spacings if 12 <= spacing <= 50]
+    chosen = None
+    inliers: list[float] = []
+    if plausible:
+        candidates = sorted(plausible)
+        best: list[float] = []
+        for candidate in candidates:
+            current = [value for value in plausible if abs(value - candidate) <= max(2.0, candidate * 0.08)]
+            if len(current) > len(best):
+                best = current
+        inliers = best
+        if inliers:
+            chosen = sum(inliers) / len(inliers)
+    if chosen is not None and len(centers) >= 3 and len(inliers) >= 2:
+        state, rejection = "measured_confident", None
+    elif chosen is not None:
+        state, rejection = "measured_low_confidence", "fewer than two consistent consecutive row spacings"
+    else:
+        state, rejection = "unresolved", "fewer than two measurable group-tree rows"
+    return {
+        "candidate_ocr_boxes": boxes, "accepted_row_centers": centers, "accepted_row_tops": row_tops,
+        "calculated_spacings": spacings, "inlier_spacings": inliers,
+        "chosen_pitch": round(chosen, 3) if chosen is not None else None,
+        "confidence_state": state, "rejection_reason": rejection,
+    }
 
 
 def calibrate_xactimate(adapter, *, directory: Path = DEFAULT_CALIBRATION_DIR) -> tuple[XactimateCalibration, Path]:
@@ -166,19 +210,34 @@ def calibrate_xactimate(adapter, *, directory: Path = DEFAULT_CALIBRATION_DIR) -
         "quick_entry_cat": list(_rect(quick_cat)), "grid_header": list(_rect(grid_header)),
         "grid_row_1": list(_rect(grid_row_1)),
     }
-    row_measurement = None
+    row_diagnostics: dict[str, Any]
     try:
-        tree_crop = image.crop((max(0, group[0] - 4), group[1], min(image.width, group[0] + 300), image.height))
-        row_measurement = measured_group_rows(adapter._ocr_data(tree_crop), 0)
-    except Exception:
-        pass
-    row_top_offset, row_height = row_measurement or (
-        adapter._GROUP_TREE_ROW_TEXT_TOP_DY, adapter._GROUP_TREE_ROW_HEIGHT,
-    )
+        subtotal = adapter._locate_label(image, "Subtotal", prefer="topmost")
+        if subtotal is None or subtotal[0] <= group[2]:
+            raise RuntimeError("Subtotal header did not establish the right edge of the Group name column")
+        tree_left, tree_top, tree_right = group[0], group[1], subtotal[0]
+        tree_crop = image.crop((tree_left, tree_top, tree_right, image.height))
+        row_diagnostics = measure_group_row_pitch(
+            adapter._ocr_data(tree_crop), region_width=tree_right - tree_left,
+            header_bottom=group[3] - group[1],
+        )
+        row_diagnostics["source_region"] = [tree_left, tree_top, tree_right, image.height]
+    except Exception as exc:
+        row_diagnostics = {
+            "candidate_ocr_boxes": [], "accepted_row_centers": [], "accepted_row_tops": [], "calculated_spacings": [],
+            "inlier_spacings": [], "chosen_pitch": None, "confidence_state": "unresolved",
+            "rejection_reason": f"group-tree row measurement unavailable: {exc}",
+        }
+    row_state = row_diagnostics["confidence_state"]
+    row_height = row_diagnostics["chosen_pitch"] if row_state == "measured_confident" else None
+    accepted_tops = row_diagnostics["accepted_row_tops"]
+    row_top_offset = accepted_tops[0] if accepted_tops and row_height is not None else None
     geometry = {
         "group_tree_bounds": [max(0, group[0] - 4), group[3], min(image.width, group[0] + adapter._GROUP_TREE_TEXT_WIDTH), image.height],
         "group_row_text_top_offset": row_top_offset,
         "group_row_height": row_height,
+        "group_row_pitch_state": row_state,
+        "group_row_diagnostics": row_diagnostics,
         "group_click_x_offset": adapter._GROUP_TREE_CLICK_DX,
         "group_click_y_offset": adapter._GROUP_TREE_CLICK_DY_OFFSET,
         "group_text_x_offset": adapter._GROUP_TREE_TEXT_DX,
@@ -195,7 +254,7 @@ def calibrate_xactimate(adapter, *, directory: Path = DEFAULT_CALIBRATION_DIR) -
     }
     confidence = {name: "detected_current_frame" for name in landmarks}
     confidence.update({
-        "group_row_height": "detected_from_current_tree_ocr" if row_measurement else "existing_measured_layout_constant_requires_multirow_tree",
+        "group_row_height": row_state,
         "selection_geometry": "existing_relative_pixel_structure",
         "new_group_dialog_geometry": "legacy_fixed_not_non_destructively_detectable",
         "group_context_menu_index": "uia_structural_semantics",
@@ -218,7 +277,7 @@ def calibrate_xactimate(adapter, *, directory: Path = DEFAULT_CALIBRATION_DIR) -
         landmarks=landmarks, geometry=geometry, confidence=confidence,
         validation_state="valid_non_destructive_core_landmarks",
         unresolved=tuple(value for value in (
-            None if row_measurement else "measured group row pitch needs a populated multi-row tree",
+            None if row_state == "measured_confident" else "Group-row geometry requires calibration",
             "New Group dialog controls require a bounded interactive calibration",
         ) if value),
     )
@@ -226,7 +285,10 @@ def calibrate_xactimate(adapter, *, directory: Path = DEFAULT_CALIBRATION_DIR) -
     return profile, path
 
 
-def validate_calibration(adapter, profile: XactimateCalibration, *, position_tolerance: int = 8) -> dict[str, Any]:
+def validate_calibration(
+    adapter, profile: XactimateCalibration, *, position_tolerance: int = 8,
+    require_safe_group_rows: bool = True,
+) -> dict[str, Any]:
     """Lightweight fail-closed validation before experimental execution."""
     found = adapter._find_main_window()
     reasons: list[str] = []
@@ -242,6 +304,8 @@ def validate_calibration(adapter, profile: XactimateCalibration, *, position_tol
         reasons.append("client size mismatch")
     if dpi != profile.dpi:
         reasons.append("DPI mismatch")
+    if require_safe_group_rows and profile.geometry.get("group_row_pitch_state") != "measured_confident":
+        reasons.append("Group-row geometry requires calibration")
     image = adapter._capture_client_image(hwnd)
     observed = {
         "group_tree_header": adapter._locate_group_tree_header(image),
@@ -261,6 +325,8 @@ def validate_calibration(adapter, profile: XactimateCalibration, *, position_tol
 
 def apply_fast_geometry(adapter, profile: XactimateCalibration) -> None:
     """Apply only fast-path relative geometry; production defaults stay intact."""
+    if profile.geometry.get("group_row_pitch_state") != "measured_confident":
+        raise RuntimeError("Group-row geometry requires calibration")
     mapping = {
         "_GROUP_TREE_ROW_TEXT_TOP_DY": "group_row_text_top_offset",
         "_GROUP_TREE_ROW_HEIGHT": "group_row_height", "_GROUP_TREE_CLICK_DX": "group_click_x_offset",

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 from estimate_extractor.xactimate_lookup.xactimate_calibration import (
-    LAYOUT_ERROR, SCHEMA_VERSION, XactimateCalibration, apply_fast_geometry,
-    load_calibration, machine_identifier, measured_group_rows, save_calibration, validate_calibration,
+    SCHEMA_VERSION, XactimateCalibration, apply_fast_geometry, load_calibration,
+    machine_identifier, measure_group_row_pitch, save_calibration, validate_calibration,
 )
 
 
@@ -21,7 +19,8 @@ def profile(*, width=1920, height=1023, dpi=96, monitor=(0, 0, 2560, 1440)):
                    "items_tab": [296, 78, 342, 98], "items_search": [508, 165, 826, 186],
                    "quick_entry_cat": [563, 459, 608, 477], "grid_header": [506, 628, 1894, 645],
                    "grid_row_1": [506, 654, 1894, 671]},
-        geometry={"group_row_text_top_offset": 23, "group_row_height": 20, "group_click_x_offset": 79,
+        geometry={"group_row_text_top_offset": 23, "group_row_height": 20,
+                  "group_row_pitch_state": "measured_confident", "group_click_x_offset": 79,
                   "group_click_y_offset": 8, "group_text_x_offset": 35, "group_text_width": 245,
                   "group_row_crop_margin_top": 3, "group_row_crop_height": 18,
                   "selection_min_overlap_run": 32, "group_context_menu_new_index": 15,
@@ -99,5 +98,80 @@ def test_fast_geometry_is_instance_only_and_uses_profile_values():
 
 
 def test_group_row_pitch_is_measured_from_current_ocr_baselines():
-    data = {"text": ["TEST", "Roof", "Siding", "Fence"], "top": [23, 43, 63, 83], "conf": [90] * 4}
-    assert measured_group_rows(data, 0) == (23, 20)
+    result = measure_group_row_pitch(_ocr(("TEST", 23), ("Roof", 43), ("Siding", 63), ("Fence", 83)), region_width=160)
+    assert result["chosen_pitch"] == 20
+    assert result["confidence_state"] == "measured_confident"
+
+
+def _ocr(*entries):
+    data = {key: [] for key in ("text", "conf", "left", "top", "width", "height")}
+    for entry in entries:
+        text, top, *rest = entry
+        left = rest[0] if rest else 20
+        width = rest[1] if len(rest) > 1 else max(12, len(text) * 6)
+        height = rest[2] if len(rest) > 2 else 10
+        conf = rest[3] if len(rest) > 3 else 90
+        for key, value in zip(data, (text, conf, left, top, width, height), strict=True): data[key].append(value)
+    return data
+
+
+def test_unrelated_nearby_words_cannot_create_false_27_pitch():
+    # Exact live failure shape: actual root row plus right-pane labels at
+    # 337/364/391. Their x positions lie outside the Group name column.
+    data = _ocr(("Test", 22, 23, 43, 14, 0), ("Desc", 337, 240),
+                ("Calc", 364, 239), ("Cov", 391, 240), ("_I", 36, 0, 20, 1, 45))
+    result = measure_group_row_pitch(data, region_width=163, header_bottom=10)
+    assert result["chosen_pitch"] is None
+    assert result["confidence_state"] == "unresolved"
+    assert all(not box["accepted"] for box in result["candidate_ocr_boxes"] if box["text"] in {"Desc", "Calc", "Cov", "_I"})
+
+
+def test_duplicate_fragments_cluster_to_one_physical_row():
+    data = _ocr(("Main", 23), ("Roof", 24, 55), ("Side", 43), ("Group", 44, 55),
+                ("Fence", 63), ("Rear", 83))
+    result = measure_group_row_pitch(data, region_width=160)
+    assert len(result["accepted_row_centers"]) == 4
+    assert result["chosen_pitch"] == pytest.approx(20, abs=0.5)
+
+
+def test_one_outlier_baseline_is_rejected_without_changing_pitch():
+    result = measure_group_row_pitch(
+        _ocr(("Aaa", 23), ("Bbb", 43), ("Noise", 50), ("Ccc", 63), ("Ddd", 83)), region_width=160,
+    )
+    assert result["chosen_pitch"] == pytest.approx(20)
+    assert result["confidence_state"] == "measured_confident"
+
+
+@pytest.mark.parametrize("data", [_ocr(), _ocr(("TEST", 23))])
+def test_empty_or_sparse_tree_is_unresolved(data):
+    result = measure_group_row_pitch(data, region_width=160)
+    assert result["chosen_pitch"] is None
+    assert result["confidence_state"] == "unresolved"
+
+
+@pytest.mark.parametrize("pitch", [18, 24, 31])
+def test_legitimate_different_pitch_is_measured_not_hard_coded(pitch):
+    result = measure_group_row_pitch(
+        _ocr(("One", 30), ("Two", 30 + pitch), ("Three", 30 + pitch * 2)), region_width=180,
+    )
+    assert result["chosen_pitch"] == pitch
+    assert result["confidence_state"] == "measured_confident"
+
+
+def test_1080p_region_geometry_does_not_affect_relative_pitch():
+    result = measure_group_row_pitch(
+        _ocr(("One", 18), ("Two", 40), ("Three", 62), ("Four", 84)), region_width=135,
+    )
+    assert result["chosen_pitch"] == 22
+
+
+def test_single_spacing_is_low_confidence_and_fast_geometry_fails_closed():
+    result = measure_group_row_pitch(_ocr(("One", 23), ("Two", 43)), region_width=160)
+    assert result["confidence_state"] == "measured_low_confidence"
+    candidate = profile()
+    candidate.geometry["group_row_pitch_state"] = "measured_low_confidence"
+    candidate.geometry["group_row_height"] = 20
+    with pytest.raises(RuntimeError, match="Group-row geometry requires calibration"):
+        apply_fast_geometry(type("Adapter", (), {})(), candidate)
+    validation = validate_calibration(FakeAdapter(), candidate)
+    assert "Group-row geometry requires calibration" in validation["reasons"]
