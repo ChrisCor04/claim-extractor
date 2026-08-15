@@ -216,3 +216,42 @@ def test_bounded_new_row_proof_cannot_satisfy_a_different_planned_group():
     facade = object.__new__(WindowsGroupBatchUI); facade.adapter = Adapter()
     assert facade._selected_exact_row(1, "P4A_0814") == (1, "P4A.0814")
     assert facade._selected_exact_row(1, "P4B_0814") is None
+
+
+def test_three_same_process_selections_reuse_inventory_without_complete_tree_ocr():
+    names = {1: "ALPHA_ROOF_4B", 2: "BRAVO_SIDING_4B", 3: "CHARLIE_FENCE_4B"}
+
+    class Adapter:
+        expected_project_name = "TEST"
+        def __init__(self): self.row_reads, self.clicks = [], []
+        def verify_application(self): return True
+        def verify_project(self): return True
+        def _unexpected_dialog_present(self): return False
+        def _find_dropdown_window(self): return None
+        def _ensure_main_window(self): return 1
+        def _force_foreground(self, hwnd): return True
+        def _capture_client_image(self, hwnd): return object()
+        def _locate_group_tree_header(self, image): return (10, 20, 30, 40)
+        def _ocr_group_tree_row_text(self, image, header, index):
+            self.row_reads.append(index); return names[index]
+        def _click_client(self, hwnd, *xy): self.clicks.append(xy)
+        def _group_tree_row_has_selection_boundary(self, image, header, index): return True
+        def _anchor_offset(self, image): return (0, 0)
+        def _items_search_pane_field(self, image): return (1, 1, 2, 2)
+        def _win32gui(self):
+            class W:
+                @staticmethod
+                def GetWindowRect(hwnd): return (0, 0, 100, 100)
+            return W
+
+    facade = object.__new__(WindowsGroupBatchUI); facade.adapter = Adapter()
+    facade._inventory = GroupInventory((0, 0, 100, 100), (10, 20, 30, 40), tuple(
+        GroupInventoryEntry(normalize_planned_group_identity(name), name, row, (50, 40 + row * 20))
+        for row, name in names.items()
+    ))
+    original_inventory = facade._inventory
+    for name in names.values():
+        facade.select_group_lightweight(name)
+        assert facade._inventory is original_inventory
+    assert facade.adapter.row_reads == [1, 2, 3]
+    assert facade.adapter.clicks == [(50, 60), (50, 80), (50, 100)]
