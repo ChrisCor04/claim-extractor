@@ -6,6 +6,8 @@ import pytest
 
 from estimate_extractor.xactimate_lookup.fast_group_executor import (
     FAST_KEY_HOLD_SECONDS, compile_executable_group_plan, execute_group_first_plan,
+    exact_planned_group_rows, normalize_planned_group_identity, reconcile_complete_group_inventory,
+    WindowsGroupBatchUI,
 )
 
 
@@ -86,6 +88,11 @@ def test_all_groups_are_created_before_selection_and_hot_loop_is_keyboard_only()
     assert report["normal_item_count"] == 3 and report["bid_item_count"] == 1
     assert report["groups"][1]["bid_items"][0]["execution_status"] == "requires_biditem_sequence"
     assert FAST_KEY_HOLD_SECONDS == .005
+    architectural = [event for event in ui.events if event[0] in {"create", "verify-all", "select", "type"}]
+    assert architectural[:4] == [
+        ("create", "A"), ("create", "B"), ("verify-all", ("A", "B")), ("select", "A"),
+    ]
+    assert architectural.index(("select", "B")) > architectural.index(("type", "IWS"))
 
 
 def test_preflight_failure_aborts_before_creation_or_input():
@@ -107,3 +114,49 @@ def test_no_mapper_or_catalog_is_accepted_by_live_executor_signature():
     # The compiled immutable plan and UI are the only live inputs.
     assert "mapper" not in execute_group_first_plan.__annotations__
     assert "catalog" not in execute_group_first_plan.__annotations__
+
+
+def test_exact_planned_identity_tolerates_formatting_without_collapsing_names():
+    assert normalize_planned_group_identity("P4A_0814") == "p4a0814"
+    rows = ["TEST", "4 P4A.0814 = $88.27", "P4B 0814", "p4c_0814"]
+    assert exact_planned_group_rows(rows, "P4A_0814") == [1]
+    assert exact_planned_group_rows(rows, "P4B_0814") == [2]
+    assert exact_planned_group_rows(rows, "P4C_0814") == [3]
+
+
+def test_complete_inventory_reproduces_and_prevents_p4_name_collision():
+    groups = ["P4A_0814", "P4B_0814", "P4C_0814"]
+    with pytest.raises(RuntimeError, match="P4B_0814.*0 exact physical row"):
+        reconcile_complete_group_inventory(["TEST", "P4A_0814"], groups)
+    assert reconcile_complete_group_inventory(
+        ["TEST", "P4A_0814", "P4B.0814", "P4C 0814"], groups,
+    ) == {"P4A_0814": 1, "P4B_0814": 2, "P4C_0814": 3}
+
+
+def test_complete_inventory_rejects_duplicate_rows_and_duplicate_planned_names():
+    with pytest.raises(RuntimeError, match="2 exact physical row"):
+        reconcile_complete_group_inventory(["P4A_0814", "P4A 0814"], ["P4A_0814"])
+    with pytest.raises(RuntimeError, match="identities are empty or duplicate"):
+        reconcile_complete_group_inventory(["P4A_0814"], ["P4A_0814", "p4a 0814"])
+
+
+def test_windows_creation_scopes_ensure_group_to_exact_planned_identity():
+    class Adapter:
+        def __init__(self):
+            self.rows = ["TEST", "P4A_0814"]
+            self.created = []
+
+        def _find_unique_group_row(self, rows, requested):
+            return 1  # reproduces the production fuzzy collision
+
+        def ensure_group(self, requested):
+            if self._find_unique_group_row(self.rows, requested) is None:
+                self.created.append(requested)
+                self.rows.append(requested)
+
+    facade = object.__new__(WindowsGroupBatchUI)
+    facade.adapter = Adapter()
+    original = facade.adapter._find_unique_group_row
+    facade.create_group("P4B_0814")
+    assert facade.adapter.created == ["P4B_0814"]
+    assert facade.adapter._find_unique_group_row == original

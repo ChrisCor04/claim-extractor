@@ -10,6 +10,7 @@ mapping, catalog access, screenshots, OCR, or verification.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,6 +21,44 @@ from .fast_quick_entry import FastEntryItem, KeyboardIO, WindowsKeyboardIO, exec
 
 
 FAST_KEY_HOLD_SECONDS = 0.005
+
+
+def normalize_planned_group_identity(value: str) -> str:
+    """Exact fast-plan identity; tolerate formatting, never edit letters/digits."""
+    return "".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def exact_planned_group_rows(rows: Sequence[str], group: str) -> list[int]:
+    """Return rows containing the complete normalized planned name."""
+    needle = normalize_planned_group_identity(group)
+    if not needle:
+        return []
+    return [
+        index for index, observed in enumerate(rows)
+        if needle in normalize_planned_group_identity(observed)
+    ]
+
+
+def reconcile_complete_group_inventory(
+    rows: Sequence[str], groups: Sequence[str],
+) -> dict[str, int]:
+    """Require one distinct physical row for every distinct planned name."""
+    normalized = [normalize_planned_group_identity(group) for group in groups]
+    if any(not value for value in normalized) or len(set(normalized)) != len(normalized):
+        raise RuntimeError("fast group executor refused: planned group identities are empty or duplicate")
+    result: dict[str, int] = {}
+    used_rows: set[int] = set()
+    for group in groups:
+        matches = exact_planned_group_rows(rows, group)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"fast group executor refused: planned group {group!r} has {len(matches)} exact physical row match(es)"
+            )
+        if matches[0] in used_rows:
+            raise RuntimeError("fast group executor refused: two planned groups resolve to the same physical row")
+        used_rows.add(matches[0])
+        result[group] = matches[0]
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,21 +242,30 @@ class WindowsGroupBatchUI:
             raise RuntimeError("fast group executor refused: blocking dialog/dropdown is present")
 
     def create_group(self, group: str) -> str:
-        self.adapter.ensure_group(group)
-        return "existing_fail_closed_ensure_group"
+        # Scope the production primitive to Phase 4's exact identity model.
+        # This changes neither its implementation nor global production
+        # behavior; every other creation safety check remains intact.
+        original = self.adapter._find_unique_group_row
+
+        def exact_unique(rows, requested):
+            matches = exact_planned_group_rows(rows, requested)
+            if len(matches) > 1:
+                raise RuntimeError(f"multiple exact rows match planned group {requested!r}")
+            return matches[0] if matches else None
+
+        self.adapter._find_unique_group_row = exact_unique
+        try:
+            self.adapter.ensure_group(group)
+        finally:
+            self.adapter._find_unique_group_row = original
+        return "existing_ensure_group_with_scoped_exact_planned_name_identity"
 
     def verify_all_groups_created(self, groups: Sequence[str]) -> str:
         """Prove the complete set exists before the first item is typed."""
         self.verify_project_and_no_modal(self.adapter.expected_project_name)
         rows = self.adapter.snapshot_group_names()
-        for group in groups:
-            try:
-                index = self.adapter._find_unique_group_row(rows, group)
-            except Exception as exc:
-                raise RuntimeError(f"fast group executor refused: group {group!r} is ambiguous") from exc
-            if index is None:
-                raise RuntimeError(f"fast group executor refused: group {group!r} was not created")
-        return "one_fresh_complete_group_tree_snapshot_with_unique_names"
+        reconcile_complete_group_inventory(rows, groups)
+        return "one_fresh_complete_group_tree_snapshot_with_distinct_exact_planned_names"
 
     def select_group_lightweight(self, group: str) -> str:
         """One fresh name proof, causal click, then fresh selection-boundary proof."""
@@ -230,11 +278,13 @@ class WindowsGroupBatchUI:
         if header is None:
             raise RuntimeError("fast group selection refused: group tree is unavailable")
         rows = self.adapter._snapshot_group_names_from_image(before)
-        index = self.adapter._find_unique_group_row(rows, group)
-        if index is None or not self.adapter._group_name_matches(
-            self.adapter._ocr_group_tree_row_text(before, header, index), group,
-        ):
+        matches = exact_planned_group_rows(rows, group)
+        if len(matches) != 1:
             raise RuntimeError("fast group selection refused: intended group is not uniquely established")
+        index = matches[0]
+        reread = self.adapter._ocr_group_tree_row_text(before, header, index)
+        if len(exact_planned_group_rows([reread], group)) != 1:
+            raise RuntimeError("fast group selection refused: clicked row failed exact independent name reread")
         self.adapter._click_client(hwnd, *self.adapter._group_tree_row_xy(header, index))
         after = self.adapter._capture_client_image(hwnd)
         if self.adapter._unexpected_dialog_present() or self.adapter._find_dropdown_window() is not None:
