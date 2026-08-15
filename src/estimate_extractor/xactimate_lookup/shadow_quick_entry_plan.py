@@ -19,6 +19,7 @@ class ShadowPlanItem:
     group: str
     section: str
     original_description: str
+    catalog_search_text: str
     quantity: float | None
     unit: str | None
     source_pricing: dict[str, Any]
@@ -28,6 +29,9 @@ class ShadowPlanItem:
     category: str | None
     selector: str | None
     catalog_description: str | None
+    execution_category: str
+    execution_selector: str
+    execution_description: str
     score: float
     margin: float
     reason: str
@@ -82,18 +86,28 @@ def build_shadow_plan(project_dir: Path, mapper: OfflineCatalogMapper | None = N
         result = mapper.map_line(context)
         if result.resolution == "resolved":
             execution_state = "fast_normal_item_ready"
+            execution_category = result.category or ""
+            execution_selector = result.selector or ""
+            execution_description = result.catalog_description or line["description"]
         elif result.resolution == "bid_item_fallback":
             execution_state = "fast_bid_item_unsupported_tab_order_unknown"
+            execution_category, execution_selector = "DOR", "BIDITM"
+            execution_description = line["description"]
         else:
-            execution_state = "review_required_ambiguous"
+            execution_state = "review_required_with_bid_item_fallback"
+            execution_category, execution_selector = "DOR", "BIDITM"
+            execution_description = line["description"]
         candidates = [candidate.to_dict() for candidate in result.candidates] if result.resolution != "resolved" else []
         item = ShadowPlanItem(
             line_item_id=line["line_item_id"], source_order=source_order,
             group=section, section=section, original_description=line["description"],
+            catalog_search_text=result.catalog_search_text,
             quantity=line.get("quantity"), unit=line.get("unit_of_measure"),
-            source_pricing=_pricing(line), source_action=action, trade_hint=normalized.get("trade"),
+            source_pricing=_pricing(line), source_action=result.source_activity, trade_hint=normalized.get("trade"),
             resolution=result.resolution, category=result.category, selector=result.selector,
             catalog_description=result.catalog_description, score=result.final_score,
+            execution_category=execution_category, execution_selector=execution_selector,
+            execution_description=execution_description,
             margin=result.margin, reason=result.reason, execution_state=execution_state,
             top_candidates=candidates,
         )
@@ -105,8 +119,9 @@ def build_shadow_plan(project_dir: Path, mapper: OfflineCatalogMapper | None = N
         grouped.setdefault(section, []).append(line["line_item_id"])
 
     counts = {state: sum(item.resolution == state for item in items) for state in ("resolved", "ambiguous", "bid_item_fallback")}
+    execution_fallbacks = sum(item.execution_category == "DOR" and item.execution_selector == "BIDITM" for item in items)
     return {
-        "schema_version": "phase3-shadow-quick-entry-plan-v1",
+        "schema_version": "phase3-shadow-quick-entry-plan-v2",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "project": project_dir.name,
         "source_estimate": str(canonical_path.relative_to(project_dir)),
@@ -114,7 +129,7 @@ def build_shadow_plan(project_dir: Path, mapper: OfflineCatalogMapper | None = N
         "catalog_row_count": len(mapper.catalog.records),
         "execution_mode": "offline_shadow_only",
         "bid_item_fast_execution": "unsupported_until_description_quantity_price_tab_order_is_verified",
-        "summary": {"total_items": len(items), **counts},
+        "summary": {"total_items": len(items), **counts, "execution_bid_item_fallback": execution_fallbacks},
         "group_first_future_layout": [
             {"group": group, "line_item_ids": line_ids} for group, line_ids in grouped.items()
         ],
@@ -130,6 +145,7 @@ def render_shadow_report(plan: dict[str, Any]) -> str:
         f"- Resolved: {summary['resolved']}",
         f"- Ambiguous/review: {summary['ambiguous']}",
         f"- DOR/BIDITM fallback: {summary['bid_item_fallback']}",
+        f"- Executable DOR/BIDITM fallback (includes unresolved review lines): {summary['execution_bid_item_fallback']}",
         "- Live execution: disabled", "",
         "| # | Group | Source description | Qty | Unit | Resolution | CAT/SEL | Score | Margin | Execution |",
         "|---:|---|---|---:|---|---|---|---:|---:|---|",

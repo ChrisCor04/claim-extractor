@@ -27,8 +27,12 @@ FALLBACK_CAT = "DOR"
 FALLBACK_SEL = "BIDITM"
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
-_LEADING_ACTION_RE = re.compile(
-    r"^(?:remove\s+and\s+replace|remove\s*&\s*replace|r\s*&\s*r|remove|replace|install)\s+"
+_LEADING_ACTION_PATTERNS = (
+    (re.compile(r"^(?:remove\s+and\s+replace|remove\s+replace|r\s+and\s+r)\b\s*"), "remove_replace"),
+    (re.compile(r"^detach\s+reset\b\s*"), "detach_reset"),
+    (re.compile(r"^remove\b\s*"), "remove"),
+    (re.compile(r"^replace\b\s*"), "replace"),
+    (re.compile(r"^install\b\s*"), "install"),
 )
 _ABBREVIATIONS = {
     "alum": "aluminum", "comp": "composition", "incl": "including",
@@ -87,8 +91,9 @@ class SourceLineContext:
 
 
 def normalize_catalog_text(value: str) -> str:
-    text = value.casefold().replace("&", " and ")
+    text = value.casefold()
     text = re.sub(r"\br\s*[/&]\s*r\b", "remove and replace", text)
+    text = text.replace("&", " and ")
     text = re.sub(r"\bdetach\s*(?:and|/)\s*reset\b", "detach reset", text)
     text = re.sub(r"\bw\s*/\s*out\b", "without", text)
     text = re.sub(r"\bw\s*/\s*o\b", "without", text)
@@ -99,12 +104,41 @@ def normalize_catalog_text(value: str) -> str:
     return " ".join(words)
 
 
-def normalize_source_text(value: str) -> str:
+@dataclass(frozen=True, slots=True)
+class SourceNormalization:
+    original_description: str
+    catalog_search_text: str
+    action: str | None
+
+
+def _canonical_action(value: str | None) -> str | None:
+    normalized = normalize_catalog_text(value or "").replace(" ", "_")
+    aliases = {
+        "remove_and_replace": "remove_replace", "r_and_r": "remove_replace",
+        "detach_and_reset": "detach_reset",
+    }
+    return aliases.get(normalized, normalized or None)
+
+
+def parse_source_normalization(value: str, *, explicit_activity: str | None = None) -> SourceNormalization:
+    """Return immutable source text, canonical action, and lookup-only text."""
     normalized = normalize_catalog_text(value)
-    # Ordinary carrier activity prefixes frequently describe the source-line
-    # operation while CAT/SEL identifies the component. Detach/reset is kept:
-    # the catalog itself contains distinct detach/reset selectors.
-    return _LEADING_ACTION_RE.sub("", normalized).strip()
+    inferred = None
+    search_text = normalized
+    for pattern, action in _LEADING_ACTION_PATTERNS:
+        match = pattern.match(normalized)
+        if match:
+            inferred = action
+            search_text = normalized[match.end():].strip()
+            break
+    return SourceNormalization(
+        original_description=value, catalog_search_text=search_text or normalized,
+        action=_canonical_action(explicit_activity) or inferred,
+    )
+
+
+def normalize_source_text(value: str) -> str:
+    return parse_source_normalization(value).catalog_search_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +175,7 @@ class CandidateScore:
 class MappingResult:
     source_description: str
     normalized_source_description: str
+    catalog_search_text: str
     resolution: str
     category: str | None
     selector: str | None
@@ -320,14 +355,17 @@ class OfflineCatalogMapper:
         if top_k < 1:
             raise ValueError("top_k must be positive")
         source = self._coerce_source(source_description)
-        query = normalize_source_text(source.description)
+        normalization = parse_source_normalization(
+            source.description, explicit_activity=source.activity,
+        )
+        query = normalization.catalog_search_text
         query_tokens = set(query.split())
         context = source.context_text
         description_categories = {
             category for category, phrases in _TRADE_CONTEXT.items()
             if any(phrase in query for phrase in phrases)
         }
-        source_action = normalize_catalog_text(" ".join(filter(None, (source.activity, source.description))))
+        source_action = normalize_catalog_text(" ".join(filter(None, (normalization.action, source.description))))
         unit = normalize_catalog_text(source.unit or "")
         scored = []
         for index in self._candidate_indices(query_tokens):
@@ -344,8 +382,13 @@ class OfflineCatalogMapper:
             # tear-off, paint) receive more weight because that language is
             # part of the catalog identity rather than generic R&R activity.
             context_weight = 0.08 if lexical_score >= 0.85 else 0.02
+            # Explicit catalog-bearing activities (detach/reset, tear-off,
+            # paint, material/labor only) remain a distinct retrieval signal
+            # after being removed from the material-description query. Generic
+            # remove/replace is deliberately absent from _ACTION_PHRASES and
+            # therefore receives no catalog-identity boost.
             score = max(
-                0.0, lexical_score + context_weight * trade_score + 0.20 * action_score + 0.015 * unit_score,
+                0.0, lexical_score + context_weight * trade_score + 0.55 * action_score + 0.015 * unit_score,
             )
             components.update({
                 "lexical_score": lexical_score,
@@ -403,6 +446,15 @@ class OfflineCatalogMapper:
             source = SourceLineContext(
                 description=source.description, quantity=quantity, unit=unit, pricing=dict(pricing or {}),
             )
+        normalization = parse_source_normalization(
+            source.description, explicit_activity=source.activity,
+        )
+        if source.activity != normalization.action:
+            source = SourceLineContext(
+                description=source.description, section=source.section, group=source.group,
+                quantity=source.quantity, unit=source.unit, activity=normalization.action,
+                trade_hint=source.trade_hint, pricing=dict(source.pricing),
+            )
         candidates = self.retrieve(source, top_k=10)
         top = candidates[0]
         second_score = candidates[1].final_score if len(candidates) > 1 else 0.0
@@ -427,7 +479,8 @@ class OfflineCatalogMapper:
             activity_resolution = "unspecified"
         return MappingResult(
             source_description=source.description,
-            normalized_source_description=normalize_source_text(source.description),
+            normalized_source_description=normalization.catalog_search_text,
+            catalog_search_text=normalization.catalog_search_text,
             resolution=resolution,
             category=(chosen.category if chosen else FALLBACK_CAT if resolution == "bid_item_fallback" else None),
             selector=(chosen.selector if chosen else FALLBACK_SEL if resolution == "bid_item_fallback" else None),

@@ -13,7 +13,9 @@ from estimate_extractor.xactimate_lookup.offline_catalog_mapper import (
     ResolutionPolicy,
     SourceLineContext,
     XactimateCatalog,
+    normalize_catalog_text,
     normalize_source_text,
+    parse_source_normalization,
 )
 from estimate_extractor.xactimate_lookup.offline_catalog_rerankers import restricted_candidate_choice
 
@@ -50,11 +52,47 @@ def test_normalization_and_irrelevant_carrier_wording(mapper, source, expected):
 
 
 def test_detach_reset_semantics_are_preserved(mapper):
-    assert normalize_source_text("Detach & Reset Gutter / downspout - aluminum - up to 5\"").startswith("detach reset")
+    parsed = parse_source_normalization("Detach & Reset Gutter / downspout - aluminum - up to 5\"")
+    assert parsed.catalog_search_text.startswith("gutter downspout")
+    assert parsed.action == "detach_reset"
     result = mapper.map_line("Detach & Reset Gutter / downspout - aluminum - up to 5\"")
     assert result.resolution == "resolved"
     assert (result.category, result.selector) == ("SFG", "GUTRS")
     assert any((c.category, c.selector) == ("SFG", "GUTRS") for c in result.candidates)
+
+
+@pytest.mark.parametrize("prefix", [
+    "R&R", "R & R", "Remove & Replace", "Remove and Replace", "Remove/Replace",
+])
+def test_leading_remove_replace_is_separated_from_catalog_search_text(prefix):
+    source = f"{prefix} Flashing - pipe jack"
+    parsed = parse_source_normalization(source)
+    assert parsed.original_description == source
+    assert parsed.catalog_search_text == "flashing pipe jack"
+    assert parsed.action == "remove_replace"
+
+
+def test_action_words_are_not_stripped_when_they_are_descriptive_not_leading():
+    source = "Door hardware - remove and replace damaged hinge"
+    parsed = parse_source_normalization(source)
+    assert parsed.catalog_search_text == normalize_catalog_text(source)
+    assert parsed.action is None
+
+
+@pytest.mark.parametrize(("description", "identity"), [
+    ("R&R Flashing - pipe jack", ("RFG", "FLPIPE")),
+    ("R&R Siding - vinyl", ("SDG", "VINYL")),
+    ("R&R Drip edge", ("RFG", "DRIP")),
+    ("R&R Soffit - metal", ("SFG", "SFTM")),
+])
+def test_remove_replace_benchmark_lines_resolve_from_catalog_text(mapper, description, identity):
+    result = mapper.map_line(description)
+    assert result.source_description == description
+    assert not result.catalog_search_text.startswith("remove")
+    assert result.source_activity == "remove_replace"
+    assert result.activity_resolution == "external_activity"
+    assert result.resolution == "resolved"
+    assert (result.category, result.selector) == identity
 
 
 def test_short_and_competing_descriptions_abstain(mapper):
