@@ -29,7 +29,8 @@ from estimate_extractor.xactimate_lookup.fast_grouped_service import (
 )
 from estimate_extractor.xactimate_lookup.window_normalization import normalize_xactimate_window
 from estimate_extractor.xactimate_lookup.xactimate_calibration import (
-    calibrate_xactimate, load_calibration, profile_path,
+    CALIBRATION_GROUP_NAMES, CREATION_PERMISSION_REQUIRED_MESSAGE,
+    calibrate_xactimate, describe_calibration_group_presence, load_calibration, profile_path,
 )
 
 
@@ -187,27 +188,47 @@ def _render_saved_calibration_status() -> dict[str, object]:
     return status
 
 
-#: This only grants permission to CREATE the three temporary calibration
-#: rows when none exist yet. It must never read as "enable calibration" --
-#: read-only inspection and recovery of rows that already exist always run,
-#: regardless of this checkbox.
-CALIBRATION_CREATION_CHECKBOX_LABEL = "Allow creation of temporary calibration groups if none exist"
-CALIBRATION_CREATION_CHECKBOX_HELP = (
-    "Only controls creation. If CAL_ROW_ALPHA/BRAVO/CHARLIE already exist, calibration always "
-    "reads them read-only, whether this is checked or not, and never creates duplicates. "
-    "Creates them only when none exist and this is checked. No line items are entered."
-)
+def _calibration_group_names_text() -> str:
+    """The three exact calibration sentinel names, one per line -- easy to
+    read/copy in the UI. Pure text, no Streamlit calls, directly testable."""
+    return "\n".join(CALIBRATION_GROUP_NAMES)
+
+
+def _calibration_setup_prompt(missing: list[str]) -> str:
+    """Actionable instructions when none of the calibration groups are
+    present yet. Pure text -- no internal terminology/stack traces."""
+    return (
+        "Calibration setup required.\n\n"
+        "Create these 3 empty groups in Xactimate:\n\n"
+        f"{_calibration_group_names_text()}\n\n"
+        "Keep them visible as consecutive rows in the Grouping panel. They may be empty.\n"
+        "Then click Calibrate Xactimate again."
+    )
+
+
+def _calibration_partial_prompt(present: list[str], missing: list[str]) -> str:
+    """Actionable instructions when only some calibration groups are
+    present, naming exactly which are found and which are still missing."""
+    return (
+        "Calibration setup incomplete.\n\n"
+        f"Found:\n{chr(10).join(present)}\n\n"
+        f"Missing:\n{chr(10).join(missing)}\n\n"
+        "Create the missing empty groups in Xactimate, keep all three visible as consecutive "
+        "rows in the Grouping panel, then calibrate again."
+    )
 
 
 def _render_fast_grouped_mode(project_dir: Path, project_name: str) -> None:
     st.warning("Experimental: one reviewed grouped plan is emitted through blind keyboard entry.")
     saved_calibration = _render_saved_calibration_status()
     calibration_project_name = project_name or str(saved_calibration.get("project_name") or "").strip()
-    allow_interactive_calibration = st.checkbox(
-        CALIBRATION_CREATION_CHECKBOX_LABEL,
-        key="quick_fast_allow_interactive_calibration",
-        help=CALIBRATION_CREATION_CHECKBOX_HELP,
+    st.markdown("**Xactimate calibration setup**")
+    st.caption(
+        "Before calibrating, create these 3 empty groups in Xactimate and keep them visible as "
+        "consecutive rows in the Grouping panel. They may be empty."
     )
+    st.code(_calibration_group_names_text(), language=None)
+    st.caption("Once they're visible, click Calibrate Xactimate. ClaimXtract measures your current Xactimate layout automatically.")
     if st.button(
         "Calibrate Xactimate", key="quick_fast_calibrate_xactimate",
         disabled=not calibration_project_name, width="stretch",
@@ -215,7 +236,7 @@ def _render_fast_grouped_mode(project_dir: Path, project_name: str) -> None:
         try:
             profile, path = calibrate_xactimate(
                 _construct_adapter(calibration_project_name, project_dir),
-                allow_interactive_group_rows=allow_interactive_calibration,
+                allow_interactive_group_rows=False,
                 evidence_dir=project_dir / "execution" / "fast_grouped" / "calibration_evidence",
             )
             if profile.geometry.get("group_row_pitch_state") == "measured_confident":
@@ -227,7 +248,21 @@ def _render_fast_grouped_mode(project_dir: Path, project_name: str) -> None:
             if profile.unresolved:
                 st.warning("Needs future interactive calibration: " + "; ".join(profile.unresolved))
         except Exception as exc:
-            st.error(f"Xactimate calibration failed: {exc}")
+            message = str(exc)
+            needs_setup_prompt = message == CREATION_PERMISSION_REQUIRED_MESSAGE or "partial calibration group set" in message
+            if needs_setup_prompt:
+                try:
+                    presence = describe_calibration_group_presence(
+                        _construct_adapter(calibration_project_name, project_dir),
+                    )
+                    if presence["present"]:
+                        st.warning(_calibration_partial_prompt(presence["present"], presence["missing"]))
+                    else:
+                        st.warning(_calibration_setup_prompt(presence["missing"]))
+                except Exception:
+                    st.error(f"Xactimate calibration failed: {exc}")
+            else:
+                st.error(f"Xactimate calibration failed: {exc}")
     if st.button(
         "Normalize Xactimate Window", key="quick_fast_normalize_window",
         disabled=not project_name, width="stretch",

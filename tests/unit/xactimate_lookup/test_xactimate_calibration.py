@@ -8,8 +8,8 @@ from estimate_extractor.xactimate_lookup import xactimate_calibration as calibra
 from estimate_extractor.xactimate_lookup.xactimate_calibration import (
     CALIBRATION_GROUP_NAMES, SCHEMA_VERSION, XactimateCalibration, apply_fast_geometry,
     calibrate_xactimate, complete_interactive_group_row_calibration, confident_known_group_measurement,
-    load_calibration, machine_identifier, measure_group_row_pitch, profile_path, save_calibration,
-    recover_existing_group_row_calibration, validate_calibration,
+    describe_calibration_group_presence, load_calibration, machine_identifier, measure_group_row_pitch,
+    profile_path, save_calibration, recover_existing_group_row_calibration, validate_calibration,
 )
 
 
@@ -1030,17 +1030,15 @@ def test_ambiguous_project_root_prevents_any_mutation(monkeypatch, tmp_path):
     assert adapter.created_names == []
 
 
-def test_calibration_checkbox_wording_controls_creation_only():
+def test_normal_ui_no_longer_exposes_the_temporary_group_creation_checkbox():
+    # The creation-permission checkbox was removed from the normal Quick
+    # Run calibration path -- manual group creation in Xactimate is now
+    # the supported workflow; automatic creation stays available
+    # internally (allow_interactive_group_rows is still a real, tested
+    # calibrate_xactimate() parameter), just not wired to a UI toggle.
     from estimate_extractor.ui.components import quick_run_panel
-    label = quick_run_panel.CALIBRATION_CREATION_CHECKBOX_LABEL
-    help_text = quick_run_panel.CALIBRATION_CREATION_CHECKBOX_HELP
-    assert "creat" in label.casefold()
-    assert "temporary" in label.casefold()
-    # must not read as a general calibration on/off switch
-    assert "enable calibration" not in label.casefold()
-    assert "if needed" not in label.casefold()  # the old, ambiguous wording
-    assert "read-only" in help_text.casefold() or "always" in help_text.casefold()
-    assert "duplicate" in help_text.casefold()
+    assert not hasattr(quick_run_panel, "CALIBRATION_CREATION_CHECKBOX_LABEL")
+    assert not hasattr(quick_run_panel, "CALIBRATION_CREATION_CHECKBOX_HELP")
 
 
 # -- calibration sentinel recognition: exact-then-guarded-fuzzy identity --
@@ -1265,3 +1263,37 @@ def test_recovery_routing_recognizes_guarded_charlie_as_present(monkeypatch, tmp
         adapter, candidate, directory=tmp_path, evidence_dir=tmp_path, allow_creation=True,
     )
     assert recovered.geometry["group_row_pitch_state"] == "measured_confident"
+
+
+# -- describe_calibration_group_presence(): read-only UI-facing helper --
+
+def test_describe_calibration_group_presence_reports_full_trio(monkeypatch):
+    inventory = _standard_trio_inventory("CAL_ROW_CHARLIE")
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: inventory)
+    presence = describe_calibration_group_presence(_InteractiveAdapter())
+    assert presence == {"present": list(CALIBRATION_GROUP_NAMES), "missing": []}
+
+
+def test_describe_calibration_group_presence_reports_zero_of_three(monkeypatch):
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: _inventory(("TEST", 100)))
+    presence = describe_calibration_group_presence(_InteractiveAdapter())
+    assert presence == {"present": [], "missing": list(CALIBRATION_GROUP_NAMES)}
+
+
+def test_describe_calibration_group_presence_reports_partial_set_names(monkeypatch):
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: _inventory(
+        ("TEST", 100), ("CAL_ROW_ALPHA", 120),
+    ))
+    presence = describe_calibration_group_presence(_InteractiveAdapter())
+    assert presence == {"present": ["CAL_ROW_ALPHA"], "missing": ["CAL_ROW_BRAVO", "CAL_ROW_CHARLIE"]}
+
+
+def test_describe_calibration_group_presence_recognizes_proven_charlie_ocr_error(monkeypatch):
+    # Must agree with _complete_or_recover_group_rows()'s own routing --
+    # the same OCR-imperfect CHARLIE counts as present here too.
+    inventory = _standard_trio_inventory("Cal_ROW_CHARLE)")
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: inventory)
+    adapter = _InteractiveAdapter()
+    presence = describe_calibration_group_presence(adapter)
+    assert presence == {"present": list(CALIBRATION_GROUP_NAMES), "missing": []}
+    assert adapter.events[0] == ("scroll", 1)  # read-only scroll-to-top ran before the presence read

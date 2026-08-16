@@ -739,6 +739,23 @@ def recover_existing_group_row_calibration(
     return recovered, measurement
 
 
+def describe_calibration_group_presence(adapter) -> dict[str, list[str]]:
+    """Read-only: which of the three calibration sentinel groups are
+    currently visible in the live Xactimate group tree. For UI display
+    only -- never clicks, types, creates, or otherwise mutates anything.
+    Reuses the exact same exact-then-guarded-fuzzy sentinel recognition
+    _complete_or_recover_group_rows() uses for its own routing decision,
+    so a caller's "present"/"missing" message always agrees with what
+    calibration itself would decide."""
+    hwnd = adapter._ensure_main_window()
+    adapter._scroll_group_tree_to_top(hwnd)
+    inventory = _group_column_inventory(adapter, adapter._capture_client_image(hwnd))
+    present = [name for name in CALIBRATION_GROUP_NAMES
+               if len(_calibration_name_guarded_matches(inventory, name)) == 1]
+    missing = [name for name in CALIBRATION_GROUP_NAMES if name not in present]
+    return {"present": present, "missing": missing}
+
+
 def calibrate_xactimate(
     adapter, *, directory: Path = DEFAULT_CALIBRATION_DIR,
     allow_interactive_group_rows: bool = False, evidence_dir: Path | None = None,
