@@ -174,25 +174,12 @@ controlling whatever version's window is currently on screen.
 
 ### 2. Download Claim Extractor
 
-> **This repository currently requires GitHub access to clone or
-> download — it is not public.** This was confirmed by querying GitHub's
-> API for this repository while logged out, which returned "Not Found"
-> (the standard response GitHub gives for a private repository when
-> you're not authenticated — a public repository would return its
-> details instead). This means:
-> - The person setting up this second computer needs a **GitHub
->   account**, and that account needs to be **added as a collaborator**
->   on this repository (done from GitHub's website, by whoever currently
->   owns/administers it — not something this README can do for you).
-> - Once added, they'll need to **sign in to GitHub** the first time
->   they clone or download — either in the browser (for the ZIP option)
->   or via a sign-in prompt that Git itself opens (for the Git option,
->   described below). Neither option requires manually creating or
->   pasting a token/password in most cases — modern Git for Windows and
->   the browser both handle this with a normal GitHub login screen.
-> - If this repository is later made public, this whole notice — and the
->   sign-in step below — no longer applies, and a plain `git clone`
->   works with no login.
+> **This repository is public — no GitHub account or sign-in is required
+> to clone or download it.** This was verified by querying GitHub's API
+> for this repository while logged out, which returned the repository's
+> normal details (a private repository would instead return "Not Found"
+> to an unauthenticated request). A plain `git clone` or ZIP download, as
+> shown below, works with no login.
 
 Pick a **short** install path, such as `C:\claim-extractor`, rather than
 somewhere deeply nested (e.g. inside several levels of `Documents\Work\Projects\...`).
@@ -246,9 +233,7 @@ What each line actually does:
 - `git clone https://github.com/ChrisCor04/claim-extractor` downloads
   the repository and **automatically creates a new folder**
   `C:\claim-extractor` for you — you do not need to (and should not)
-  create that folder yourself first. If a sign-in window appears here
-  (see the access note above), complete it; the clone will continue
-  automatically afterward.
+  create that folder yourself first. No GitHub sign-in is needed.
 - `cd claim-extractor` moves PowerShell **into** that newly created
   folder. After this command, your PowerShell prompt should show you're
   working inside `C:\claim-extractor` — that's where you'll run the
@@ -289,8 +274,8 @@ to install Git — but you'll need to download a fresh ZIP for any future
 update rather than running one `git pull`, unless a future version of
 this project adds its own updater.
 
-1. In your browser, sign in to GitHub if you aren't already (see the
-   access note above), then open this repository's GitHub page:
+1. In your browser, open this repository's GitHub page (no sign-in
+   required):
    <https://github.com/ChrisCor04/claim-extractor>
 2. Click the green **Code** button.
 3. Click **Download ZIP**.
@@ -482,7 +467,7 @@ Only move on to a real claim once this completes cleanly.
 | `py` / `python` "is not recognized" | Reopen PowerShell in a new window (PATH changes need a fresh window). If it still fails, reinstall Python and check "Add python.exe to PATH". |
 | `git` "is not recognized" | Install Git for Windows (default options) from <https://git-scm.com/download/win>, then reopen PowerShell. See [step 2](#2-download-claim-extractor). |
 | You're using Command Prompt (`cmd.exe`) instead of PowerShell | Open **Windows PowerShell** from the Start menu instead — `.\setup-windows.ps1`-style commands are PowerShell syntax. |
-| Cloning/downloading asks you to sign in, or fails with a permission/access error on GitHub | This repository currently requires GitHub access — see the note at the top of [step 2](#2-download-claim-extractor). Confirm your GitHub account has been added as a collaborator. |
+| Cloning/downloading asks you to sign in, or fails with a permission/access error on GitHub | This repository is public, so this shouldn't happen — it may indicate a temporary GitHub issue, or that this repository's visibility has since changed. Try again shortly, or confirm with whoever administers the repository. |
 | `git clone` fails with "Permission denied" right under `C:\` | Don't run as Administrator to force it — clone into `$env:USERPROFILE` instead (a folder you already own). See [step 2](#2-download-claim-extractor). |
 | `destination path '...' already exists` | A folder from a previous attempt is already there. Reuse it (`cd` into it) if it looks complete, or delete the stray folder and re-clone. |
 | PowerShell won't run `setup-windows.ps1` (execution policy error) | Run it via `powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1` — this affects only that one invocation, nothing permanent. See details below. |
