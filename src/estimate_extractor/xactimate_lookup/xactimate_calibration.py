@@ -439,13 +439,84 @@ def _new_physical_rows(
             if not any(abs(row["center_y"] - center) <= tolerance for center in before_centers)]
 
 
+#: How much taller than the shortest of the three known calibration
+#: rows' own measured text-box height counts as "this row's geometry
+#: looks corrupted" -- live-caught cause: a selected/highlighted row's
+#: OCR text fragments can all read back with an abnormally inflated
+#: bounding-box height while the row's TEXT identity still reads fine.
+#: Always relative to the OTHER known rows in THIS SAME live frame,
+#: never an absolute pixel value -- scales with whatever font/DPI is
+#: actually live, never hardcoded from any one machine/session.
+_SENTINEL_GEOMETRY_OUTLIER_HEIGHT_RATIO = 1.6
+
+#: How far a geometry-corrected row's own raw measured center may still
+#: diverge from the independently-interpolated position and count as
+#: corroborating evidence, expressed as a FRACTION of the measured pitch
+#: itself (never an absolute pixel value). Generous enough to absorb the
+#: center-of-mass shift an inflated bounding box produces, but still a
+#: real, falsifiable check -- a row that is actually in the wrong
+#: physical position, not just imprecisely measured, will not pass it.
+_SENTINEL_GEOMETRY_CORROBORATION_PITCH_FRACTION = 0.5
+
+
+def _sentinel_implied_height(row: dict[str, Any]) -> float:
+    return 2 * (row["center_y"] - row["top"])
+
+
+def _corrected_sentinel_centers(
+    mapping: dict[str, dict[str, Any]], names: tuple[str, ...], centers: dict[str, float],
+) -> tuple[dict[str, float], dict[str, Any] | None]:
+    """If exactly one of the three known rows shows an outlier text-box
+    height relative to the other two, independently re-derive its center
+    from the other two rows' own measured spacing (interpolating the
+    middle row, extrapolating an end row), accepting the correction only
+    if that row's own raw center still corroborates the result within a
+    pitch-relative bound. Sentinel identity (which row is which) is never
+    touched here -- only the numeric center of an already-identified row.
+    Returns the centers unchanged and None if there is nothing to correct
+    or the correction cannot be safely corroborated; genuinely bad
+    spacing among normally-measured rows is untouched and continues to
+    fail the existing tolerance check exactly as before."""
+    heights = {name: _sentinel_implied_height(mapping[name]) for name in names}
+    baseline = min(heights.values())
+    if baseline <= 0:
+        return centers, None
+    outliers = [name for name in names if heights[name] > baseline * _SENTINEL_GEOMETRY_OUTLIER_HEIGHT_RATIO]
+    if len(outliers) != 1:
+        return centers, None
+    flagged = outliers[0]
+    index = names.index(flagged)
+    if index == 1:
+        corrected = (centers[names[0]] + centers[names[2]]) / 2
+        reference_pitch = abs(centers[names[2]] - centers[names[0]]) / 2
+    elif index == 0:
+        corrected = 2 * centers[names[1]] - centers[names[2]]
+        reference_pitch = abs(centers[names[2]] - centers[names[1]])
+    else:
+        corrected = 2 * centers[names[1]] - centers[names[0]]
+        reference_pitch = abs(centers[names[1]] - centers[names[0]])
+    if reference_pitch <= 0:
+        return centers, None
+    raw = centers[flagged]
+    if abs(raw - corrected) > reference_pitch * _SENTINEL_GEOMETRY_CORROBORATION_PITCH_FRACTION:
+        return centers, None
+    updated = dict(centers)
+    updated[flagged] = corrected
+    diagnostic = {"corrected_row": flagged, "raw_center": raw, "corrected_center": corrected,
+                  "implied_heights": heights, "height_outlier_ratio": _SENTINEL_GEOMETRY_OUTLIER_HEIGHT_RATIO}
+    return updated, diagnostic
+
+
 def confident_known_group_measurement(
     inventory: dict[str, Any], names=CALIBRATION_GROUP_NAMES,
     *, tolerance: float = GROUP_ROW_SPACING_TOLERANCE_PX,
 ) -> dict[str, Any]:
     """Measure two spacings from three known calibration rows, identified
     by exact text first and the bounded calibration-only fuzzy tier only
-    when a sentinel has no exact match (see _guarded_calibration_row_map)."""
+    when a sentinel has no exact match (see _guarded_calibration_row_map).
+    Row Y-center itself may be independently corrected for exactly one
+    geometry-corrupted row before the spacing/tolerance check runs -- see
+    _corrected_sentinel_centers()."""
     try:
         mapping = _guarded_calibration_row_map(inventory, names)
     except RuntimeError as exc:
@@ -453,6 +524,7 @@ def confident_known_group_measurement(
                 "chosen_pitch": None, "tolerance_px": tolerance, "confidence_state": "unresolved",
                 "rejection_reason": str(exc), "inventory": inventory}
     centers = {name: float(mapping[name]["center_y"]) for name in names}
+    centers, geometry_correction = _corrected_sentinel_centers(mapping, names, centers)
     spacings = [centers[names[1]] - centers[names[0]], centers[names[2]] - centers[names[1]]]
     if any(value <= 0 for value in spacings):
         state, pitch, rejection = "unresolved", None, "calibration rows are not in expected physical order"
@@ -460,9 +532,12 @@ def confident_known_group_measurement(
         state, pitch, rejection = "measured_low_confidence", None, "known-row spacings disagree beyond tolerance"
     else:
         state, pitch, rejection = "measured_confident", round(sum(spacings) / 2, 3), None
-    return {"calibration_group_names": list(names), "detected_row_centers": centers,
+    result = {"calibration_group_names": list(names), "detected_row_centers": centers,
             "measured_spacings": spacings, "chosen_pitch": pitch, "tolerance_px": tolerance,
             "confidence_state": state, "rejection_reason": rejection, "inventory": inventory}
+    if geometry_correction is not None:
+        result["geometry_correction"] = geometry_correction
+    return result
 
 
 def _settled_group_column_inventory(adapter, hwnd, *, timeout_s: float = 5.0, poll_interval_s: float = 0.05) -> dict[str, Any]:

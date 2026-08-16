@@ -218,6 +218,136 @@ def test_known_calibration_rows_with_inconsistent_spacing_fail_closed():
     assert result["chosen_pitch"] is None
 
 
+def _inventory_with_tops(*rows):
+    """Like _inventory(), but each entry is (name, center_y, top) so a
+    row's implied text-box height (2*(center_y-top)) can be controlled
+    explicitly -- needed to simulate a geometry-corrupted row (e.g. a
+    selected/highlighted row's OCR fragments reading back with an
+    abnormally inflated bounding box) independently of its center."""
+    return {"header": [10, 10, 40, 20], "subtotal_header": [180, 10, 220, 20],
+            "source_region": [10, 10, 180, 300], "ocr_diagnostics": {},
+            "rows": [{"raw_text": name, "normalized_text": "".join(ch for ch in name.casefold() if ch.isalnum()),
+                      "center_y": center, "relative_center_y": center - 10, "top": top}
+                     for name, center, top in rows]}
+
+
+# -- geometry-corrupted sentinel row: independent center correction -----
+
+def test_three_clean_evenly_spaced_rows_still_measure_confidently():
+    result = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 100, 95), ("CAL_ROW_BRAVO", 122, 117), ("CAL_ROW_CHARLIE", 144, 139),
+    ))
+    assert result["confidence_state"] == "measured_confident"
+    assert result["chosen_pitch"] == 22
+    assert "geometry_correction" not in result
+
+
+def test_selected_middle_row_inflated_height_does_not_cause_false_rejection():
+    # BRAVO's own raw center (120) is close to, but not exactly, the
+    # independently-interpolated position (122) -- exactly the kind of
+    # small center-of-mass shift a selection-highlight-inflated bounding
+    # box produces, proven live (CAL_ROW_CHARLIE-shaped case).
+    result = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 100, 95), ("CAL_ROW_BRAVO", 120, 92), ("CAL_ROW_CHARLIE", 144, 139),
+    ))
+    assert result["confidence_state"] == "measured_confident"
+    assert result["chosen_pitch"] == 22
+    assert result["detected_row_centers"]["CAL_ROW_BRAVO"] == 122
+    assert result["geometry_correction"]["corrected_row"] == "CAL_ROW_BRAVO"
+
+
+def test_selected_first_row_inflated_height_does_not_cause_false_rejection():
+    result = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 97, 69), ("CAL_ROW_BRAVO", 122, 117), ("CAL_ROW_CHARLIE", 144, 139),
+    ))
+    assert result["confidence_state"] == "measured_confident"
+    assert result["chosen_pitch"] == 22
+    assert result["detected_row_centers"]["CAL_ROW_ALPHA"] == 100
+    assert result["geometry_correction"]["corrected_row"] == "CAL_ROW_ALPHA"
+
+
+def test_selected_last_row_inflated_height_does_not_cause_false_rejection():
+    result = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 100, 95), ("CAL_ROW_BRAVO", 122, 117), ("CAL_ROW_CHARLIE", 147, 119),
+    ))
+    assert result["confidence_state"] == "measured_confident"
+    assert result["chosen_pitch"] == 22
+    assert result["detected_row_centers"]["CAL_ROW_CHARLIE"] == 144
+    assert result["geometry_correction"]["corrected_row"] == "CAL_ROW_CHARLIE"
+
+
+def test_genuinely_uneven_spacing_with_normal_heights_still_fails():
+    # All three rows have ordinary, mutually-consistent heights -- the
+    # new correction path must never engage, and genuine bad spacing
+    # among cleanly-measured rows must still fail exactly as before.
+    result = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 100, 95), ("CAL_ROW_BRAVO", 120, 115), ("CAL_ROW_CHARLIE", 147, 142),
+    ))
+    assert result["confidence_state"] == "measured_low_confidence"
+    assert result["chosen_pitch"] is None
+    assert "geometry_correction" not in result
+
+
+def test_corrupted_geometry_that_cannot_be_reconciled_fails_closed():
+    # BRAVO's box height is an outlier (same signature as the live-caught
+    # case), but its raw center is far from where the other two rows'
+    # own consistent spacing says it should be -- too far to trust as
+    # corroborating evidence, so the correction must be refused and the
+    # existing tolerance check must still (correctly) reject.
+    result = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 100, 95), ("CAL_ROW_BRAVO", 105, 62), ("CAL_ROW_CHARLIE", 144, 139),
+    ))
+    assert result["confidence_state"] == "measured_low_confidence"
+    assert result["chosen_pitch"] is None
+    assert "geometry_correction" not in result
+
+
+def test_two_geometry_outliers_are_not_corrected():
+    # With two of the three rows showing outlier heights, there is no
+    # longer a reliable pair of clean rows to interpolate/extrapolate
+    # from -- must not attempt a correction at all, and must fail closed
+    # exactly as the uncorrected measurement would.
+    result = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 97, 69), ("CAL_ROW_BRAVO", 110, 82), ("CAL_ROW_CHARLIE", 144, 139),
+    ))
+    assert "geometry_correction" not in result
+    assert result["confidence_state"] == "measured_low_confidence"
+    assert result["detected_row_centers"]["CAL_ROW_ALPHA"] == 97  # uncorrected -- no correction was attempted
+
+
+def test_sentinel_identity_stays_independent_of_geometry_correction():
+    # Combines the proven-live fuzzy-OCR-identity case (CHARLIE read as
+    # "CHARLE)") with an independently geometry-corrupted BRAVO row --
+    # both mechanisms must work correctly together without interfering.
+    result = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 100, 95), ("Cal_ROW_BRAVO", 120, 92), ("Cal_ROW_CHARLE)", 144, 139),
+    ))
+    assert result["confidence_state"] == "measured_confident"
+    assert result["chosen_pitch"] == 22
+    assert set(result["detected_row_centers"]) == {"CAL_ROW_ALPHA", "CAL_ROW_BRAVO", "CAL_ROW_CHARLIE"}
+
+
+def test_geometry_correction_tolerance_is_unchanged():
+    assert calibration.GROUP_ROW_SPACING_TOLERANCE_PX == 2.0
+
+
+def test_geometry_correction_introduces_no_fixed_pitch_and_scales_with_the_live_frame():
+    # Same relative structure (one selected/inflated middle row, ~10%
+    # off its interpolated center) reproduced at two unrelated absolute
+    # scales -- the corrected pitch must come out proportional to each
+    # scale, proving nothing is hardcoded to any one pixel/DPI regime.
+    small = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 100, 95), ("CAL_ROW_BRAVO", 120, 92), ("CAL_ROW_CHARLIE", 144, 139),
+    ))
+    large = confident_known_group_measurement(_inventory_with_tops(
+        ("CAL_ROW_ALPHA", 1000, 950), ("CAL_ROW_BRAVO", 1200, 920), ("CAL_ROW_CHARLIE", 1440, 1390),
+    ))
+    assert small["confidence_state"] == large["confidence_state"] == "measured_confident"
+    assert small["chosen_pitch"] == 22
+    assert large["chosen_pitch"] == 220
+    assert small["chosen_pitch"] != large["chosen_pitch"]
+
+
 class _Image:
     width, height = 1920, 1023
     def save(self, path): path.write_bytes(b"png")
