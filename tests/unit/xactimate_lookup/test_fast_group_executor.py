@@ -302,6 +302,180 @@ def test_inventory_accepts_advisory_header_width_jitter_with_exact_origin():
     assert facade.select_group_lightweight("ORBIT_ROOF_C").startswith("verified_inventory_row")
 
 
+def test_select_group_lightweight_succeeds_with_a_realistically_displaced_selection_boundary():
+    """End-to-end regression for the live 'Exterior' failure: the click
+    lands on the correct cached row and the row IS genuinely selected, but
+    the rendered border sits a pixel off the OCR-derived nominal edge.
+    Uses the REAL windows_adapter selection-boundary detector (not a
+    return-True stub) against a real drawn image, an arbitrary group name,
+    and an arbitrary row index -- proving the generalized tolerance fix,
+    not anything Exterior- or row-1-specific."""
+    from PIL import Image, ImageDraw
+
+    from estimate_extractor.xactimate_lookup.windows_adapter import WindowsXactimateAdapter
+
+    real = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    header = (270, 155, 301, 165)
+    group = "SomeArbitraryGroup"
+    row_index = 3
+
+    image = Image.new("RGB", (700, 400), "white")
+    nominal_top = real._group_tree_row_crop_top(header[1], row_index)
+    dy = 1  # the live-observed displacement
+    top_y = nominal_top + dy
+    bottom_y = nominal_top + dy + real._GROUP_TREE_ROW_CROP_HEIGHT - 2
+    draw = ImageDraw.Draw(image)
+    draw.line((header[0] - 4, top_y, 600, top_y), fill=(125, 162, 206), width=1)
+    draw.line((header[0] - 4, bottom_y, 600, bottom_y), fill=(125, 162, 206), width=1)
+
+    class Adapter:
+        expected_project_name = "TEST"
+        def verify_application(self): return True
+        def verify_project(self): return True
+        def _unexpected_dialog_present(self): return False
+        def _find_dropdown_window(self): return None
+        def _ensure_main_window(self): return 1
+        def _force_foreground(self, hwnd): return True
+        def _capture_client_image(self, hwnd): return image
+        def _locate_group_tree_header(self, img): return header
+        def _ocr_group_tree_row_text(self, img, hdr, index): return group
+        def _click_client(self, hwnd, *xy): self.clicked = xy
+        def _group_tree_row_has_selection_boundary(self, img, hdr, index):
+            return WindowsXactimateAdapter._group_tree_row_has_selection_boundary(real, img, hdr, index)
+        def _anchor_offset(self, img): return (0, 0)
+        def _items_search_pane_field(self, img): return (1, 1, 2, 2)
+        def _win32gui(self):
+            class W:
+                @staticmethod
+                def GetWindowRect(hwnd): return (0, 0, 100, 100)
+            return W
+
+    facade = object.__new__(WindowsGroupBatchUI)
+    facade.adapter = Adapter()
+    row_center = real._group_tree_row_xy(header, row_index)
+    facade._inventory = GroupInventory(
+        window_rect=(0, 0, 100, 100), header_rect=header,
+        entries=(GroupInventoryEntry(normalize_planned_group_identity(group), group, row_index, row_center),),
+    )
+
+    result = facade.select_group_lightweight(group)
+
+    assert result.startswith("verified_inventory_row")
+    assert facade.adapter.clicked == row_center
+
+
+def test_select_group_lightweight_still_fails_when_no_boundary_is_present_at_all():
+    """Sanity counterpart: an undisplaced, genuinely absent boundary must
+    still refuse -- the tolerance widens WHERE a boundary may be found, it
+    does not make a missing boundary pass."""
+    class Adapter:
+        expected_project_name = "TEST"
+        def verify_application(self): return True
+        def verify_project(self): return True
+        def _unexpected_dialog_present(self): return False
+        def _find_dropdown_window(self): return None
+        def _ensure_main_window(self): return 1
+        def _force_foreground(self, hwnd): return True
+        def _capture_client_image(self, hwnd): return object()
+        def _locate_group_tree_header(self, image): return (10, 20, 30, 40)
+        def _ocr_group_tree_row_text(self, image, header, index): return "P4B.0814"
+        def _click_client(self, hwnd, *xy): self.clicked = xy
+        def _group_tree_row_has_selection_boundary(self, image, header, index): return False
+        def _win32gui(self):
+            class W:
+                @staticmethod
+                def GetWindowRect(hwnd): return (0, 0, 100, 100)
+            return W
+
+    facade = object.__new__(WindowsGroupBatchUI)
+    facade.adapter = Adapter()
+    facade._inventory = GroupInventory(
+        window_rect=(0, 0, 100, 100), header_rect=(10, 20, 30, 40),
+        entries=(GroupInventoryEntry("p4b0814", "P4B_0814", 2, (50, 70)),),
+    )
+    with pytest.raises(RuntimeError, match="fresh selection boundary is absent"):
+        facade.select_group_lightweight("P4B_0814")
+
+
+def test_selection_boundary_failure_persists_diagnostic_evidence(tmp_path):
+    class Adapter:
+        expected_project_name = "TEST"
+        evidence_dir = tmp_path
+        def verify_application(self): return True
+        def verify_project(self): return True
+        def _unexpected_dialog_present(self): return False
+        def _find_dropdown_window(self): return None
+        def _ensure_main_window(self): return 1
+        def _force_foreground(self, hwnd): return True
+        def _capture_client_image(self, hwnd): return object()
+        def _locate_group_tree_header(self, image): return (10, 20, 30, 40)
+        def _ocr_group_tree_row_text(self, image, header, index): return "Exterior"
+        def _click_client(self, hwnd, *xy): pass
+        def _group_tree_row_has_selection_boundary(self, image, header, index): return False
+        def snapshot_group_names(self): return ["TEST", "Exterior"]
+        def _anchor_offset(self, image): return (0, 0)
+        def _items_search_pane_field(self, image): return (1, 1, 2, 2)
+        def _win32gui(self):
+            class W:
+                @staticmethod
+                def GetWindowRect(hwnd): return (0, 0, 100, 100)
+            return W
+
+    facade = object.__new__(WindowsGroupBatchUI)
+    facade.adapter = Adapter()
+    facade._inventory = GroupInventory(
+        window_rect=(0, 0, 100, 100), header_rect=(10, 20, 30, 40),
+        entries=(GroupInventoryEntry("exterior", "Exterior", 1, (50, 70)),),
+    )
+    with pytest.raises(RuntimeError, match="fresh selection boundary is absent"):
+        facade.select_group_lightweight("Exterior")
+
+    evidence_files = list(tmp_path.glob("group_selection_verification_failure_*.json"))
+    assert len(evidence_files) == 1
+    payload = json.loads(evidence_files[0].read_text())
+    assert payload["requested_group"] == "Exterior"
+    assert payload["failure_stage"] == "selection_boundary_absent"
+    assert payload["physical_row"] == 1
+    assert payload["reread_text"] == "Exterior"
+    assert payload["has_selection_boundary"] is False
+    assert payload["anchor_offset"] == [0, 0]
+    assert payload["items_search_pane_field"] == [1, 1, 2, 2]
+
+
+def test_selection_diagnostic_capture_failure_never_masks_the_real_error():
+    """The diagnostic write itself must be fully best-effort: an adapter
+    with no evidence_dir at all (e.g. every pre-existing lightweight test
+    fake in this file) must still raise the ORIGINAL, unmodified error."""
+    class Adapter:
+        expected_project_name = "TEST"
+        # deliberately no evidence_dir attribute
+        def verify_application(self): return True
+        def verify_project(self): return True
+        def _unexpected_dialog_present(self): return False
+        def _find_dropdown_window(self): return None
+        def _ensure_main_window(self): return 1
+        def _force_foreground(self, hwnd): return True
+        def _capture_client_image(self, hwnd): return object()
+        def _locate_group_tree_header(self, image): return (10, 20, 30, 40)
+        def _ocr_group_tree_row_text(self, image, header, index): return "P4B.0814"
+        def _click_client(self, hwnd, *xy): pass
+        def _group_tree_row_has_selection_boundary(self, image, header, index): return False
+        def _win32gui(self):
+            class W:
+                @staticmethod
+                def GetWindowRect(hwnd): return (0, 0, 100, 100)
+            return W
+
+    facade = object.__new__(WindowsGroupBatchUI)
+    facade.adapter = Adapter()
+    facade._inventory = GroupInventory(
+        window_rect=(0, 0, 100, 100), header_rect=(10, 20, 30, 40),
+        entries=(GroupInventoryEntry("p4b0814", "P4B_0814", 2, (50, 70)),),
+    )
+    with pytest.raises(RuntimeError, match="fresh selection boundary is absent"):
+        facade.select_group_lightweight("P4B_0814")
+
+
 def test_fresh_exact_group_row_cannot_satisfy_a_different_planned_group():
     class Adapter:
         def snapshot_group_names(self): return ["TEST", "P4A_0814"]

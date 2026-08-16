@@ -5862,6 +5862,16 @@ class WindowsXactimateAdapter(XactimateAdapter):
     #: pixels), so an index found one way always means the same
     #: physical row to every other consumer.
     _GROUP_TREE_ROW_TEXT_TOP_DY = 23
+    #: Uncalibrated fallback for the first CHILD row's own text-top offset
+    #: (row_index == 1), kept independent of the root's offset above. Root
+    #: and child rows are not guaranteed to share the same OCR-cluster
+    #: height, so child row placement must never be derived by walking the
+    #: root's offset forward by one pitch -- it needs its own anchor.
+    #: Defaults to root-offset + one row height only to reproduce this
+    #: class's historical uncalibrated behavior when no calibration profile
+    #: has been applied yet; real (calibrated) usage always overrides this
+    #: from a measurement taken directly on a real child row.
+    _GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY = 43
     _GROUP_TREE_ROW_HEIGHT = 20
     _GROUP_TREE_CLICK_DX = 79
     #: Click Y lands a few px below the text's top edge -- safely
@@ -7709,18 +7719,46 @@ class WindowsXactimateAdapter(XactimateAdapter):
     def _locate_group_tree_header(self, image) -> tuple[int, int, int, int] | None:
         return self._locate_label(image, "Group", prefer="topmost")
 
+    def _group_tree_row_text_top(self, header_top: int, row_index: int) -> int:
+        """Row-relative text-top pixel position -- the shared arithmetic
+        behind every row position/crop consumer in this file.
+
+        Row 0 (the root/project row) is targeted from its own independently
+        measured offset, never from the child anchor: root and child rows
+        are not guaranteed to share the same OCR-cluster height, so walking
+        the root's offset forward by whole pitches systematically mistargets
+        every child row by the root/child height difference. Rows >= 1 are
+        instead anchored directly to the first child row's own measured
+        position and then walked forward by (row_index - 1) additional
+        pitches, so the anchor is always taken from a real child row, never
+        extrapolated from the root.
+
+        Rounded once here, at this shared anchor -- the only place a
+        fractional (calibration-measured) pitch is involved -- so every
+        consumer's own flat integer offset (click Y, crop margin) is then
+        added to an already-integer pixel and never needs its own separate
+        rounding. Rounding independently in each caller instead can
+        disagree by a pixel at exact .5 ties (banker's rounding does not
+        commute with addition), which would make the click target and the
+        OCR crop for the same row_index silently drift apart.
+        """
+        if row_index == 0:
+            return round(header_top + self._GROUP_TREE_ROW_TEXT_TOP_DY)
+        return round(
+            header_top
+            + self._GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY
+            + (row_index - 1) * self._GROUP_TREE_ROW_HEIGHT
+        )
+
     def _group_tree_row_xy(self, header_pos: tuple[int, int], row_index: int) -> tuple[int, int]:
         left, top = header_pos[0], header_pos[1]
         return (
             left + self._GROUP_TREE_CLICK_DX,
-            top + self._GROUP_TREE_ROW_TEXT_TOP_DY + row_index * self._GROUP_TREE_ROW_HEIGHT + self._GROUP_TREE_CLICK_DY_OFFSET,
+            self._group_tree_row_text_top(top, row_index) + self._GROUP_TREE_CLICK_DY_OFFSET,
         )
 
     def _group_tree_row_crop_top(self, header_top: int, row_index: int) -> int:
-        return (
-            header_top + self._GROUP_TREE_ROW_TEXT_TOP_DY + row_index * self._GROUP_TREE_ROW_HEIGHT
-            - self._GROUP_TREE_ROW_CROP_MARGIN_TOP
-        )
+        return self._group_tree_row_text_top(header_top, row_index) - self._GROUP_TREE_ROW_CROP_MARGIN_TOP
 
     def _ocr_group_tree_name_crop(self, crop) -> str:
         """Read one group-name crop, retrying only a blank selected row.
@@ -7843,6 +7881,31 @@ class WindowsXactimateAdapter(XactimateAdapter):
     _GROUP_TREE_SELECTION_LINE_COLOR_TOLERANCE = 18
     _GROUP_TREE_SELECTION_MIN_CHROMA = 45
     _GROUP_TREE_SELECTION_MIN_OVERLAP_RUN = 32
+    #: Upper cap (px) on how far the top/bottom edge-line pair may be
+    #: searched away from its OCR-derived nominal position. The row-crop
+    #: geometry this reuses (_group_tree_row_crop_top/_GROUP_TREE_ROW_CROP_
+    #: HEIGHT) is tuned for OCR headroom, not border-line exactness -- live-
+    #: caught: a genuinely selected row's rendered border sat 1px away from
+    #: the nominal edge lines, which OCR tolerates easily (an 18px-tall crop
+    #: absorbs a 1px shift) but an exact single-pixel-row sample does not.
+    #: This is only a ceiling: _group_tree_row_boundary_search_tolerance()
+    #: additionally clamps it against the live row pitch so the widened
+    #: search can never reach into a neighboring row's own crop band.
+    _GROUP_TREE_SELECTION_EDGE_SEARCH_TOLERANCE_PX = 3
+
+    def _group_tree_row_boundary_search_tolerance(self) -> int:
+        """Safe search tolerance for one edge line, in pixels.
+
+        Bounded by half the gap between this row's crop band and the next
+        row's (row pitch minus crop height), less one pixel of guaranteed
+        separation, so the top/bottom search bands this enables can never
+        overlap a neighboring row's -- however tight the calibrated pitch.
+        Falls back to 0 (exact original behavior) when there is no safe
+        headroom at all.
+        """
+        gap = int(self._GROUP_TREE_ROW_HEIGHT) - self._GROUP_TREE_ROW_CROP_HEIGHT
+        safe_max = max(0, (gap + 1) // 2)
+        return min(self._GROUP_TREE_SELECTION_EDGE_SEARCH_TOLERANCE_PX, safe_max)
 
     def _group_tree_row_has_selection_boundary(
         self, image, header_pos: tuple[int, int], row_index: int,
@@ -7858,6 +7921,18 @@ class WindowsXactimateAdapter(XactimateAdapter):
         depth and tree content, so it need not be the dominant color or occupy
         a fixed percentage of the row.  A single average color, fixed RGB value,
         fixed indentation, or absolute screen coordinate is never used.
+
+        The top/bottom edge-line pair is tried at its nominal row-relative
+        position first, then at a small number of positions shifted together
+        by up to _group_tree_row_boundary_search_tolerance() pixels (nominal
+        first, then +-1, +-2, ... so the untolerant/original position is
+        always preferred when it already matches). Top and bottom always
+        shift by the SAME offset together -- this tolerates the whole
+        nominal band landing a pixel or two off (the observed failure mode),
+        not independently wandering edges, which keeps the search from ever
+        pairing an unrelated top line with an unrelated bottom line. Every
+        other protection (chroma, background separation, continuous-run
+        length) applies unchanged at each position tried.
         """
         from collections import Counter
 
@@ -7869,7 +7944,6 @@ class WindowsXactimateAdapter(XactimateAdapter):
             return False
         rgb = image.convert("RGB")
 
-        top = Counter(rgb.getpixel((x, row_top)) for x in range(row_left, row_right))
         interior = Counter(
             rgb.getpixel((x, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT // 2))
             for x in range(row_left, row_right)
@@ -7879,25 +7953,36 @@ class WindowsXactimateAdapter(XactimateAdapter):
         def distance(a, b) -> int:
             return sum(abs(int(x) - int(y)) for x, y in zip(a, b))
 
-        for top_color, _top_count in top.most_common():
-            if max(top_color) - min(top_color) < self._GROUP_TREE_SELECTION_MIN_CHROMA:
+        tolerance = self._group_tree_row_boundary_search_tolerance()
+        offsets = [0]
+        for step in range(1, tolerance + 1):
+            offsets.extend((step, -step))
+
+        for dy in offsets:
+            top_y = row_top + dy
+            bottom_y = row_top + dy + self._GROUP_TREE_ROW_CROP_HEIGHT - 2
+            if top_y < 0 or bottom_y < 0 or top_y >= image.height or bottom_y >= image.height:
                 continue
-            if distance(top_color, interior_color) < self._GROUP_TREE_SELECTION_MIN_BACKGROUND_DISTANCE:
-                continue
-            overlap_run = 0
-            longest_overlap_run = 0
-            for x in range(row_left, row_right):
-                top_matches = distance(rgb.getpixel((x, row_top)), top_color) <= self._GROUP_TREE_SELECTION_LINE_COLOR_TOLERANCE
-                bottom_matches = distance(
-                    rgb.getpixel((x, row_top + self._GROUP_TREE_ROW_CROP_HEIGHT - 2)), top_color,
-                ) <= self._GROUP_TREE_SELECTION_LINE_COLOR_TOLERANCE
-                if top_matches and bottom_matches:
-                    overlap_run += 1
-                    longest_overlap_run = max(longest_overlap_run, overlap_run)
-                else:
-                    overlap_run = 0
-            if longest_overlap_run >= self._GROUP_TREE_SELECTION_MIN_OVERLAP_RUN:
-                return True
+            top_candidates = Counter(rgb.getpixel((x, top_y)) for x in range(row_left, row_right))
+            for top_color, _top_count in top_candidates.most_common():
+                if max(top_color) - min(top_color) < self._GROUP_TREE_SELECTION_MIN_CHROMA:
+                    continue
+                if distance(top_color, interior_color) < self._GROUP_TREE_SELECTION_MIN_BACKGROUND_DISTANCE:
+                    continue
+                overlap_run = 0
+                longest_overlap_run = 0
+                for x in range(row_left, row_right):
+                    top_matches = distance(rgb.getpixel((x, top_y)), top_color) <= self._GROUP_TREE_SELECTION_LINE_COLOR_TOLERANCE
+                    bottom_matches = distance(
+                        rgb.getpixel((x, bottom_y)), top_color,
+                    ) <= self._GROUP_TREE_SELECTION_LINE_COLOR_TOLERANCE
+                    if top_matches and bottom_matches:
+                        overlap_run += 1
+                        longest_overlap_run = max(longest_overlap_run, overlap_run)
+                    else:
+                        overlap_run = 0
+                if longest_overlap_run >= self._GROUP_TREE_SELECTION_MIN_OVERLAP_RUN:
+                    return True
         return False
 
     #: Grand Total's own label+value block is FIXED left-sidebar chrome

@@ -481,6 +481,51 @@ class WindowsGroupBatchUI:
         )
         return "one_fresh_complete_group_tree_snapshot_with_distinct_exact_planned_names"
 
+    def _report_selection_verification_failure(
+        self, *, group: str, stage: str, image=None, header=None, index: int | None = None,
+    ) -> None:
+        """Best-effort diagnostic capture for a select_group_lightweight()
+        verification failure -- purely additive evidence; any error here is
+        swallowed and never changes, replaces, or delays the actual
+        failure. `stage` names which specific check refused (geometry,
+        OCR identity, blocking UI, missing boundary, or post-click
+        context), since select_group_lightweight()'s prior failures left
+        no evidence at all to distinguish between those causes."""
+        try:
+            payload: dict[str, Any] = {"requested_group": group, "failure_stage": stage}
+            if header is not None:
+                payload["header_rect"] = list(header)
+            if index is not None:
+                payload["physical_row"] = index
+            if image is not None and header is not None and index is not None:
+                try:
+                    payload["reread_text"] = self.adapter._ocr_group_tree_row_text(image, header, index)
+                except Exception:
+                    payload["reread_text"] = None
+                try:
+                    payload["has_selection_boundary"] = self.adapter._group_tree_row_has_selection_boundary(
+                        image, header, index,
+                    )
+                except Exception:
+                    payload["has_selection_boundary"] = None
+            if image is not None:
+                try:
+                    payload["anchor_offset"] = self.adapter._anchor_offset(image)
+                except Exception:
+                    payload["anchor_offset"] = None
+                try:
+                    items_search = self.adapter._items_search_pane_field(image)
+                    payload["items_search_pane_field"] = list(items_search) if items_search else None
+                except Exception:
+                    payload["items_search_pane_field"] = None
+            evidence_root = self.adapter.evidence_dir
+            evidence_root.mkdir(parents=True, exist_ok=True)
+            slug = normalize_planned_group_identity(group) or "unknown"
+            path = evidence_root / f"group_selection_verification_failure_{slug}.json"
+            path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        except Exception:
+            pass
+
     def select_group_lightweight(self, group: str) -> str:
         """One fresh name proof, causal click, then fresh selection-boundary proof."""
         self.verify_project_and_no_modal(self.adapter.expected_project_name)
@@ -500,19 +545,32 @@ class WindowsGroupBatchUI:
             or tuple(header[:2]) != self._inventory.header_rect[:2]
             or self._window_rect(hwnd) != self._inventory.window_rect
         ):
+            self._report_selection_verification_failure(group=group, stage="geometry_invalidated", image=before, header=header)
             raise RuntimeError("fast group selection refused: reusable inventory geometry was invalidated")
         entry = self._inventory.entry(group)
         index = entry.physical_row
         reread = self.adapter._ocr_group_tree_row_text(before, header, index)
         if len(exact_planned_group_rows([reread], group)) != 1:
+            self._report_selection_verification_failure(
+                group=group, stage="ocr_identity_mismatch", image=before, header=header, index=index,
+            )
             raise RuntimeError("fast group selection refused: clicked row failed exact independent name reread")
         self.adapter._click_client(hwnd, *entry.row_center)
         after = self.adapter._capture_client_image(hwnd)
         if self.adapter._unexpected_dialog_present() or self.adapter._find_dropdown_window() is not None:
+            self._report_selection_verification_failure(
+                group=group, stage="unexpected_dialog_or_dropdown", image=after, header=header, index=index,
+            )
             raise RuntimeError("fast group selection refused: blocking UI appeared")
         if not self.adapter._group_tree_row_has_selection_boundary(after, header, index):
+            self._report_selection_verification_failure(
+                group=group, stage="selection_boundary_absent", image=after, header=header, index=index,
+            )
             raise RuntimeError("fast group selection refused: fresh selection boundary is absent")
         if self.adapter._anchor_offset(after) is None or self.adapter._items_search_pane_field(after) is None:
+            self._report_selection_verification_failure(
+                group=group, stage="post_click_context_unestablished", image=after, header=header, index=index,
+            )
             raise RuntimeError("fast group selection refused: selected Items/grid context is not established")
         return "verified_inventory_row_then_single_row_exact_ocr_and_selection_boundary"
 

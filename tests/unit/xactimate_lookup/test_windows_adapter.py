@@ -3430,6 +3430,323 @@ def test_group_selection_rejects_non_overlapping_top_bottom_runs():
     assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
 
 
+def _draw_boundary_at_offset(image, adapter, header, row_index, *, dy):
+    """Draw a full-width selection border at `dy` pixels away from the row's
+    nominal crop_top -- used to simulate a rendered border that lands
+    slightly off the OCR-derived nominal row edge."""
+    from PIL import ImageDraw
+
+    nominal_top = adapter._group_tree_row_crop_top(header[1], row_index)
+    top_y = nominal_top + dy
+    bottom_y = nominal_top + dy + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2
+    draw = ImageDraw.Draw(image)
+    draw.line((28, top_y, 300, top_y), fill=(125, 162, 206), width=1)
+    draw.line((28, bottom_y, 300, bottom_y), fill=(125, 162, 206), width=1)
+    return top_y, bottom_y
+
+
+def test_boundary_tolerance_recognizes_the_perfectly_aligned_nominal_case():
+    """The untolerant/nominal position must still be found -- the search
+    tries dy=0 first, so an already-perfectly-aligned border is unaffected
+    by the new tolerance."""
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    _draw_boundary_at_offset(image, adapter, header, 2, dy=0)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is True
+
+
+def test_boundary_tolerance_recognizes_the_live_observed_one_pixel_displacement():
+    """Regression for the live 'Exterior' failure: a genuinely selected
+    row's rendered border sat 1px away from the nominal crop-derived edge
+    lines. Uses the adapter's own default (uncalibrated) geometry, not the
+    live session's absolute pixel values -- this proves the fix is
+    geometry-relative, not a hardcoded live coordinate."""
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    _draw_boundary_at_offset(image, adapter, header, 2, dy=1)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is True
+
+
+def test_boundary_tolerance_scales_to_a_different_row_pitch_without_live_coordinates():
+    """The same displaced-boundary shape, reproduced at a deliberately
+    different scale (larger pitch/crop height than any live-observed
+    geometry) -- proves the search tolerance is derived from the row
+    geometry itself, not a fixed absolute pixel value tied to one layout."""
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._GROUP_TREE_ROW_HEIGHT = 40.0
+    adapter._GROUP_TREE_ROW_CROP_HEIGHT = 34
+    image = Image.new("RGB", (400, 260), "white")
+    header = (20, 20, 60, 30)
+    tolerance = adapter._group_tree_row_boundary_search_tolerance()
+    assert tolerance >= 2  # a wider pitch/crop gap must yield more usable headroom
+    _draw_boundary_at_offset(image, adapter, header, 2, dy=2)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is True
+
+
+def test_boundary_tolerance_rejects_an_unselected_row():
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
+
+
+def test_boundary_tolerance_rejects_random_colored_glyph_pixels():
+    """Scattered chromatic pixels (text glyphs, icons) within the search
+    band must not be mistaken for a continuous border line."""
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    nominal_top = adapter._group_tree_row_crop_top(header[1], 2)
+    draw = ImageDraw.Draw(image)
+    for x in range(30, 200, 5):
+        draw.point((x, nominal_top + (x % 3)), fill=(125, 162, 206))
+        draw.point((x + 1, nominal_top + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2 - (x % 4)), fill=(125, 162, 206))
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
+
+
+def test_boundary_tolerance_rejects_a_boundary_on_only_one_edge():
+    """A strong chromatic line on the top edge with no matching bottom line
+    at any searched offset must not verify -- both edges must move together
+    and both must be present."""
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    nominal_top = adapter._group_tree_row_crop_top(header[1], 2)
+    draw = ImageDraw.Draw(image)
+    draw.line((28, nominal_top + 1, 300, nominal_top + 1), fill=(125, 162, 206), width=1)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
+
+
+def test_boundary_tolerance_rejects_short_runs_even_when_displaced():
+    """The minimum-overlap-run protection still applies at every searched
+    offset, not just the nominal one."""
+    from PIL import Image, ImageDraw
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    nominal_top = adapter._group_tree_row_crop_top(header[1], 2)
+    top_y = nominal_top + 1
+    bottom_y = nominal_top + 1 + adapter._GROUP_TREE_ROW_CROP_HEIGHT - 2
+    draw = ImageDraw.Draw(image)
+    short_run = adapter._GROUP_TREE_SELECTION_MIN_OVERLAP_RUN - 5
+    draw.line((28, top_y, 28 + short_run, top_y), fill=(125, 162, 206), width=1)
+    draw.line((28, bottom_y, 28 + short_run, bottom_y), fill=(125, 162, 206), width=1)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
+
+
+def test_boundary_tolerance_does_not_bleed_into_the_neighboring_row():
+    """A real, valid border drawn on the NEXT row must never verify as this
+    row's own boundary just because it lies within the search tolerance of
+    this row's nominal bottom edge."""
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 220), "white")
+    header = (20, 20, 60, 30)
+    _draw_boundary_at_offset(image, adapter, header, 3, dy=0)  # genuinely row 3's own border
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 2) is False
+    assert adapter._group_tree_row_has_selection_boundary(image, header, 3) is True
+
+
+@pytest.mark.parametrize("row_index", [1, 2, 4, 6])
+def test_boundary_tolerance_works_across_multiple_row_indices(row_index):
+    from PIL import Image
+
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    image = Image.new("RGB", (400, 320), "white")
+    header = (20, 20, 60, 30)
+    _draw_boundary_at_offset(image, adapter, header, row_index, dy=1)
+
+    assert adapter._group_tree_row_has_selection_boundary(image, header, row_index) is True
+    # a sibling row at a different index must remain unaffected
+    other = row_index + 1
+    assert adapter._group_tree_row_has_selection_boundary(image, header, other) is False
+
+
+def test_boundary_search_tolerance_never_exceeds_half_the_row_to_row_gap():
+    """Direct check of the safety clamp across a range of pitch/crop-height
+    combinations -- the widened search band (tolerance px on both sides of
+    each edge) must never be able to reach the next row's own crop band."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    for pitch, crop_height in [(20, 18), (14, 12), (40, 34), (18, 18), (25, 10)]:
+        adapter._GROUP_TREE_ROW_HEIGHT = float(pitch)
+        adapter._GROUP_TREE_ROW_CROP_HEIGHT = crop_height
+        tolerance = adapter._group_tree_row_boundary_search_tolerance()
+        gap = pitch - crop_height
+        assert tolerance >= 0
+        # this row's widened bottom-edge search must stay strictly below
+        # the next row's widened top-edge search
+        this_row_bottom_reach = (crop_height - 2) + tolerance
+        next_row_top_reach = pitch - tolerance
+        assert this_row_bottom_reach < next_row_top_reach
+
+
+def test_boundary_tolerance_does_not_alter_ocr_row_crop_geometry():
+    """The fix must be isolated to the selection-boundary detector --
+    _group_tree_row_crop_top() itself (used by OCR name/subtotal crops)
+    must return the exact same nominal value as before, unaffected by the
+    new tolerance search."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    header_top = 156
+    for row_index in range(0, 6):
+        # unchanged formula: no tolerance/offset applied to the crop itself
+        expected = adapter._group_tree_row_text_top(header_top, row_index) - adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP
+        assert adapter._group_tree_row_crop_top(header_top, row_index) == expected
+
+
+def test_group_tree_row_zero_uses_its_own_root_anchor_independent_of_child_geometry():
+    """Root row targeting (right-click 'New Group', etc.) must never be
+    forced through the child-row anchor/pitch formula -- it keeps its own,
+    separately measured offset, unaffected by whatever the child anchor or
+    pitch happen to be."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._GROUP_TREE_ROW_TEXT_TOP_DY = 13
+    adapter._GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY = 999  # deliberately absurd -- must not leak into row 0
+    adapter._GROUP_TREE_ROW_HEIGHT = 19.75
+    header_top = 100
+
+    assert adapter._group_tree_row_crop_top(header_top, 0) == round(
+        header_top + 13 - adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP
+    )
+
+
+def test_group_tree_row_one_is_derived_from_first_child_anchor_not_root_plus_pitch():
+    """Row 1 (the first real group) must come directly from the measured
+    first-child anchor, not from root_offset + 1*pitch -- those two only
+    agree when root and child OCR clusters happen to share a height, which
+    is exactly the assumption that produced the live 'Exterior' failure."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._GROUP_TREE_ROW_TEXT_TOP_DY = 13          # root's own anchor
+    adapter._GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY = 23  # child anchor, deliberately != root + pitch
+    adapter._GROUP_TREE_ROW_HEIGHT = 20
+    header_top = 100
+
+    old_buggy = round(header_top + 13 + 1 * 20 - adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP)
+    correct = round(header_top + 23 - adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP)
+    assert old_buggy != correct  # sanity: the two conventions genuinely disagree here
+
+    assert adapter._group_tree_row_crop_top(header_top, 1) == correct
+
+
+def test_group_tree_rows_after_first_child_step_by_measured_pitch():
+    """Rows 2..N must walk forward from the first-child anchor by whole
+    pitches, never from the root row."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._GROUP_TREE_ROW_TEXT_TOP_DY = 13
+    adapter._GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY = 23
+    adapter._GROUP_TREE_ROW_HEIGHT = 20
+    header_top = 100
+
+    for row_index in range(1, 7):
+        expected = round(header_top + 23 + (row_index - 1) * 20 - adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP)
+        assert adapter._group_tree_row_crop_top(header_top, row_index) == expected
+
+
+def test_fractional_pitch_does_not_accumulate_truncation_error_at_later_rows():
+    """Fix 2: a measured pitch like 19.75 must not be truncated to 19 before
+    being multiplied by a growing row_index -- that would drift further
+    from the true position at every subsequent row instead of staying
+    bounded to sub-pixel rounding."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._GROUP_TREE_ROW_TEXT_TOP_DY = 13
+    adapter._GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY = 23
+    adapter._GROUP_TREE_ROW_HEIGHT = 19.75
+    header_top = 100
+    row_index = 10  # a later row, where truncation error would have compounded
+
+    exact_float = header_top + 23 + (row_index - 1) * 19.75 - adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP
+    truncated_wrong = header_top + 23 + (row_index - 1) * 19 - adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP
+
+    observed = adapter._group_tree_row_crop_top(header_top, row_index)
+
+    assert observed == round(exact_float)
+    assert observed != truncated_wrong
+    assert abs(observed - truncated_wrong) >= 6  # proves the drift is real, not a rounding coincidence
+
+
+def test_group_tree_row_xy_and_crop_top_target_the_same_row_anchor():
+    """snapshot_group_names() (via _group_tree_row_crop_top) and every
+    clicking path (via _group_tree_row_xy) must agree on exactly the same
+    physical row for a given row_index -- they may only differ by their own
+    fixed additive click/crop constants, never by a different anchor or
+    pitch convention."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    adapter._GROUP_TREE_ROW_TEXT_TOP_DY = 13
+    adapter._GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY = 23
+    adapter._GROUP_TREE_ROW_HEIGHT = 19.75
+    header_pos = (50, 100)
+
+    for row_index in range(0, 5):
+        crop_top = adapter._group_tree_row_crop_top(header_pos[1], row_index)
+        _left, click_y = adapter._group_tree_row_xy(header_pos, row_index)
+        assert click_y - crop_top == adapter._GROUP_TREE_CLICK_DY_OFFSET + adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP
+
+
+def test_snapshot_group_names_places_exterior_crop_on_the_first_child_row_despite_root_child_height_divergence(
+    monkeypatch,
+):
+    """Exterior regression fixture: reproduces the generalized failure
+    shape (root's OCR box a different height than the child rows', measured
+    pitch fractional) without hardcoding the historical 23/20 constants or
+    special-casing 'Exterior'. The correct child-row crop position is
+    computed independently of the method under test; only a fake image
+    that returns real text at that exact position (and nothing usable
+    anywhere else) is wired up, so this can only pass if the production
+    formula genuinely lands the crop on the real child row."""
+    adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
+    monkeypatch.setattr(adapter, "_locate_group_tree_header", lambda image: (0, 0, 40, 10))
+
+    root_anchor, first_child_anchor, pitch = 13, 23, 19.75
+    adapter._GROUP_TREE_ROW_TEXT_TOP_DY = root_anchor
+    adapter._GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY = first_child_anchor
+    adapter._GROUP_TREE_ROW_HEIGHT = pitch
+    header_top = 0
+    margin = adapter._GROUP_TREE_ROW_CROP_MARGIN_TOP
+
+    correct_row1_top = round(header_top + first_child_anchor - margin)
+    old_buggy_row1_top = round(header_top + root_anchor + 1 * int(pitch) - margin)
+    assert correct_row1_top != old_buggy_row1_top  # sanity: old and new conventions disagree
+
+    class _FakeImage:
+        def crop(self, box):
+            return "exterior_row_crop" if box[1] == correct_row1_top else "wrong_position_crop"
+
+    monkeypatch.setattr(
+        adapter, "_ocr_group_tree_name_crop",
+        lambda crop: "Exterior" if crop == "exterior_row_crop" else "",
+    )
+    monkeypatch.setattr(adapter, "_capture_client_image", lambda hwnd: _FakeImage())
+    monkeypatch.setattr(adapter, "_ensure_main_window", lambda: 123)
+
+    rows = adapter.snapshot_group_names()
+
+    assert rows[0] == "TEST"
+    assert rows[1] == "Exterior"
+
+
 def test_non_destructive_group_frame_rejects_duplicate_group_match(monkeypatch):
     adapter = WindowsXactimateAdapter(expected_project_name="TEST", window_finder=lambda: ([], []))
     _wire_group_verification_frame(monkeypatch, adapter, rows=["TEST", "Exterior", "Exterior"])
