@@ -230,6 +230,23 @@ def compile_executable_group_plan(shadow: dict[str, Any]) -> ExecutableGroupPlan
     ever sees it -- Xactimate raises its own "Duplicate Item(s)" dialog if
     both are submitted separately, and the keyboard hot loop stays entirely
     unaware this collapsing ever happens.
+
+    The paired base row is not required to be the immediate next source
+    row. Real estimates interleave unrelated rows (or a second, distinct
+    remove/base pair) between a "Remove X" row and its "X" partner, so each
+    candidate later row in the SAME group is offered to
+    _remove_base_pair_reason() -- unchanged, still the sole authority on
+    whether two rows pair -- in source order, taking the first match. A
+    group-local `consumed_bases` set (reset per group) tracks which later
+    rows have already been claimed as someone's base, so: a base can never
+    be matched or emitted twice, a remove row stops searching at its first
+    match (never claims a second base), and a row already claimed as a
+    base is skipped entirely when the outer loop reaches its own position
+    -- never emitted standalone, never itself treated as a new remove
+    anchor. Because rows are still visited in strict source order and a
+    remove row only ever searches forward, repeated identical identities
+    (e.g. two "Remove A" rows followed by two "A" rows) pair up
+    first-available-to-first-available, preserving FIFO source order.
     """
     rows_by_id = {row["line_item_id"]: row for row in shadow["items"]}
     seen: set[str] = set()
@@ -237,9 +254,10 @@ def compile_executable_group_plan(shadow: dict[str, Any]) -> ExecutableGroupPlan
     for group_spec in shadow["group_first_future_layout"]:
         batch: list[ExecutableQuickEntryItem] = []
         line_ids = group_spec["line_item_ids"]
-        index = 0
-        while index < len(line_ids):
-            line_id = line_ids[index]
+        consumed_bases: set[str] = set()
+        for index, line_id in enumerate(line_ids):
+            if line_id in consumed_bases:
+                continue  # already collapsed into an earlier remove row's paired base
             if line_id in seen or line_id not in rows_by_id:
                 raise ValueError(f"shadow plan has missing or duplicate line item {line_id!r}")
             row = rows_by_id[line_id]
@@ -247,13 +265,14 @@ def compile_executable_group_plan(shadow: dict[str, Any]) -> ExecutableGroupPlan
             paired_line_id: str | None = None
             paired_row: dict[str, Any] | None = None
             collapse_reason: str | None = None
-            if index + 1 < len(line_ids):
-                candidate_id = line_ids[index + 1]
-                if candidate_id not in seen and candidate_id in rows_by_id:
-                    candidate_row = rows_by_id[candidate_id]
-                    reason = _remove_base_pair_reason(row, candidate_row)
-                    if reason:
-                        paired_line_id, paired_row, collapse_reason = candidate_id, candidate_row, reason
+            for candidate_id in line_ids[index + 1:]:
+                if candidate_id in consumed_bases or candidate_id in seen or candidate_id not in rows_by_id:
+                    continue
+                candidate_row = rows_by_id[candidate_id]
+                reason = _remove_base_pair_reason(row, candidate_row)
+                if reason:
+                    paired_line_id, paired_row, collapse_reason = candidate_id, candidate_row, reason
+                    break
 
             seen.add(line_id)
             category = row.get("execution_category") or row.get("category")
@@ -280,6 +299,7 @@ def compile_executable_group_plan(shadow: dict[str, Any]) -> ExecutableGroupPlan
             quantity_disagreement = False
             if paired_row is not None:
                 seen.add(paired_line_id)
+                consumed_bases.add(paired_line_id)
                 source_line_item_ids = (line_id, paired_line_id)
                 source_descriptions = (row["original_description"], paired_row["original_description"])
                 paired_quantity = paired_row.get("quantity")
@@ -292,7 +312,6 @@ def compile_executable_group_plan(shadow: dict[str, Any]) -> ExecutableGroupPlan
                 remove_qty = row.get("quantity")
                 if remove_qty is None or paired_quantity is None or format(remove_qty, "g") != format(paired_quantity, "g"):
                     quantity_disagreement = True
-                index += 1  # the paired row is consumed here, never emitted on its own
             batch.append(ExecutableQuickEntryItem(
                 line_item_id=line_id, group=group_spec["group"],
                 original_description=row["original_description"],
@@ -310,7 +329,6 @@ def compile_executable_group_plan(shadow: dict[str, Any]) -> ExecutableGroupPlan
                 human_review_required=quantity_disagreement, collapse_reason=collapse_reason,
                 quantity_tab_count=quantity_tab_count,
             ))
-            index += 1
         groups.append(ExecutableGroupBatch(group=group_spec["group"], items=tuple(batch)))
     if seen != set(rows_by_id):
         raise ValueError(f"shadow plan contains {len(set(rows_by_id) - seen)} ungrouped item(s)")
@@ -802,27 +820,25 @@ class WindowsGroupBatchUI:
         both handled identically here since Xactimate raises the same
         Duplicate Item(s) confirmation for either after its normal commit.
 
-        Window-title presence is a cheap non-OCR synchronization point. Live
-        calibration observed the dialog at 22.75 ms; 100 ms preserves a
-        bounded margin while the 5 ms poll avoids a fixed sleep.
+        Window-title presence is a cheap non-OCR synchronization point --
+        the same _poll() bounded-retry pattern create_group() already uses
+        to wait on the "New Group" dialog by title, reused here with its
+        own default 5 s bound. Live calibration observed the dialog at
+        22.75 ms; the previous 100 ms hand-rolled window was too tight for
+        Xactimate's normal render latency under real load.
         """
         started = time.perf_counter()
-        deadline = started + 0.1
-        while self.adapter._find_window_by_title(self.adapter._DUPLICATE_ITEM_DIALOG_TITLE) is None:
-            if time.perf_counter() >= deadline:
-                raise RuntimeError(
-                    "expected repeated group-local item identity did not present Duplicate Item(s) within 100 ms"
-                )
-            time.sleep(0.005)
+        if self._poll(lambda: self.adapter._find_window_by_title(self.adapter._DUPLICATE_ITEM_DIALOG_TITLE)) is None:
+            raise RuntimeError(
+                "expected repeated group-local item identity did not present Duplicate Item(s) within the bounded wait"
+            )
         appeared = time.perf_counter()
         self.keyboard.press_tab()
         self.keyboard.press_tab()
         self.keyboard.press_enter()
-        close_deadline = time.perf_counter() + 0.1
-        while self.adapter._find_window_by_title(self.adapter._DUPLICATE_ITEM_DIALOG_TITLE) is not None:
-            if time.perf_counter() >= close_deadline:
-                raise RuntimeError("expected Duplicate Item(s) remained after Tab x2 -> Enter")
-            time.sleep(0.005)
+        closed = self._poll(lambda: self.adapter._find_window_by_title(self.adapter._DUPLICATE_ITEM_DIALOG_TITLE) is None)
+        if not closed:
+            raise RuntimeError("expected Duplicate Item(s) remained after Tab x2 -> Enter")
         return {
             "appearance_wait_seconds": appeared - started,
             "acceptance_seconds": time.perf_counter() - appeared,

@@ -378,6 +378,123 @@ def test_unrelated_items_around_a_collapsing_pair_preserve_order_and_are_untouch
     assert items[1].source_line_item_ids == ("a1", "a2")
 
 
+def test_non_adjacent_remove_base_pair_collapses_across_an_unrelated_row():
+    """The paired base row need not be the very next row -- only the
+    immediate index+1 check historically enforced that. Proves a single
+    unrelated row between remove and base no longer blocks collapse."""
+    shadow = _pair_shadow([("A", [
+        ("a1", "Remove Additional charge for widget mounting", "ABC", "WIDGET", 9.36, "resolved"),
+        ("a2", "An unrelated middle item", "QRS", "MID", 3.0, "resolved"),
+        ("a3", "Additional charge for widget mounting", "ABC", "WIDGET", 9.36, "resolved"),
+    ])])
+    plan = compile_executable_group_plan(shadow)
+    items = plan.groups[0].items
+    assert [item.line_item_id for item in items] == ["a1", "a2"]
+    assert items[0].collapse_reason == "paired_remove_base_same_identity"
+    assert items[0].source_line_item_ids == ("a1", "a3")
+    assert items[1].collapse_reason is None  # unrelated middle item untouched
+
+
+def test_garrety_style_interleaved_remove_base_pairs_collapse_in_source_order():
+    """Regression for the real Garrety Insurance V2 'Dwelling roof' group:
+    two distinct STEEP selector pairs interleaved with an unrelated row,
+    exactly as persisted in the real shadow plan (see the diagnosis this
+    fix resolves). Both pairs must collapse and RFG/300S must remain
+    independent, physically positioned at its own source-order slot."""
+    shadow = _pair_shadow([("Dwelling roof", [
+        ("line_0002", "Remove Additional charge for steep roof - 10/12 - 12/12 slope", "RFG", "STEEP>", 44.76, "resolved"),
+        ("line_0003", "Remove Additional charge for steep roof greater than 12/12 slope", "RFG", "STEEP>>", 0.3, "resolved"),
+        ("line_0004", "Laminated - comp. shingle rfg. - w/out felt", "RFG", "300S", 49.67, "resolved"),
+        ("line_0005", "Additional charge for steep roof - 10/12 - 12/12 slope", "RFG", "STEEP>", 49.33, "resolved"),
+        ("line_0006", "Additional charge for steep roof greater than 12/12 slope", "RFG", "STEEP>>", 0.33, "resolved"),
+    ])])
+    plan = compile_executable_group_plan(shadow)
+    items = plan.groups[0].items
+    assert [item.line_item_id for item in items] == ["line_0002", "line_0003", "line_0004"]
+    steep_gt, steep_ggt, s300 = items
+    assert steep_gt.collapse_reason == "paired_remove_base_same_identity"
+    assert steep_gt.source_line_item_ids == ("line_0002", "line_0005")
+    assert (steep_gt.category, steep_gt.selector, steep_gt.quantity) == ("RFG", "STEEP>", 44.76)
+    assert steep_ggt.collapse_reason == "paired_remove_base_same_identity"
+    assert steep_ggt.source_line_item_ids == ("line_0003", "line_0006")
+    assert (steep_ggt.category, steep_ggt.selector, steep_ggt.quantity) == ("RFG", "STEEP>>", 0.3)
+    assert s300.collapse_reason is None
+    assert (s300.category, s300.selector, s300.quantity) == ("RFG", "300S", 49.67)
+
+
+def test_repeated_identical_remove_base_identity_pairs_fifo_in_source_order():
+    """Remove A / Remove A / unrelated / A / A must pair
+    first-available-to-first-available, never crossing pairs or losing
+    multiplicity the way a bare identity set would."""
+    shadow = _pair_shadow([("A", [
+        ("r1", "Remove Additional charge for widget mounting", "ABC", "WIDGET", 1.0, "resolved"),
+        ("r2", "Remove Additional charge for widget mounting", "ABC", "WIDGET", 2.0, "resolved"),
+        ("c", "An unrelated item", "QRS", "MID", 3.0, "resolved"),
+        ("b1", "Additional charge for widget mounting", "ABC", "WIDGET", 1.5, "resolved"),
+        ("b2", "Additional charge for widget mounting", "ABC", "WIDGET", 2.5, "resolved"),
+    ])])
+    plan = compile_executable_group_plan(shadow)
+    items = plan.groups[0].items
+    assert [item.line_item_id for item in items] == ["r1", "r2", "c"]
+    assert items[0].source_line_item_ids == ("r1", "b1")
+    assert items[1].source_line_item_ids == ("r2", "b2")
+    assert items[0].quantity == 1.0 and items[1].quantity == 2.0
+    assert all(item.collapse_reason == "paired_remove_base_same_identity" for item in items[:2])
+    assert items[2].collapse_reason is None
+
+
+def test_consumed_base_row_cannot_be_paired_or_emitted_twice():
+    """One remove row and two later identical-identity base rows: only the
+    first later base is consumed; the second stays a standalone, uncollapsed
+    item rather than being silently paired again or dropped."""
+    shadow = _pair_shadow([("A", [
+        ("r1", "Remove Additional charge for widget mounting", "ABC", "WIDGET", 9.36, "resolved"),
+        ("c", "An unrelated item", "QRS", "MID", 3.0, "resolved"),
+        ("b1", "Additional charge for widget mounting", "ABC", "WIDGET", 9.36, "resolved"),
+        ("b2", "Additional charge for widget mounting", "ABC", "WIDGET", 9.36, "resolved"),
+    ])])
+    plan = compile_executable_group_plan(shadow)
+    items = plan.groups[0].items
+    assert [item.line_item_id for item in items] == ["r1", "c", "b2"]
+    assert items[0].collapse_reason == "paired_remove_base_same_identity"
+    assert items[0].source_line_item_ids == ("r1", "b1")
+    assert items[2].collapse_reason is None  # b2 never re-paired, never dropped
+    assert items[2].source_line_item_ids == ("b2",)
+
+
+def test_genuinely_independent_duplicate_identities_never_collapse():
+    """Two separate physical items that legitimately share CAT/SEL (neither
+    is 'Remove'-shaped) must never be swallowed by the wider forward search
+    -- they stay two items and remain the responsibility of the existing
+    group-local duplicate-dialog handling, untouched by this fix."""
+    shadow = _pair_shadow([("A", [
+        ("d1", "Widget mounting bracket", "ABC", "WIDGET", 4.0, "resolved"),
+        ("c", "An unrelated item", "QRS", "MID", 3.0, "resolved"),
+        ("d2", "Widget mounting bracket", "ABC", "WIDGET", 4.0, "resolved"),
+    ])])
+    plan = compile_executable_group_plan(shadow)
+    items = plan.groups[0].items
+    assert [item.line_item_id for item in items] == ["d1", "c", "d2"]
+    assert all(item.collapse_reason is None for item in items)
+
+
+def test_genuinely_independent_duplicate_identities_still_trigger_expected_duplicate_dialog():
+    """End-to-end (compiler + executor): the same non-collapsing duplicate
+    identity from the test above must still reach the existing group-local
+    duplicate-dialog handling exactly as before this fix -- remove/base
+    collapsing and group-local duplicate detection are different concepts
+    and must not interfere with each other."""
+    shadow = _pair_shadow([("A", [
+        ("d1", "Widget mounting bracket", "ABC", "WIDGET", 4.0, "resolved"),
+        ("c", "An unrelated item", "QRS", "MID", 3.0, "resolved"),
+        ("d2", "Widget mounting bracket", "ABC", "WIDGET", 4.0, "resolved"),
+    ])])
+    plan = compile_executable_group_plan(shadow)
+    ui = UI(); execute_group_first_plan(plan, ui, clock=Clock())
+    duplicate_polls = [event for event in ui.events if event[0] == "duplicate-poll"]
+    assert len(duplicate_polls) == 1  # only d2, the repeat, ever triggers it
+
+
 def test_collapsed_pair_preserves_provenance_from_both_source_rows():
     shadow = _pair_shadow([("A", [
         ("a1", "Remove Additional charge for widget mounting", "ABC", "WIDGET", 9.36, "resolved"),
@@ -1529,3 +1646,145 @@ def test_three_same_process_selections_reuse_inventory_without_complete_tree_ocr
         assert facade._inventory is original_inventory
     assert facade.adapter.row_reads == [1, 2, 3]
     assert facade.adapter.clicks == [(50, 60), (50, 80), (50, 100)]
+
+
+# accept_expected_group_local_duplicate() now reuses the same _poll()
+# bounded-retry pattern create_group() uses for the "New Group" dialog,
+# instead of a hand-rolled 100 ms window -- these tests exercise its
+# Win32 title-detection wait/accept/close-confirm sequence in isolation,
+# the same way _MinimalCreateGroupAdapter exercises create_group().
+
+class _RecordingKeyboard:
+    def __init__(self, events):
+        self.events = events
+    def press_tab(self):
+        self.events.append("tab")
+    def press_enter(self):
+        self.events.append("enter")
+
+
+class _MinimalDuplicateDialogAdapter:
+    """Deliberately has no OCR, image-capture, or group-tree method at
+    all -- if accept_expected_group_local_duplicate() ever reached for
+    anything but native Win32 title lookup this would raise
+    AttributeError instead of succeeding.
+
+    appear_after: number of "not present" polls before the dialog is
+    reported present (0 = present on the very first poll).
+    close_after: number of "still present" polls, after Tab x2 -> Enter,
+    before the dialog is reported gone (0 = gone on the very first
+    post-accept poll).
+    never_appears / never_closes: force permanent failure for the
+    fail-closed tests.
+    """
+    _DUPLICATE_ITEM_DIALOG_TITLE = "Duplicate Item(s)"
+
+    def __init__(self, events, *, appear_after=0, close_after=0, never_appears=False, never_closes=False):
+        self.events = events
+        self._appear_after = appear_after
+        self._close_after = close_after
+        self._never_appears = never_appears
+        self._never_closes = never_closes
+        self._pre_appear_polls = 0
+        self._appeared = False
+        self._post_appear_polls = 0
+
+    def _find_window_by_title(self, title):
+        assert title == self._DUPLICATE_ITEM_DIALOG_TITLE
+        if not self._appeared:
+            if self._never_appears:
+                self.events.append(("find", False))
+                return None
+            if self._pre_appear_polls >= self._appear_after:
+                self._appeared = True
+                self.events.append(("find", True))
+                return 4242
+            self._pre_appear_polls += 1
+            self.events.append(("find", False))
+            return None
+        if self._never_closes:
+            self.events.append(("find", True))
+            return 4242
+        if self._post_appear_polls >= self._close_after:
+            self.events.append(("find", False))
+            return None
+        self._post_appear_polls += 1
+        self.events.append(("find", True))
+        return 4242
+
+
+def _duplicate_dialog_facade(adapter, keyboard):
+    facade = object.__new__(WindowsGroupBatchUI)
+    facade.adapter = adapter
+    facade.keyboard = keyboard
+    return facade
+
+
+def test_duplicate_dialog_accepted_when_it_appears_well_after_the_old_100ms_window(monkeypatch):
+    """30 * 50 ms = 1500 ms -- would have failed the previous 100 ms
+    hand-rolled deadline, but must still succeed under the new bound."""
+    events = []
+    clock = _fake_clock_installed(monkeypatch)
+    adapter = _MinimalDuplicateDialogAdapter(events, appear_after=30, close_after=0)
+    facade = _duplicate_dialog_facade(adapter, _RecordingKeyboard(events))
+
+    result = facade.accept_expected_group_local_duplicate()
+
+    assert result["appearance_wait_seconds"] == pytest.approx(30 * 0.05)
+    assert clock.now > 0.1  # genuinely past the old 100 ms window
+
+
+def test_duplicate_dialog_tab_tab_enter_sent_only_after_detection(monkeypatch):
+    events = []
+    _fake_clock_installed(monkeypatch)
+    adapter = _MinimalDuplicateDialogAdapter(events, appear_after=5, close_after=0)
+    facade = _duplicate_dialog_facade(adapter, _RecordingKeyboard(events))
+
+    facade.accept_expected_group_local_duplicate()
+
+    first_true_find = events.index(("find", True))
+    key_events = [e for e in events if e in ("tab", "enter")]
+    assert key_events == ["tab", "tab", "enter"]
+    # every key press happens strictly after the first successful detection
+    assert all(events.index(k) > first_true_find for k in ("tab", "enter"))
+    # and no find-True poll happened before any key was pressed with a
+    # false result recorded first (i.e. detection genuinely gated typing)
+    assert events[:first_true_find] == [("find", False)] * first_true_find
+
+
+def test_duplicate_dialog_waits_for_close_before_returning(monkeypatch):
+    events = []
+    clock = _fake_clock_installed(monkeypatch)
+    adapter = _MinimalDuplicateDialogAdapter(events, appear_after=0, close_after=20)
+    facade = _duplicate_dialog_facade(adapter, _RecordingKeyboard(events))
+
+    result = facade.accept_expected_group_local_duplicate()
+
+    assert result["acceptance_seconds"] == pytest.approx(20 * 0.05)
+    # the dialog was still reported present at least once after Tab x2 -> Enter
+    enter_index = events.index("enter")
+    assert ("find", True) in events[enter_index + 1:]
+
+
+def test_duplicate_dialog_absence_fails_closed(monkeypatch):
+    events = []
+    clock = _fake_clock_installed(monkeypatch)
+    adapter = _MinimalDuplicateDialogAdapter(events, never_appears=True)
+    facade = _duplicate_dialog_facade(adapter, _RecordingKeyboard(events))
+
+    with pytest.raises(RuntimeError, match="did not present Duplicate Item"):
+        facade.accept_expected_group_local_duplicate()
+    assert clock.now >= 4.9  # genuinely exhausted the bounded wait, not an instant failure
+    assert "tab" not in events and "enter" not in events  # never blindly sent
+
+
+def test_duplicate_dialog_remaining_open_after_accept_fails_closed(monkeypatch):
+    events = []
+    clock = _fake_clock_installed(monkeypatch)
+    adapter = _MinimalDuplicateDialogAdapter(events, appear_after=0, never_closes=True)
+    facade = _duplicate_dialog_facade(adapter, _RecordingKeyboard(events))
+
+    with pytest.raises(RuntimeError, match="remained after Tab x2 -> Enter"):
+        facade.accept_expected_group_local_duplicate()
+    assert ["tab", "tab", "enter"] == [e for e in events if e in ("tab", "enter")]
+    assert clock.now >= 4.9  # genuinely exhausted the close-wait bound before failing
