@@ -65,6 +65,13 @@ each machine and stores the result outside the repository, keyed to that
 machine. A new computer must calibrate itself — never copy a calibration
 file from another machine (see [step 5](#5-first-time-xactimate-calibration)).
 
+**All commands in this guide are PowerShell commands, not Command
+Prompt.** Windows 10/11 both include PowerShell by default — open the
+Start menu and search for **"Windows PowerShell"** (not "Command
+Prompt" / "cmd"). The `.\something.ps1` syntax used throughout this
+guide is PowerShell-specific and will not work the same way in
+Command Prompt.
+
 ### 1. Install prerequisites
 
 #### Python
@@ -161,9 +168,31 @@ in any way. Before continuing:
   Claim Extractor to control it.
 
 This guide does not cover obtaining, installing, or licensing Xactimate —
-that's between you and Xactware.
+that's between you and Xactware. Claim Extractor's code does not check
+for or require any specific Xactimate version — it works by reading and
+controlling whatever version's window is currently on screen.
 
 ### 2. Download Claim Extractor
+
+> **This repository currently requires GitHub access to clone or
+> download — it is not public.** This was confirmed by querying GitHub's
+> API for this repository while logged out, which returned "Not Found"
+> (the standard response GitHub gives for a private repository when
+> you're not authenticated — a public repository would return its
+> details instead). This means:
+> - The person setting up this second computer needs a **GitHub
+>   account**, and that account needs to be **added as a collaborator**
+>   on this repository (done from GitHub's website, by whoever currently
+>   owns/administers it — not something this README can do for you).
+> - Once added, they'll need to **sign in to GitHub** the first time
+>   they clone or download — either in the browser (for the ZIP option)
+>   or via a sign-in prompt that Git itself opens (for the Git option,
+>   described below). Neither option requires manually creating or
+>   pasting a token/password in most cases — modern Git for Windows and
+>   the browser both handle this with a normal GitHub login screen.
+> - If this repository is later made public, this whole notice — and the
+>   sign-in step below — no longer applies, and a plain `git clone`
+>   works with no login.
 
 Pick a **short** install path, such as `C:\claim-extractor`, rather than
 somewhere deeply nested (e.g. inside several levels of `Documents\Work\Projects\...`).
@@ -172,26 +201,123 @@ observed during setup validation — a dependency install failed purely
 because of an overly long folder path, with no other problem involved.
 A short path avoids that entirely.
 
-**Option A — Git (recommended if you have Git installed):**
+**Option A — Git.** Preferable if you're willing to install one extra
+tool, because future updates are then a single `git pull` (see
+[Updating later](#8-updating-later)) instead of re-downloading a new ZIP
+each time.
+
+**Do you already have Git?** Open PowerShell and run:
 
 ```powershell
+git --version
+```
+
+If that prints something like `git version 2.xx.x.windows.1`, Git is
+already installed — skip to "Clone the repository" below.
+
+**If PowerShell says `git` is not recognized, install Git for Windows:**
+
+1. Download the installer from the official source:
+   <https://git-scm.com/download/win>
+2. Run the installer. The default options are sufficient for this
+   guide — you only need `git clone`/`git pull`, and the installer's
+   default settings already include adding `git` to your `PATH` and
+   installing Git Credential Manager (which is what will show you a
+   normal GitHub sign-in window when needed, described above). You do
+   not need to change any installer screen for this setup to work.
+3. Close and reopen PowerShell (a window opened before installing won't
+   see the update), then verify:
+   ```powershell
+   git --version
+   ```
+   This should now print a version number.
+
+**Clone the repository:**
+
+```powershell
+cd C:\
 git clone https://github.com/ChrisCor04/claim-extractor
 cd claim-extractor
 ```
 
-> **Note:** this URL comes from this repository's currently configured
-> `origin` remote. If you intend to share this repository from a
-> different (e.g. private, org-hosted) location, confirm this is the URL
-> the recipient should actually use before sending these instructions.
+What each line actually does:
+- `cd C:\` moves PowerShell to the root of your `C:` drive — everything
+  after this happens relative to there.
+- `git clone https://github.com/ChrisCor04/claim-extractor` downloads
+  the repository and **automatically creates a new folder**
+  `C:\claim-extractor` for you — you do not need to (and should not)
+  create that folder yourself first. If a sign-in window appears here
+  (see the access note above), complete it; the clone will continue
+  automatically afterward.
+- `cd claim-extractor` moves PowerShell **into** that newly created
+  folder. After this command, your PowerShell prompt should show you're
+  working inside `C:\claim-extractor` — that's where you'll run the
+  remaining commands in this guide.
 
-**Option B — ZIP download (no Git required):**
+> **Note on the URL:** `https://github.com/ChrisCor04/claim-extractor`
+> comes from this repository's currently configured `origin` remote. If
+> you intend to share this repository from a different (e.g. renamed or
+> org-hosted) location, confirm this is the URL the recipient should
+> actually use before sending these instructions.
 
-1. On the repository's GitHub page, click **Code → Download ZIP**.
-2. Move the downloaded ZIP to a short path, e.g. `C:\`, then extract it
-   there (right-click → **Extract All...**). You should end up with
-   `C:\claim-extractor-main\` or similar.
-3. Open PowerShell **inside that extracted folder**: in File Explorer,
-   click the address bar, type `powershell`, and press Enter.
+**If something goes wrong:**
+- **`git : The term 'git' is not recognized...`** — Git isn't installed
+  or PowerShell wasn't reopened after installing it. See the install
+  steps above.
+- **`fatal: destination path 'claim-extractor' already exists and is
+  not an empty directory`** — you (or a previous attempt) already
+  created/cloned into `C:\claim-extractor`. Either `cd C:\claim-extractor`
+  to reuse it if it looks complete, or remove that folder first if it's
+  a stray leftover, then re-clone.
+- **`fatal: could not create work tree dir... Permission denied`** (or
+  similar, right after `cd C:\`) — some machines (especially
+  company-managed ones) restrict write access to the `C:\` root for
+  standard (non-Administrator) accounts. Don't run this as Administrator
+  just to work around it — instead, clone into a folder you already own,
+  e.g.:
+  ```powershell
+  cd $env:USERPROFILE
+  git clone https://github.com/ChrisCor04/claim-extractor
+  cd claim-extractor
+  ```
+  This creates `C:\Users\<you>\claim-extractor` instead — still short
+  enough to avoid the path-length problem above, and always writable by
+  your own account.
+
+**Option B — ZIP download (no Git required).** Simpler if you don't want
+to install Git — but you'll need to download a fresh ZIP for any future
+update rather than running one `git pull`, unless a future version of
+this project adds its own updater.
+
+1. In your browser, sign in to GitHub if you aren't already (see the
+   access note above), then open this repository's GitHub page:
+   <https://github.com/ChrisCor04/claim-extractor>
+2. Click the green **Code** button.
+3. Click **Download ZIP**.
+4. Wait for the download to finish.
+5. In File Explorer, open your **Downloads** folder and find the
+   downloaded file (typically `claim-extractor-main.zip`).
+6. If you want it somewhere other than Downloads, move or copy the ZIP
+   there now (e.g. to `C:\`) — doing this before extracting is usually
+   simplest.
+7. Right-click the ZIP file and choose **Extract All...**, then choose a
+   **short** destination (e.g. `C:\`) and confirm.
+8. GitHub ZIPs normally extract into a folder named after the repository
+   and branch, e.g. **`C:\claim-extractor-main`** — the exact name can
+   differ slightly (a different branch or version could produce a
+   different suffix). Open that folder and confirm it contains files
+   including `README.md`, `setup-windows.ps1`, `start-windows.ps1`, and
+   `requirements-windows.txt` — if you see those, you're in the right
+   place.
+9. Open PowerShell **inside that folder**: in File Explorer, open the
+   folder, click the address bar, type `powershell`, and press Enter.
+   (Alternatively, from any PowerShell window: `cd C:\claim-extractor-main`,
+   adjusting the path to match whatever folder name you actually got in
+   step 8.)
+
+ZIP users should **not** run `git clone` — you already have the files.
+The remaining steps in this guide (`setup-windows.ps1` and onward) are
+identical either way.
 
 ### 3. Run setup
 
@@ -204,6 +330,10 @@ From inside the repository folder in PowerShell:
 **If PowerShell refuses to run it** (a message about scripts being
 disabled), see [Troubleshooting](#7-troubleshooting) — do not
 permanently change your machine's security settings to work around this.
+
+This does not require Administrator/elevated PowerShell — it only
+creates a folder and installs packages inside the repository you already
+own, the same as any normal `pip install`.
 
 **What this script does, exactly** (read `setup-windows.ps1` directly if
 you want to verify this yourself before running it):
@@ -250,7 +380,23 @@ After starting, you should see console output ending with a local URL,
 and your browser should open (or you can open it manually) to
 `http://127.0.0.1:8501`, showing the **ClaimXtract** app with a sidebar
 ("Workspace: Quick Run / Advanced") and a title reading "Add a claim PDF
-and execute it in Xactimate. Everything stays on this computer."
+and execute it in Xactimate. Everything stays on this computer." If your
+browser doesn't open on its own, opening that URL manually in any
+browser works the same way.
+
+You may see a Windows Defender Firewall prompt the first time you start
+it — this can happen even for a localhost-only app on some Windows
+configurations. It's safe to allow it; the app only listens on
+`127.0.0.1` regardless of how you answer.
+
+**Starting order:** it doesn't matter whether you start Claim Extractor
+or Xactimate first — Xactimate only needs to be open and showing a
+project once you get to calibration or executing a plan, not just to
+launch this UI.
+
+**Stopping it:** press `Ctrl+C` in the PowerShell window `start-windows.ps1`
+is running in (or simply close that window). **Restarting it:** run
+`.\start-windows.ps1` again.
 
 ### 5. First-time Xactimate calibration
 
@@ -292,6 +438,16 @@ in a file named after a hash of this computer's hostname — entirely
 outside the repository folder, so it survives a `git pull` and is never
 committed or shared by cloning the repo.
 
+**It survives restarting the app and rebooting the computer** — it's an
+ordinary file on disk, not tied to the running process. You only need to
+repeat calibration when something about the Xactimate window's on-screen
+geometry has actually changed: a different monitor, a different display
+scaling/DPI setting, or the Xactimate window being resized. If you move
+Xactimate to a different monitor with different DPI/scaling, or change
+Windows display scaling, re-calibrate before your next Fast Grouped run —
+the app detects this mismatch (see [Troubleshooting](#7-troubleshooting),
+"Needs calibration") rather than silently using stale coordinates.
+
 ### 6. First test
 
 Before running an important live claim on a new computer, validate the
@@ -310,6 +466,13 @@ whole path end-to-end with something low-stakes:
 7. Confirm the run finishes without errors, matching what you saw on the
    screen.
 
+**While a Fast Grouped run is executing, don't touch your mouse or
+keyboard, and don't click into Xactimate yourself.** The automation
+drives Xactimate with real, synthetic mouse and keyboard input — anything
+you do at the same time can land in the wrong place and corrupt the run
+in progress. Wait for it to finish before interacting with the screen
+again.
+
 Only move on to a real claim once this completes cleanly.
 
 ### 7. Troubleshooting
@@ -317,6 +480,11 @@ Only move on to a real claim once this completes cleanly.
 | Symptom | Least-invasive fix first |
 |---|---|
 | `py` / `python` "is not recognized" | Reopen PowerShell in a new window (PATH changes need a fresh window). If it still fails, reinstall Python and check "Add python.exe to PATH". |
+| `git` "is not recognized" | Install Git for Windows (default options) from <https://git-scm.com/download/win>, then reopen PowerShell. See [step 2](#2-download-claim-extractor). |
+| You're using Command Prompt (`cmd.exe`) instead of PowerShell | Open **Windows PowerShell** from the Start menu instead — `.\setup-windows.ps1`-style commands are PowerShell syntax. |
+| Cloning/downloading asks you to sign in, or fails with a permission/access error on GitHub | This repository currently requires GitHub access — see the note at the top of [step 2](#2-download-claim-extractor). Confirm your GitHub account has been added as a collaborator. |
+| `git clone` fails with "Permission denied" right under `C:\` | Don't run as Administrator to force it — clone into `$env:USERPROFILE` instead (a folder you already own). See [step 2](#2-download-claim-extractor). |
+| `destination path '...' already exists` | A folder from a previous attempt is already there. Reuse it (`cd` into it) if it looks complete, or delete the stray folder and re-clone. |
 | PowerShell won't run `setup-windows.ps1` (execution policy error) | Run it via `powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1` — this affects only that one invocation, nothing permanent. See details below. |
 | PowerShell says the file "is blocked" / came from another computer | The ZIP download may carry Windows' "Mark of the Web". Run `Unblock-File .\setup-windows.ps1` (and optionally every file: `Get-ChildItem -Recurse \| Unblock-File`), then try again. |
 | Dependency install fails partway through | Re-run `.\setup-windows.ps1` — pip resumes/redownloads as needed. If it fails at the *same* package every time, note the exact error before asking for help. |
@@ -327,6 +495,7 @@ Only move on to a real claim once this completes cleanly.
 | "Not calibrated" / "Calibration required" | Expected on a brand-new computer — follow [step 5](#5-first-time-xactimate-calibration). |
 | "Needs calibration" after previously showing Ready | Something about the Xactimate window changed (size, DPI, moved monitor). Re-calibrate on this machine — do not reuse a profile from before the change. |
 | UI doesn't start / browser shows nothing | Check the PowerShell window setup/start ran in for an error. Confirm you're visiting `http://127.0.0.1:8501` (not `0.0.0.0`). |
+| Windows Defender Firewall prompt appears on first start | Safe to allow — the app only listens on `127.0.0.1` (this computer only) regardless of how you answer the prompt. |
 | "Port already in use" / port 8501 busy | Another Claim Extractor instance (or something else) is already using that port. Close it, or start with a different port: `.\.venv\Scripts\python.exe -m estimate_extractor ui --port 8502`. |
 
 **About the execution-policy fix specifically:** Windows' default
