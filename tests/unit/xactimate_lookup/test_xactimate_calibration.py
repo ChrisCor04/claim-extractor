@@ -1041,3 +1041,227 @@ def test_calibration_checkbox_wording_controls_creation_only():
     assert "if needed" not in label.casefold()  # the old, ambiguous wording
     assert "read-only" in help_text.casefold() or "always" in help_text.casefold()
     assert "duplicate" in help_text.casefold()
+
+
+# -- calibration sentinel recognition: exact-then-guarded-fuzzy identity --
+
+def _standard_trio_inventory(charlie_raw_text):
+    return _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140), (charlie_raw_text, 160))
+
+
+def test_guarded_map_accepts_exact_alpha():
+    mapping = calibration._guarded_calibration_row_map(_standard_trio_inventory("CAL_ROW_CHARLIE"))
+    assert mapping["CAL_ROW_ALPHA"]["raw_text"] == "CAL_ROW_ALPHA"
+
+
+def test_guarded_map_accepts_exact_bravo():
+    mapping = calibration._guarded_calibration_row_map(_standard_trio_inventory("CAL_ROW_CHARLIE"))
+    assert mapping["CAL_ROW_BRAVO"]["raw_text"] == "CAL_ROW_BRAVO"
+
+
+def test_guarded_map_accepts_exact_charlie():
+    mapping = calibration._guarded_calibration_row_map(_standard_trio_inventory("CAL_ROW_CHARLIE"))
+    assert mapping["CAL_ROW_CHARLIE"]["raw_text"] == "CAL_ROW_CHARLIE"
+
+
+def test_guarded_map_tolerates_surrounding_ocr_noise_around_exact_sentinels():
+    inventory = _inventory(("TEST", 100), ("fy Cal_ROW_ALPHA", 120), ("Cal_ROW. BRAVO", 140), ("CAL_ROW_CHARLIE", 160))
+    mapping = calibration._guarded_calibration_row_map(inventory)
+    assert mapping["CAL_ROW_ALPHA"]["raw_text"] == "fy Cal_ROW_ALPHA"
+    assert mapping["CAL_ROW_BRAVO"]["raw_text"] == "Cal_ROW. BRAVO"
+
+
+def test_guarded_map_accepts_proven_live_charlie_ocr_error():
+    # Real captured OCR shape from the live app: CAL_ROW_CHARLIE -> "Cal_ROW_CHARLE)" (dropped "I").
+    mapping = calibration._guarded_calibration_row_map(_standard_trio_inventory("Cal_ROW_CHARLE)"))
+    assert mapping["CAL_ROW_CHARLIE"]["raw_text"] == "Cal_ROW_CHARLE)"
+
+
+def test_guarded_map_accepts_unique_one_character_deletion():
+    mapping = calibration._guarded_calibration_row_map(_standard_trio_inventory("CAL_ROW_CHARLE"))
+    assert mapping["CAL_ROW_CHARLIE"]["raw_text"] == "CAL_ROW_CHARLE"
+
+
+def test_guarded_map_accepts_unique_one_character_substitution():
+    mapping = calibration._guarded_calibration_row_map(_standard_trio_inventory("CAL_ROW_CHARLXE"))
+    assert mapping["CAL_ROW_CHARLIE"]["raw_text"] == "CAL_ROW_CHARLXE"
+
+
+def test_guarded_map_accepts_two_edit_error_only_when_uniquely_attributable():
+    # "CAL_ROW_CHRLIF" is distance 2 from CHARLIE, distance 4/5 from ALPHA/BRAVO -- unambiguous.
+    mapping = calibration._guarded_calibration_row_map(_standard_trio_inventory("CAL_ROW_CHRLIF"))
+    assert mapping["CAL_ROW_CHARLIE"]["raw_text"] == "CAL_ROW_CHRLIF"
+
+
+def test_guarded_map_rejects_error_beyond_bound_for_all_sentinels():
+    # Distance >2 from every sentinel -- must fail closed, not guess the "closest" one.
+    with pytest.raises(RuntimeError, match="CAL_ROW_CHARLIE"):
+        calibration._guarded_calibration_row_map(_standard_trio_inventory("CAL_ROW_CHXXXX"))
+
+
+def test_guarded_map_rejects_candidate_ambiguous_between_two_sentinels():
+    # Synthetic close sentinel pair (real ones are >=5 apart; this exercises
+    # the uniqueness guard directly): "CAL_ROW_FO" sits at distance 1 from
+    # BOTH "CAL_ROW_FOO" and "CAL_ROW_FOZ" -- must never guess.
+    names = ("CAL_ROW_FOO", "CAL_ROW_FOZ")
+    inventory = _inventory(("CAL_ROW_FO", 100))
+    with pytest.raises(RuntimeError):
+        calibration._guarded_calibration_row_map(inventory, names)
+
+
+def test_guarded_map_rejects_multiple_physical_candidates_for_one_sentinel():
+    # Two distinct rows both within the bound of CHARLIE (and far from ALPHA/BRAVO).
+    inventory = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140),
+                           ("Cal_ROW_CHARLE)", 160), ("CAL_ROW_CHRLIF", 180))
+    with pytest.raises(RuntimeError, match="CAL_ROW_CHARLIE"):
+        calibration._guarded_calibration_row_map(inventory)
+
+
+def test_strict_presence_duplicate_check_is_unaffected_by_fuzzy_recognition(monkeypatch, tmp_path):
+    # complete_interactive_group_row_calibration()'s own pre-creation
+    # "does this already exist" guard must stay exact-only: a near-miss
+    # OCR'd row must NOT be treated as "already exists" and must not
+    # suppress legitimate creation.
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    near_miss_only = _inventory(("TEST", 100), ("CAL_ROW_CHRLIF", 120))  # close to CHARLIE, not exact
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: near_miss_only)
+    created = []
+    with pytest.raises(RuntimeError):
+        # Fails for an unrelated reason (creator not reaching a full trio in
+        # this minimal fixture) but must NOT fail with "already exists".
+        complete_interactive_group_row_calibration(
+            _InteractiveAdapter(), candidate, directory=tmp_path,
+            group_creator=lambda name: created.append(name) or {"name": name},
+        )
+    assert created  # creation was attempted -- not suppressed as "already exists"
+
+
+def test_ordinary_production_group_matching_stays_exact_and_unaffected():
+    from estimate_extractor.xactimate_lookup.fast_group_executor import reconcile_complete_group_inventory
+    with pytest.raises(RuntimeError, match="exact physical row match"):
+        reconcile_complete_group_inventory(["Roaf"], ["Roof"])  # near-miss OCR must NOT fuzzy-match
+
+
+def test_sentinel_pairwise_distances_exceed_the_fuzzy_bound():
+    needles = {name: calibration._calibration_name_needle(name) for name in CALIBRATION_GROUP_NAMES}
+    keys = list(needles)
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            d = calibration._min_substring_edit_distance(needles[keys[i]], needles[keys[j]])
+            assert d > calibration.CALIBRATION_SENTINEL_MAX_EDIT_DISTANCE, (keys[i], keys[j], d)
+
+
+# -- creation: causal physical-delta binding --
+
+class _FakeClock:
+    """Advances instantly on sleep() -- lets bounded-deadline loops in
+    xactimate_calibration.py be tested without a real multi-second wait."""
+    def __init__(self): self.now = 0.0
+    def perf_counter(self): return self.now
+    def sleep(self, seconds): self.now += seconds
+
+
+def test_creation_binds_via_physical_delta_with_ocr_imperfect_new_row(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["new_group_dialog_name_click"] = [185, 18]
+    candidate.geometry["new_group_dialog_attach_click"] = [305, 75]
+    adapter = _BootstrapCreationAdapter(root_center=100.0, pitch=20.0)
+    def fake_inventory(adapter_arg, _image):
+        rows = [("TEST", adapter_arg.root_center)]
+        for i, created_name in enumerate(adapter_arg.created_names, start=1):
+            displayed = "Cal_ROW_CHARLE)" if created_name == "CAL_ROW_CHARLIE" else created_name
+            rows.append((displayed, adapter_arg.root_center + i * adapter_arg.pitch))
+        return _inventory(*rows)
+    monkeypatch.setattr(calibration, "_group_column_inventory", fake_inventory)
+    result = calibration._create_one_calibration_group(adapter, candidate, "CAL_ROW_CHARLIE")
+    assert result["state"] == "created_and_exactly_observed"
+    assert result["physical_delta"] == 1
+
+
+def test_creation_fails_closed_on_zero_physical_delta(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["new_group_dialog_name_click"] = [185, 18]
+    candidate.geometry["new_group_dialog_attach_click"] = [305, 75]
+    adapter = _BootstrapCreationAdapter(root_center=100.0, pitch=20.0)
+    clock = _FakeClock()
+    monkeypatch.setattr(calibration.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(calibration.time, "sleep", clock.sleep)
+    # No new row ever appears, no matter what the dialog flow does.
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: _inventory(("TEST", 100.0)))
+    with pytest.raises(RuntimeError, match="was not exactly observed"):
+        calibration._create_one_calibration_group(adapter, candidate, "CAL_ROW_CHARLIE")
+
+
+def test_creation_fails_closed_on_multiple_new_physical_rows(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["new_group_dialog_name_click"] = [185, 18]
+    candidate.geometry["new_group_dialog_attach_click"] = [305, 75]
+    adapter = _BootstrapCreationAdapter(root_center=100.0, pitch=20.0)
+    clock = _FakeClock()
+    monkeypatch.setattr(calibration.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(calibration.time, "sleep", clock.sleep)
+    # Two new rows appear -- one plausibly compatible, one not. Must never
+    # bind to "the one that looks right" out of an ambiguous delta.
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: _inventory(
+        ("TEST", 100.0), ("CAL_ROW_CHARLIE", 120.0), ("Unrelated Extra Row", 140.0),
+    ))
+    with pytest.raises(RuntimeError, match="was not exactly observed"):
+        calibration._create_one_calibration_group(adapter, candidate, "CAL_ROW_CHARLIE")
+
+
+def test_creation_fails_closed_when_new_row_ocr_is_incompatible(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["new_group_dialog_name_click"] = [185, 18]
+    candidate.geometry["new_group_dialog_attach_click"] = [305, 75]
+    adapter = _BootstrapCreationAdapter(root_center=100.0, pitch=20.0)
+    clock = _FakeClock()
+    monkeypatch.setattr(calibration.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(calibration.time, "sleep", clock.sleep)
+    # Exactly one new physical row -- but its text is unrelated to any sentinel.
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: _inventory(
+        ("TEST", 100.0), ("Completely Unrelated Text", 120.0),
+    ))
+    with pytest.raises(RuntimeError, match="was not exactly observed"):
+        calibration._create_one_calibration_group(adapter, candidate, "CAL_ROW_CHARLIE")
+
+
+# -- recovery: guarded-only (no causal delta available) --
+
+def test_recovery_accepts_the_proven_charlie_ocr_error(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    inventory = _standard_trio_inventory("Cal_ROW_CHARLE)")
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: inventory)
+    adapter = _InteractiveAdapter()
+    recovered, detail = recover_existing_group_row_calibration(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path,
+    )
+    assert recovered.geometry["group_row_pitch_state"] == "measured_confident"
+    assert recovered.validation_state == "ready_for_fast_execution"
+
+
+def test_recovery_fails_closed_on_competing_fuzzy_charlie_candidates(monkeypatch, tmp_path):
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    inventory = _inventory(("TEST", 100), ("CAL_ROW_ALPHA", 120), ("CAL_ROW_BRAVO", 140),
+                           ("Cal_ROW_CHARLE)", 160), ("CAL_ROW_CHRLIF", 180))
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: inventory)
+    adapter = _InteractiveAdapter()
+    with pytest.raises(RuntimeError):
+        recover_existing_group_row_calibration(
+            adapter, candidate, directory=tmp_path, evidence_dir=tmp_path,
+        )
+
+
+def test_recovery_routing_recognizes_guarded_charlie_as_present(monkeypatch, tmp_path):
+    # _complete_or_recover_group_rows()'s presence check must also
+    # recognize the OCR-imperfect CHARLIE as present, routing to
+    # read-only recovery rather than a redundant/incorrect creation.
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    inventory = _standard_trio_inventory("Cal_ROW_CHARLE)")
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: inventory)
+    monkeypatch.setattr(calibration, "complete_interactive_group_row_calibration",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not create -- CHARLIE already exists")))
+    adapter = _InteractiveAdapter()
+    recovered, _detail = calibration._complete_or_recover_group_rows(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path, allow_creation=True,
+    )
+    assert recovered.geometry["group_row_pitch_state"] == "measured_confident"

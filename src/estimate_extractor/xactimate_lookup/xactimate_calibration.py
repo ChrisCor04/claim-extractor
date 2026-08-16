@@ -284,15 +284,25 @@ def _group_column_inventory(adapter, image) -> dict[str, Any]:
             "ocr_diagnostics": measured, "rows": rows}
 
 
-def _exact_calibration_row_map(inventory: dict[str, Any], names=CALIBRATION_GROUP_NAMES) -> dict[str, dict[str, Any]]:
+def _calibration_name_needle(name: str) -> str:
     from .fast_group_executor import normalize_planned_group_identity
 
+    return normalize_planned_group_identity(name)
+
+
+def _exact_calibration_name_matches(
+    inventory: dict[str, Any], needle: str, *, exclude: frozenset[int] = frozenset(),
+) -> list[tuple[int, dict[str, Any]]]:
+    return [(index, row) for index, row in enumerate(inventory["rows"])
+            if needle and needle in row["normalized_text"] and index not in exclude]
+
+
+def _exact_calibration_row_map(inventory: dict[str, Any], names=CALIBRATION_GROUP_NAMES) -> dict[str, dict[str, Any]]:
     result = {}
     used: set[int] = set()
     for name in names:
-        needle = normalize_planned_group_identity(name)
-        matches = [(index, row) for index, row in enumerate(inventory["rows"])
-                   if needle and needle in row["normalized_text"]]
+        needle = _calibration_name_needle(name)
+        matches = _exact_calibration_name_matches(inventory, needle)
         if len(matches) != 1:
             raise RuntimeError(f"calibration group {name!r} has {len(matches)} exact physical row match(es)")
         index, row = matches[0]
@@ -303,13 +313,141 @@ def _exact_calibration_row_map(inventory: dict[str, Any], names=CALIBRATION_GROU
     return result
 
 
+#: Live-caught: OCR can drop an internal character from a genuinely
+#: correct calibration sentinel name (observed: CAL_ROW_CHARLIE read as
+#: "Cal_ROW_CHARLE)"). The three sentinel names are deliberately far
+#: apart (minimum true pairwise normalized Levenshtein distance is 5;
+#: see docs/calibration-sentinel-audit notes), so a small bounded
+#: distance here cannot cross-match them. Scoped ONLY to the three known
+#: calibration sentinel names -- never used for production group names.
+CALIBRATION_SENTINEL_MAX_EDIT_DISTANCE = 2
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Standard edit distance. Small local helper -- no new dependency;
+    used only by the bounded calibration-sentinel matcher below."""
+    if a == b:
+        return 0
+    m, n = len(a), len(b)
+    if m == 0:
+        return n
+    if n == 0:
+        return m
+    previous = list(range(n + 1))
+    for i in range(1, m + 1):
+        current = [i] + [0] * n
+        for j in range(1, n + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+        previous = current
+    return previous[n]
+
+
+def _min_substring_edit_distance(text: str, needle: str) -> int:
+    """Edit distance between `needle` and its best-aligned substring of
+    `text` -- free start/end within `text`, so surrounding OCR noise
+    (glyph fragments merged into the same clustered row, e.g. the "fy"
+    prefix seen live before a correctly-read sentinel) never inflates the
+    distance, matching the tolerance the exact-substring check already
+    has. Only genuine corruption WITHIN the aligned span counts."""
+    m, n = len(needle), len(text)
+    if m == 0:
+        return 0
+    if n == 0:
+        return m
+    previous = [0] * (n + 1)  # dp[0][j] = 0: free start anywhere in text
+    for i in range(1, m + 1):
+        current = [i] + [0] * n
+        for j in range(1, n + 1):
+            cost = 0 if needle[i - 1] == text[j - 1] else 1
+            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+        previous = current
+    return min(previous)  # free end: needle fully consumed, any remaining suffix ignored
+
+
+def _calibration_name_guarded_matches(
+    inventory: dict[str, Any], name: str, names=CALIBRATION_GROUP_NAMES,
+    *, max_edit_distance: int = CALIBRATION_SENTINEL_MAX_EDIT_DISTANCE,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Physical rows attributable to `name`: exact normalized-substring
+    containment first (identical semantics to _exact_calibration_row_map
+    -- if any exact match exists, that is the answer, unfiltered by the
+    fuzzy guards below). Only when there are ZERO exact matches does the
+    bounded, calibration-only fuzzy tier run: a row qualifies only if its
+    best-aligned substring edit distance to `name` is within
+    `max_edit_distance` AND it is not simultaneously that close to any
+    OTHER calibration sentinel (never guess between two plausible
+    sentinels). Hierarchy/indentation is never consulted here -- not an
+    identity predicate."""
+    needle = _calibration_name_needle(name)
+    exact = _exact_calibration_name_matches(inventory, needle)
+    if exact:
+        return exact
+    other_needles = [_calibration_name_needle(other) for other in names if other != name]
+    fuzzy: list[tuple[int, dict[str, Any]]] = []
+    for index, row in enumerate(inventory["rows"]):
+        distance = _min_substring_edit_distance(row["normalized_text"], needle)
+        if distance > max_edit_distance:
+            continue
+        if any(_min_substring_edit_distance(row["normalized_text"], other_needle) <= max_edit_distance
+               for other_needle in other_needles):
+            continue  # ambiguous against another sentinel -- never guess
+        fuzzy.append((index, row))
+    return fuzzy
+
+
+def _guarded_calibration_row_map(
+    inventory: dict[str, Any], names=CALIBRATION_GROUP_NAMES,
+    *, max_edit_distance: int = CALIBRATION_SENTINEL_MAX_EDIT_DISTANCE,
+) -> dict[str, dict[str, Any]]:
+    """Like _exact_calibration_row_map, but each sentinel with zero exact
+    matches falls back to the bounded, calibration-only fuzzy tier (see
+    _calibration_name_guarded_matches). Still requires exactly one
+    physical row per sentinel and fails closed on 0, 2+, or a row already
+    claimed by an earlier sentinel in this call."""
+    result = {}
+    used: set[int] = set()
+    for name in names:
+        matches = [(index, row) for index, row in _calibration_name_guarded_matches(inventory, name, names, max_edit_distance=max_edit_distance)
+                   if index not in used]
+        if len(matches) != 1:
+            raise RuntimeError(f"calibration group {name!r} has {len(matches)} exact/guarded physical row match(es)")
+        index, row = matches[0]
+        used.add(index)
+        result[name] = row
+    return result
+
+
+#: Two physical rows are the "same" row across a before/after capture if
+#: their measured centers land within this tolerance -- matches the row-
+#: clustering tolerance _group_column_inventory() already uses, and is
+#: deliberately position-only (never OCR text, which is exactly the
+#: imperfect signal the causal-delta check below exists to route around).
+_PHYSICAL_ROW_RECONCILE_TOLERANCE_PX = 5.0
+
+
+def _new_physical_rows(
+    before: dict[str, Any], after: dict[str, Any], *, tolerance: float = _PHYSICAL_ROW_RECONCILE_TOLERANCE_PX,
+) -> list[dict[str, Any]]:
+    """Rows present in `after` with no positional counterpart in
+    `before`. Reconciled by physical Y position only -- never by OCR text
+    (the imperfect signal being routed around) and never by absolute
+    list index (nesting/insertion can shift indices without any row
+    actually moving)."""
+    before_centers = [row["center_y"] for row in before["rows"]]
+    return [row for row in after["rows"]
+            if not any(abs(row["center_y"] - center) <= tolerance for center in before_centers)]
+
+
 def confident_known_group_measurement(
     inventory: dict[str, Any], names=CALIBRATION_GROUP_NAMES,
     *, tolerance: float = GROUP_ROW_SPACING_TOLERANCE_PX,
 ) -> dict[str, Any]:
-    """Measure two spacings from three exact, known calibration rows."""
+    """Measure two spacings from three known calibration rows, identified
+    by exact text first and the bounded calibration-only fuzzy tier only
+    when a sentinel has no exact match (see _guarded_calibration_row_map)."""
     try:
-        mapping = _exact_calibration_row_map(inventory, names)
+        mapping = _guarded_calibration_row_map(inventory, names)
     except RuntimeError as exc:
         return {"calibration_group_names": list(names), "detected_row_centers": {}, "measured_spacings": [],
                 "chosen_pitch": None, "tolerance_px": tolerance, "confidence_state": "unresolved",
@@ -384,14 +522,36 @@ def _create_one_calibration_group(adapter, profile: XactimateCalibration, name: 
         time.sleep(0.05)
     if adapter._find_window_by_title("New Group") is not None:
         raise RuntimeError("New Group dialog did not close")
+    # Confirmation binds on the causal physical delta first (exactly one
+    # new physical row versus the `inventory` captured before this
+    # creation began), not on OCR identity alone -- OCR can drop an
+    # internal character from a genuinely correct sentinel (live-caught:
+    # CAL_ROW_CHARLIE read as "Cal_ROW_CHARLE)"). The one new row is then
+    # required to be OCR-compatible with the intended sentinel under the
+    # same bounded, calibration-only guard _guarded_calibration_row_map
+    # uses, so a coincidental unrelated new row can never be bound simply
+    # because a delta of exactly one appeared.
     deadline = time.perf_counter() + 5
     while time.perf_counter() < deadline:
         try:
             current = _group_column_inventory(adapter, adapter._capture_client_image(hwnd))
-            _exact_calibration_row_map(current, (name,))
-            return {"name": name, "state": "created_and_exactly_observed"}
         except RuntimeError:
             time.sleep(0.05)
+            continue
+        new_rows = _new_physical_rows(inventory, current)
+        if len(new_rows) == 1:
+            candidate = new_rows[0]
+            needle = _calibration_name_needle(name)
+            other_needles = [_calibration_name_needle(other) for other in CALIBRATION_GROUP_NAMES if other != name]
+            distance = _min_substring_edit_distance(candidate["normalized_text"], needle)
+            competing = any(
+                _min_substring_edit_distance(candidate["normalized_text"], other_needle) <= CALIBRATION_SENTINEL_MAX_EDIT_DISTANCE
+                for other_needle in other_needles
+            )
+            if distance <= CALIBRATION_SENTINEL_MAX_EDIT_DISTANCE and not competing:
+                return {"name": name, "state": "created_and_exactly_observed",
+                        "physical_delta": 1, "match_distance": distance}
+        time.sleep(0.05)
     raise RuntimeError(f"new calibration group {name!r} was not exactly observed")
 
 
@@ -436,7 +596,7 @@ def complete_interactive_group_row_calibration(
     root_matches = [row for row in final_inventory["rows"] if root_identity and root_identity in row["normalized_text"]]
     if len(root_matches) != 1:
         raise RuntimeError("Group-row geometry requires calibration: project root row is not unique")
-    known_mapping = _exact_calibration_row_map(final_inventory)
+    known_mapping = _guarded_calibration_row_map(final_inventory)
     click_offsets = [known_mapping[name]["center_y"] - known_mapping[name]["top"] for name in CALIBRATION_GROUP_NAMES]
     geometry.update({"group_row_height": measurement["chosen_pitch"],
                      "group_row_pitch_state": "measured_confident",
@@ -477,14 +637,23 @@ def _complete_or_recover_group_rows(
     # absent and route into (redundant, failure-prone) creation.
     adapter._scroll_group_tree_to_top(adapter._ensure_main_window())
     inventory = _group_column_inventory(adapter, adapter._capture_client_image(adapter._ensure_main_window()))
+    # Presence uses the same exact-then-guarded-fuzzy policy recovery
+    # itself will use -- a sentinel that already, genuinely exists but
+    # OCR'd imperfectly (live-caught: CAL_ROW_CHARLIE -> "CHARLE)") must
+    # still route to read-only recovery, not a redundant/wrong creation
+    # attempt. This is distinct from complete_interactive_group_row_
+    # calibration()'s own pre-creation "does this already exist" guard,
+    # which stays exact-only deliberately (see that function).
     present = []
     for name in CALIBRATION_GROUP_NAMES:
-        try:
-            _exact_calibration_row_map(inventory, (name,))
+        matches = _calibration_name_guarded_matches(inventory, name)
+        if len(matches) == 1:
             present.append(name)
-        except RuntimeError as exc:
-            if "0 exact" not in str(exc):
-                raise
+        elif len(matches) > 1:
+            raise RuntimeError(
+                f"interactive row calibration refused: calibration group {name!r} has "
+                f"{len(matches)} exact/guarded physical row match(es)"
+            )
     if len(present) == len(CALIBRATION_GROUP_NAMES):
         return recover_existing_group_row_calibration(
             adapter, profile, directory=directory, evidence_dir=evidence_dir,
@@ -528,7 +697,7 @@ def recover_existing_group_row_calibration(
                        "group_row_diagnostics": measurement})
         save_calibration(replace(profile, geometry=failed), directory)
         raise RuntimeError("Group-row geometry requires calibration: " + str(measurement["rejection_reason"]))
-    mapping = _exact_calibration_row_map(inventory)
+    mapping = _guarded_calibration_row_map(inventory)
     root_identity = "".join(ch for ch in profile.window_title.casefold() if ch.isalnum())
     root_matches = [row for row in inventory["rows"] if root_identity and root_identity in row["normalized_text"]]
     if len(root_matches) != 1:
