@@ -302,15 +302,170 @@ def test_inventory_accepts_advisory_header_width_jitter_with_exact_origin():
     assert facade.select_group_lightweight("ORBIT_ROOF_C").startswith("verified_inventory_row")
 
 
-def test_bounded_new_row_proof_cannot_satisfy_a_different_planned_group():
+def test_fresh_exact_group_row_cannot_satisfy_a_different_planned_group():
     class Adapter:
-        def _capture_client_image(self, hwnd): return object()
-        def _locate_group_tree_header(self, image): return (10, 20, 30, 40)
-        def _group_tree_row_has_selection_boundary(self, image, header, index): return index == 1
-        def _ocr_group_tree_row_text(self, image, header, index): return "P4A.0814"
+        def snapshot_group_names(self): return ["TEST", "P4A_0814"]
     facade = object.__new__(WindowsGroupBatchUI); facade.adapter = Adapter()
-    assert facade._selected_exact_row(1, "P4A_0814") == (1, "P4A.0814")
-    assert facade._selected_exact_row(1, "P4B_0814") is None
+    assert facade._fresh_exact_group_row("P4A_0814") == (1, ["TEST", "P4A_0814"])
+    assert facade._fresh_exact_group_row("P4B_0814") is None
+
+
+# -- create_group(): fresh name-based reacquisition, no selection dependency --
+
+class _FakeClock:
+    """Advances instantly on sleep() -- lets bounded-deadline loops be
+    tested without a real multi-second wait."""
+    def __init__(self): self.now = 0.0
+    def perf_counter(self): return self.now
+    def sleep(self, seconds): self.now += seconds
+
+
+class _CreateGroupAdapter:
+    """Drives WindowsGroupBatchUI.create_group()'s full dialog-driven
+    creation sequence against a controllable sequence of fresh
+    snapshot_group_names() reads -- proving the post-dialog verification
+    is a name-based reacquisition, not a selection-boundary/OCR read.
+    Deliberately has no _group_tree_row_has_selection_boundary or
+    _ocr_group_tree_row_text method at all: the new verification must
+    never call either."""
+    expected_project_name = "TEST"
+    _GROUP_MENU_NEW_INDEX = 15
+
+    def __init__(self, snapshot_sequence):
+        self._snapshots = iter(snapshot_sequence)
+        self._last_snapshot = None
+        self._dialog_open = False
+        self._click_count = 0
+        self.evidence_dir = None
+
+    def verify_application(self): return True
+    def verify_project(self): return True
+    def _unexpected_dialog_present(self): return False
+    def _find_dropdown_window(self): return None
+    def _ensure_main_window(self): return 1
+    def _capture_client_image(self, hwnd): return object()
+    def _locate_group_tree_header(self, image): return (10, 20, 30, 40)
+    def _open_group_tree_context_menu(self, hwnd, header, row_index): return ["item"] * 20
+    def _click_group_menu_item(self, items, index): self._dialog_open = True
+    def _find_window_by_title(self, title):
+        return 999 if (title == "New Group" and self._dialog_open) else None
+    def _click_client(self, hwnd, *xy):
+        self._click_count += 1
+        if self._click_count == 2:  # the Attach/OK click closes the dialog
+            self._dialog_open = False
+    def _select_all_and_delete(self): pass
+    def _type_keybdevent(self, text, char_interval_s=None): pass
+    def snapshot_group_names(self):
+        try:
+            self._last_snapshot = next(self._snapshots)
+        except StopIteration:
+            pass  # keep returning the last value once the sequence is exhausted
+        return self._last_snapshot
+
+
+def _create_group_facade(adapter, evidence_dir):
+    facade = object.__new__(WindowsGroupBatchUI)
+    facade.adapter = adapter
+    facade.calibration = type("Calibration", (), {"geometry": {
+        "new_group_dialog_name_click": [1, 1], "new_group_dialog_attach_click": [2, 2],
+    }})()
+    facade._initial_rows = ["TEST"]
+    facade._inventory = None
+    adapter.evidence_dir = evidence_dir
+    return facade
+
+
+def test_creation_verification_tolerates_transient_incomplete_snapshot(tmp_path):
+    adapter = _CreateGroupAdapter([
+        ["TEST"],               # immediately after dialog closes -- not yet visible
+        ["TEST"],               # still not settled
+        ["TEST", "Exterior"],   # settled
+    ])
+    facade = _create_group_facade(adapter, tmp_path)
+    detail = facade.create_group("Exterior")
+    assert detail["creation_state"] == "created"
+    assert detail["verification_method"] == "dialog_close_then_fresh_exact_name_reacquisition"
+    assert detail["observed_row"] == 1
+    assert detail["observed_display_name"] == "Exterior"
+    assert detail["verification_attempts"] == 3
+
+
+def test_creation_verification_never_depends_on_selection_boundary(tmp_path):
+    # _CreateGroupAdapter deliberately has no selection-boundary or
+    # per-row-OCR method at all -- if create_group() called either, this
+    # would raise AttributeError instead of succeeding.
+    adapter = _CreateGroupAdapter([["TEST", "Exterior"]])
+    facade = _create_group_facade(adapter, tmp_path)
+    detail = facade.create_group("Exterior")
+    assert detail["creation_state"] == "created"
+
+
+def test_creation_verification_tolerates_surrounding_ocr_noise(tmp_path):
+    adapter = _CreateGroupAdapter([["TEST", "fej Exterior | Simila"]])
+    facade = _create_group_facade(adapter, tmp_path)
+    detail = facade.create_group("Exterior")
+    assert detail["creation_state"] == "created"
+    assert detail["observed_display_name"] == "fej Exterior | Simila"
+
+
+def test_creation_verification_fails_closed_when_group_never_appears(tmp_path, monkeypatch):
+    import estimate_extractor.xactimate_lookup.fast_group_executor as fge_module
+    clock = _FakeClock()
+    monkeypatch.setattr(fge_module.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(fge_module.time, "sleep", clock.sleep)
+    adapter = _CreateGroupAdapter([["TEST"]])  # never changes -- exhausts the bounded poll
+    facade = _create_group_facade(adapter, tmp_path)
+    with pytest.raises(RuntimeError, match="was not uniquely established"):
+        facade.create_group("Exterior")
+
+
+def test_creation_verification_fails_closed_when_a_different_group_appears(tmp_path, monkeypatch):
+    import estimate_extractor.xactimate_lookup.fast_group_executor as fge_module
+    clock = _FakeClock()
+    monkeypatch.setattr(fge_module.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(fge_module.time, "sleep", clock.sleep)
+    adapter = _CreateGroupAdapter([["TEST", "Dwelling Roof"]])
+    facade = _create_group_facade(adapter, tmp_path)
+    with pytest.raises(RuntimeError, match="was not uniquely established"):
+        facade.create_group("Exterior")
+
+
+def test_creation_verification_fails_closed_on_ambiguous_match(tmp_path):
+    adapter = _CreateGroupAdapter([["TEST", "Exterior", "New Exterior Zone"]])
+    facade = _create_group_facade(adapter, tmp_path)
+    with pytest.raises(RuntimeError, match="2 exact physical rows match"):
+        facade.create_group("Exterior")
+
+
+def test_creation_verification_failure_persists_diagnostic_evidence(tmp_path, monkeypatch):
+    import estimate_extractor.xactimate_lookup.fast_group_executor as fge_module
+    clock = _FakeClock()
+    monkeypatch.setattr(fge_module.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(fge_module.time, "sleep", clock.sleep)
+    adapter = _CreateGroupAdapter([["TEST", "Dwelling Roof"]])
+    facade = _create_group_facade(adapter, tmp_path)
+    with pytest.raises(RuntimeError, match="was not uniquely established"):
+        facade.create_group("Exterior")
+    evidence_files = list(tmp_path.glob("group_creation_verification_failure_*.json"))
+    assert len(evidence_files) == 1
+    payload = json.loads(evidence_files[0].read_text())
+    assert payload["requested_group"] == "Exterior"
+    assert payload["exact_match_indices"] == []
+    assert payload["final_inventory"] == ["TEST", "Dwelling Roof"]
+    assert payload["verification_attempts"] >= 1
+    assert payload["verification_elapsed_seconds"] >= 0
+
+
+def test_diagnostic_capture_failure_never_masks_the_real_error(tmp_path, monkeypatch):
+    import estimate_extractor.xactimate_lookup.fast_group_executor as fge_module
+    clock = _FakeClock()
+    monkeypatch.setattr(fge_module.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(fge_module.time, "sleep", clock.sleep)
+    adapter = _CreateGroupAdapter([["TEST"]])
+    facade = _create_group_facade(adapter, tmp_path)
+    adapter.evidence_dir = None  # forces the best-effort diagnostic capture itself to fail
+    with pytest.raises(RuntimeError, match="was not uniquely established"):
+        facade.create_group("Exterior")
 
 
 def test_three_same_process_selections_reuse_inventory_without_complete_tree_ocr():

@@ -356,20 +356,45 @@ class WindowsGroupBatchUI:
                 return None
             time.sleep(interval_s)
 
-    def _selected_exact_row(self, hwnd: int, group: str):
-        image = self.adapter._capture_client_image(hwnd)
-        header = self.adapter._locate_group_tree_header(image)
-        if header is None:
-            return None
-        selected = [
-            index for index in range(1, 24)
-            if self.adapter._group_tree_row_has_selection_boundary(image, header, index)
-        ]
-        if len(selected) != 1:
-            return None
-        row = selected[0]
-        displayed = self.adapter._ocr_group_tree_row_text(image, header, row)
-        return (row, displayed) if exact_planned_group_rows([displayed], group) == [0] else None
+    def _fresh_exact_group_row(self, group: str) -> tuple[int, list[str]] | None:
+        """Fresh, full-tree, name-based row lookup -- deliberately
+        independent of any current selection state. Live-caught
+        regression: requiring the newly-created row to still be the
+        selected one at verification time was found to fail closed on a
+        row that was, moments later, correctly created/selected/named --
+        the verification window can outlast a real but transient repaint
+        delay. Re-locating by name in a fresh snapshot (the same
+        mechanism verify_all_groups_created() already uses) has no such
+        dependency. Two or more exact matches is genuine ambiguity, not
+        something a retry can resolve -- fails closed immediately rather
+        than waiting out the poll."""
+        rows = self.adapter.snapshot_group_names()
+        matches = exact_planned_group_rows(rows, group)
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"fast group creation refused: {len(matches)} exact physical rows match {group!r} in the group tree"
+            )
+        return (matches[0], rows) if matches else None
+
+    def _report_creation_verification_failure(self, *, group: str, attempts: int, elapsed_seconds: float) -> None:
+        """Best-effort diagnostic capture for a creation-verification
+        failure -- purely additive evidence; any error here is swallowed
+        and never changes, replaces, or delays the actual failure."""
+        try:
+            rows = self.adapter.snapshot_group_names()
+            matches = exact_planned_group_rows(rows, group)
+            payload = {
+                "requested_group": group, "verification_attempts": attempts,
+                "verification_elapsed_seconds": elapsed_seconds,
+                "final_inventory": rows, "exact_match_indices": matches,
+            }
+            evidence_root = self.adapter.evidence_dir
+            evidence_root.mkdir(parents=True, exist_ok=True)
+            slug = normalize_planned_group_identity(group) or "unknown"
+            path = evidence_root / f"group_creation_verification_failure_{slug}.json"
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def create_group(self, group: str) -> dict[str, Any]:
         if self._initial_rows is None:
@@ -410,16 +435,30 @@ class WindowsGroupBatchUI:
             raise RuntimeError("fast group creation refused: New Group dialog did not close")
 
         verify_started = time.perf_counter()
-        observed = self._poll(lambda: self._selected_exact_row(hwnd, group))
+        attempt_count = 0
+
+        def _attempt():
+            nonlocal attempt_count
+            attempt_count += 1
+            return self._fresh_exact_group_row(group)
+
+        observed = self._poll(_attempt)
         verify_seconds = time.perf_counter() - verify_started
         if observed is None:
-            raise RuntimeError(f"fast group creation refused: newly selected row did not read exactly as {group!r}")
+            self._report_creation_verification_failure(
+                group=group, attempts=attempt_count, elapsed_seconds=verify_seconds,
+            )
+            raise RuntimeError(
+                f"fast group creation refused: {group!r} was not uniquely established in the group tree "
+                f"after {attempt_count} verification attempt(s) over {verify_seconds:.2f}s"
+            )
+        observed_row, final_rows = observed
         return {
-            "creation_state": "created", "verification_method": "dialog_close_then_selected_row_exact_ocr",
+            "creation_state": "created", "verification_method": "dialog_close_then_fresh_exact_name_reacquisition",
             "new_group_command_seconds": command_seconds, "group_name_input_seconds": input_seconds,
             "attach_to_dialog_close_seconds": attach_seconds,
-            "bounded_new_row_verification_seconds": verify_seconds,
-            "observed_row": observed[0], "observed_display_name": observed[1],
+            "bounded_new_row_verification_seconds": verify_seconds, "verification_attempts": attempt_count,
+            "observed_row": observed_row, "observed_display_name": final_rows[observed_row],
         }
 
     def verify_all_groups_created(self, groups: Sequence[str]) -> str:
