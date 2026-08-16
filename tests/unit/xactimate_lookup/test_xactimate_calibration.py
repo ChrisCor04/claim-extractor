@@ -8,8 +8,9 @@ from estimate_extractor.xactimate_lookup import xactimate_calibration as calibra
 from estimate_extractor.xactimate_lookup.xactimate_calibration import (
     CALIBRATION_GROUP_NAMES, SCHEMA_VERSION, XactimateCalibration, apply_fast_geometry,
     calibrate_xactimate, complete_interactive_group_row_calibration, confident_known_group_measurement,
-    describe_calibration_group_presence, load_calibration, machine_identifier, measure_group_row_pitch,
-    profile_path, save_calibration, recover_existing_group_row_calibration, validate_calibration,
+    describe_calibration_group_presence, get_monitor_info, load_calibration, machine_identifier,
+    measure_group_row_pitch, profile_path, save_calibration, recover_existing_group_row_calibration,
+    validate_calibration,
 )
 
 
@@ -24,7 +25,8 @@ def profile(*, width=1920, height=1023, dpi=96, monitor=(0, 0, 2560, 1440)):
                    "items_tab": [296, 78, 342, 98], "items_search": [508, 165, 826, 186],
                    "quick_entry_cat": [563, 459, 608, 477], "grid_header": [506, 628, 1894, 645],
                    "grid_row_1": [506, 654, 1894, 671]},
-        geometry={"group_row_text_top_offset": 23, "group_row_height": 20,
+        geometry={"group_row_text_top_offset": 23, "group_first_child_row_text_top_offset": 43,
+                  "group_row_height": 20,
                   "group_row_pitch_state": "measured_confident", "group_click_x_offset": 79,
                   "group_click_y_offset": 8, "group_text_x_offset": 35, "group_text_width": 245,
                   "group_row_crop_margin_top": 3, "group_row_crop_height": 18,
@@ -584,6 +586,81 @@ def test_read_only_existing_rows_recovery_makes_profile_executable_without_creat
     apply_fast_geometry(type("Adapter", (), {})(), recovered)
 
 
+def test_recovery_anchors_child_rows_to_cal_row_alpha_not_the_root_row(monkeypatch, tmp_path):
+    """The audited bug: production used to derive every child row's
+    position from the ROOT row's own OCR-cluster top walked forward by
+    whole pitches, silently assuming root and child rows share the same
+    glyph height. This fixture gives the root row a taller OCR box (90..100,
+    i.e. height 20) than the three CAL_ROW sentinels (each height 10), the
+    exact shape that produced the live 'Exterior' misread. Recovery must
+    persist a dedicated first-child anchor taken directly from
+    CAL_ROW_ALPHA's own measured top, independent of the root row's own
+    (differently-sized) OCR box."""
+    candidate = profile(); candidate.geometry["group_row_pitch_state"] = "unresolved"
+    candidate.geometry["group_row_height"] = None
+    inventory = _inventory_with_tops(
+        ("TEST", 100, 90), ("CAL_ROW_ALPHA", 120, 115),
+        ("CAL_ROW_BRAVO", 140, 135), ("CAL_ROW_CHARLIE", 160, 155),
+    )
+    inventory["boundary_method"] = "bounded_header_prefix_ocr"
+    monkeypatch.setattr(calibration, "_group_column_inventory", lambda *_: inventory)
+    adapter = _InteractiveAdapter()
+
+    recovered, _detail = recover_existing_group_row_calibration(
+        adapter, candidate, directory=tmp_path, evidence_dir=tmp_path / "evidence",
+    )
+
+    header_top = inventory["header"][1]
+    assert recovered.geometry["group_row_text_top_offset"] == 90 - header_top
+    assert recovered.geometry["group_first_child_row_text_top_offset"] == 115 - header_top
+    old_buggy_row1_offset = recovered.geometry["group_row_text_top_offset"] + recovered.geometry["group_row_height"]
+    assert recovered.geometry["group_first_child_row_text_top_offset"] != old_buggy_row1_offset
+    apply_fast_geometry(type("Adapter", (), {})(), recovered)
+
+
+def test_old_schema_profile_is_rejected_rather_than_silently_reinterpreted(tmp_path):
+    """A profile saved before the child-anchor fix has no
+    group_first_child_row_text_top_offset at all, and its
+    group_row_text_top_offset was measured under the OLD (root-anchor)
+    semantic. Loading it must fail closed -- forcing recalibration -- never
+    silently reuse the old value as the new child anchor."""
+    stale = profile()
+    stale = replace(stale, schema_version="1.1")
+    del stale.geometry["group_first_child_row_text_top_offset"]
+    save_calibration(stale, tmp_path)
+
+    with pytest.raises(RuntimeError, match="Xactimate layout differs from saved calibration"):
+        load_calibration(tmp_path)
+
+
+def test_apply_fast_geometry_refuses_a_profile_missing_the_first_child_anchor():
+    """Defense in depth alongside the schema-version rejection: even if a
+    pre-fix profile's geometry dict somehow reached apply_fast_geometry
+    directly, it must refuse rather than target every child row from an
+    undefined/None anchor."""
+    candidate = profile()
+    candidate.geometry["group_first_child_row_text_top_offset"] = None
+    with pytest.raises(RuntimeError, match="predates the first-child row anchor"):
+        apply_fast_geometry(type("Adapter", (), {})(), candidate)
+
+
+def test_apply_fast_geometry_preserves_fractional_pitch_without_truncation():
+    """Fix 2: group_row_height is a PITCH multiplied by a growing row_index
+    downstream, so truncating its fractional part here would compound error
+    across later rows. Every other geometry field is a flat, single
+    additive offset, so ordinary rounding remains sufficient for those."""
+    adapter = type("Adapter", (), {})()
+    candidate = profile()
+    candidate.geometry["group_row_height"] = 19.75
+    candidate.geometry["group_click_x_offset"] = 79.4  # flat offset: rounds, does not need float precision
+
+    apply_fast_geometry(adapter, candidate)
+
+    assert adapter._GROUP_TREE_ROW_HEIGHT == 19.75
+    assert isinstance(adapter._GROUP_TREE_ROW_HEIGHT, float)
+    assert adapter._GROUP_TREE_CLICK_DX == 79
+
+
 @pytest.mark.parametrize("allow_creation", [False, True])
 def test_complete_existing_calibration_set_routes_to_read_only_recovery(monkeypatch, tmp_path, allow_creation):
     # Recovery is read-only and must run the same way whether creation
@@ -727,23 +804,154 @@ from ctypes import wintypes as _real_wintypes
 class _FakeUser32ForCalibration:
     def __init__(self, dpi, monitor_rect, work_rect):
         self.dpi, self.monitor_rect, self.work_rect = dpi, monitor_rect, work_rect
+
+        # A real ctypes function pointer supports `.argtypes`/`.restype`
+        # attribute assignment (get_monitor_info() declares both); a bound
+        # method does not. Storing this as a plain function -- not a class
+        # method -- on the instance reproduces that real capability.
+        def GetMonitorInfoW(_hmonitor, info_ref):
+            info = info_ref._obj
+            info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom = self.monitor_rect
+            info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom = self.work_rect
+            return 1
+        self.GetMonitorInfoW = GetMonitorInfoW
+
     def GetDpiForWindow(self, _hwnd): return self.dpi
     def MonitorFromWindow(self, _hwnd, _flags): return 1
-    def GetMonitorInfoW(self, _hmonitor, info_ref):
-        info = info_ref._obj
-        info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom = self.monitor_rect
-        info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom = self.work_rect
-        return 1
     def IsZoomed(self, _hwnd): return False
     def IsIconic(self, _hwnd): return False
 
 
 class _FakeCtypesForCalibration:
-    """Real ctypes.Structure/sizeof/byref; only the DLL call layer is fake."""
+    """Real ctypes.Structure/sizeof/byref/c_void_p/POINTER; only the DLL
+    call layer (user32 itself) is fake -- get_monitor_info() declares real
+    argtypes/restype against these, exactly as it does against the real
+    ctypes module in production."""
     Structure = _real_ctypes.Structure
     sizeof = staticmethod(_real_ctypes.sizeof)
     byref = staticmethod(_real_ctypes.byref)
+    c_void_p = _real_ctypes.c_void_p
+    POINTER = staticmethod(_real_ctypes.POINTER)
     def __init__(self, user32): self.windll = type("Windll", (), {"user32": user32})()
+
+
+# -- get_monitor_info(): the shared Win32 monitor-info binding -------------
+#
+# ctypes binds a DLL function's `.argtypes` on the shared, process-wide
+# function-pointer object -- ctypes.windll.user32.GetMonitorInfoW is the
+# SAME Python object no matter which module accesses it. Before the fix,
+# window_normalization.py and xactimate_calibration.py each defined their
+# own local MONITORINFO ctypes.Structure subclass and called GetMonitorInfoW
+# independently. Whichever ran first in a given process locked argtypes to
+# ITS class; the other's `ctypes.byref()` of its own, separately-defined
+# (but byte-identical) class then failed with exactly:
+#   TypeError: argument 2: TypeError: expected LP_MONITORINFO instance
+#   instead of pointer to MONITORINFO
+# These tests use the REAL ctypes.windll.user32 (not a mock) because the
+# bug is specifically about real ctypes argtypes-binding semantics, which a
+# plain Python mock object cannot reproduce -- confirmed directly: the
+# pre-existing _FakeUser32ForCalibration-based tests above never caught
+# this, since a mocked user32 never enforces argtypes at all. No live
+# window or Xactimate interaction is needed or performed: GetMonitorInfoW's
+# argument-type check happens in ctypes' own Python/C glue layer before any
+# actual Win32 call is dispatched, and a bogus HMONITOR value is enough to
+# exercise it safely offline. Global ctypes state is always restored.
+
+import ctypes as _live_ctypes
+from ctypes import wintypes as _live_wintypes
+
+
+def test_get_monitor_info_survives_a_conflicting_prior_argtypes_binding():
+    """Reproduces the exact live bug, then proves get_monitor_info() is
+    unaffected by it."""
+    user32 = _live_ctypes.windll.user32
+    original_argtypes = user32.GetMonitorInfoW.argtypes
+    original_restype = user32.GetMonitorInfoW.restype
+    try:
+        # Both locally-scoped classes are deliberately named MONITORINFO,
+        # matching the OLD buggy code in both files verbatim (each defined
+        # `class MONITORINFO(ctypes.Structure): ...` inside its own
+        # function) -- this reproduces ctypes' generated LP_MONITORINFO
+        # pointer-type name exactly, not just the underlying mechanism.
+        def _window_normalizations_old_class():
+            class MONITORINFO(_live_ctypes.Structure):
+                _fields_ = [("cbSize", _live_wintypes.DWORD), ("rcMonitor", _live_wintypes.RECT),
+                            ("rcWork", _live_wintypes.RECT), ("dwFlags", _live_wintypes.DWORD)]
+            return MONITORINFO
+
+        def _calibrations_old_class():
+            class MONITORINFO(_live_ctypes.Structure):
+                _fields_ = [("cbSize", _live_wintypes.DWORD), ("rcMonitor", _live_wintypes.RECT),
+                            ("rcWork", _live_wintypes.RECT), ("dwFlags", _live_wintypes.DWORD)]
+            return MONITORINFO
+
+        other_callers_class = _window_normalizations_old_class()
+        this_callers_class = _calibrations_old_class()
+        assert other_callers_class is not this_callers_class  # two distinct classes, same name/layout
+
+        # Simulate "some other caller already bound argtypes to ITS OWN
+        # class" -- exactly what window_normalization.py's old code did.
+        user32.GetMonitorInfoW.argtypes = [_live_ctypes.c_void_p, _live_ctypes.POINTER(other_callers_class)]
+
+        # Reproduce the OLD bug directly: calibration.py's old code passed
+        # byref() of its own, separately-defined, byte-identical class.
+        old_info = this_callers_class(cbSize=_live_ctypes.sizeof(this_callers_class))
+        with pytest.raises(_live_ctypes.ArgumentError, match="LP_MONITORINFO"):
+            user32.GetMonitorInfoW(1, _live_ctypes.byref(old_info))  # the exact live failure, reproduced
+
+        # The fix: get_monitor_info() always (re)declares argtypes against
+        # its OWN one shared class immediately before calling, so it stays
+        # correct no matter what argtypes an earlier caller left bound.
+        result = get_monitor_info(_live_ctypes, _live_wintypes, user32, hwnd=0)
+        assert result is None or hasattr(result, "rcWork")
+    finally:
+        user32.GetMonitorInfoW.argtypes = original_argtypes
+        user32.GetMonitorInfoW.restype = original_restype
+
+
+def test_get_monitor_info_primary_monitor_work_area_lookup_succeeds():
+    """Real ctypes.windll.user32, hwnd=0 -- MONITOR_DEFAULTTONEAREST always
+    resolves to a real monitor (the primary, absent any other window) per
+    Win32 semantics, so this exercises the real API end-to-end with no
+    live window or Xactimate interaction required."""
+    result = get_monitor_info(_live_ctypes, _live_wintypes, _live_ctypes.windll.user32, hwnd=0)
+    assert result is not None
+    assert result.rcWork.right > result.rcWork.left
+    assert result.rcWork.bottom > result.rcWork.top
+
+
+def test_get_monitor_info_is_order_independent_across_repeated_calls():
+    """Directly proves the fix's generalization: calling get_monitor_info()
+    repeatedly (simulating calibration then window normalization, or vice
+    versa, in either order, any number of times) never re-triggers the
+    argtypes conflict -- every call shares the same one canonical class."""
+    user32 = _live_ctypes.windll.user32
+    first = get_monitor_info(_live_ctypes, _live_wintypes, user32, hwnd=0)
+    second = get_monitor_info(_live_ctypes, _live_wintypes, user32, hwnd=0)
+    third = get_monitor_info(_live_ctypes, _live_wintypes, user32, hwnd=0)
+    for result in (first, second, third):
+        assert result is not None and hasattr(result, "rcWork")
+
+
+def test_get_monitor_info_handles_negative_origin_monitor_coordinates():
+    """A secondary monitor positioned left of/above the primary reports
+    negative rcMonitor/rcWork coordinates -- proves the shared structure's
+    signed RECT fields round-trip correctly, using the same fake-DLL-layer
+    pattern as the existing calibrate_xactimate() tests (a real monitor
+    with negative coordinates is not guaranteed to exist on the test
+    machine, so this is verified via the mocked DLL layer)."""
+    user32 = _FakeUser32ForCalibration(dpi=96, monitor_rect=(-1920, 0, 0, 1080), work_rect=(-1920, 0, 0, 1040))
+    ctypes_module = _FakeCtypesForCalibration(user32)
+    result = get_monitor_info(ctypes_module, _live_wintypes, user32, hwnd=1)
+    assert result is not None
+    assert (result.rcMonitor.left, result.rcMonitor.top, result.rcMonitor.right, result.rcMonitor.bottom) == (-1920, 0, 0, 1080)
+    assert (result.rcWork.left, result.rcWork.top, result.rcWork.right, result.rcWork.bottom) == (-1920, 0, 0, 1040)
+
+
+def test_get_monitor_info_returns_none_when_monitor_handle_is_unavailable():
+    class _NoMonitorUser32:
+        def MonitorFromWindow(self, _hwnd, _flags): return 0
+    assert get_monitor_info(_live_ctypes, _live_wintypes, _NoMonitorUser32(), hwnd=0) is None
 
 
 class _FreshImage:

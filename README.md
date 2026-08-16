@@ -42,6 +42,319 @@ Approved estimate JSON + review history
 Automation input JSON + approved line items CSV
 ```
 
+## Windows Setup — New Computer
+
+This section is for someone setting up Claim Extractor on a Windows PC for
+the first time, including with little or no Python experience. It covers
+the local review UI and the Xactimate desktop automation (Fast Grouped).
+If you only want the PDF-extraction CLI on macOS/Linux, skip to
+[Installation](#installation) instead.
+
+**Overview:**
+
+1. Install prerequisites (Python, Tesseract OCR)
+2. Download Claim Extractor
+3. Run `setup-windows.ps1`
+4. Start Claim Extractor
+5. Calibrate Xactimate on this computer
+6. Run a test estimate
+
+**Calibration is per computer.** Xactimate's on-screen layout differs by
+monitor, DPI, and window size, so Claim Extractor measures it fresh on
+each machine and stores the result outside the repository, keyed to that
+machine. A new computer must calibrate itself — never copy a calibration
+file from another machine (see [step 5](#5-first-time-xactimate-calibration)).
+
+### 1. Install prerequisites
+
+#### Python
+
+Claim Extractor requires **Python 3.11 or newer** (`pyproject.toml`
+declares `requires-python = ">=3.11"`). `setup-windows.ps1` looks for
+Python 3.13, then 3.12, then 3.11 via the `py` launcher, in that order.
+This has been validated end-to-end (clean venv, dependency install, and
+import test) on **Python 3.12**.
+
+1. Download Python from the official source: <https://www.python.org/downloads/windows/>
+   Any 3.11, 3.12, or 3.13 release works; 3.12 is the version this setup
+   has been directly validated against.
+2. Run the installer. **Check "Add python.exe to PATH"** on the first
+   installer screen — this is what makes the `py` launcher and `python`
+   command work from PowerShell afterward.
+3. Verify the install in a **new** PowerShell window:
+   ```powershell
+   py --version
+   ```
+   This should print `Python 3.11.x`, `3.12.x`, or `3.13.x`. If PowerShell
+   says `py` (or `python`) is not recognized, re-run the installer and
+   make sure "Add python.exe to PATH" is checked, or open a new terminal
+   window (PATH changes don't apply to already-open windows).
+
+Do not install a version older than 3.11 — nothing in this repository has
+been validated against it, and `pyproject.toml` will refuse the install.
+
+#### Tesseract OCR
+
+**What it is:** Tesseract is a free, local OCR (optical character
+recognition) engine. Claim Extractor's Xactimate automation uses it to
+read on-screen text in the Xactimate window (group names, field labels,
+etc.) — it never sends screenshots anywhere; everything stays on your
+computer.
+
+**Why Claim Extractor needs it:** the Xactimate automation layer
+(`windows_adapter.py`) calls `pytesseract` unconditionally the first time
+it needs to read anything on screen. Without a working Tesseract install,
+calibration and Fast Grouped execution cannot function — this is not the
+same as the *optional* OCR fallback described later in
+[Optional OCR setup](#optional-ocr-setup) for the PDF-extraction pipeline.
+
+**Exactly how Claim Extractor finds it (verified against the current
+code):** at startup of any Xactimate automation feature, the app checks
+whether `C:\Program Files\Tesseract-OCR\tesseract.exe` exists.
+- If it exists, that exact path is used directly — no PATH entry needed.
+- If it does not exist at that exact path, the app falls back to
+  `pytesseract`'s own default behavior, which looks for a program named
+  `tesseract` on your system `PATH`.
+
+There is **no environment-variable override** for this specific lookup
+(unlike the `TESSERACT_CMD` mention in
+[Optional OCR setup](#optional-ocr-setup) below, which applies only to
+the separate PDF-extraction OCR fallback, not to the Xactimate automation
+path) — install to the default location and you won't need to think
+about this further.
+
+**Installation steps:**
+
+1. Download the Windows installer from
+   [UB-Mannheim's Tesseract build](https://github.com/UB-Mannheim/tesseract/wiki)
+   (the standard, widely-used Windows distribution of Tesseract).
+2. Run the installer and **accept the default installation directory**
+   (`C:\Program Files\Tesseract-OCR`). This matches exactly what Claim
+   Extractor checks for automatically — no PATH changes needed.
+3. Verify the file exists:
+   ```powershell
+   Test-Path "C:\Program Files\Tesseract-OCR\tesseract.exe"
+   ```
+   This should print `True`.
+4. Verify it actually runs, by invoking it at its full path (it is not on
+   `PATH` by default, so a bare `tesseract --version` will typically say
+   "not recognized" even after a correct install — this is expected):
+   ```powershell
+   & "C:\Program Files\Tesseract-OCR\tesseract.exe" --version
+   ```
+   This should print a version line such as `tesseract v5.4.0...`.
+
+If you install Tesseract somewhere other than the default directory, you
+must add that folder to your system `PATH` yourself and confirm a bare
+`tesseract --version` works from PowerShell — otherwise the Xactimate
+automation will not find it.
+
+#### Xactimate desktop
+
+Claim Extractor automates your **existing, already-installed** Xactimate
+desktop application — it does not install, license, or replace Xactimate
+in any way. Before continuing:
+
+- Xactimate desktop must already be installed on this computer.
+- It must be licensed and opening normally on its own.
+- You should be able to open a project in it manually before asking
+  Claim Extractor to control it.
+
+This guide does not cover obtaining, installing, or licensing Xactimate —
+that's between you and Xactware.
+
+### 2. Download Claim Extractor
+
+Pick a **short** install path, such as `C:\claim-extractor`, rather than
+somewhere deeply nested (e.g. inside several levels of `Documents\Work\Projects\...`).
+Windows has a default 260-character path limit, and this was directly
+observed during setup validation — a dependency install failed purely
+because of an overly long folder path, with no other problem involved.
+A short path avoids that entirely.
+
+**Option A — Git (recommended if you have Git installed):**
+
+```powershell
+git clone https://github.com/ChrisCor04/claim-extractor
+cd claim-extractor
+```
+
+> **Note:** this URL comes from this repository's currently configured
+> `origin` remote. If you intend to share this repository from a
+> different (e.g. private, org-hosted) location, confirm this is the URL
+> the recipient should actually use before sending these instructions.
+
+**Option B — ZIP download (no Git required):**
+
+1. On the repository's GitHub page, click **Code → Download ZIP**.
+2. Move the downloaded ZIP to a short path, e.g. `C:\`, then extract it
+   there (right-click → **Extract All...**). You should end up with
+   `C:\claim-extractor-main\` or similar.
+3. Open PowerShell **inside that extracted folder**: in File Explorer,
+   click the address bar, type `powershell`, and press Enter.
+
+### 3. Run setup
+
+From inside the repository folder in PowerShell:
+
+```powershell
+.\setup-windows.ps1
+```
+
+**If PowerShell refuses to run it** (a message about scripts being
+disabled), see [Troubleshooting](#7-troubleshooting) — do not
+permanently change your machine's security settings to work around this.
+
+**What this script does, exactly** (read `setup-windows.ps1` directly if
+you want to verify this yourself before running it):
+1. Checks you're on Windows.
+2. Looks for a Python 3.13/3.12/3.11 interpreter via the `py` launcher
+   (falling back to a plain `python` on PATH if it's 3.11+).
+3. Creates a `.venv` folder in the repository — only if one doesn't
+   already exist; it never deletes or recreates an existing `.venv`.
+4. Installs `requirements-windows.txt` (the UI + Xactimate automation
+   dependencies) and then the repository itself, editable, into that
+   `.venv`.
+5. Prints next steps.
+
+**What it explicitly does NOT do:**
+- It does not install, configure, or launch Xactimate.
+- It does not run a claim or touch any project data.
+- It does not copy calibration from another machine — calibration
+  doesn't exist yet until you do it yourself in step 5.
+- It does not change Fast Grouped, calibration, or any other application
+  behavior — it only installs Python packages and the repo itself.
+
+A successful run ends by printing `Setup complete.` followed by the next
+steps listed in the script. The exact pip output above that will vary
+run to run (package download order, cached-vs-downloaded, etc.) — don't
+worry if it doesn't look identical between machines, as long as no red
+`ERROR` lines appear and the script reaches `Setup complete.`.
+
+### 4. Start Claim Extractor
+
+```powershell
+.\start-windows.ps1
+```
+
+This runs the repository's own entrypoint
+(`.\.venv\Scripts\python.exe -m estimate_extractor ui`) using the `.venv`
+that setup just created — it does not add any behavior of its own.
+
+The UI binds to `127.0.0.1` only (localhost) — consistent with the
+existing CLI's own documented behavior ("Binds to 127.0.0.1 only — never
+0.0.0.0") — so it is reachable only from this computer, never from your
+network.
+
+After starting, you should see console output ending with a local URL,
+and your browser should open (or you can open it manually) to
+`http://127.0.0.1:8501`, showing the **ClaimXtract** app with a sidebar
+("Workspace: Quick Run / Advanced") and a title reading "Add a claim PDF
+and execute it in Xactimate. Everything stays on this computer."
+
+### 5. First-time Xactimate calibration
+
+> **IMPORTANT — every new computer must be calibrated.** Calibration
+> measures where things are on *this* screen, at *this* window size and
+> DPI. It is stored outside the repository, named after a hash of this
+> machine's own hostname, and the app will not find or reuse a
+> calibration file from a different computer even if you tried to copy
+> one over — and doing so would silently corrupt automation if it somehow
+> matched a file name, since the coordinates would describe a different
+> screen.
+
+With Xactimate open and Claim Extractor running (Workspace: **Quick
+Run**):
+
+1. In Xactimate's **Grouping** panel, create **3 empty groups** named
+   exactly:
+   ```
+   CAL_ROW_ALPHA
+   CAL_ROW_BRAVO
+   CAL_ROW_CHARLIE
+   ```
+   Keep all three visible as consecutive rows in the Grouping panel (they
+   can stay empty).
+2. In Claim Extractor, under **Xactimate calibration setup**, click
+   **Calibrate Xactimate**.
+3. Claim Extractor measures your current Xactimate layout automatically —
+   no further input from you. On success you'll see **"Calibration
+   complete — Ready for Fast Execution"**, and the **Saved Xactimate
+   calibration** panel above it will show **Status: Ready** along with
+   your measured client size, DPI, and row pitch.
+
+If the button reports missing or incomplete groups, it will tell you
+exactly which of the three names it found and which are still missing —
+create the missing ones and click **Calibrate Xactimate** again.
+
+**Where it's stored:** `%LOCALAPPDATA%\ClaimExtractor\xactimate_calibrations\`,
+in a file named after a hash of this computer's hostname — entirely
+outside the repository folder, so it survives a `git pull` and is never
+committed or shared by cloning the repo.
+
+### 6. First test
+
+Before running an important live claim on a new computer, validate the
+whole path end-to-end with something low-stakes:
+
+1. Launch Claim Extractor (`.\start-windows.ps1`) and open Xactimate.
+2. Use a disposable/**TEST** Xactimate project — not a real client file —
+   for this first run.
+3. Complete calibration (step 5) if you haven't already.
+4. Add a small, known estimate PDF via **Add claim and run → Add file**.
+5. Use **Generate / refresh fast grouped plan**, review the plan Claim
+   Extractor shows you, then **Execute approved fast grouped plan**.
+6. Watch Xactimate: confirm groups are created, then confirm several
+   individual line items appear correctly (right category/selector/
+   quantity) as execution proceeds.
+7. Confirm the run finishes without errors, matching what you saw on the
+   screen.
+
+Only move on to a real claim once this completes cleanly.
+
+### 7. Troubleshooting
+
+| Symptom | Least-invasive fix first |
+|---|---|
+| `py` / `python` "is not recognized" | Reopen PowerShell in a new window (PATH changes need a fresh window). If it still fails, reinstall Python and check "Add python.exe to PATH". |
+| PowerShell won't run `setup-windows.ps1` (execution policy error) | Run it via `powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1` — this affects only that one invocation, nothing permanent. See details below. |
+| PowerShell says the file "is blocked" / came from another computer | The ZIP download may carry Windows' "Mark of the Web". Run `Unblock-File .\setup-windows.ps1` (and optionally every file: `Get-ChildItem -Recurse \| Unblock-File`), then try again. |
+| Dependency install fails partway through | Re-run `.\setup-windows.ps1` — pip resumes/redownloads as needed. If it fails at the *same* package every time, note the exact error before asking for help. |
+| Install fails mentioning a very long filename/path | You're likely inside a deeply nested folder. Move the whole repository to a short path such as `C:\claim-extractor` and re-run setup. |
+| "Could not invoke tesseract" / Xactimate automation errors mentioning OCR | Confirm `Test-Path "C:\Program Files\Tesseract-OCR\tesseract.exe"` returns `True`. If Tesseract is installed elsewhere, add its folder to `PATH` and confirm `tesseract --version` works directly. |
+| `tesseract --version` says "not recognized" right after installing | Expected if you accepted the default install directory — Tesseract isn't on `PATH` by default. Verify with the full-path command in [step 1](#tesseract-ocr) instead; only add it to `PATH` if you installed elsewhere. |
+| Xactimate not detected | Confirm Xactimate is open, licensed, and showing a project (not a splash/login screen) before clicking Calibrate Xactimate or executing a plan. |
+| "Not calibrated" / "Calibration required" | Expected on a brand-new computer — follow [step 5](#5-first-time-xactimate-calibration). |
+| "Needs calibration" after previously showing Ready | Something about the Xactimate window changed (size, DPI, moved monitor). Re-calibrate on this machine — do not reuse a profile from before the change. |
+| UI doesn't start / browser shows nothing | Check the PowerShell window setup/start ran in for an error. Confirm you're visiting `http://127.0.0.1:8501` (not `0.0.0.0`). |
+| "Port already in use" / port 8501 busy | Another Claim Extractor instance (or something else) is already using that port. Close it, or start with a different port: `.\.venv\Scripts\python.exe -m estimate_extractor ui --port 8502`. |
+
+**About the execution-policy fix specifically:** Windows' default
+`RemoteSigned` policy blocks unsigned scripts that were downloaded from
+the internet, but does not require permanently loosening your machine's
+security to run one script once. `powershell -ExecutionPolicy Bypass
+-File .\setup-windows.ps1` only bypasses the policy for that single
+process — it does not change any persistent setting on your machine.
+Avoid running `Set-ExecutionPolicy` at the `LocalMachine` or
+`CurrentUser` scope just to get this script running.
+
+### 8. Updating later
+
+If you set up with Git:
+
+```powershell
+git pull
+.\setup-windows.ps1
+```
+
+Re-running `setup-windows.ps1` after a `git pull` is safe: it reuses your
+existing `.venv` rather than deleting it (it only creates one if missing)
+and simply re-installs/updates packages from `requirements-windows.txt`
+into it. It has no knowledge of, and does not touch, your saved Xactimate
+calibration, which lives outside the repository entirely.
+
+---
+
 ## Purpose and non-goals
 
 This project has four internal stages, all offline and all living in

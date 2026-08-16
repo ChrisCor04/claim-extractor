@@ -55,3 +55,24 @@ config/backups/*
 # Local overrides
 config.yaml
 config.local.yaml
+
+# Locally-learned/generated SQLite state (e.g. internal_lookup_registry.db --
+# self-bootstraps via registry.create_database() and accumulates reviewer
+# approvals over time; not a shared/static asset).
+config/*.db
+
+# Live Xactimate automation evidence (screenshots, per-run diagnostics) --
+# always machine/session-local, never shared.
+automation_evidence/
+
+# pytest temp-directory fixtures left behind by ad hoc/manual test runs
+# (tests that pass tmp_path explicitly outside the normal pytest tmp dir).
+.pytest-tmp-*/
+
+# Local Streamlit server logs from manual `streamlit run` invocations.
+streamlit-server.*.log
+
+# Historical artifact of a since-fixed unquoted --projects-dir bug: a
+# mis-named sibling of projects/ that can contain real claim data. Ignored
+# defensively in case it reappears; see projects/* above for the real path.
+Userschrisclaim-extractorprojects/

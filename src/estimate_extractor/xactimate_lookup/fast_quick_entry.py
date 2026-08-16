@@ -20,6 +20,10 @@ class FastEntryItem:
     selector: str
     quantity: float
     source_line_id: str | None = None
+    #: Tab presses between selector and quantity. 3 for the standard
+    #: Cat->Sel->Act->Desc->Qty layout; 2 for a catalog identity with no
+    #: traversable Act control (Cat->Sel->Desc->Qty).
+    quantity_tab_count: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +118,8 @@ def execute_fast_items(
         keyboard.type_text(item.selector)
         if after_sel_seconds:
             time.sleep(after_sel_seconds)
-        keyboard.press_tab()
-        keyboard.press_tab()
-        keyboard.press_tab()
+        for _ in range(item.quantity_tab_count):
+            keyboard.press_tab()
         quantity_entry = clock()
         keyboard.type_text(format(item.quantity, "g"))
         submit = clock()

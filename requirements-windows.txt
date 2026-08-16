@@ -1,0 +1,33 @@
+# Windows runtime dependency list: local review UI + Xactimate desktop
+# automation (Fast Grouped, calibration, window normalization).
+#
+# This file exists because pywin32/comtypes -- required the moment any
+# xactimate_lookup code path runs -- were previously installed manually on
+# the development machine and declared nowhere. It also lists pytesseract
+# and Pillow directly (rather than pulling in requirements-dev.txt) because
+# the Xactimate automation's on-screen text/landmark reading
+# (windows_adapter.py) uses OCR unconditionally at runtime -- for this
+# workflow OCR is a required runtime dependency, not the optional
+# PDF-extraction fallback requirements-dev.txt describes it as. Pulling in
+# requirements-dev.txt here would also force end users to install
+# pytest/pytest-cov, which the live application never needs.
+#
+# Tesseract itself is a separate, non-pip, external install -- see the
+# README "Optional OCR setup" section and setup-windows.ps1's printed
+# next steps. This file cannot install it.
+
+-r requirements-ui.txt
+
+# Xactimate desktop automation (Windows-only). Pinned exactly: this is the
+# live-validated pair this session's automation work ran against, and
+# neither package has any prior declared version history to preserve.
+pywin32==312
+comtypes==1.4.16
+
+# OCR: required by windows_adapter.py's on-screen text/landmark reading,
+# not merely the optional PDF-extraction OCR fallback. Pinned exactly to
+# the live-validated versions rather than requirements-dev.txt's broader
+# floor-only ranges (pytesseract>=0.3.10, Pillow>=10.0), since those were
+# never validated against the Xactimate automation specifically.
+pytesseract==0.3.13
+Pillow==12.3.0

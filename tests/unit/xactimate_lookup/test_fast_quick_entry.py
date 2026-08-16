@@ -36,6 +36,28 @@ def test_exact_authoritative_sequence_has_three_tabs_and_no_delay_calls():
     assert timing[0].cat_start < timing[0].sel_entry < timing[0].quantity_entry < timing[0].submit < timing[0].ready_for_next
 
 
+def test_standard_item_defaults_to_three_tabs():
+    keyboard = RecordingKeyboard()
+    execute_fast_items(keyboard, [FastEntryItem("RFG", "300S", 35.33)], clock=Clock())
+    assert keyboard.events == [
+        ("type", "RFG"), ("type", "300S"),
+        ("tab",), ("tab",), ("tab",),
+        ("type", "35.33"), ("enter",),
+    ]
+
+
+def test_no_act_item_uses_two_tabs_when_quantity_tab_count_is_two():
+    keyboard = RecordingKeyboard()
+    execute_fast_items(
+        keyboard, [FastEntryItem("RFG", "ARMV>", 33.66, quantity_tab_count=2)], clock=Clock(),
+    )
+    assert keyboard.events == [
+        ("type", "RFG"), ("type", "ARMV>"),
+        ("tab",), ("tab",),
+        ("type", "33.66"), ("enter",),
+    ]
+
+
 def test_multiple_items_execute_back_to_back_and_report_timings():
     keyboard = RecordingKeyboard()
     items = [FastEntryItem("RFG", "IWS", 1), FastEntryItem("SDG", "VINYL", 2)]

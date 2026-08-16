@@ -18,7 +18,15 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "1.1"
+#: Bumped 1.1 -> 1.2 when group_row_text_top_offset's implied semantic for
+#: child rows changed: production row placement now anchors child rows
+#: (row_index >= 1) to a dedicated group_first_child_row_text_top_offset
+#: measurement instead of walking the root row's own offset forward by
+#: whole pitches. A profile saved under 1.1 has no such field and its root
+#: offset must never be silently reused as a child anchor -- the version
+#: bump makes load_calibration()'s existing schema check reject it outright
+#: (forcing recalibration) rather than mistargeting every child row.
+SCHEMA_VERSION = "1.2"
 DEFAULT_CALIBRATION_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ClaimExtractor" / "xactimate_calibrations"
 LAYOUT_ERROR = "Xactimate layout differs from saved calibration — recalibrate"
 CALIBRATION_GROUP_NAMES = ("CAL_ROW_ALPHA", "CAL_ROW_BRAVO", "CAL_ROW_CHARLIE")
@@ -112,6 +120,52 @@ def load_calibration(directory: Path = DEFAULT_CALIBRATION_DIR) -> XactimateCali
 
 def _rect(value) -> tuple[int, int, int, int]:
     return tuple(int(part) for part in value)
+
+
+#: Cache of the one canonical MONITORINFO ctypes.Structure subclass for
+#: this process, populated lazily by _monitor_info_struct(). ctypes binds
+#: a function's `.argtypes` on the shared, process-wide ctypes.windll.user32
+#: function-pointer object -- not per caller -- so once ANY caller declares
+#: GetMonitorInfoW.argtypes = [..., POINTER(SomeLocalMONITORINFO)], every
+#: other caller in the same process must pass a byref() of that SAME
+#: Python class, or ctypes raises "expected LP_MONITORINFO instance
+#: instead of pointer to MONITORINFO" -- even though the two classes have
+#: byte-identical field layouts. Live-caught: window_normalization.py and
+#: this module each used to define their own local MONITORINFO class,
+#: which worked in isolation but broke as soon as both ran in the same
+#: process (e.g. Normalize Xactimate Window, then Calibrate Xactimate).
+#: One shared class, constructed once, makes every caller's byref()
+#: compatible regardless of call order.
+_MONITORINFO_CLASS = None
+
+
+def _monitor_info_struct(ctypes_module, wintypes_module):
+    global _MONITORINFO_CLASS
+    if _MONITORINFO_CLASS is None:
+        class MONITORINFO(ctypes_module.Structure):
+            _fields_ = [
+                ("cbSize", wintypes_module.DWORD), ("rcMonitor", wintypes_module.RECT),
+                ("rcWork", wintypes_module.RECT), ("dwFlags", wintypes_module.DWORD),
+            ]
+        _MONITORINFO_CLASS = MONITORINFO
+    return _MONITORINFO_CLASS
+
+
+def get_monitor_info(ctypes_module, wintypes_module, user32, hwnd: int):
+    """Query GetMonitorInfoW for the monitor nearest `hwnd` (MONITOR_DEFAULTTONEAREST),
+    via the one shared MONITORINFO structure -- see _monitor_info_struct().
+    Returns None (never raises) if the monitor handle or the info query
+    itself fails; callers keep their own existing refusal wording."""
+    monitor = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+    if not monitor:
+        return None
+    MONITORINFO = _monitor_info_struct(ctypes_module, wintypes_module)
+    user32.GetMonitorInfoW.argtypes = [ctypes_module.c_void_p, ctypes_module.POINTER(MONITORINFO)]
+    user32.GetMonitorInfoW.restype = wintypes_module.BOOL
+    info = MONITORINFO(cbSize=ctypes_module.sizeof(MONITORINFO))
+    if not user32.GetMonitorInfoW(monitor, ctypes_module.byref(info)):
+        return None
+    return info
 
 
 def measure_group_row_pitch(
@@ -676,6 +730,8 @@ def complete_interactive_group_row_calibration(
     geometry.update({"group_row_height": measurement["chosen_pitch"],
                      "group_row_pitch_state": "measured_confident",
                      "group_row_text_top_offset": root_matches[0]["top"] - final_inventory["header"][1],
+                     "group_first_child_row_text_top_offset":
+                         known_mapping[CALIBRATION_GROUP_NAMES[0]]["top"] - final_inventory["header"][1],
                      "group_click_y_offset": round(sum(click_offsets) / len(click_offsets)),
                      "group_row_diagnostics": measurement})
     confidence = dict(profile.confidence); confidence["group_row_height"] = "measured_confident"
@@ -781,6 +837,8 @@ def recover_existing_group_row_calibration(
     geometry = dict(profile.geometry)
     geometry.update({"group_row_height": measurement["chosen_pitch"], "group_row_pitch_state": "measured_confident",
                      "group_row_text_top_offset": root_matches[0]["top"] - inventory["header"][1],
+                     "group_first_child_row_text_top_offset":
+                         mapping[CALIBRATION_GROUP_NAMES[0]]["top"] - inventory["header"][1],
                      "group_click_y_offset": round(sum(click_offsets) / len(click_offsets)),
                      "group_row_diagnostics": measurement})
     confidence = dict(profile.confidence); confidence["group_row_height"] = "measured_confident"
@@ -862,11 +920,8 @@ def calibrate_xactimate(
     ctypes, wintypes = adapter._win32()
     user32 = ctypes.windll.user32
     dpi = int(user32.GetDpiForWindow(hwnd))
-    monitor = user32.MonitorFromWindow(hwnd, 2)
-    class MONITORINFO(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
-    info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
-    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+    info = get_monitor_info(ctypes, wintypes, user32, hwnd)
+    if info is None:
         raise RuntimeError("Calibration refused: monitor geometry is unavailable")
     monitor_rect = (info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom)
     work_rect = (info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom)
@@ -904,9 +959,18 @@ def calibrate_xactimate(
     row_height = row_diagnostics["chosen_pitch"] if row_state == "measured_confident" else None
     accepted_tops = row_diagnostics["accepted_row_tops"]
     row_top_offset = accepted_tops[0] if accepted_tops and row_height is not None else None
+    # measured_confident (see measure_group_row_pitch) requires at least
+    # three row clusters, so accepted_tops[0] (the project root row, this
+    # measurement's first/topmost cluster) and accepted_tops[1] (the first
+    # real child row below it) are both safe here whenever row_height is
+    # set. The child anchor must come from this cluster directly, not from
+    # walking the root's own offset forward by one pitch -- root and child
+    # OCR clusters are not guaranteed to share the same glyph height.
+    first_child_top_offset = accepted_tops[1] if row_height is not None and len(accepted_tops) > 1 else None
     geometry = {
         "group_tree_bounds": [max(0, group[0] - 4), group[3], min(image.width, group[0] + adapter._GROUP_TREE_TEXT_WIDTH), image.height],
         "group_row_text_top_offset": row_top_offset,
+        "group_first_child_row_text_top_offset": first_child_top_offset,
         "group_row_height": row_height,
         "group_row_pitch_state": row_state,
         "group_row_diagnostics": row_diagnostics,
@@ -1016,12 +1080,31 @@ def validate_calibration(
     return {"ok": not reasons, "reasons": reasons, "client_rect": client, "dpi": dpi, "landmarks": {k: list(v) if v else None for k, v in observed.items()}}
 
 
+#: group_row_height is a per-row PITCH: production multiplies it by a
+#: growing row_index, so truncating its fractional part with int() (as
+#: every other geometry field below safely can, being flat one-time
+#: additive offsets) would accumulate error across later rows instead of
+#: staying bounded to sub-pixel rounding. It is kept as a float all the way
+#: to windows_adapter's row-position formulas, which round only the final
+#: pixel coordinate. Threading floats through every geometry field the same
+#: way would be strictly more invasive than this file's other consumers
+#: need -- click/crop offsets are only ever added once, so a single
+#: round-to-nearest here is already exact to within half a pixel.
+_FLOAT_PRESERVED_GEOMETRY_ATTRIBUTES = frozenset({"_GROUP_TREE_ROW_HEIGHT"})
+
+
 def apply_fast_geometry(adapter, profile: XactimateCalibration) -> None:
     """Apply only fast-path relative geometry; production defaults stay intact."""
     if profile.geometry.get("group_row_pitch_state") != "measured_confident":
         raise RuntimeError("Group-row geometry requires calibration")
+    if profile.geometry.get("group_first_child_row_text_top_offset") is None:
+        raise RuntimeError(
+            "Group-row geometry requires calibration: saved profile predates the "
+            "first-child row anchor and must be recalibrated"
+        )
     mapping = {
         "_GROUP_TREE_ROW_TEXT_TOP_DY": "group_row_text_top_offset",
+        "_GROUP_TREE_FIRST_CHILD_ROW_TEXT_TOP_DY": "group_first_child_row_text_top_offset",
         "_GROUP_TREE_ROW_HEIGHT": "group_row_height", "_GROUP_TREE_CLICK_DX": "group_click_x_offset",
         "_GROUP_TREE_CLICK_DY_OFFSET": "group_click_y_offset", "_GROUP_TREE_TEXT_DX": "group_text_x_offset",
         "_GROUP_TREE_TEXT_WIDTH": "group_text_width", "_GROUP_TREE_ROW_CROP_MARGIN_TOP": "group_row_crop_margin_top",
@@ -1029,4 +1112,8 @@ def apply_fast_geometry(adapter, profile: XactimateCalibration) -> None:
         "_GROUP_MENU_NEW_INDEX": "group_context_menu_new_index",
     }
     for attribute, key in mapping.items():
-        setattr(adapter, attribute, int(profile.geometry[key]))
+        value = profile.geometry[key]
+        if attribute in _FLOAT_PRESERVED_GEOMETRY_ATTRIBUTES:
+            setattr(adapter, attribute, float(value))
+        else:
+            setattr(adapter, attribute, round(value))

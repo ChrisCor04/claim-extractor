@@ -6,7 +6,7 @@ import ctypes
 from ctypes import wintypes
 from typing import Any
 
-from .xactimate_calibration import LAYOUT_ERROR, XactimateCalibration, validate_calibration
+from .xactimate_calibration import LAYOUT_ERROR, XactimateCalibration, get_monitor_info, validate_calibration
 
 
 def centered_rect(work_rect: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
@@ -35,18 +35,10 @@ def normalize_xactimate_window(adapter, profile: XactimateCalibration) -> dict[s
     if dpi != profile.dpi:
         raise RuntimeError(f"{LAYOUT_ERROR}: DPI {dpi} != calibrated {profile.dpi}")
 
-    class MONITORINFO(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
-
-    user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
-    user32.MonitorFromPoint.restype = ctypes.c_void_p
-    user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
     # Normalize onto the monitor currently containing Xactimate. This works
     # for negative-origin secondary monitors and does not assume (0, 0).
-    primary = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
-    info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
-    if not primary or not user32.GetMonitorInfoW(primary, ctypes.byref(info)):
+    info = get_monitor_info(ctypes, wintypes, user32, hwnd)
+    if info is None:
         raise RuntimeError("window normalization refused: primary monitor work area is unavailable")
     work = (info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom)
 
